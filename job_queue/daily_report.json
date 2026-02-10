@@ -1,0 +1,11 @@
+{
+  "id": "daily_stats",
+  "name": "data_backup",
+  "cron_expr": "0 9 * * *",
+  "is_repeat": true,
+  "payload": {
+    "type": "daily_report",
+    "recipients": ["admin@example.com"]
+  },
+  "max_retries": 2
+}

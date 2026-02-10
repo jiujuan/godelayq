@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Goschedjob 实时监控</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
+        #status { display: flex; gap: 20px; margin-bottom: 20px; }
+        .stat-box { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        #events { background: white; padding: 20px; border-radius: 8px; height: 500px; overflow-y: auto; }
+        .event { padding: 10px; margin: 5px 0; border-left: 4px solid #ccc; background: #f9f9f9; }
+        .event.scheduled { border-color: #3498db; }
+        .event.started { border-color: #f39c12; }
+        .event.completed { border-color: #27ae60; }
+        .event.failed { border-color: #e74c3c; }
+        .event.cancelled { border-color: #95a5a6; }
+        .timestamp { color: #7f8c8d; font-size: 12px; }
+    </style>
+</head>
+<body>
+    <h1>🚀 Goschedjob 实时监控面板</h1>
+    
+    <div id="status">
+        <div class="stat-box">
+            <h3>WebSocket 状态</h3>
+            <p id="ws-status">Disconnected</p>
+        </div>
+        <div class="stat-box">
+            <h3>待处理任务</h3>
+            <p id="pending-count">0</p>
+        </div>
+        <div class="stat-box">
+            <h3>运行中</h3>
+            <p id="running-count">0</p>
+        </div>
+    </div>
+    
+    <div>
+        <h3>过滤条件：</h3>
+        <label><input type="checkbox" class="filter" value="job.scheduled" checked> 已调度</label>
+        <label><input type="checkbox" class="filter" value="job.started" checked> 开始</label>
+        <label><input type="checkbox" class="filter" value="job.completed" checked> 完成</label>
+        <label><input type="checkbox" class="filter" value="job.failed" checked> 失败</label>
+    </div>
+    
+    <div id="events"></div>
+
+    <script>
+        const ws = new WebSocket('ws://localhost:8080/ws');
+        const eventsDiv = document.getElementById('events');
+        
+        ws.onopen = () => {
+            document.getElementById('ws-status').textContent = 'Connected';
+            document.getElementById('ws-status').style.color = 'green';
+            
+            // 发送订阅消息（关注 payment_check 类型任务）
+            ws.send(JSON.stringify({
+                action: 'subscribe',
+                filter: {
+                    job_types: ['payment_check', 'email_send'],
+                    event_types: ['job.scheduled', 'job.started', 'job.completed', 'job.failed']
+                }
+            }));
+        };
+        
+        ws.onmessage = (event) => {
+            const data = JSON.parse(event.data);
+            console.log('Received:', data);
+            
+            // 创建事件卡片
+            const div = document.createElement('div');
+            div.className = `event ${data.type.replace('job.', '')}`;
+            
+            const time = new Date(data.timestamp).toLocaleTimeString();
+            div.innerHTML = `
+                <div class="timestamp">${time}</div>
+                <strong>[${data.type}]</strong> ${data.job_name} 
+                (ID: ${data.job_id.substring(0, 8)}...)
+                ${data.metadata ? `<pre>${JSON.stringify(data.metadata, null, 2)}</pre>` : ''}
+            `;
+            
+            eventsDiv.insertBefore(div, eventsDiv.firstChild);
+            
+            // 限制显示数量
+            if (eventsDiv.children.length > 100) {
+                eventsDiv.removeChild(eventsDiv.lastChild);
+            }
+            
+            // 更新统计（实际应从stats API获取）
+            updateStats(data);
+        };
+        
+        ws.onclose = () => {
+            document.getElementById('ws-status').textContent = 'Disconnected';
+            document.getElementById('ws-status').style.color = 'red';
+        };
+        
+        // 心跳保活
+        setInterval(() => {
+            if (ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({action: 'ping'}));
+            }
+        }, 30000);
+        
+        function updateStats(event) {
+            // 简化统计逻辑
+            if (event.type === 'job.scheduled') {
+                const el = document.getElementById('pending-count');
+                el.textContent = parseInt(el.textContent) + 1;
+            }
+        }
+        
+        // 客户端过滤（根据复选框）
+        document.querySelectorAll('.filter').forEach(cb => {
+            cb.addEventListener('change', () => {
+                const selected = Array.from(document.querySelectorAll('.filter:checked')).map(c => c.value);
+                ws.send(JSON.stringify({
+                    action: 'subscribe',
+                    filter: { event_types: selected }
+                }));
+            });
+        });
+    </script>
+</body>
+</html>

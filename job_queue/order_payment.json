@@ -1,0 +1,13 @@
+{
+  "id": "task_001",
+  "name": "payment_check",
+  "delay": "10m",
+  "payload": {
+    "order_id": "ORD-12345",
+    "amount": 99.99
+  },
+  "max_retries": 3,
+  "retry_delay": "1m",
+  "tags": ["payment", "critical"],
+  "description": "检查订单支付状态"
+}

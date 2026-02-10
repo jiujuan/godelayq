@@ -1,0 +1,8 @@
+{
+  "name": "email_notify",
+  "trigger_at": "2024-12-25T10:00:00+08:00",
+  "payload": {
+    "to": "user@example.com",
+    "subject": "圣诞快乐"
+  }
+}
