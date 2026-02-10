@@ -10,19 +10,19 @@ import (
 	"log"
 	"time"
 
-	"goschedjob"
-	"goschedjob/api"
+	"godelayq"
+	"godelayq/api"
 )
 
 func main() {
 	// 初始化组件
-	store, err := goschedjob.NewJSONFileStore("./data/jobs.json")
+	store, err := godelayq.NewJSONFileStore("./data/jobs.json")
 	if err != nil {
 		log.Fatal(err)
 	}
 	
 	// 创建调度器
-	scheduler := goschedjob.NewScheduler(store, &goschedjob.ExponentialBackoffRetry{
+	scheduler := godelayq.NewScheduler(store, &godelayq.ExponentialBackoffRetry{
 		MaxDelay: 30 * time.Minute,
 	}, nil)
 	
@@ -30,7 +30,7 @@ func main() {
 	server := api.NewServer(scheduler, store, "8080")
 	
 	// 注册订单超时处理器
-	server.RegisterJobHandler("order_timeout_cancel", func(ctx context.Context, job *goschedjob.Job) error {
+	server.RegisterJobHandler("order_timeout_cancel", func(ctx context.Context, job *godelayq.Job) error {
 		var payload struct {
 			OrderID string  `json:"order_id"`
 			Amount  float64 `json:"amount"`
@@ -134,7 +134,7 @@ if err := loader.Start(); err != nil {
 const ws = new WebSocket('ws://localhost:8080/ws');
 
 ws.onopen = () => {
-    console.log('Connected to GoschedJob');
+    console.log('Connected to godelayq');
     
     // 订阅支付相关任务
     ws.send(JSON.stringify({

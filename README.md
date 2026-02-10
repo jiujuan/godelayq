@@ -100,6 +100,77 @@
 | `websocket.go` | 实时通信 | 心跳保活、过滤订阅、自动重连支持 |
 | `load.go` | 文件任务加载 | fsnotify 实时监控，支持原子移动和错误隔离 |
 
+
+## 目录结构
+
+```shell
+godelayq/
+├── README.md                 # 项目文档（本文件）
+├── LICENSE                   # MIT 许可证
+├── go.mod                    # Go 模块定义
+├── go.sum                    # 依赖校验
+├── Makefile                  # 构建脚本
+├── Dockerfile                # 容器镜像
+├── docker-compose.yml        # 快速部署配置
+│
+├── cmd/                      # 可执行程序入口
+│   ├── server/               # HTTP API 服务器
+│   │   └── main.go           # 主程序入口
+│   └── cli/                  # 命令行工具（可选）
+│       └── main.go
+│
+├── core/                      # 核心库代码
+│   ├── heap.go               # 四叉堆实现（核心数据结构）
+│   ├── heap_test.go          # 堆单元测试
+│   ├── job.go                # 任务定义与状态管理
+│   ├── job_test.go           # 任务单元测试
+│   ├── scheduler.go          # 调度器主逻辑
+│   ├── scheduler_test.go     # 调度器单元测试
+│   ├── store.go              # 持久化接口与JSON实现
+│   ├── store_test.go         # 存储单元测试
+│   ├── retry.go              # 重试策略
+│   ├── retry_test.go         # 重试策略测试
+│   ├── cron.go               # Cron表达式解析
+│   ├── cron_test.go          # Cron测试
+│   ├── event.go              # 事件总线
+│   ├── event_test.go         # 事件总线测试
+│   ├── load.go             # 目录任务加载器
+│   ├── load_test.go        # 加载器测试
+│   └── websocket.go          # WebSocket服务器
+│
+├── api/                      # HTTP API 层
+│   ├── server.go             # Gin服务器与路由
+│   ├── handlers.go           # HTTP处理器实现
+│   ├── dto.go                # 请求/响应数据结构
+│   ├── middleware.go         # 中间件（日志、恢复、CORS）
+│   ├── websocket.go          # WebSocket升级处理
+│   ├── sse.go                # Server-Sent Events
+│   └── api_test.go           # API集成测试
+│
+│
+├── web/                      # 前端监控面板
+│   └── dashboard/
+│       ├── index.html        # 实时监控页面
+│       ├── app.js            # 前端逻辑
+│       └── style.css         # 样式表
+│
+├── configs/                  # 配置文件
+│   ├── config.yaml           # 主配置
+│   └── jobs/                 # 示例任务文件
+│       ├── payment_check.json
+│       └── daily_report.json
+│
+├── scripts/                  # 运维脚本
+│   ├── init.sh               # 初始化脚本
+│   └── backup.sh             # 备份脚本
+│
+└── docs/                     # 详细文档
+    ├── architecture.md       # 架构设计文档
+    ├── api.md                # API详细文档
+    ├── deployment.md         # 部署指南
+└── benchmark.md          # 性能测试报告
+```
+
 ---
 
 ## 核心特性

@@ -14,17 +14,17 @@ scheduler:
   
 store:
   type: json               # json/redis/mysql
-  path: /var/lib/goschedjob/jobs.json
+  path: /var/lib/godelayq/jobs.json
   # redis:
   #   addr: localhost:6379
   #   db: 0
   
 loader:
   enabled: true
-  dir: /var/spool/goschedjob
+  dir: /var/spool/godelayq
   pattern: "*.json"
   action: archive          # delete/archive/keep
-  archive_dir: /var/spool/goschedjob/archive
+  archive_dir: /var/spool/godelayq/archive
   
 websocket:
   max_connections: 10000
@@ -33,23 +33,23 @@ websocket:
 logging:
   level: info              # debug/info/warn/error
   format: json             # json/text
-  output: /var/log/goschedjob/app.log
+  output: /var/log/godelayq/app.log
 ```
 
 ## Systemd 服务配置
 
 ```ini
-# /etc/systemd/system/goschedjob.service
+# /etc/systemd/system/godelayq.service
 [Unit]
-Description=GoschedJob Delayed Task Scheduler
+Description=godelayq Delayed Task Scheduler
 After=network.target
 
 [Service]
 Type=simple
-User=goschedjob
-Group=goschedjob
-WorkingDirectory=/opt/goschedjob
-ExecStart=/opt/goschedjob/goschedjob-server -config=/etc/goschedjob/config.yaml
+User=godelayq
+Group=godelayq
+WorkingDirectory=/opt/godelayq
+ExecStart=/opt/godelayq/godelayq-server -config=/etc/godelayq/config.yaml
 Restart=always
 RestartSec=5
 
@@ -69,15 +69,15 @@ WantedBy=multi-user.target
 
 ```shell
 sudo systemctl daemon-reload
-sudo systemctl enable goschedjob
-sudo systemctl start goschedjob
-sudo systemctl status goschedjob
+sudo systemctl enable godelayq
+sudo systemctl start godelayq
+sudo systemctl status godelayq
 ```
 
 ## Nginx 反向代理（SSL）
 
 ```shell
-upstream goschedjob {
+upstream godelayq {
     server 127.0.0.1:8080;
     keepalive 32;
 }
@@ -90,7 +90,7 @@ server {
     ssl_certificate_key /path/to/key.pem;
     
     location / {
-        proxy_pass http://goschedjob;
+        proxy_pass http://godelayq;
         proxy_http_version 1.1;
         proxy_set_header Upgrade $http_upgrade;
         proxy_set_header Connection "upgrade";
