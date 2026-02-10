@@ -10,7 +10,7 @@ import (
 	"log"
 	"time"
 
-	"godelayq"
+	"godelayq/core"
 	"godelayq/api"
 )
 
