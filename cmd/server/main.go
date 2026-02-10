@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"core"
-	"core/api"
+	"godelayq/api"
 )
 
 func main() {
