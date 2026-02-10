@@ -1,25 +1,3 @@
-## 项目简介
-
-**GoschedJob** 是一个生产级的 Go 语言延迟任务调度系统，采用四叉堆（4-ary Heap）作为核心数据结构，相比传统二叉堆具有更好的 CPU 缓存局部性。设计灵感来源于 Go 标准库 `time` 包的定时器实现。
-
-### 为什么选择四叉堆？
-
-| 特性 | 二叉堆 | 四叉堆 |
-|------|--------|--------|
-| 层数 | 高 | 低（减少约50%） |
-| 缓存命中率 | 一般 | 更高 |
-| 父子节点距离 | 远 | 近 |
-| 适合场景 | 通用 | 高频调度 |
-
-### 适用场景
-
-- 🛒 **电商系统**：订单超时取消、延迟支付检查、库存回滚
-- 📧 **消息推送**：定时邮件、短信、App 推送
-- 📊 **数据处理**：定时报表生成、数据同步、日志清理
-- 🔄 **工作流引擎**：状态机流转、审批超时提醒
-- ⏰ **定时任务**：Cron 表达式支持的周期性任务
-
-
 ## 架构设计
 ┌─────────────────────────────────────────────────────────────────┐
 │                         API Gateway (Gin)                        │
@@ -67,7 +45,7 @@
 │  │  • 崩溃恢复      │  │  • 集群支持      │  │  • 复杂查询      │  │
 │  └─────────────────┘  └─────────────────┘  └─────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
-复制
+
 
 ### 数据流图
 
@@ -80,6 +58,76 @@
 │                                         [重试/Cron/归档]
 ▼
 [立即返回任务ID]
+
+
+## 目录结构
+```shell
+goschedjob/
+├── README.md                 # 项目文档（本文件）
+├── LICENSE                   # MIT 许可证
+├── go.mod                    # Go 模块定义
+├── go.sum                    # 依赖校验
+├── Makefile                  # 构建脚本
+├── Dockerfile                # 容器镜像
+├── docker-compose.yml        # 快速部署配置
+│
+├── cmd/                      # 可执行程序入口
+│   ├── server/               # HTTP API 服务器
+│   │   └── main.go           # 主程序入口
+│   └── cli/                  # 命令行工具（可选）
+│       └── main.go
+│
+├── core/                      # 核心库代码
+│   ├── heap.go               # 四叉堆实现（核心数据结构）
+│   ├── heap_test.go          # 堆单元测试
+│   ├── job.go                # 任务定义与状态管理
+│   ├── job_test.go           # 任务单元测试
+│   ├── scheduler.go          # 调度器主逻辑
+│   ├── scheduler_test.go     # 调度器单元测试
+│   ├── store.go              # 持久化接口与JSON实现
+│   ├── store_test.go         # 存储单元测试
+│   ├── retry.go              # 重试策略
+│   ├── retry_test.go         # 重试策略测试
+│   ├── cron.go               # Cron表达式解析
+│   ├── cron_test.go          # Cron测试
+│   ├── event.go              # 事件总线
+│   ├── event_test.go         # 事件总线测试
+│   ├── loader.go             # 目录任务加载器
+│   ├── loader_test.go        # 加载器测试
+│   └── websocket.go          # WebSocket服务器
+│
+├── api/                      # HTTP API 层
+│   ├── server.go             # Gin服务器与路由
+│   ├── handlers.go           # HTTP处理器实现
+│   ├── dto.go                # 请求/响应数据结构
+│   ├── middleware.go         # 中间件（日志、恢复、CORS）
+│   ├── websocket.go          # WebSocket升级处理
+│   ├── sse.go                # Server-Sent Events
+│   └── api_test.go           # API集成测试
+│
+│
+├── web/                      # 前端监控面板
+│   └── dashboard/
+│       ├── index.html        # 实时监控页面
+│       ├── app.js            # 前端逻辑
+│       └── style.css         # 样式表
+│
+├── configs/                  # 配置文件
+│   ├── config.yaml           # 主配置
+│   └── jobs/                 # 示例任务文件
+│       ├── payment_check.json
+│       └── daily_report.json
+│
+├── scripts/                  # 运维脚本
+│   ├── init.sh               # 初始化脚本
+│   └── backup.sh             # 备份脚本
+│
+└── docs/                     # 详细文档
+    ├── architecture.md       # 架构设计文档
+    ├── api.md                # API详细文档
+    ├── deployment.md         # 部署指南
+└── benchmark.md          # 性能测试报告
+```
 
 ### 核心文件详解
 
@@ -96,74 +144,31 @@
 ## 核心特性
 
 ### 1. 高性能调度
+
 - **四叉堆数据结构**：比二叉堆减少约 50% 的层级，提升缓存命中率
 - **O(log n) 操作复杂度**：插入、删除、更新均为对数时间
 - **无锁设计**：读多写少场景使用 RWMutex，高并发优化
 
 ### 2. 可靠性保障
+
 - **持久化存储**：JSON 文件原子写入，崩溃后自动恢复
 - **至少一次执行**：失败自动重试，支持指数退避和最大重试限制
 - **优雅关闭**：SIGTERM 信号处理，等待正在执行的任务完成
 
 ### 3. 灵活的任务定义
+
 - **多种触发方式**：延迟执行（Duration）、定时执行（Time）、周期执行（Cron）
 - **动态注册**：运行时注册任务处理器，支持热更新
 - **上下文传递**：支持 cancellation 和 timeout
 
 ### 4. 实时可观测性
+
 - **WebSocket 推送**：任务状态变更实时推送到前端
 - **SSE 备选方案**：兼容不支持 WebSocket 的客户端
 - **REST API 查询**：完整的任务生命周期管理接口
 - **监控面板**：内置 Web Dashboard
 
 ### 5. 扩展能力
+
 - **存储插件化**：接口设计支持 Redis、MySQL 等扩展
 - **任务文件化**：支持通过文件系统提交任务，便于 CI/CD 集成
-
----
-
-## 快速开始
-
-### 环境要求
-
-- Go 1.21+
-- Linux/macOS/Windows
-
-### 安装
-
-```bash
-# 克隆项目
-git clone https://github.com/jiujuan/godelayq.git
-cd godelayq
-
-# 下载依赖
-go mod download
-
-# 编译
-go build -o godelayq-server ./cmd/server
-
-# 运行
-./godelayq-server
-```
-
-### Docker 部署
-
-```bash
-# 构建镜像
-docker build -t godelayq:latest .
-
-# 运行容器
-docker run -d \
-  -p 8080:8080 \
-  -v /data/godelayq:/app/data \
-  -e TZ=Asia/Shanghai \
-  --name godelayq \
-  godelayq:latest
-```
-
-## 其它文档
-
-- [API文档](./docs/api.md)
-- [架构文档](./docs/architecture.md)
-- [例子](./docs/example.md)
-- [部署文档](./docs/deployment.md)
