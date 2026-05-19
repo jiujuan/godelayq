@@ -9,84 +9,151 @@ import (
 	"syscall"
 	"time"
 
-	"core"
 	"godelayq/api"
+	"godelayq/core"
 )
 
+const (
+	defaultDataPath = "./data/jobs.json"
+	defaultPort     = "8080"
+)
+
+type schedulerAPI interface {
+	Start()
+	Stop()
+	RegisterHandler(jobType string, handler core.Handler)
+}
+
+type serverAPI interface {
+	RegisterJobHandler(name string, handler core.Handler)
+	Start() error
+	Stop(ctx context.Context) error
+}
+
+type signalNotifier func(chan<- os.Signal, ...os.Signal)
+
+type runtimeDeps struct {
+	newStore      func(path string) (core.Store, error)
+	newScheduler  func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI
+	newServer     func(scheduler schedulerAPI, store core.Store, port string) (serverAPI, error)
+	notifySignals signalNotifier
+	timeout       time.Duration
+	logger        *log.Logger
+}
+
+func defaultRuntimeDeps() runtimeDeps {
+	return runtimeDeps{
+		newStore: func(path string) (core.Store, error) {
+			return core.NewJSONFileStore(path)
+		},
+		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
+			return core.NewScheduler(store, retryPolicy, eventBus)
+		},
+		newServer: func(scheduler schedulerAPI, store core.Store, port string) (serverAPI, error) {
+			coreScheduler, ok := scheduler.(*core.Scheduler)
+			if !ok {
+				return nil, fmt.Errorf("default server requires *core.Scheduler, got %T", scheduler)
+			}
+			return api.NewServer(coreScheduler, store, port), nil
+		},
+		notifySignals: signal.Notify,
+		timeout:       5 * time.Second,
+		logger:        log.Default(),
+	}
+}
+
 func main() {
-	// 初始化存储
-	store, err := core.NewJSONFileStore("./data/jobs.json")
-	if err != nil {
+	if err := run(defaultRuntimeDeps()); err != nil {
 		log.Fatal(err)
 	}
+}
 
-	// 创建调度器
-	scheduler := core.NewScheduler(store, &core.ExponentialBackoffRetry{
+func run(deps runtimeDeps) error {
+	if deps.newStore == nil || deps.newScheduler == nil || deps.newServer == nil || deps.notifySignals == nil {
+		return fmt.Errorf("runtime dependencies are incomplete")
+	}
+	if deps.timeout <= 0 {
+		deps.timeout = 5 * time.Second
+	}
+	if deps.logger == nil {
+		deps.logger = log.Default()
+	}
+
+	store, err := deps.newStore(defaultDataPath)
+	if err != nil {
+		return err
+	}
+
+	scheduler := deps.newScheduler(store, &core.ExponentialBackoffRetry{
 		MaxDelay: 30 * time.Minute,
-	})
+	}, nil)
 
-	// 创建API服务器
-	server := api.NewServer(scheduler, store, "8080")
+	server, err := deps.newServer(scheduler, store, defaultPort)
+	if err != nil {
+		return err
+	}
+	registerHandlers(server)
 
-	// 注册Job处理器（业务逻辑）
+	scheduler.Start()
+
+	if err := server.Start(); err != nil {
+		scheduler.Stop()
+		return err
+	}
+
+	quit := make(chan os.Signal, 1)
+	deps.notifySignals(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+
+	deps.logger.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), deps.timeout)
+	defer cancel()
+
+	if err := server.Stop(ctx); err != nil {
+		deps.logger.Printf("Server forced to shutdown: %v", err)
+	}
+
+	scheduler.Stop()
+	deps.logger.Println("Server exited")
+	return nil
+}
+
+func registerHandlers(server serverAPI) {
 	server.RegisterJobHandler("payment_check", handlePaymentCheck)
 	server.RegisterJobHandler("email_send", handleEmailSend)
 	server.RegisterJobHandler("data_sync", handleDataSync)
 	server.RegisterJobHandler("report_generate", handleReportGenerate)
+}
 
-	// 启动调度器
-	scheduler.Start()
-
-	// 启动HTTP API
-	if err := server.Start(); err != nil {
-		log.Fatal(err)
+func handlePaymentCheck(ctx context.Context, job *core.Job) error {
+	fmt.Printf("processing payment check: %s\n", string(job.Payload))
+	select {
+	case <-time.After(2 * time.Second):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
 
-	// 优雅关闭处理
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-	<-quit
-
-	log.Println("Shutting down server...")
-
-	// 优雅关闭HTTP（5秒超时）
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	if err := server.Stop(ctx); err != nil {
-		log.Printf("Server forced to shutdown: %v", err)
+func handleEmailSend(ctx context.Context, job *core.Job) error {
+	fmt.Printf("sending email: %s\n", string(job.Payload))
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-
-	// 停止调度器（等待正在执行的任务）
-	scheduler.Stop()
-
-	log.Println("Server exited")
-}
-
-// Job Handlers 实现
-
-func handlePaymentCheck(ctx context.Context, job *goschedjob.Job) error {
-	fmt.Printf("执行支付检查: %s\n", string(job.Payload))
-	// 模拟调用支付API
-	time.Sleep(2 * time.Second)
 	return nil
 }
 
-func handleEmailSend(ctx context.Context, job *goschedjob.Job) error {
-	fmt.Printf("发送邮件: %s\n", string(job.Payload))
-	// 模拟SMTP发送
+func handleDataSync(ctx context.Context, job *core.Job) error {
+	fmt.Printf("syncing data: %s\n", string(job.Payload))
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	return nil
 }
 
-func handleDataSync(ctx context.Context, job *goschedjob.Job) error {
-	fmt.Printf("数据同步: %s\n", string(job.Payload))
-	// 模拟数据同步
-	return nil
-}
-
-func handleReportGenerate(ctx context.Context, job *goschedjob.Job) error {
-	fmt.Printf("生成报表: %s\n", string(job.Payload))
-	// 模拟报表生成（可能耗时较长）
+func handleReportGenerate(ctx context.Context, job *core.Job) error {
+	fmt.Printf("generating report: %s\n", string(job.Payload))
 	select {
 	case <-time.After(10 * time.Second):
 		return nil
