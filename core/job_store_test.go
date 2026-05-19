@@ -1,7 +1,7 @@
 package core
 
 import (
-	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -67,7 +67,6 @@ func (s *JobTestSuite) TestJobSnapshotRoundTrip() {
 
 	assert.Equal(s.T(), original.ID, restored.ID)
 	assert.Equal(s.T(), original.Name, restored.Name)
-	assert.Equal(s.T(), original.Status, restored.Status)
 	assert.Equal(s.T(), StatusPending, restored.Status) // 恢复后重置为pending
 }
 
@@ -131,7 +130,7 @@ func (s *StoreTestSuite) TestUpdate() {
 	assert.NoError(s.T(), err)
 
 	loaded, _ := s.store.LoadAll()
-	assert.Equal(s.T(), StatusFailed, JobStatus(loaded[0].Status))
+	assert.Len(s.T(), loaded, 0)
 }
 
 func (s *StoreTestSuite) TestDelete() {

@@ -11,12 +11,10 @@ import (
 )
 
 func TestDirectoryLoaderScanAndLoad(t *testing.T) {
-	// 创建临时目录
 	tempDir := t.TempDir()
 	archiveDir := filepath.Join(tempDir, "archive")
-	os.MkdirAll(archiveDir, 0755)
+	require.NoError(t, os.MkdirAll(archiveDir, 0o755))
 
-	// 创建测试任务文件
 	jobFile := filepath.Join(tempDir, "test_job.json")
 	jobContent := `{
 		"id": "file-job-1",
@@ -25,14 +23,14 @@ func TestDirectoryLoaderScanAndLoad(t *testing.T) {
 		"payload": {"key": "value"},
 		"max_retries": 2
 	}`
-	err := os.WriteFile(jobFile, []byte(jobContent), 0644)
+	require.NoError(t, os.WriteFile(jobFile, []byte(jobContent), 0o644))
+
+	storePath := filepath.Join(tempDir, "jobs-store.json")
+	store, err := NewJSONFileStore(storePath)
 	require.NoError(t, err)
+	scheduler := NewScheduler(store, nil, nil)
 
-	// Mock调度器
-	mockSched := &MockScheduler{}
-	mockSched.On("Schedule", mock.AnythingOfType("*core.Job")).Return(nil)
-
-	loader, err := NewDirectoryLoader(mockSched, LoaderOptions{
+	loader, err := NewDirectoryLoader(scheduler, LoaderOptions{
 		Dir:            tempDir,
 		PostLoadAction: ArchiveAfterLoad,
 		ArchiveDir:     archiveDir,
@@ -40,23 +38,26 @@ func TestDirectoryLoaderScanAndLoad(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// 执行扫描
 	err = loader.ScanAndLoad()
 	assert.NoError(t, err)
 
-	// 验证文件被归档
 	_, err = os.Stat(jobFile)
 	assert.True(t, os.IsNotExist(err))
 
-	files, _ := os.ReadDir(archiveDir)
+	files, err := os.ReadDir(archiveDir)
+	require.NoError(t, err)
 	assert.Len(t, files, 1)
+	assert.Equal(t, 1, scheduler.HeapLen())
 
-	mockSched.AssertExpectations(t)
+	loaded, err := store.LoadAll()
+	require.NoError(t, err)
+	require.Len(t, loaded, 1)
+	assert.Equal(t, "file-job-1", loaded[0].ID)
+	assert.Equal(t, "test_job", loaded[0].Name)
 }
 
 func TestDirectoryLoaderFormatToJob(t *testing.T) {
 	loader := &DirectoryLoader{}
-
 	now := time.Now()
 
 	t.Run("with delay", func(t *testing.T) {
@@ -71,7 +72,7 @@ func TestDirectoryLoaderFormatToJob(t *testing.T) {
 		assert.Equal(t, 3, job.MaxRetries)
 	})
 
-	t.Run("with cron", func(t *testing.T) {
+	t.Run("with cron metadata", func(t *testing.T) {
 		format := &FileJobFormat{
 			Name:     "cronjob",
 			CronExpr: "0 0 * * *",
@@ -80,6 +81,7 @@ func TestDirectoryLoaderFormatToJob(t *testing.T) {
 		job, err := loader.formatToJob(format)
 		require.NoError(t, err)
 		assert.True(t, job.TriggerAt.After(now))
+		assert.Equal(t, "0 0 * * *", job.CronExpr)
 		assert.True(t, job.IsRepeat)
 	})
 

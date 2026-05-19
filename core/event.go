@@ -6,97 +6,174 @@ import (
 	"time"
 )
 
-// EventType 事件类型
+// EventType 表示系统内可广播的事件类型。
 type EventType string
 
 const (
-	EventJobScheduled EventType = "job.scheduled" // 任务已调度
-	EventJobStarted   EventType = "job.started"   // 开始执行
-	EventJobCompleted EventType = "job.completed" // 执行成功
-	EventJobFailed    EventType = "job.failed"    // 执行失败
-	EventJobCancelled EventType = "job.cancelled" // 已取消
-	EventJobRetrying  EventType = "job.retrying"  // 重试中
-	EventHeapUpdate   EventType = "heap.updated"  // 堆状态变更（用于监控）
+	// EventJobScheduled 表示任务已进入调度队列。
+	EventJobScheduled EventType = "job.scheduled"
+	// EventJobStarted 表示任务开始执行。
+	EventJobStarted EventType = "job.started"
+	// EventJobCompleted 表示任务执行成功结束。
+	EventJobCompleted EventType = "job.completed"
+	// EventJobFailed 表示任务执行失败。
+	EventJobFailed EventType = "job.failed"
+	// EventJobCancelled 表示任务被取消。
+	EventJobCancelled EventType = "job.cancelled"
+	// EventJobRetrying 表示任务进入重试流程。
+	EventJobRetrying EventType = "job.retrying"
+	// EventHeapUpdate 预留给堆状态变化或监控场景使用。
+	EventHeapUpdate EventType = "heap.updated"
 )
 
-// Event 任务事件
+// Event 是在调度生命周期中流转的标准事件结构。
 type Event struct {
-	Type      EventType              `json:"type"`
-	JobID     string                 `json:"job_id"`
-	JobName   string                 `json:"job_name"`
-	Status    JobStatus              `json:"status"`
-	Timestamp time.Time              `json:"timestamp"`
-	Data      json.RawMessage        `json:"data,omitempty"`     // 额外数据（如错误信息、执行结果）
-	Metadata  map[string]interface{} `json:"metadata,omitempty"` // 元数据（执行时长、重试次数等）
+	// Type 表示事件类别，例如调度、开始、完成、失败等。
+	Type EventType `json:"type"`
+	// JobID 是任务的唯一标识。
+	JobID string `json:"job_id"`
+	// JobName 是任务名称或类型名。
+	JobName string `json:"job_name"`
+	// Status 表示事件发生时任务的状态。
+	Status JobStatus `json:"status"`
+	// Timestamp 记录事件产生的时间。
+	Timestamp time.Time `json:"timestamp"`
+	// Data 保存事件的原始附加数据，例如错误信息。
+	Data json.RawMessage `json:"data,omitempty"`
+	// Metadata 保存结构化附加信息，例如重试次数、耗时等。
+	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
-// EventHandler 事件处理器接口
+// EventHandler 定义事件处理器接口，便于外部实现统一处理逻辑。
 type EventHandler interface {
 	Handle(event Event)
 }
 
-// EventBus 事件总线（支持多订阅者）
-type EventBus struct {
-	subscribers map[string][]chan Event
-	mu          sync.RWMutex
-	bufferSize  int
+// eventSubscription 保存单个订阅的内部元数据。
+type eventSubscription struct {
+	// ch 是当前订阅接收事件的通道。
+	ch chan Event
+	// eventTypes 记录当前订阅已绑定的事件类型键。
+	eventTypes []string
 }
 
+// EventBus 是一个线程安全的内存事件总线。
+type EventBus struct {
+	// subscribers 按事件类型维护订阅通道列表。
+	subscribers map[string][]chan Event
+	// subscriptions 按订阅ID维护订阅详情，用于精准取消订阅。
+	subscriptions map[string]eventSubscription
+	// mu 保护订阅表和订阅详情的并发访问。
+	mu sync.RWMutex
+	// bufferSize 是每个订阅通道的默认缓冲区大小。
+	bufferSize int
+}
+
+// NewEventBus 创建一个新的事件总线。
+// 当 bufferSize 小于等于 0 时，会回退到默认缓冲区大小 100。
 func NewEventBus(bufferSize int) *EventBus {
 	if bufferSize <= 0 {
 		bufferSize = 100
 	}
 	return &EventBus{
-		subscribers: make(map[string][]chan Event),
-		bufferSize:  bufferSize,
+		subscribers:   make(map[string][]chan Event),
+		subscriptions: make(map[string]eventSubscription),
+		bufferSize:    bufferSize,
 	}
 }
 
-// Subscribe 订阅指定类型的事件，返回订阅ID和通道
+// Subscribe 订阅指定事件类型，并返回订阅ID与只读事件通道。
 func (eb *EventBus) Subscribe(eventTypes ...EventType) (string, <-chan Event) {
-	id := generateID()
 	ch := make(chan Event, eb.bufferSize)
 
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
+	id := eb.nextSubscriptionIDLocked()
 
+	keys := make([]string, 0, len(eventTypes))
 	for _, et := range eventTypes {
-		eb.subscribers[string(et)] = append(eb.subscribers[string(et)], ch)
+		key := string(et)
+		eb.subscribers[key] = append(eb.subscribers[key], ch)
+		keys = append(keys, key)
+	}
+
+	eb.subscriptions[id] = eventSubscription{
+		ch:         ch,
+		eventTypes: keys,
 	}
 
 	return id, ch
 }
 
-// SubscribeAll 订阅所有事件
+// SubscribeAll 订阅所有事件类型。
+// 内部通过特殊键 "all" 挂载，发布任意事件时都会广播给它。
 func (eb *EventBus) SubscribeAll() (string, <-chan Event) {
-	id := generateID()
 	ch := make(chan Event, eb.bufferSize)
 
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
+	id := eb.nextSubscriptionIDLocked()
 
-	// 订阅所有已知事件类型
-	allTypes := []EventType{
-		EventJobScheduled, EventJobStarted, EventJobCompleted,
-		EventJobFailed, EventJobCancelled, EventJobRetrying, EventHeapUpdate,
-	}
-	for _, et := range allTypes {
-		eb.subscribers[string(et)] = append(eb.subscribers[string(et)], ch)
+	eb.subscribers["all"] = append(eb.subscribers["all"], ch)
+	eb.subscriptions[id] = eventSubscription{
+		ch:         ch,
+		eventTypes: []string{"all"},
 	}
 
 	return id, ch
 }
 
-// Unsubscribe 取消订阅
+// Unsubscribe 按订阅ID取消订阅。
+// 如果未传 eventTypes，则取消该订阅关联的全部事件类型；
+// 如果传入 eventTypes，则只移除对应类型，其余类型继续保留。
 func (eb *EventBus) Unsubscribe(id string, eventTypes ...EventType) {
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
 
-	// 简单实现：关闭对应channel并从列表移除
-	// 实际生产环境需要更精确的ID匹配
+	sub, ok := eb.subscriptions[id]
+	if !ok {
+		return
+	}
+
+	removeAll := len(eventTypes) == 0
+	removeSet := make(map[string]struct{}, len(eventTypes))
+	for _, et := range eventTypes {
+		removeSet[string(et)] = struct{}{}
+	}
+
+	remaining := make([]string, 0, len(sub.eventTypes))
+	for _, key := range sub.eventTypes {
+		if removeAll {
+			eb.subscribers[key] = removeSubscriberChannel(eb.subscribers[key], sub.ch)
+			if len(eb.subscribers[key]) == 0 {
+				delete(eb.subscribers, key)
+			}
+			continue
+		}
+
+		if _, shouldRemove := removeSet[key]; shouldRemove {
+			eb.subscribers[key] = removeSubscriberChannel(eb.subscribers[key], sub.ch)
+			if len(eb.subscribers[key]) == 0 {
+				delete(eb.subscribers, key)
+			}
+			continue
+		}
+
+		remaining = append(remaining, key)
+	}
+
+	if removeAll || len(remaining) == 0 {
+		close(sub.ch)
+		delete(eb.subscriptions, id)
+		return
+	}
+
+	sub.eventTypes = remaining
+	eb.subscriptions[id] = sub
 }
 
-// Publish 发布事件（异步，不阻塞）
+// Publish 向匹配的订阅者广播事件。
+// 发送采用非阻塞方式，订阅者缓冲区满时会直接丢弃该事件，避免拖慢调度主流程。
 func (eb *EventBus) Publish(event Event) {
 	eb.mu.RLock()
 	defer eb.mu.RUnlock()
@@ -104,13 +181,11 @@ func (eb *EventBus) Publish(event Event) {
 	subs := eb.subscribers[string(event.Type)]
 	for _, ch := range subs {
 		select {
-		case ch <- event: // 缓冲区未满，直接发送
-		default: // 缓冲区已满，丢弃（避免阻塞调度器）
-			// 可记录日志或扩展为环形缓冲区
+		case ch <- event:
+		default:
 		}
 	}
 
-	// 同时发送给订阅"all"的客户端
 	if allSubs, ok := eb.subscribers["all"]; ok {
 		for _, ch := range allSubs {
 			select {
@@ -121,15 +196,44 @@ func (eb *EventBus) Publish(event Event) {
 	}
 }
 
-// Close 关闭总线
+// Close 关闭事件总线。
+// 它会关闭所有仍然存活的订阅通道，并清空内部状态。
 func (eb *EventBus) Close() {
 	eb.mu.Lock()
 	defer eb.mu.Unlock()
 
-	for _, subs := range eb.subscribers {
-		for _, ch := range subs {
-			close(ch)
+	closed := make(map[chan Event]struct{})
+	for _, sub := range eb.subscriptions {
+		if _, ok := closed[sub.ch]; ok {
+			continue
+		}
+		close(sub.ch)
+		closed[sub.ch] = struct{}{}
+	}
+
+	eb.subscribers = make(map[string][]chan Event)
+	eb.subscriptions = make(map[string]eventSubscription)
+}
+
+// removeSubscriberChannel 从某个事件类型的订阅通道列表中移除目标通道。
+func removeSubscriberChannel(subs []chan Event, target chan Event) []chan Event {
+	result := subs[:0]
+	for _, ch := range subs {
+		if ch != target {
+			result = append(result, ch)
 		}
 	}
-	eb.subscribers = make(map[string][]chan Event)
+	return result
+}
+
+// nextSubscriptionIDLocked 生成一个当前 EventBus 内唯一的订阅ID。
+// 调用方必须已经持有写锁。
+func (eb *EventBus) nextSubscriptionIDLocked() string {
+	id := generateID()
+	for {
+		if _, exists := eb.subscriptions[id]; !exists {
+			return id
+		}
+		id = id + "-sub"
+	}
 }
