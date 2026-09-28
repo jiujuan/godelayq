@@ -144,11 +144,14 @@ GET /jobs?status=pending&name=payment_check&limit=20&offset=0
 
 | 参数     | 类型     | 说明                                            |
 | ------ | ------ | --------------------------------------------- |
-| status | string | 过滤状态：pending/running/success/failed/cancelled |
+| status | string | 过滤状态：pending/running/success/failed/cancelled（大小写不敏感） |
 | name   | string | 按任务类型过滤                                       |
-| limit  | int    | 分页大小，默认 50，最大 100                             |
-| offset | int    | 分页偏移                                          |
+| limit  | int    | 分页大小，默认 50，最大 100（超过按 100 截断）  |
+| offset | int    | 分页偏移，默认 0；非数字或负数按 0 处理            |
 
+
+`status` 只接受状态名；旧版按数字（`status=1`）过滤的写法现在返回 400。
+返回按 `updated_at` 倒序（同刻度按 ID 升序）排列，`total` 是匹配总数、不受分页影响。
 
 响应：
 
@@ -164,12 +167,17 @@ GET /jobs?status=pending&name=payment_check&limit=20&offset=0
       "next_run_in": "5m30s",
       "retry_count": 0,
       "max_retries": 3,
+      "timeout": "30s",
       "is_repeat": false,
       "created_at": "2024-01-02T15:20:00+08:00"
     }
   ]
 }
 ```
+
+任务列表来自存储：未完成任务（pending/running）加上按保留策略留痕的终态记录，
+因此 `status=success|failed` 能查到历史（见部署文档的 `store.history_*`）。
+`timeout` 在执行超时时才出现，未设置时字段省略。
 
 ### 4. 获取任务详情
 
@@ -186,11 +194,13 @@ Content-Type: application/json
 {
   "trigger_at": "2024-01-02T16:00:00+08:00",
   "payload": {"order_id": "ORD-NEW-001"},
-  "max_retries": 5
+  "max_retries": 5,
+  "timeout": "30s"
 }
 ```
 
-只更新给出的字段，任务 ID 保持不变。更新在堆内原地完成（重排位置并写回快照），
+只更新给出的字段，任务 ID 保持不变（未列出的字段沿用原值；`timeout` 传 `"0s"` 可取消限制，
+格式非法返回 400）。更新在堆内原地完成（重排位置并写回快照），
 不再走"先取消再重排"，因此不存在两步之间失败导致任务丢失的窗口。
 任务已被弹出执行或已结束时返回 409（`job cannot be modified`），ID 从未存在返回 404。
 
@@ -208,6 +218,10 @@ POST /jobs/:id/cancel
 ```json
 POST /jobs/:id/retry
 ```
+
+在存储中查找该 ID 且状态为 `failed` 的记录，重置 `retry_count` 并在 1 秒后重新入队，
+返回新的任务视图（状态 `pending`）。这条路径依赖终态留痕：若已关闭留痕
+（`store.history_limit: -1`）或该记录已被保留策略淘汰，则返回 404。
 
 ## 统计与监控 API
 
@@ -229,6 +243,18 @@ GET /stats
   "uptime": "72h15m30s"
 }
 ```
+
+字段口径：
+
+| 字段 | 来源 | 说明 |
+| --- | --- | --- |
+| pending / completed / failed | 存储快照按状态计数 | completed/failed 依赖终态留痕，关闭留痕后恒 0 |
+| running | 进程内实时执行数 | 已进入 Handler、尚未返回的任务数 |
+| heap_size | 调度堆长度 | 仍在堆里等待的任务数 |
+| uptime | 进程启动至今 | 计数器不跨重启，completed/failed 随存储恢复而继续累计 |
+
+`pending` 与 `heap_size` 通常相等，差值来自"已出堆、还在执行队列里排队"的那一小段：
+它的快照仍是 `pending`，但已不在堆里，也未进入 Handler。`running` 只统计已进入 Handler 的任务。
 
 ### 健康检查
 

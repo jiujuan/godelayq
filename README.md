@@ -185,6 +185,7 @@ godelayq/
 ### 2. 可靠性保障
 
 - **持久化存储**：JSON 文件原子写入，崩溃后自动恢复；写入按 200ms 周期合并，崩溃时最多丢失一个周期的状态变更
+- **终态留痕**：成功/失败的快照按 `history_limit` / `history_ttl` 有界保留，`GET /jobs?status=success|failed` 与统计里的 completed/failed 因此可读；设为 -1 可关闭留痕回到"完成即删"
 - **至少一次执行**：失败自动重试，支持指数退避和最大重试限制；被关停打断的执行不计入失败与重试，会保持待处理状态等下次启动恢复
 - **执行超时**：任务可配置 `timeout`，到期后 Handler 收到 `DeadlineExceeded`（需自行检查 ctx）
 - **优雅关闭**：SIGTERM 信号处理，停止投递新任务、取消在途任务上下文并等待执行协程退出
@@ -258,6 +259,8 @@ store:
   type: json                  # 目前仅支持 json
   path: ./data/jobs.json
   flush_interval: 200ms       # 合并落盘周期
+  history_limit: 1000         # 终态快照留痕条数；-1 表示不留痕
+  history_ttl: 0s             # 终态快照保留时长，如 24h；0 不按时间淘汰
 ```
 
 设置 `server.auth.token` 后，全部端点（含 `/ws`、`/sse/events`、`/api/v1/health`）都要凭据，

@@ -74,7 +74,7 @@
 2. `Scheduler.Schedule()` 给任务补齐 ID、状态、触发时间并放进 `QuaternaryHeap`
 3. `scheduleLoop()` 只关注堆顶任务，到期后弹出执行
 4. 执行前后通过 `EventBus` 发布状态事件
-5. 成功任务从存储中删除，失败任务按重试策略重新入堆
+5. 成功与最终失败的任务都留下终态快照（受存储的留痕策略约束），中间失败按重试策略重新入堆
 6. `Cancel()` 通过 `indexMap` 精确删除任务并广播取消事件
 
 ## 5.1 时序图
@@ -120,7 +120,7 @@ sequenceDiagram
                     Scheduler->>Store: Save(job)
                     Scheduler->>EventBus: Publish(job.scheduled)
                 else 一次性任务
-                    Scheduler->>Store: Delete(job.ID)
+                    Scheduler->>Store: Update(success snapshot)
                 end
             else 执行失败
                 Handler-->>Scheduler: error
@@ -166,7 +166,7 @@ graph TD
     B --> B4["Bind handler from HandlerMap"]
 
     E --> E1["Save pending job"]
-    E --> E2["Delete completed job"]
+    E --> E2["Keep terminal snapshot (bounded)"]
     E --> E3["Update failed snapshot"]
 ```
 
@@ -179,6 +179,14 @@ graph TD
 - 到期风暴或批量导入时，几百次变更合并成个位数次写入
 - 崩溃时最多丢失一个周期的状态；需要立即落盘的调用方可以显式 `Flush()`
 - 进程退出路径必须 `Close()`（`cmd/server` 用 defer 保证），它会停掉后台协程并做最后一次写盘
+
+`LoadAll()` 返回存储里的**全部**快照，含终态留痕——状态过滤由调用方负责：
+`Restore()` 自己跳过终态并把上次崩溃时的 `running` 复位为 `pending`，
+`GET /jobs` 与 `GET /stats` 则按状态名过滤。任务进入 Handler 前会写一次 `running` 快照，
+执行结束写终态，所以"当时在跑什么"在崩溃后依然可查。
+
+终态留痕有界，避免 JSON 文件无界增长：`history_limit`（默认 1000 条，`-1` 关闭留痕）
+与 `history_ttl` 只在写入终态时触发淘汰，`pending`/`running` 永不回收。
 
 恢复侧由 `Scheduler.Restore()` 负责：只捞 `pending/running` 的快照，过期任务入堆后立即补跑，
 Handler 在执行前按 `HandlerKey`（`Type`，回退 `Name`）绑定。

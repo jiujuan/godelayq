@@ -28,6 +28,8 @@ store:
   type: json                  # 目前仅支持 json
   path: /var/lib/godelayq/jobs.json
   flush_interval: 200ms       # 合并落盘周期；崩溃时最多丢失一个周期的状态
+  history_limit: 1000         # 终态快照留痕条数；0 用默认值，-1 不留痕
+  history_ttl: 0s             # 终态快照保留时长，如 24h；0 不按时间淘汰
 ```
 
 两点设计取舍，配置校验会直接拒绝未知键，因此不要照抄旧文档里的其它字段：
@@ -38,6 +40,23 @@ store:
 - **`loader` / `websocket.max_connections` / `logging` 尚未实现为配置项**：
   目录加载器需在代码中显式创建（见 `core/load.go`），WebSocket 缓冲区固定 256 条，
   日志仍是标准库 `log` 输出到 stderr。
+
+### 终态留痕与容量
+
+任务执行成功后，快照不再被直接删除，而是与最终失败记录一起作为终态留痕保存，
+`GET /jobs?status=success|failed`、`POST /jobs/:id/retry` 与统计里的 completed/failed 都依赖它。
+淘汰只作用于终态记录（`pending`/`running` 永不回收），在每次写入终态快照时顺带完成：
+
+- `history_limit`：保留最近 N 条（按 `updated_at` 排序）。默认 1000，写 `0` 等价默认，
+  写 `-1` 表示完全不留痕——回到"完成即删"，此时 completed/failed 计数与历史查询都为空。
+- `history_ttl`：超过该时长的终态记录被清掉，`0` 表示不按时间淘汰。
+
+存储是一个 JSON 对象文件，整文件重写，因此留痕条数直接决定文件大小与每次刷盘的开销：
+1000 条约几百 KB 到 1 MB 量级。任务量大又只需观测当前状态时，把 `history_limit` 调小、
+或配合 `history_ttl` 限定窗口；不需要历史时设 `-1`。
+
+注意两点边界：Cron 重复任务沿用同一 ID，每轮成功都会被下一轮的 `pending` 覆盖，
+所以看不到逐轮历史；进程重启后 `uptime` 归零，但 completed/failed 会随留痕记录一并恢复。
 
 ### 接入层安全（token 与跨域）
 
