@@ -26,6 +26,9 @@ func newSecurityServer(t *testing.T, sec Security) *Server {
 
 	store, err := core.NewJSONFileStore(filepath.Join(t.TempDir(), "jobs.json"))
 	require.NoError(t, err)
+	// 存储有后台合并协程，测试结束（含 t.TempDir 清理）前必须收口，
+	// 否则协程会往已被删除的目录写临时文件并刷出 flush failed。
+	t.Cleanup(func() { _ = store.Close() })
 
 	return NewServer(core.NewScheduler(store, nil, nil), store, "0", sec, newTestLogger())
 }
@@ -54,7 +57,7 @@ func TestAuthDisabledWhenTokenEmpty(t *testing.T) {
 }
 
 func TestAuthRejectsMissingOrWrongToken(t *testing.T) {
-	srv := newSecurityServer(t, Security{AuthToken: testToken})
+	srv := newSecurityServer(t, Security{Auth: core.AuthConfig{Token: testToken}})
 
 	for _, tc := range []struct {
 		name   string
@@ -72,13 +75,13 @@ func TestAuthRejectsMissingOrWrongToken(t *testing.T) {
 			var body ErrorResponse
 			require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
 			assert.Equal(t, 401, body.Code)
-			assert.Equal(t, "invalid or missing token", body.Message)
+			assert.Equal(t, "invalid or missing credentials", body.Message)
 		})
 	}
 }
 
 func TestAuthAcceptsEveryTokenChannel(t *testing.T) {
-	srv := newSecurityServer(t, Security{AuthToken: testToken})
+	srv := newSecurityServer(t, Security{Auth: core.AuthConfig{Token: testToken}})
 
 	for _, tc := range []struct {
 		name   string
@@ -98,7 +101,7 @@ func TestAuthAcceptsEveryTokenChannel(t *testing.T) {
 
 // 浏览器发的 Authorization 优先于 query，配错 scheme 时不应回退到 query 蒙混过关
 func TestAuthHeaderTakesPrecedenceOverQuery(t *testing.T) {
-	srv := newSecurityServer(t, Security{AuthToken: testToken})
+	srv := newSecurityServer(t, Security{Auth: core.AuthConfig{Token: testToken}})
 
 	header := http.Header{"Authorization": {"Token " + testToken}}
 	recorder := doGet(t, srv, "/api/v1/health?token="+testToken, header)
@@ -107,7 +110,7 @@ func TestAuthHeaderTakesPrecedenceOverQuery(t *testing.T) {
 }
 
 func TestProtectedWritesAndStreamsNeedToken(t *testing.T) {
-	srv := newSecurityServer(t, Security{AuthToken: testToken})
+	srv := newSecurityServer(t, Security{Auth: core.AuthConfig{Token: testToken}})
 
 	body, _ := json.Marshal(CreateJobRequest{Name: "payment_check", Delay: "1m"})
 	req, err := http.NewRequest(http.MethodPost, "/api/v1/jobs", strings.NewReader(string(body)))
@@ -122,7 +125,7 @@ func TestProtectedWritesAndStreamsNeedToken(t *testing.T) {
 }
 
 func TestPreflightSkipsAuth(t *testing.T) {
-	srv := newSecurityServer(t, Security{AuthToken: testToken})
+	srv := newSecurityServer(t, Security{Auth: core.AuthConfig{Token: testToken}})
 
 	req, err := http.NewRequest(http.MethodOptions, "/api/v1/jobs", nil)
 	require.NoError(t, err)
@@ -165,7 +168,9 @@ func TestCORSWhitelistEchoesMatchedOrigin(t *testing.T) {
 
 func TestWebsocketHandshakeHonoursTokenAndOrigin(t *testing.T) {
 	srv := newSecurityServer(t, Security{
-		AuthToken:    testToken,
+		Auth: core.AuthConfig{
+			Token: testToken,
+		},
 		AllowOrigins: []string{"https://app.example.com"},
 	})
 	hs := httptest.NewServer(srv.engine)

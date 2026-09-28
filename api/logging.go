@@ -28,6 +28,12 @@ func requestLogger(l *slog.Logger) gin.HandlerFunc {
 		if c.Request.URL.RawQuery != "" {
 			attrs = append(attrs, "query", c.Request.URL.RawQuery)
 		}
+		// 审计：谁、以什么身份、动了哪个端点。设计文档 §5.7.6 只要求写操作留痕，
+		// 这里对所有请求都记 —— 认证中间件在下游，c.Next() 之后身份一定已就位，
+		// 多记一份读操作的开销远小于"事后发现查不到是谁看过"的代价。
+		if principal, ok := PrincipalFrom(c); ok {
+			attrs = append(attrs, "who", principal.Name, "role", principal.Role.String())
+		}
 		if len(c.Errors) > 0 {
 			attrs = append(attrs, "error", c.Errors.String())
 		}

@@ -62,7 +62,7 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				return nil, fmt.Errorf("default server requires *core.Scheduler, got %T", scheduler)
 			}
 			security := api.Security{
-				AuthToken:        cfg.Server.Auth.Token,
+				Auth:             cfg.Server.Auth,
 				AllowOrigins:     cfg.Server.CORS.AllowOrigins,
 				AllowCredentials: cfg.Server.CORS.AllowCredentials,
 			}

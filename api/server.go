@@ -27,6 +27,17 @@ type Server struct {
 	// logger 访问日志与服务器生命周期日志
 	logger *slog.Logger
 
+	// auth 是控制台账号的认证器；nil 表示只配了机器凭据或完全没配鉴权
+	auth *Authenticator
+	// tokens 承载登录态的服务端部分：refresh 表 / jti 拒绝表 / 一次性 ticket
+	tokens *authStore
+	// loginLimit 给登录端点做双维度（IP+账号）失败计数：
+	// bcrypt 单次约 60-100ms，不限流的登录端点等于一个免费的重量级 DoS 开关
+	loginLimit *loginLimiter
+	// authErr 推迟到 Start 才报错：构造认证器要校验 bcrypt 哈希，失败必须让进程起不来，
+	// 但 NewServer 的签名不带 error（调用方遍布测试），因此在监听前统一抛出。
+	authErr error
+
 	// baseCtx 传给每个请求；Stop 取消它即可让 SSE 等长连接立即收尾
 	baseCtx    context.Context
 	baseCancel context.CancelFunc
@@ -58,8 +69,22 @@ func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Sec
 		sec:        sec,
 		startTime:  time.Now(),
 		logger:     logger,
+		tokens:     newAuthStore(),
+		loginLimit: newLoginLimiter(),
 		baseCtx:    baseCtx,
 		baseCancel: baseCancel,
+	}
+
+	// 账号配置有问题（哈希格式、cost、缺密钥）必须挡住启动：
+	// 否则鉴权看似开启，实际所有登录都失败，运维只在现场发现。
+	auth, err := NewAuthenticator(sec.Auth)
+	if err != nil {
+		s.authErr = err
+		logger.Error("authentication is configured but cannot be initialized", "error", err)
+	}
+	s.auth = auth
+	if auth != nil {
+		logger.Info("console accounts loaded", "count", len(auth.accountNames()))
 	}
 
 	// 持有唯一的 http.Server 实例，Stop 才能真正关闭监听
@@ -102,25 +127,29 @@ func (s *Server) setupMiddleware() {
 func (s *Server) setupRoutes() {
 	api := s.engine.Group("/api/v1")
 	{
-		// 任务管理
+		// 只读端点：任何已认证身份都够用（machine 凭据也在内）
+		reader := s.RequireRole(core.RoleViewer)
+
+		// 任务管理：读放行宽，写要求 operator 档
 		jobs := api.Group("/jobs")
 		{
-			jobs.POST("", s.CreateJob)
-			jobs.GET("", s.ListJobs)
-			jobs.GET("/:id", s.GetJob)
-			jobs.PUT("/:id", s.UpdateJob)
-			jobs.DELETE("/:id", s.CancelJob)
-			jobs.POST("/:id/cancel", s.CancelJob)
-			jobs.POST("/:id/retry", s.RetryJob)
-			jobs.POST("/batch", s.BatchCreateJobs)
+			jobs.GET("", reader, s.ListJobs)
+			jobs.GET("/:id", reader, s.GetJob)
+			jobs.POST("", s.RequireRole(core.RoleOperator), s.CreateJob)
+			jobs.PUT("/:id", s.RequireRole(core.RoleOperator), s.UpdateJob)
+			jobs.DELETE("/:id", s.RequireRole(core.RoleOperator), s.CancelJob)
+			jobs.POST("/:id/cancel", s.RequireRole(core.RoleOperator), s.CancelJob)
+			jobs.POST("/:id/retry", s.RequireRole(core.RoleOperator), s.RetryJob)
+			jobs.POST("/batch", s.RequireRole(core.RoleOperator), s.BatchCreateJobs)
 		}
 
-		// 统计与监控
-		api.GET("/stats", s.GetStats)
-		api.GET("/health", s.HealthCheck)
+		// 统计与监控。/health 继续保持"启用鉴权则需凭据"的历史契约
+		// （docs/api.md 现有描述），控制台的登录页正是靠它的 401/200 判断鉴权是否开启。
+		api.GET("/stats", reader, s.GetStats)
+		api.GET("/health", reader, s.HealthCheck)
 
 		// 获取支持的Job类型（用于前端展示）
-		api.GET("/job-types", s.ListJobTypes)
+		api.GET("/job-types", reader, s.ListJobTypes)
 	}
 
 	// 404处理
@@ -131,17 +160,27 @@ func (s *Server) setupRoutes() {
 		})
 	})
 
+	// 实时通道与 REST 同一套身份要求（viewer 档）：
+	// 事件流里带着任务名与 payload 摘要，不该让未认证连接旁听。
+	// 控制台走 ?ticket=，脚本沿用 ?token=（见 api/security.go 的通道说明）。
+	reader := s.RequireRole(core.RoleViewer)
+
 	// WebSocket 端点：core.WSServer 只认 http，升级请求由 gin 转发
-	s.engine.GET("/ws", func(c *gin.Context) {
+	s.engine.GET("/ws", reader, func(c *gin.Context) {
 		s.wsServer.Handle(c.Writer, c.Request)
 	})
 
 	// SSE 备选方案（对于不支持WebSocket的客户端）
-	s.engine.GET("/sse/events", s.handleSSE)
+	s.engine.GET("/sse/events", reader, s.handleSSE)
 }
 
 // Start 启动HTTP服务（非阻塞）。监听失败直接返回错误，便于上层回滚。
 func (s *Server) Start() error {
+	// 鉴权配置坏掉时绝不带着"半开"的权限体系上线
+	if s.authErr != nil {
+		return fmt.Errorf("authentication is misconfigured: %w", s.authErr)
+	}
+
 	ln, err := net.Listen("tcp", s.httpSrv.Addr)
 	if err != nil {
 		return fmt.Errorf("listen on %s failed: %w", s.httpSrv.Addr, err)
