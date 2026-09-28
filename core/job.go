@@ -20,12 +20,17 @@ const (
 type Job struct {
 	ID        string    `json:"id"`
 	Name      string    `json:"name"`
-	Payload   []byte    `json:"payload"`    // 任务数据
-	TriggerAt time.Time `json:"trigger_at"` // 下次触发时间
+	Type      string    `json:"type,omitempty"` // Handler 注册键；为空时回退到 Name
+	Payload   []byte    `json:"payload"`        // 任务数据
+	TriggerAt time.Time `json:"trigger_at"`     // 下次触发时间
 
 	// 执行配置
 	Handler Handler         `json:"-"` // 处理函数（不持久化）
 	Ctx     context.Context `json:"-"` // 上下文（不持久化）
+
+	// Timeout 单次执行的超时时间，0 表示不限制。
+	// Handler 必须检查 ctx，否则超时只能被观测、无法中断其执行。
+	Timeout time.Duration `json:"timeout"`
 
 	// Cron 重复任务支持
 	CronExpr string `json:"cron_expr,omitempty"` // Cron表达式，空表示一次性任务
@@ -58,16 +63,28 @@ func (j *Job) GetID() string {
 	return j.ID
 }
 
-// CloneForRetry 创建重试副本
+// HandlerKey 返回查找注册 Handler 的键：优先 Type，为空时回退 Name
+func (j *Job) HandlerKey() string {
+	if j.Type != "" {
+		return j.Type
+	}
+	return j.Name
+}
+
+// CloneForRetry 创建重试副本。
+// 保留原 ID 以维持任务链（查询/取消/存储清理按同一 ID）；
+// 清除 Cron 属性，避免一次性任务失败重试后被误当作周期任务重新排期。
 func (j *Job) CloneForRetry(nextTime time.Time) *Job {
 	return &Job{
-		ID:         j.ID + "_retry_" + time.Now().Format("20060102150405"),
+		ID:         j.ID,
 		Name:       j.Name,
+		Type:       j.Type,
 		Payload:    j.Payload,
 		TriggerAt:  nextTime,
 		Handler:    j.Handler,
-		CronExpr:   j.CronExpr,
-		IsRepeat:   j.IsRepeat,
+		Timeout:    j.Timeout,
+		CronExpr:   "",
+		IsRepeat:   false,
 		MaxRetries: j.MaxRetries,
 		RetryCount: j.RetryCount + 1,
 		RetryDelay: j.RetryDelay * 2, // 指数退避
@@ -81,10 +98,12 @@ func (j *Job) CloneForRetry(nextTime time.Time) *Job {
 type JobSnapshot struct {
 	ID         string    `json:"id"`
 	Name       string    `json:"name"`
+	Type       string    `json:"type,omitempty"`
 	Payload    []byte    `json:"payload"`
 	TriggerAt  time.Time `json:"trigger_at"`
 	CronExpr   string    `json:"cron_expr"`
 	IsRepeat   bool      `json:"is_repeat"`
+	Timeout    int64     `json:"timeout"` // nanoseconds
 	MaxRetries int       `json:"max_retries"`
 	RetryCount int       `json:"retry_count"`
 	RetryDelay int64     `json:"retry_delay"` // nanoseconds
@@ -99,10 +118,12 @@ func (j *Job) ToSnapshot() JobSnapshot {
 	return JobSnapshot{
 		ID:         j.ID,
 		Name:       j.Name,
+		Type:       j.Type,
 		Payload:    j.Payload,
 		TriggerAt:  j.TriggerAt,
 		CronExpr:   j.CronExpr,
 		IsRepeat:   j.IsRepeat,
+		Timeout:    int64(j.Timeout),
 		MaxRetries: j.MaxRetries,
 		RetryCount: j.RetryCount,
 		RetryDelay: int64(j.RetryDelay),
@@ -117,10 +138,12 @@ func (j *Job) ToSnapshot() JobSnapshot {
 func (j *Job) FromSnapshot(s JobSnapshot) {
 	j.ID = s.ID
 	j.Name = s.Name
+	j.Type = s.Type
 	j.Payload = s.Payload
 	j.TriggerAt = s.TriggerAt
 	j.CronExpr = s.CronExpr
 	j.IsRepeat = s.IsRepeat
+	j.Timeout = time.Duration(s.Timeout)
 	j.MaxRetries = s.MaxRetries
 	j.RetryCount = s.RetryCount
 	j.RetryDelay = time.Duration(s.RetryDelay)

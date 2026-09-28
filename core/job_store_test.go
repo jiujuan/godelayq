@@ -30,7 +30,7 @@ func (s *JobTestSuite) TestJobCloneForRetry() {
 	nextTime := time.Now().Add(5 * time.Minute)
 	retryJob := original.CloneForRetry(nextTime)
 
-	assert.Contains(s.T(), retryJob.ID, "job-1_retry_")
+	assert.Equal(s.T(), "job-1", retryJob.ID)
 	assert.Equal(s.T(), original.Name, retryJob.Name)
 	assert.Equal(s.T(), original.Payload, retryJob.Payload)
 	assert.Equal(s.T(), 2, retryJob.RetryCount)

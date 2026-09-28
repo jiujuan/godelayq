@@ -79,12 +79,9 @@ func TestJob_CloneForRetry(t *testing.T) {
 
 	clone := original.CloneForRetry(nextTime)
 
-	// Verify ID is different and contains retry suffix
-	if clone.ID == original.ID {
-		t.Error("Clone ID should be different from original")
-	}
-	if len(clone.ID) <= len(original.ID) {
-		t.Error("Clone ID should contain retry suffix")
+	// Verify ID is preserved to keep the retry chain intact
+	if clone.ID != original.ID {
+		t.Errorf("Clone ID should match original: got %s vs %s", clone.ID, original.ID)
 	}
 
 	// Verify copied fields
@@ -97,11 +94,13 @@ func TestJob_CloneForRetry(t *testing.T) {
 	if !clone.TriggerAt.Equal(nextTime) {
 		t.Errorf("Expected TriggerAt %v, got %v", nextTime, clone.TriggerAt)
 	}
-	if clone.CronExpr != original.CronExpr {
-		t.Errorf("Expected CronExpr %s, got %s", original.CronExpr, clone.CronExpr)
+	// Retry clones must drop cron semantics, otherwise a failed one-shot job
+	// would be re-armed as a recurring task after its final retry.
+	if clone.CronExpr != "" {
+		t.Errorf("Expected empty CronExpr on retry clone, got %s", clone.CronExpr)
 	}
-	if clone.IsRepeat != original.IsRepeat {
-		t.Errorf("Expected IsRepeat %v, got %v", original.IsRepeat, clone.IsRepeat)
+	if clone.IsRepeat {
+		t.Error("Expected IsRepeat false on retry clone")
 	}
 	if clone.MaxRetries != original.MaxRetries {
 		t.Errorf("Expected MaxRetries %d, got %d", original.MaxRetries, clone.MaxRetries)

@@ -19,6 +19,9 @@ type CreateJobRequest struct {
 	Payload  json.RawMessage `json:"payload,omitempty" swaggertype:"object"` // 任务数据
 	IsRepeat bool            `json:"is_repeat,omitempty"`                    // 是否重复执行（Cron任务）
 
+	// 单次执行超时，如 "30s"；为空表示不限制（Handler 需检查 ctx 才能被中止）
+	Timeout string `json:"timeout,omitempty" example:"30s"`
+
 	// 重试策略
 	MaxRetries int    `json:"max_retries,omitempty" example:"3"`   // 最大重试次数
 	RetryDelay string `json:"retry_delay,omitempty" example:"30s"` // 重试间隔

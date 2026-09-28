@@ -49,6 +49,21 @@ func (s *Server) CreateJob(c *gin.Context) {
 		}
 	}
 
+	// 解析执行超时（格式非法直接拒绝，不静默忽略）
+	var timeout time.Duration
+	if req.Timeout != "" {
+		d, err := time.ParseDuration(req.Timeout)
+		if err != nil {
+			c.JSON(400, ErrorResponse{
+				Code:    400,
+				Message: "invalid timeout format",
+				Details: err.Error(),
+			})
+			return
+		}
+		timeout = d
+	}
+
 	// 创建任务
 	job := &core.Job{
 		Name:       req.Name,
@@ -56,6 +71,7 @@ func (s *Server) CreateJob(c *gin.Context) {
 		TriggerAt:  triggerAt,
 		CronExpr:   req.CronExpr,
 		IsRepeat:   req.IsRepeat,
+		Timeout:    timeout,
 		MaxRetries: req.MaxRetries,
 		RetryDelay: retryDelay,
 		Status:     core.StatusPending,

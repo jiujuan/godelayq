@@ -28,6 +28,9 @@ type FileJobFormat struct {
 	CronExpr string `json:"cron_expr,omitempty"`
 	IsRepeat bool   `json:"is_repeat"`
 
+	// 单次执行超时，如 "30s"；为空表示不限制
+	Timeout string `json:"timeout,omitempty"`
+
 	// 重试配置
 	MaxRetries int    `json:"max_retries"`
 	RetryDelay string `json:"retry_delay"` // 如 "30s", "5m"
@@ -249,9 +252,10 @@ func (l *DirectoryLoader) formatToJob(f *FileJobFormat) (*Job, error) {
 		Status:     StatusPending,
 	}
 
-	// 生成ID（如果未指定）
+	// 生成ID（如果未指定）。不能用 UnixNano 直接拼：时钟粒度会让同批文件得到相同 ID，
+	// 后一个任务会覆盖前一个。
 	if job.ID == "" {
-		job.ID = fmt.Sprintf("file_%d", time.Now().UnixNano())
+		job.ID = generateID()
 	}
 
 	// 处理触发时间（绝对时间优先）
@@ -278,6 +282,15 @@ func (l *DirectoryLoader) formatToJob(f *FileJobFormat) (*Job, error) {
 		job.RetryDelay = rd
 	} else {
 		job.RetryDelay = 1 * time.Minute // 默认
+	}
+
+	// 解析执行超时
+	if f.Timeout != "" {
+		td, err := time.ParseDuration(f.Timeout)
+		if err != nil {
+			return nil, fmt.Errorf("invalid timeout format: %w", err)
+		}
+		job.Timeout = td
 	}
 
 	// 默认重试次数
