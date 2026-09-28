@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -171,13 +172,13 @@ func TestHandlers_WritePayloadToStdout(t *testing.T) {
 }
 
 func TestDefaultRuntimeDeps(t *testing.T) {
-	deps := defaultRuntimeDeps()
+	deps := defaultRuntimeDeps(core.DefaultConfig())
 
 	if deps.newStore == nil || deps.newScheduler == nil || deps.newServer == nil || deps.notifySignals == nil {
 		t.Fatal("expected all runtime dependencies to be set")
 	}
-	if deps.timeout != 5*time.Second {
-		t.Fatalf("expected timeout to be 5s, got %v", deps.timeout)
+	if deps.timeout != core.DefaultConfig().Scheduler.ShutdownTimeout {
+		t.Fatalf("expected timeout to come from config, got %v", deps.timeout)
 	}
 	if deps.logger == nil {
 		t.Fatal("expected default logger to be set")
@@ -185,9 +186,11 @@ func TestDefaultRuntimeDeps(t *testing.T) {
 }
 
 func TestDefaultNewStore_CreatesUsableStore(t *testing.T) {
-	path := t.TempDir() + "\\jobs.json"
+	cfg := core.DefaultConfig()
+	cfg.Store.Path = filepath.Join(t.TempDir(), "jobs.json")
+	cfg.Store.FlushInterval = 10 * time.Millisecond
 
-	store, err := defaultRuntimeDeps().newStore(path)
+	store, err := defaultRuntimeDeps(cfg).newStore()
 	if err != nil {
 		t.Fatalf("expected store creation to succeed, got %v", err)
 	}
@@ -214,6 +217,17 @@ func TestDefaultNewStore_CreatesUsableStore(t *testing.T) {
 	var decoded map[string]any
 	if err := json.Unmarshal(items[0].Payload, &decoded); err != nil {
 		t.Fatalf("expected payload to stay valid JSON, got %v", err)
+	}
+
+	// 配置的 flush_interval 应真实生效：合并写入后文件即出现在配置的路径上
+	if err := store.Flush(); err != nil {
+		t.Fatalf("expected flush to succeed, got %v", err)
+	}
+	if _, err := os.Stat(cfg.Store.Path); err != nil {
+		t.Fatalf("expected store file at configured path: %v", err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatalf("expected close to succeed, got %v", err)
 	}
 }
 

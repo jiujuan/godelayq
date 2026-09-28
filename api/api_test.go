@@ -104,6 +104,26 @@ func (s *APITestSuite) TestCancelJobNotFound() {
 	assert.Equal(s.T(), 404, w.Code)
 }
 
+func (s *APITestSuite) TestGetStatsReportsHeapSize() {
+	for i := 0; i < 3; i++ {
+		require.NoError(s.T(), s.scheduler.Schedule(&core.Job{
+			Name:      "stats_job",
+			TriggerAt: time.Now().Add(time.Hour),
+		}))
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/api/v1/stats", nil)
+	s.router.ServeHTTP(w, req)
+
+	require.Equal(s.T(), 200, w.Code)
+
+	var stats StatsResponse
+	require.NoError(s.T(), json.Unmarshal(w.Body.Bytes(), &stats))
+	assert.Equal(s.T(), 3, stats.HeapSize, "heap_size must reflect the live scheduling queue")
+	assert.Equal(s.T(), 3, stats.Pending)
+}
+
 func (s *APITestSuite) TestCalculateTriggerTime() {
 	now := time.Now()
 

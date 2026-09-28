@@ -336,9 +336,8 @@ func (s *Server) GetStats(c *gin.Context) {
 		}
 	}
 
-	// 获取堆大小（活跃任务数）
-	// 注意：需要在scheduler中暴露HeapLen方法
-	// stats.HeapSize = s.scheduler.HeapLen()
+	// 堆中待执行任务数（活跃任务）
+	stats.HeapSize = s.scheduler.HeapLen()
 
 	c.JSON(200, stats)
 }

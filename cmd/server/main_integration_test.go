@@ -22,13 +22,19 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 	server.onRegister = scheduler.RegisterHandler
 	var logs strings.Builder
 
+	cfg := core.Config{}
+	cfg.Server.Port = "9999"
+	cfg.Scheduler.Workers = 7
+	cfg.Scheduler.QueueCapacity = 3
+	cfg.Scheduler.MaxRetryDelay = 11 * time.Second
+	cfg.Scheduler.ShutdownTimeout = 40 * time.Millisecond
+	cfg.Store.Type = "json"
+	cfg.Store.Path = "custom/jobs.json"
+	cfg.Store.FlushInterval = 10 * time.Millisecond
+
 	deps := runtimeDeps{
-		newStore: func(path string) (core.Store, error) {
-			if path != defaultDataPath {
-				t.Fatalf("expected default path %q, got %q", defaultDataPath, path)
-			}
-			return store, nil
-		},
+		config:   cfg,
+		newStore: func() (core.Store, error) { return store, nil },
 		newScheduler: func(gotStore core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
 			if gotStore != store {
 				t.Fatal("expected scheduler to receive created store")
@@ -40,8 +46,8 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 			if !ok {
 				t.Fatalf("expected exponential retry policy, got %T", retryPolicy)
 			}
-			if backoff.MaxDelay != 30*time.Minute {
-				t.Fatalf("expected max delay 30m, got %v", backoff.MaxDelay)
+			if backoff.MaxDelay != cfg.Scheduler.MaxRetryDelay {
+				t.Fatalf("expected max delay %v, got %v", cfg.Scheduler.MaxRetryDelay, backoff.MaxDelay)
 			}
 			return scheduler
 		},
@@ -52,8 +58,8 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 			if gotStore != store {
 				t.Fatal("expected server to receive created store")
 			}
-			if port != defaultPort {
-				t.Fatalf("expected default port %q, got %q", defaultPort, port)
+			if port != cfg.Server.Port {
+				t.Fatalf("expected configured port %q, got %q", cfg.Server.Port, port)
 			}
 			return server, nil
 		},
@@ -71,6 +77,11 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 
 	if err := run(deps); err != nil {
 		t.Fatalf("expected run to succeed, got %v", err)
+	}
+
+	if scheduler.concurrency != cfg.Scheduler.Workers || scheduler.queueCapacity != cfg.Scheduler.QueueCapacity {
+		t.Fatalf("expected config to reach scheduler, got workers=%d queue=%d",
+			scheduler.concurrency, scheduler.queueCapacity)
 	}
 
 	if scheduler.startCalls != 1 {
@@ -118,7 +129,7 @@ func TestRun_ServerStartFailureStopsScheduler(t *testing.T) {
 	server.startErr = errors.New("listen failed")
 
 	err := run(runtimeDeps{
-		newStore: func(path string) (core.Store, error) { return store, nil },
+		newStore: func() (core.Store, error) { return store, nil },
 		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
 			return scheduler
 		},
@@ -148,7 +159,7 @@ func TestRun_StoreCreationFailure(t *testing.T) {
 	wantErr := errors.New("store create failed")
 
 	err := run(runtimeDeps{
-		newStore: func(path string) (core.Store, error) { return nil, wantErr },
+		newStore: func() (core.Store, error) { return nil, wantErr },
 		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
 			t.Fatal("scheduler should not be created when store creation fails")
 			return nil
@@ -181,7 +192,7 @@ func TestRun_ServerStopErrorIsLoggedAndIgnored(t *testing.T) {
 	var logs strings.Builder
 
 	err := run(runtimeDeps{
-		newStore: func(path string) (core.Store, error) { return store, nil },
+		newStore: func() (core.Store, error) { return store, nil },
 		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
 			return scheduler
 		},
@@ -211,7 +222,7 @@ func TestRun_UsesDefaultTimeoutAndLoggerWhenUnset(t *testing.T) {
 	server := newFakeServer()
 
 	err := run(runtimeDeps{
-		newStore: func(path string) (core.Store, error) { return store, nil },
+		newStore: func() (core.Store, error) { return store, nil },
 		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
 			return scheduler
 		},
@@ -246,7 +257,7 @@ func TestRun_ServerFactoryError(t *testing.T) {
 	wantErr := errors.New("server factory failed")
 
 	err := run(runtimeDeps{
-		newStore: func(path string) (core.Store, error) { return store, nil },
+		newStore: func() (core.Store, error) { return store, nil },
 		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
 			return scheduler
 		},
@@ -266,16 +277,30 @@ func TestRun_ServerFactoryError(t *testing.T) {
 }
 
 type spyScheduler struct {
-	mu         sync.Mutex
-	startCalls int
-	stopCalls  int
-	registered map[string]core.Handler
+	mu            sync.Mutex
+	startCalls    int
+	stopCalls     int
+	registered    map[string]core.Handler
+	concurrency   int
+	queueCapacity int
 }
 
 func newSpyScheduler() *spyScheduler {
 	return &spyScheduler{
 		registered: make(map[string]core.Handler),
 	}
+}
+
+func (s *spyScheduler) SetConcurrency(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.concurrency = n
+}
+
+func (s *spyScheduler) SetQueueCapacity(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queueCapacity = n
 }
 
 func (s *spyScheduler) Start() {

@@ -1,0 +1,22 @@
+# godelayq 运行配置
+# 通过 ./godelayq-server -config=configs/config.yaml 指定；
+# 留空时按 ./configs/config.yaml 自动查找，文件不存在则使用代码默认值。
+#
+# 每一项都可被环境变量覆盖，前缀 GODELAYQ_、层级用下划线连接，
+# 例如 GODELAYQ_SERVER_PORT=9090、GODELAYQ_SCHEDULER_WORKERS=32。
+#
+# 注意：这里只收录当前真正生效的配置项，写入未知键会直接报错。
+
+server:
+  port: "8080"          # HTTP 监听端口
+
+scheduler:
+  workers: 100          # 并发执行协程数；0 表示使用 core.DefaultConcurrency
+  queue_capacity: 0     # 执行队列容量；0 表示与 workers 相等。队列满时调度循环阻塞入队
+  max_retry_delay: 30m  # 指数退避的单次重试延迟上限
+  shutdown_timeout: 5s  # 优雅关闭等待时长
+
+store:
+  type: json            # 存储后端，目前仅支持 json
+  path: ./data/jobs.json
+  flush_interval: 200ms # 合并落盘周期；崩溃时最多丢失一个周期的状态变更
