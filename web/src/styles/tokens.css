@@ -1,0 +1,43 @@
+/* 设计 token：白为主、蓝为辅、灰打底（docs/design/web-console-design.md §4.3）。
+   值与命名与文档表格逐条对齐，页面只引用这些变量而不写死十六进制——
+   将来要出深色主题只需换这一张表。 */
+@theme {
+  /* 品牌与语义色 */
+  --color-primary: #2563eb;
+  --color-primary-hover: #1d4ed8;
+  --color-primary-soft: #eff6ff;
+  --color-bg: #ffffff;
+  --color-surface: #f9fafb;
+  --color-border: #e5e7eb;
+  --color-text: #111827;
+  --color-text-muted: #6b7280;
+
+  /* 状态色：与后端 JobStatus.String() 一一对应，映射表只有 JobStatusBadge 一处 */
+  --color-status-pending: #2563eb;
+  --color-status-running: #d97706;
+  --color-status-success: #16a34a;
+  --color-status-failed: #dc2626;
+  --color-status-cancelled: #9ca3af;
+  --color-status-paused: #4f46e5;
+
+  /* 实时通道状态 */
+  --color-ws-connected: #16a34a;
+  --color-ws-reconnecting: #d97706;
+  --color-ws-offline: #9ca3af;
+
+  /* 圆角与间距：只在少数几档里选，避免每页各写一个值 */
+  --radius-card: 8px;
+  --radius-control: 6px;
+  --radius-pill: 9999px;
+  --space-page: 24px;
+  --space-block: 16px;
+  --space-inline: 8px;
+
+  /* 布局尺寸（§4.3 双栏） */
+  --width-sidebar: 240px;
+  --width-sidebar-collapsed: 64px;
+  --height-topbar: 56px;
+
+  /* 字体 */
+  --font-sans: 'Inter', 'PingFang SC', 'Microsoft YaHei', system-ui, -apple-system, 'Segoe UI', sans-serif;
+}
