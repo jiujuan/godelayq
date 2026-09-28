@@ -47,7 +47,7 @@ func main() {
 		ID:         "heartbeat_001", // 固定ID确保只有一个实例
 		Name:       "heartbeat",
 		Payload:    []byte(`{"type": "ping"}`),
-		CronExpr:   "*/5 * * * *", // 每5分钟（当前解析器为分钟级精度）
+		CronExpr:   "*/5 * * * *", // 每5分钟（解析器也接受 6 字段秒级写法，如 "*/30 * * * * *"）
 		IsRepeat:   true,
 		MaxRetries: 2,
 	}

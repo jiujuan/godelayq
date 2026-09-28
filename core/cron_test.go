@@ -89,8 +89,32 @@ func TestCronParser_Next(t *testing.T) {
 			},
 		},
 		{
+			name:     "Every 10 seconds (6-field, second precision)",
+			cronExpr: "*/10 * * * * *",
+			now:      time.Date(2024, 1, 1, 12, 0, 5, 0, time.UTC),
+			wantErr:  false,
+			validate: func(t *testing.T, next time.Time, now time.Time) {
+				expected := time.Date(2024, 1, 1, 12, 0, 10, 0, time.UTC)
+				if !next.Equal(expected) {
+					t.Errorf("Expected next time %v, got %v", expected, next)
+				}
+			},
+		},
+		{
+			name:     "Daily at 09:30:00 (6-field)",
+			cronExpr: "0 30 9 * * *",
+			now:      time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC),
+			wantErr:  false,
+			validate: func(t *testing.T, next time.Time, now time.Time) {
+				expected := time.Date(2024, 1, 2, 9, 30, 0, 0, time.UTC)
+				if !next.Equal(expected) {
+					t.Errorf("Expected next time %v, got %v", expected, next)
+				}
+			},
+		},
+		{
 			name:     "Invalid cron expression - too many fields",
-			cronExpr: "* * * * * *",
+			cronExpr: "* * * * * * *",
 			now:      time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC),
 			wantErr:  true,
 		},

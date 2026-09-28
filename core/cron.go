@@ -12,9 +12,10 @@ type CronParser struct {
 }
 
 func NewCronParser() CronParser {
-	// 使用标准解析器，支持秒级精度（可选）
+	// SecondOptional 同时接受两种写法：
+	// 5 字段（分 时 日 月 周，历史写法）与 6 字段（秒 分 时 日 月 周，秒级精度）。
 	return CronParser{
-		parser: cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow),
+		parser: cron.NewParser(cron.SecondOptional | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow),
 	}
 }
 
