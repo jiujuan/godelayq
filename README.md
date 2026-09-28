@@ -161,10 +161,12 @@ godelayq/
 │   └── demo2/                # 目录加载器
 │
 ├── dashboard/
-│   └── index.html            # 单文件监控页（浏览器直接打开，可填 token）
+│   └── index.html            # 旧单文件监控页的跳转页（能力已并入 web/ 控制台的实时页）
 │
-├── web/                      # Vue 3 控制台前端（npm 工程，尚未内嵌进二进制）
+├── web/                      # Vue 3 控制台前端（npm 工程；-tags dashboard 时产物内嵌进二进制）
 │   ├── vite.config.ts        # dev 代理 /api、/sse、/ws → :8080
+│   ├── embed_dashboard.go    # //go:build dashboard：//go:embed all:dist 暴露 web.Dist
+│   ├── embed_stub.go         # //go:build !dashboard：web.Dist 恒为 nil，构建不依赖 npm
 │   ├── package.json          # 版本钉在设计文档 §4.1：Vite 7 / TS 5 / Pinia 3 / Router 4
 │   └── src/
 │       ├── api/              # types、client（401→刷新→重放一次）、auth、jobs、groups、events、admin、keys、stats
@@ -230,7 +232,8 @@ godelayq/
   补"打开页面之前"的历史；重启即清空，长期留痕请接外部日志
 - **运维端点**：`GET /admin/runtime` 读 worker/队列/堆/缓冲占用，`POST /admin/scheduler/suspend|unsuspend`
   是维护窗口的调度总开关（进程内状态，重启自动解除）
-- **监控页**：`dashboard/index.html` 是单文件页面，用浏览器直接打开即可连 `/ws` 与统计接口（不由服务端托管，需自行处理跨域或同源部署）
+- **控制台**：`web/` 的 Vue 控制台共八个页面（概览、任务列表、任务详情、分组、实时、运维、设置、登录）；
+  带 `-tags dashboard` 构建时与 API 同源提供，旧 `dashboard/index.html` 只剩一个跳转页
 - **结构化日志**：全进程 `log/slog`，级别与格式可配，HTTP 访问日志与 panic 堆栈同流
 
 ### 5. 接入层安全
@@ -249,6 +252,9 @@ godelayq/
 - **跨域与握手来源**：`server.cors.allow_origins` 同时约束 HTTP 与 WebSocket 握手来源
 - **登录限流**：同一来源对同一账号 1 分钟内失败 5 次、对任意账号失败 20 次即 429
   （bcrypt 单次约 60-100ms，不限流的登录端点是免费的 DoS 开关）
+- **静态产物免鉴权，也只到产物为止**：带前端的二进制里 `GET`/`HEAD` 的 `/`、`/assets/*`
+  与 SPA 深链不需要凭据（登录页本身就在产物里）；`/api`、`/ws`、`/sse` 三个名字空间与
+  一切写方法照旧要凭据，未知路径也不会被兜底成页面
 - **边界**：无 HTTPS、无在线账号管理、无审计落盘（写操作只进结构化日志），需前置反代
 
 ### 6. 扩展能力
@@ -286,9 +292,9 @@ go build -o godelayq-server ./cmd/server
 ./godelayq-server -config=configs/config.yaml
 ```
 
-### 前端控制台（开发模式）
+### 前端控制台的两种部署形态
 
-`web/` 是独立的 npm 工程，开发期与 Go 进程分开跑，靠 Vite 代理同源访问后端：
+**开发形态**（默认）：`web/` 是独立的 npm 工程，开发期与 Go 进程分开跑，靠 Vite 代理同源访问后端：
 
 ```bash
 # 终端 1：后端（默认 :8080）
@@ -303,7 +309,28 @@ npm run dev        # http://localhost:5173，端口被占用时 Vite 自动顺�
 页面一律用相对路径请求 `/api`、`/ws`，所以顺延端口同样能用。校验命令：
 `npx vue-tsc --noEmit`（类型）与 `npm run build`（产物在 `web/dist`，已 gitignore）。
 **依赖版本钉在设计文档 §4.1**（Vite 7 / TS 5 / Pinia 3 / vue-router 4），
-`npm install` 时不要随手升到最新大版本。内嵌进单二进制（`embed`）与联调属 M5。
+`npm install` 时不要随手升到最新大版本。
+
+**单二进制**：前端产物内嵌进 Go 二进制，一个进程同时提供 API 与控制台，
+没有跨域、也不需要上面那条代理。**顺序必须先是 npm 再是 go**：
+
+```bash
+cd web && npm run build && cd ..        # 产出 web/dist
+go build -tags dashboard -o godelayq-console ./cmd/server
+./godelayq-console -config=configs/config.yaml   # 浏览器打开 http://localhost:8080/
+```
+
+`-tags dashboard` 让 `web/embed_dashboard.go` 的 `//go:embed all:dist` 生效；
+没跑过 `npm run build` 时这一步会直接编译失败（`pattern all:dist: no matching files found`），
+而不是给出一个没有页面的二进制。不带这个 tag 的构建里 `web.Dist` 恒为 `nil`，
+服务端只提供 API——`go build ./...` 与全部测试因此完全不依赖 Node。
+启动日志的 `embedded console enabled mount=/` 用来确认这个二进制带没带前端。
+
+同源托管下的路径划分（详见 `docs/api.md` 的"控制台与静态托管"）：`/` 给 `index.html`
+（`no-cache`），`/assets/*` 给带哈希的产物（`immutable`），其余 `GET` 且浏览器声明
+`Accept: text/html` 的路径回落 `index.html` 由前端路由接管；`/api`、`/ws`、`/sse`
+三个名字空间的行为与不带前端时完全一致。启用鉴权时静态产物免凭据（登录页也在产物里），
+写方法与三个名字空间照旧要凭据。
 
 ### 配置项
 

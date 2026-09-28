@@ -236,5 +236,6 @@ setInterval(() => {
 }, 30000);
 ```
 
-仓库里的 `dashboard/index.html` 就是一个这种单文件页面，用浏览器直接打开即可，
-不由服务端托管；跨域部署时需把服务端的 `server.cors.allow_origins` 指到面板所在来源。
+仓库里的 `dashboard/index.html` 是这种单文件页面的**历史版本**：它已被 `web/` 的 Vue 控制台
+取代，现在只会把人跳回同源根路径。想要一个自己托管的极简页面，照本节自己写一份即可；
+跨域部署时需把服务端的 `server.cors.allow_origins` 指到面板所在来源。

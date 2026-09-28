@@ -84,6 +84,34 @@ HTTP 访问日志与 panic 恢复由 `api/logging.go` 的中间件产出，替�
 注意两点边界：Cron 重复任务沿用同一 ID，每轮成功都会被下一轮的 `pending` 覆盖，
 所以看不到逐轮历史；进程重启后 `uptime` 归零，但 completed/failed 会随留痕记录一并恢复。
 
+### 控制台与前端产物
+
+控制台有两种形态，API 契约一致，生产上推荐第二种（一个进程、一个端口、同源）：
+
+```bash
+# 开发形态：两个进程，Vite 代理 /api、/ws、/sse 到 :8080
+cd web && npm run dev
+
+# 单二进制：先产前端，再编后端
+cd web && npm run build && cd ..
+go build -tags dashboard -o godelayq-server ./cmd/server
+```
+
+- **顺序不能反**。`-tags dashboard` 下 `//go:embed all:dist` 在编译期就要求
+  `web/dist` 存在，缺了它构建直接失败（`pattern all:dist: no matching files found`），
+  不会给出一个"看起来成功、打开没有页面"的二进制。发布流水线里两步之间要有依赖关系，
+  不能并行。
+- **不带 tag 的构建不含前端**：`go build ./...` 与全部测试因此不需要 Node，
+  `web.Dist` 恒为 `nil`，访问 `/` 得到 JSON 404。启动日志里的
+  `embedded console enabled mount=/` 是判断"这个二进制到底带没带页面"的最快办法。
+- **同源之后跨域不再是问题**：`/api`、`/ws`、`/sse` 与页面同一个 Origin，
+  浏览器不做预检。`allow_origins` 依然要收紧——它管的是*其它*站点访问这台服务，
+  跟控制台从哪来无关。
+- **缓存**：`index.html` 是 `no-cache`，`/assets/*` 是 `max-age=31536000, immutable`
+  （文件名带内容哈希）。反代或 CDN 上如果给 `index.html` 加了缓存，升级后旧页面会去取
+  已经不存在的哈希资源，表现是白屏而不是报错。
+- `web/dist` 不进版本库，发布时构建。
+
 ### 接入层安全（账号、token 与跨域）
 
 **默认是敞开的**：不配任何凭据时，任何能连上端口的主机都能创建/取消任务并订阅全部事件，
@@ -114,6 +142,9 @@ HTTP 访问日志与 panic 恢复由 `api/logging.go` 的中间件产出，替�
   机器凭据仍可用 `?token=`。后者会出现在访问日志与浏览器历史里，
   暴露给不可信网络前请在反向代理层关掉 `/ws`、`/sse/events` 的 query 日志，或只在内网开放。
 - 健康检查 `/api/v1/health` 在保护范围内，探针需要带凭据。
+- 带前端产物的二进制里，`GET`/`HEAD` 的静态资源与 SPA 深链**免凭据**（登录页本身就在产物里）。
+  放行范围只到产物为止：`/api/`、`/ws`、`/sse/` 三个名字空间与一切写方法照旧要凭据，
+  判定见 `api/console.go` 的 `consoleRequest`。产物里不含任何业务数据，但会暴露"这里有个控制台"。
 - 写操作只有结构化日志，没有可查询的审计存储；要留证据链请收集 stdout 日志（见下文日志与观测）。
 
 数据目录需提前创建并保证进程可写：

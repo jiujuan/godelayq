@@ -20,8 +20,8 @@ Content-Type: application/json
 | 用户名 + 密码 → JWT | `server.auth.users`（bcrypt 哈希）+ `server.auth.jwt.secret` | 账号自身角色 | Web 控制台 |
 | 静态 token | `server.auth.token` | `machine` | 脚本、CI、旧集成 |
 
-配置了任一凭据后，除 `POST /api/v1/auth/login`、`POST /api/v1/auth/refresh` 两个登录入口外，
-全部端点（含 `/ws`、`/sse/events`、`/api/v1/health`）都要求有效凭据，缺失或无效返回 401：
+配置了任一凭据后，除下面列出的免鉴权路径外，全部端点（含 `/ws`、`/sse/events`、
+`/api/v1/health`）都要求有效凭据，缺失或无效返回 401：
 
 ```json
 { "code": 401, "message": "invalid or missing credentials" }
@@ -29,6 +29,21 @@ Content-Type: application/json
 
 角色不足返回 403（`{"code":403,"message":"insufficient role"}`），登录失败过于频繁返回 429
 并附 `Retry-After` 秒数。
+
+### 免鉴权路径
+
+只有三类请求不需要凭据就能通过鉴权中间件：
+
+| 路径 | 为什么放行 |
+| --- | --- |
+| `POST /api/v1/auth/login`、`POST /api/v1/auth/refresh` | 它们本身就是领取凭据的入口 |
+| 带前端产物的二进制里，`GET`/`HEAD` 的 `/`、`/assets/*` 与 SPA 深链（如 `/jobs/<id>`） | 登录页也是产物的一部分；拦住它等于启用鉴权后连登录框都打不开 |
+
+产物那一条的判定与路由分派共用一个函数（`api/console.go` 的 `consoleRequest`），
+口径是"**GET 或 HEAD**，且路径不在 `/api/`、`/ws`、`/sse/` 名字空间里，且（除 `/` 与
+`/assets/` 之外）请求头声明接受 `text/html`"。任何写方法都不在放行范围内；
+未注入产物的部署（`go build` 不带 `-tags dashboard`，或没调 `WithConsole`）里这条
+豁免根本不存在，`/` 依旧返回 JSON 404 或 401。
 
 ### 认证端点
 
@@ -115,6 +130,34 @@ curl -H "X-Auth-Token: $GODELAYQ_TOKEN"         http://localhost:8080/api/v1/sta
 curl -X POST -d '{"username":"admin01","password":"..."}' http://localhost:8080/api/v1/auth/login
 curl -H "Authorization: Bearer <access_token>" http://localhost:8080/api/v1/jobs
 ```
+
+## 控制台与静态托管
+
+Web 控制台有两种部署形态，API 契约完全一致，区别只在前端从哪里来（设计文档 §5.8）：
+
+**开发形态**：`cd web && npm run dev` 起 Vite（默认 :5173），`vite.config.ts` 把
+`/api`、`/ws`（`ws: true`）、`/sse` 代理到 :8080。此时后端进程里没有产物，
+访问 `http://localhost:8080/` 得到 JSON 404 是正常的。
+
+**单二进制**：先 `cd web && npm run build` 产出 `web/dist`，再
+`go build -tags dashboard ./cmd/server`。`-tags dashboard` 会让
+`web/embed_dashboard.go` 的 `//go:embed all:dist` 生效；不带这个 tag 的构建里
+`web.Dist` 恒为 `nil`，服务端只提供 API——所以先 build 前端、后 build 二进制，
+顺序反了会直接编译失败（`pattern all:dist: no matching files found`）。
+
+产物挂在根路径上，与 API 同源，因此不存在跨域、也不需要那条代理：
+
+| 请求 | 响应 |
+| --- | --- |
+| `GET /` | `web/dist/index.html`，`Cache-Control: no-cache` |
+| `GET /assets/<name>` | 对应产物文件，`Cache-Control: public, max-age=31536000, immutable`（文件名带内容哈希） |
+| `GET /jobs/<id>` 等 SPA 深链，且 `Accept` 含 `text/html` | 回落 `index.html`，由前端路由决定显示什么 |
+| `GET /assets/<不存在>` | 404（不拿 index.html 兜，否则得到一个 200 的白屏 JS） |
+| `/api/v1/*`、`/ws`、`/sse/*` 下的未知路径 | 维持原样：启用鉴权先 401，带凭据后 JSON 404 |
+
+`index.html` 必须 `no-cache`：它引用的是哈希文件名，缓存住它，升级后旧页面就会
+去取已经被换掉的资源。启动日志里的 `embedded console enabled mount=/` 用来确认
+这个二进制到底带没带前端。
 
 ## 任务管理 API
 
