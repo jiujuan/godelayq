@@ -12,6 +12,12 @@ import (
 // DefaultConfigPath 是约定的配置文件位置
 const DefaultConfigPath = "configs/config.yaml"
 
+// 控制台令牌的默认有效期。访问令牌取短，靠 refresh 续期，缩短被盗用窗口。
+const (
+	DefaultAccessTTL  = 15 * time.Minute
+	DefaultRefreshTTL = 12 * time.Hour
+)
+
 // Config 是进程的可配置项。只收录当前真正生效的字段：
 // 未实现的选项（存储后端类型、加载器、WebSocket 上限等）故意不出现，
 // LoadConfig 使用精确解码，写入未知键会直接报错而不是被忽略。
@@ -26,16 +32,98 @@ type Config struct {
 type ServerConfig struct {
 	// Port 监听端口，如 "8080"
 	Port string `mapstructure:"port"`
-	// Auth 静态 token 鉴权
+	// Auth 控制台账号与机器凭据
 	Auth AuthConfig `mapstructure:"auth"`
 	// CORS 跨域来源白名单
 	CORS CORSConfig `mapstructure:"cors"`
 }
 
-// AuthConfig 鉴权配置。Token 为空表示不启用鉴权。
+// AuthConfig 鉴权配置。Token 为空且 Users 为空表示不启用鉴权。
 type AuthConfig struct {
-	// Token 访问受保护端点所需的静态 token，通过 GODELAYQ_SERVER_AUTH_TOKEN 注入更安全
+	// Token 静态机器凭据，通过 GODELAYQ_SERVER_AUTH_TOKEN 注入更安全。
+	// 它不再是控制台凭据：以它进来的调用方身份是 core.RoleMachine，
+	// 能读写任务但不能强制暂停、删组或使用运维端点。
 	Token string `mapstructure:"token"`
+	// JWT 控制台令牌的签发参数；Users 非空时必填 Secret。
+	JWT JWTConfig `mapstructure:"jwt"`
+	// Users 控制台账号。账号只在此声明，改动需重启进程。
+	Users []UserConfig `mapstructure:"users"`
+}
+
+// JWTConfig 访问令牌参数。密钥只走环境变量注入更安全。
+type JWTConfig struct {
+	// Secret HS256 签名密钥；轮换会使全部已发令牌立即失效
+	Secret string `mapstructure:"secret"`
+	// AccessTTL 访问令牌有效期，0 表示 DefaultAccessTTL
+	AccessTTL time.Duration `mapstructure:"access_ttl"`
+	// RefreshTTL 刷新令牌有效期，0 表示 DefaultRefreshTTL
+	RefreshTTL time.Duration `mapstructure:"refresh_ttl"`
+}
+
+// UserConfig 一个控制台账号。密码只存 bcrypt 哈希，明文禁止入配置。
+type UserConfig struct {
+	// Name 登录名，配置内唯一
+	Name string `mapstructure:"name"`
+	// PasswordBcrypt bcrypt 哈希（可用 cmd/hashpassword 生成）
+	PasswordBcrypt string `mapstructure:"password_bcrypt"`
+	// Role viewer|operator|admin|ops
+	Role string `mapstructure:"role"`
+}
+
+// Enabled 表示是否配置了任何凭据（静态 token 或账号）。
+func (a AuthConfig) Enabled() bool {
+	return a.Token != "" || len(a.Users) > 0
+}
+
+// Validate 检查账号列表自身的一致性。
+// 哈希格式是否真是 bcrypt 留给 api 层在启动时用 bcrypt.Cost 校验：
+// core 不该为了校验一个字符串而依赖 crypto 库。
+func (a AuthConfig) Validate() error {
+	if len(a.Users) == 0 {
+		return nil
+	}
+	// 有账号却没有签名密钥，等于登录页能开但永远签不出令牌
+	if a.JWT.Secret == "" {
+		return fmt.Errorf("server.auth.jwt.secret must not be empty when server.auth.users is configured")
+	}
+	if len(a.JWT.Secret) < minJWTSecretLen {
+		return fmt.Errorf("server.auth.jwt.secret must be at least %d bytes, got %d", minJWTSecretLen, len(a.JWT.Secret))
+	}
+	if a.JWT.AccessTTL < 0 {
+		return fmt.Errorf("server.auth.jwt.access_ttl must not be negative, got %v", a.JWT.AccessTTL)
+	}
+	if a.JWT.RefreshTTL < 0 {
+		return fmt.Errorf("server.auth.jwt.refresh_ttl must not be negative, got %v", a.JWT.RefreshTTL)
+	}
+
+	seen := make(map[string]bool, len(a.Users))
+	for i, user := range a.Users {
+		name := strings.TrimSpace(user.Name)
+		if name == "" {
+			return fmt.Errorf("server.auth.users[%d].name must not be empty", i)
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			return fmt.Errorf("server.auth.users contains duplicate name %q (case-insensitive)", name)
+		}
+		seen[key] = true
+
+		if user.PasswordBcrypt == "" {
+			return fmt.Errorf("server.auth.users[%d].password_bcrypt must not be empty for user %q", i, name)
+		}
+		if _, ok := ParseRole(user.Role); !ok {
+			return fmt.Errorf("server.auth.users[%d].role %q for user %q is invalid, use viewer|operator|admin|ops", i, user.Role, name)
+		}
+	}
+	return nil
+}
+
+// minJWTSecretLen 是 HS256 密钥的最小长度；短密钥容易被离线爆破。
+const minJWTSecretLen = 32
+
+// ResolveRole 解析账号角色；非法取值由 Validate 拦截，调用方仍需处理 false。
+func (u UserConfig) ResolveRole() (Role, bool) {
+	return ParseRole(u.Role)
 }
 
 // CORSConfig 跨域配置。AllowOrigins 为空等价于 ["*"]（历史行为）。
@@ -87,7 +175,12 @@ func DefaultConfig() Config {
 		Server: ServerConfig{
 			Port: "8080",
 			Auth: AuthConfig{
-				Token: "", // 空即不启用鉴权
+				Token: "", // 空即不启用静态凭据
+				JWT: JWTConfig{
+					Secret:     "", // 无账号时不需要密钥
+					AccessTTL:  DefaultAccessTTL,
+					RefreshTTL: DefaultRefreshTTL,
+				},
 			},
 			CORS: CORSConfig{
 				AllowOrigins:     []string{"*"},
@@ -132,9 +225,14 @@ func LoadConfig(path string) (Config, error) {
 
 	// 环境变量覆盖：GODELAYQ_SERVER_PORT / GODELAYQ_SCHEDULER_WORKERS ...
 	// 列表型（allow_origins）由 viper 默认的逗号分隔 hook 解析。
+	// server.auth.users 故意不绑定环境变量：它是"名字+哈希+角色"的嵌套列表，
+	// 逗号分隔 hook 无法表达，且把账号塞进环境变量很容易被 `ps eww` 之类的旁路读到。
 	for _, key := range []string{
 		"server.port",
 		"server.auth.token",
+		"server.auth.jwt.secret",
+		"server.auth.jwt.access_ttl",
+		"server.auth.jwt.refresh_ttl",
 		"server.cors.allow_origins",
 		"server.cors.allow_credentials",
 		"scheduler.workers",
@@ -222,6 +320,10 @@ func (c Config) Validate() error {
 		return fmt.Errorf("invalid logging.format %q, use text or json", c.Logging.Format)
 	}
 
+	if err := c.Server.Auth.Validate(); err != nil {
+		return err
+	}
+
 	for _, origin := range c.Server.CORS.AllowOrigins {
 		if strings.TrimSpace(origin) == "" {
 			return fmt.Errorf("server.cors.allow_origins must not contain an empty entry")
@@ -272,6 +374,12 @@ func (c Config) Normalized() Config {
 	}
 	if c.Store.HistoryLimit == 0 {
 		c.Store.HistoryLimit = defaults.Store.HistoryLimit
+	}
+	if c.Server.Auth.JWT.AccessTTL == 0 {
+		c.Server.Auth.JWT.AccessTTL = defaults.Server.Auth.JWT.AccessTTL
+	}
+	if c.Server.Auth.JWT.RefreshTTL == 0 {
+		c.Server.Auth.JWT.RefreshTTL = defaults.Server.Auth.JWT.RefreshTTL
 	}
 	if c.Logging.Level == "" {
 		c.Logging.Level = defaults.Logging.Level

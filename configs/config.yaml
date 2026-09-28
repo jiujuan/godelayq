@@ -10,11 +10,26 @@
 server:
   port: "8080"          # HTTP 监听端口
   auth:
-    # 静态访问 token：留空即不启用鉴权（当前默认，便于本地开发）。
+    # 静态机器凭据：留空即不启用。它只给脚本/CI 用——以它进来的身份是 machine，
+    # 能读写任务，但不能强制暂停、不能删组、不能用运维端点。
+    # 控制台账号请配下面的 users，凭 JWT 登录。
     # 生产环境用环境变量注入：GODELAYQ_SERVER_AUTH_TOKEN=...
-    # 启用后 REST 用 Authorization: Bearer <token> 或 X-Auth-Token；
-    # 浏览器 WebSocket / EventSource 只能用 ?token=<token>
     token: ""
+    jwt:
+      # HS256 签名密钥，至少 32 字节；禁止把明文密钥提交进本文件，
+      # 请用环境变量注入：GODELAYQ_SERVER_AUTH_JWT_SECRET=...
+      # 轮换密钥会让全部已签发令牌立即失效（所有人需重新登录）。
+      secret: ""
+      access_ttl: 15m   # 访问令牌有效期；0 表示用代码默认值 15m
+      refresh_ttl: 12h  # 刷新令牌有效期；0 表示用代码默认值 12h
+    # 控制台账号。本项不能靠环境变量覆盖（嵌套列表无法用逗号分隔表达），
+    # 增删账号需改本文件并重启进程。
+    # 密码只存 bcrypt 哈希，用 `go run ./cmd/hashpassword` 生成；明文禁止写入配置。
+    # role 取 viewer|operator|admin|ops，权限矩阵见 docs/design/web-console-design.md §5.7.3
+    users: []
+    #  - name: admin01
+    #    password_bcrypt: "$2a$10$..."
+    #    role: admin
   cors:
     # 跨域来源白名单，元素为完整 origin；["*"] 或留空表示任意来源
     allow_origins: ["*"]

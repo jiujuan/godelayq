@@ -3,6 +3,7 @@ package core
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -259,4 +260,137 @@ func TestConfig_ThreadsIntoComponents(t *testing.T) {
 	defer scheduler.mu.RUnlock()
 	assert.Equal(t, 3, scheduler.concurrency)
 	assert.Equal(t, 9, scheduler.queueCapacity)
+}
+
+func TestLoadConfig_AuthUsers(t *testing.T) {
+	path := writeConfigFile(t, `
+server:
+  auth:
+    token: machine-token
+    jwt:
+      secret: "12345678901234567890123456789012"
+      access_ttl: 5m
+      refresh_ttl: 1h
+    users:
+      - name: admin01
+        password_bcrypt: "$2a$10$abc"
+        role: admin
+      - name: ops01
+        password_bcrypt: "$2a$10$def"
+        role: ops
+`)
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, "machine-token", cfg.Server.Auth.Token)
+	assert.Equal(t, 5*time.Minute, cfg.Server.Auth.JWT.AccessTTL)
+	assert.Equal(t, time.Hour, cfg.Server.Auth.JWT.RefreshTTL)
+	require.Len(t, cfg.Server.Auth.Users, 2)
+	assert.Equal(t, "admin01", cfg.Server.Auth.Users[0].Name)
+	assert.Equal(t, "$2a$10$abc", cfg.Server.Auth.Users[0].PasswordBcrypt)
+
+	role, ok := cfg.Server.Auth.Users[1].ResolveRole()
+	require.True(t, ok)
+	assert.Equal(t, RoleOps, role)
+
+	// 配了账号就必须能启用鉴权，登录页据此决定是否显示
+	assert.True(t, cfg.Server.Auth.Enabled())
+}
+
+func TestLoadConfig_AuthJWTSecretFromEnv(t *testing.T) {
+	path := writeConfigFile(t, `
+server:
+  auth:
+    jwt:
+      secret: "in-file-secret-too-short"
+    users:
+      - name: only
+        password_bcrypt: "$2a$10$abc"
+        role: viewer
+`)
+	t.Setenv("GODELAYQ_SERVER_AUTH_JWT_SECRET", strings.Repeat("k", 40))
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	assert.Equal(t, strings.Repeat("k", 40), cfg.Server.Auth.JWT.Secret,
+		"密钥应可被环境变量覆盖，便于不落盘")
+}
+
+func TestLoadConfig_AuthUsersRejected(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			name: "users without secret",
+			yaml: "server:\n  auth:\n    users:\n      - name: a\n        password_bcrypt: \"$2a$10$x\"\n        role: admin\n",
+			want: "jwt.secret must not be empty",
+		},
+		{
+			name: "short secret",
+			yaml: "server:\n  auth:\n    jwt:\n      secret: \"short\"\n    users:\n      - name: a\n        password_bcrypt: \"$2a$10$x\"\n        role: admin\n",
+			want: "at least 32 bytes",
+		},
+		{
+			name: "unknown role",
+			yaml: "server:\n  auth:\n    jwt:\n      secret: \"0123456789012345678901234567890ab\"\n    users:\n      - name: a\n        password_bcrypt: \"$2a$10$x\"\n        role: superuser\n",
+			want: "role \"superuser\" for user \"a\" is invalid",
+		},
+		{
+			name: "machine is not configurable",
+			yaml: "server:\n  auth:\n    jwt:\n      secret: \"0123456789012345678901234567890ab\"\n    users:\n      - name: a\n        password_bcrypt: \"$2a$10$x\"\n        role: machine\n",
+			want: "role \"machine\"",
+		},
+		{
+			name: "duplicate name differs only by case",
+			yaml: "server:\n  auth:\n    jwt:\n      secret: \"0123456789012345678901234567890ab\"\n    users:\n      - name: Admin\n        password_bcrypt: \"$2a$10$x\"\n        role: admin\n      - name: admin\n        password_bcrypt: \"$2a$10$y\"\n        role: viewer\n",
+			want: "duplicate name",
+		},
+		{
+			name: "empty password hash",
+			yaml: "server:\n  auth:\n    jwt:\n      secret: \"0123456789012345678901234567890ab\"\n    users:\n      - name: a\n        role: admin\n",
+			want: "password_bcrypt must not be empty",
+		},
+		{
+			name: "negative ttl",
+			yaml: "server:\n  auth:\n    jwt:\n      secret: \"0123456789012345678901234567890ab\"\n      access_ttl: -1m\n    users:\n      - name: a\n        password_bcrypt: \"$2a$10$x\"\n        role: admin\n",
+			want: "access_ttl must not be negative",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadConfig(writeConfigFile(t, tc.yaml))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestAuthConfig_NoUsersSkipsJWTChecks(t *testing.T) {
+	// 只有机器凭据（或完全不配鉴权）时不该被 JWT 规则拦住，
+	// 否则现有部署升级后会直接起不来。
+	cfg := DefaultConfig()
+	cfg.Server.Auth.Token = "legacy-token"
+	assert.NoError(t, cfg.Validate())
+
+	cfg.Server.Auth.JWT.Secret = ""
+	cfg.Server.Auth.JWT.AccessTTL = -time.Minute
+	assert.NoError(t, cfg.Validate(), "未启用账号时 JWT 参数无意义")
+	assert.False(t, cfg.Server.Auth.Enabled() && len(cfg.Server.Auth.Users) > 0)
+}
+
+func TestConfig_NormalizedFillsJWTDefaults(t *testing.T) {
+	cfg := Config{}
+	cfg.Server.Auth.JWT.Secret = strings.Repeat("s", 32)
+	cfg.Server.Auth.Users = []UserConfig{{Name: "a", PasswordBcrypt: "$2a$10$x", Role: "viewer"}}
+
+	normalized := cfg.Normalized()
+	assert.Equal(t, DefaultAccessTTL, normalized.Server.Auth.JWT.AccessTTL)
+	assert.Equal(t, DefaultRefreshTTL, normalized.Server.Auth.JWT.RefreshTTL)
+
+	// 显式值保留
+	kept := normalized
+	kept.Server.Auth.JWT.AccessTTL = time.Minute
+	assert.Equal(t, time.Minute, kept.Normalized().Server.Auth.JWT.AccessTTL)
 }
