@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
-	rand "math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // DefaultConcurrency 默认的并发执行 worker 数量，与 docs/deployment.md 中的
@@ -707,20 +708,11 @@ func (s *Scheduler) GetEventBus() *EventBus {
 	return s.eventBus
 }
 
+// generateID 生成任务/订阅/客户端的标识：UUIDv7，时间有序且随机位来自 crypto/rand。
+// 旧实现是"秒级时间戳 + 8 位 math/rand 后缀"，同一秒提交的任务会因随机位碰撞得到
+// 相同 ID，后一个直接覆盖前一个（任务静默丢失，无任何报错）。
 func generateID() string {
-	return time.Now().Format("20060102150405") + "-" + randomString(8)
-}
-
-// randomString 生成 n 位随机后缀。
-// 早期实现用 time.Now().UnixNano() 逐位取模，同一函数调用内几乎恒定，
-// 后缀实际只有 62 种取值，同秒提交的任务会因 ID 相同互相覆盖而丢失。
-func randomString(n int) string {
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	b := make([]byte, n)
-	for i := range b {
-		b[i] = letters[rand.IntN(len(letters))]
-	}
-	return string(b)
+	return uuid.Must(uuid.NewV7()).String()
 }
 
 // HeapLen 获取堆中任务数量（用于监控）

@@ -38,7 +38,7 @@ type UpdateJobRequest struct {
 
 // JobResponse 任务响应
 type JobResponse struct {
-	ID        string          `json:"id" example:"job_1704182400_abc123"`
+	ID        string          `json:"id" example:"0198a2e3-7d4f-7abc-9def-0123456789ab"`
 	Name      string          `json:"name" example:"payment_check"`
 	Status    string          `json:"status" example:"pending" enums:"pending,running,success,failed,cancelled"`
 	TriggerAt time.Time       `json:"trigger_at" format:"date-time"`
