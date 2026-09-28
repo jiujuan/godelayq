@@ -41,6 +41,9 @@ export interface Stats {
   failed: number
   heap_size: number
   uptime: string
+  /** 调度总开关是否被挂起（维护窗口）。它放在 /stats 而不是 ops 专属的
+      /admin/runtime，否则"任务为什么不出"这句提示只给改得动它的人看 */
+  scheduling_suspended: boolean
 }
 
 export interface ErrorResponse {
