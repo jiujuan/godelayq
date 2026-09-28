@@ -127,6 +127,17 @@ func (s *Server) setupMiddleware() {
 func (s *Server) setupRoutes() {
 	api := s.engine.Group("/api/v1")
 	{
+		// 认证：login/refresh 由 authMiddleware 的显式白名单放行（见 publicAuthEndpoints），
+		// 其余都要带有效凭据
+		auth := api.Group("/auth")
+		{
+			auth.POST("/login", s.Login)
+			auth.POST("/refresh", s.Refresh)
+			auth.POST("/logout", s.Logout)
+			auth.GET("/me", s.Me)
+			auth.POST("/ws-ticket", s.WsTicket)
+		}
+
 		// 只读端点：任何已认证身份都够用（machine 凭据也在内）
 		reader := s.RequireRole(core.RoleViewer)
 
