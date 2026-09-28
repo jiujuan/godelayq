@@ -147,6 +147,7 @@ Content-Type: application/json
 | trigger\_at  | string | 条件 | 绝对时间，ISO 8601 格式                                    |
 | cron\_expr   | string | 条件 | Cron 表达式，如 "0 \*/5 \* \* \* \*"                     |
 | payload      | object | ❌  | 任务数据，JSON 对象，会透传给 Handler                           |
+| group        | string | ❌  | 分组标签，`[A-Za-z0-9_-]{1,64}`；不要求该分组已在 `/groups` 注册   |
 | is\_repeat   | bool   | ❌  | 是否重复执行（Cron 任务需设为 true）                             |
 | timeout      | string | ❌  | 单次执行超时，如 "30s"；为空不限制。Handler 需检查 ctx 才能被按时中止      |
 | max\_retries | int    | ❌  | 最大重试次数。**省略即 0（不重试）**，想要重试必须显式给值                |
@@ -236,6 +237,7 @@ GET /jobs?status=pending&name=payment_check&limit=20&offset=0
 | ------ | ------ | --------------------------------------------- |
 | status | string | 过滤状态：pending/running/success/failed/cancelled/paused（大小写不敏感） |
 | name   | string | 按任务类型过滤                                       |
+| group  | string | 按分组过滤，忽略大小写。**省略=不筛**，`group=`（空值）=只看未分组 |
 | limit  | int    | 分页大小，默认 50，最大 100（超过按 100 截断）  |
 | offset | int    | 分页偏移，默认 0；非数字或负数按 0 处理            |
 
@@ -253,6 +255,7 @@ GET /jobs?status=pending&name=payment_check&limit=20&offset=0
       "id": "0198a2e3-7d4f-7abc-9def-0123456789ab",
       "name": "payment_check",
       "status": "pending",
+      "group": "nightly",
       "trigger_at": "2024-01-02T15:30:00+08:00",
       "next_run_in": "5m30s",
       "retry_count": 0,
@@ -291,14 +294,19 @@ Content-Type: application/json
   "trigger_at": "2024-01-02T16:00:00+08:00",
   "payload": {"order_id": "ORD-NEW-001"},
   "max_retries": 5,
-  "timeout": "30s"
+  "timeout": "30s",
+  "group": "nightly"
 }
 ```
 
 只更新给出的字段，任务 ID 保持不变（未列出的字段沿用原值；`timeout` 传 `"0s"` 可取消限制，
-格式非法返回 400）。更新在堆内原地完成（重排位置并写回快照），
+格式非法返回 400）。`group` 用**是否出现**来区分意图：省略=不改分组，`"group": ""`=取消分组。
+更新在堆内原地完成（重排位置并写回快照），
 不再走"先取消再重排"，因此不存在两步之间失败导致任务丢失的窗口。
 任务已被弹出执行或已结束时返回 409（`job cannot be modified`），ID 从未存在返回 404。
+
+暂停中的任务同样不能用它改分组（不在堆里 → 409）；给暂停或已结束的任务移组，
+用下面的批量操作端点。
 
 ### 6. 取消任务
 
@@ -331,29 +339,76 @@ POST /jobs/:id/retry
 { "code": 404, "message": "failed job not found" }
 ```
 
-### 8. 暂停状态（`paused`）目前只能观测
-
-任务模型已支持 `paused`：调度器提供 `Pause` / `ForcePause` / `Resume`，
-暂停中的任务离开待触发堆但**保留快照**（与 `Cancel` 连记录一起删不同），
-重启后仍是暂停态——`Restore` 不会替用户解除这个决定。
-
-本仓库当前只在库层暴露这些能力（`core.Scheduler`，用法见 `examples/`），
-**HTTP 侧还没有 pause / resume / force-pause 端点**，它们随 Web 控制台的
-后端里程碑一起提供（见 `docs/design/web-console-design.md` §5.4）。
-
-因此这个状态现在"看得到、改不了"：
-
-- `GET /jobs?status=paused` 可正常过滤，`JobResponse.status` 会返回 `"paused"`；
-- WS 的 `status` 过滤与 SSE 的 `event_types=job.paused|job.resumed` 均已支持；
-- 暂停中的任务既不在堆里也不在执行中，`PUT /jobs/:id` 返回 409（仅 pending 可改），
-  但 `DELETE /jobs/:id` 能删掉它。
-
-`group` 字段同理：任务模型与分组存储（`core.GroupStore` → `data/groups.json`）已就位，
-但按分组过滤、分组增删改查的端点尚未开放。
-
 这条路径依赖终态留痕：若已关闭留痕（`store.history_limit: -1`）或该记录已被保留策略淘汰，则 404。
 
-### 8. 批量创建任务
+### 8. 暂停、恢复与强制暂停
+
+```json
+POST /jobs/:id/pause        # operator 及以上
+POST /jobs/:id/resume       # operator 及以上
+POST /jobs/:id/force-pause  # admin、ops
+```
+
+三者都返回操作后的任务视图（`200`），失败返回 404（ID 不存在）或 409（状态不允许）。
+
+**pause**：把任务从待触发堆里取出，状态落成 `paused`，**快照与历史都保留**
+（这是它与 `DELETE` 的本质差别）。重启后仍是暂停态——`Restore` 不会替用户解除这个决定。
+对已暂停的任务重复调用是幂等的（仍返回 200），控制器的双击或重试不会变成 409。
+
+```json
+// 对正在执行的任务调 pause：409
+{
+  "code": 409,
+  "message": "job is running; force-pause interrupts the current attempt"
+}
+```
+
+**force-pause**：中止正在执行的这一次尝试，不计失败、不消耗重试次数，停在 `paused`。
+返回 200 表示"中止已发起"：Handler 收到 `context.Canceled` 后自己退场，
+状态由执行收尾钉回 `paused`；不检查 ctx 的 Handler 会跑完这一次，
+但收尾仍把它停在 `paused`（不会记成成功，也不会重新排期）。
+对还没出堆的任务调用时行为等同 pause，并且更强：保证不再执行一次。
+
+**resume**：按原 ID 重新排期。Cron 重复任务按表达式取下一个未来时点；
+一次性任务的 `trigger_at` 若已过期则立刻补跑（与崩溃恢复同一口径）。
+强制暂停后紧跟着恢复可能被拒（`409`，任务还在收尾），稍后重试即可。
+
+暂停中的任务既不在堆里也不在执行中：`PUT /jobs/:id` 返回 409，但 `DELETE /jobs/:id` 能删掉它，
+`/stats` 里的 `paused` 计数与 `GET /jobs?status=paused` 都能查到它。
+
+### 9. 批量操作已有任务
+
+```json
+POST /jobs/batch-ops        # operator 及以上；action=force-pause 整批要求 admin 以上
+Content-Type: application/json
+
+{ "action": "pause", "ids": ["0198a2e3-...", "0198a2e4-..."] }
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `action` | `cancel` / `pause` / `force-pause` / `resume` / `move` |
+| `ids` | 任务 ID 数组，1-100 条；空数组或超限返回 400 |
+| `group` | 仅 `action=move` 使用，**必填**；`""` 表示取消分组 |
+
+逐条独立执行，响应固定 `207`，失败原因按 ID 返回：
+
+```json
+{
+  "action": "pause",
+  "succeeded": 2,
+  "failed": 1,
+  "items": [ { "id": "0198a2e3-...", "status": "paused" } ],
+  "errors": [ { "id": "0198a2e9-...", "code": 404, "message": "job not found" } ]
+}
+```
+
+`cancel` 之后没有任务现状可返回，所以 `items` 里不含这些条目。
+`move` 对暂停中与已结束留痕的任务同样有效（它改的是分组标签，不重排任务）。
+`action=force-pause` 时整批要求 admin 以上：档位判断要看请求体，
+所以这一条在处理器里完成，越权请求整批 403 而不是"批里几条偷偷执行"。
+
+### 10. 批量创建任务
 
 ```json
 POST /jobs/batch
@@ -388,6 +443,178 @@ Content-Type: application/json
 校验规则与单条 `POST /jobs` 完全一致（同一套解析逻辑），包括 `delay`/`trigger_at`/`cron_expr`
 优先级、`timeout` 格式非法即拒绝、以及未注册的 `name` 视为错误。
 
+## 分组管理 API
+
+分组的元数据存在 `store.groups_path`（默认 `./data/groups.json`）。
+任务上的 `group` 只是一个标签字符串，**不要求分组先注册**：`POST /jobs` 带任何合法组名都能写进去。
+用 `WithGroupStore` 之外的方式启动（没有装配注册表）时，本章端点统一返回 503。
+
+### 列出分组
+
+```json
+GET /groups      # viewer 及以上
+```
+
+响应是数组，按名称字典序（忽略大小写），每项是注册表条目加上实时统计的挂载数：
+
+```json
+[
+  {
+    "name": "nightly",
+    "description": "夜间批处理",
+    "color": "#2563eb",
+    "created_at": "2024-01-02T15:20:00+08:00",
+    "updated_at": "2024-01-02T15:20:00+08:00",
+    "job_count": 12,
+    "paused_count": 1,
+    "registered": true
+  },
+  {
+    "name": "adhoc",
+    "created_at": "0001-01-01T00:00:00Z",
+    "updated_at": "0001-01-01T00:00:00Z",
+    "job_count": 3,
+    "paused_count": 0,
+    "registered": false
+  }
+]
+```
+
+`job_count` / `paused_count` 来自扫描任务快照（含终态留痕），大小写不同的同组名算同一组。
+`registered: false` 表示这个组名只出现在任务标签上、注册表里没有对应条目——
+包括手工建的临时组，也包括改名改到一半失败留下的"半个旧组"，UI 需要看得见它才能兜住。
+
+### 新建分组
+
+```json
+POST /groups      # operator 及以上
+Content-Type: application/json
+
+{ "name": "nightly", "description": "夜间批处理", "color": "#2563eb" }
+```
+
+`name` 必填且需匹配 `[A-Za-z0-9_-]{1,64}`；`color` 取 `#rgb` 或 `#rrggbb`。
+非法取值 400，重名（忽略大小写）409，成功返回 201 与上面的单项结构。
+
+### 改名 / 改描述 / 改颜色
+
+```json
+PUT /groups/:name      # operator 及以上
+Content-Type: application/json
+
+{ "name": "nightly-batch", "description": "", "color": "#0ea5e9" }
+```
+
+字段全部可选，**出现了才改**（`description: ""` 是明确的清空）。改名会连带改写
+挂着这个组的任务的 `group` 标签：堆里的条目与存储快照一起更新，因此正在等待与已暂停、
+已结束留痕的任务都会跟着改名，任务执行完也不会把旧组名写回去。
+改名撞上已有分组返回 409，组不存在返回 404。
+
+改写任务标签是逐条落盘、非原子的：中途失败会留下部分任务仍挂在旧组名上，
+重发一次 PUT 即可（幂等）。
+
+### 删除分组
+
+```json
+DELETE /groups/:name            # admin、ops；默认 detach
+DELETE /groups/:name?strategy=block
+```
+
+**任何角色都不会通过这两个调用删掉任务**（决策 D5）：
+
+- 默认 `detach`：组内任务的 `group` 置空（归入"未分组"），然后删除分组记录，返回 204；
+- `strategy=block`：组内还有任务时返回 409，空组才允许删；
+- `strategy` 的其他取值返回 400，不会被静默当成 detach 处理；
+- 组不存在返回 404。
+
+## 运行事件 API
+
+事件历史是**进程内的环形缓冲**（每个任务最近 100 条、全局最近 500 条、
+最多记录 2000 个任务后按 LRU 整体淘汰），不是审计日志：**重启即清空**。
+需要长期留痕请接外部日志/存储。
+
+```json
+GET /jobs/:id/events?limit=50   # viewer 及以上
+GET /events?limit=100           # viewer 及以上，跨任务的全局最近事件
+```
+
+两者返回同一结构，条目**按时间升序**（详情页时间线可直接铺）：
+
+```json
+{
+  "job_id": "0198a2e3-7d4f-7abc-9def-0123456789ab",
+  "count": 2,
+  "items": [
+    { "type": "job.scheduled", "job_id": "0198a2e3-...", "job_name": "payment_check", "status": 0, "timestamp": "2024-01-02T15:20:00+08:00" },
+    { "type": "job.paused", "job_id": "0198a2e3-...", "job_name": "payment_check", "status": 5, "timestamp": "2024-01-02T15:21:00+08:00", "metadata": { "forced": false, "trigger_at": "2024-01-02T17:20:00+08:00" } }
+  ],
+  "note": "in-memory buffer, cleared on restart"
+}
+```
+
+`limit` 缺省或非法表示"给我全部已留存的"，上限就是窗口容量本身。
+没有记录时返回空列表而不是 404：详情页时间线本来就可能在等第一个事件。
+事件与实时通道的关系：这里补的是"打开页面之前"的历史，之后的增量仍由 WS/SSE 推送。
+
+## 运维 API（ops）
+
+只有 `ops` 档可用（`admin` 也不行）。未启用鉴权时所有请求都是匿名的 ops 档，
+这些端点同样可调用（`docs/api.md` 的鉴权章节）。
+
+### 运行时诊断
+
+```json
+GET /admin/runtime
+```
+
+```json
+{
+  "uptime": "72h15m30s",
+  "started_at": "2024-01-01T09:00:00+08:00",
+  "scheduler": {
+    "started": true,
+    "workers": 100,
+    "queue_capacity": 100,
+    "queue_length": 0,
+    "running": 3,
+    "heap_size": 15,
+    "suspended": false,
+    "force_pause_pending": 0
+  },
+  "event_history": {
+    "jobs": 42,
+    "events": 118,
+    "global_capacity": 500,
+    "per_job_capacity": 100,
+    "job_capacity": 2000
+  }
+}
+```
+
+只读，不含任务内容与凭据。`queue_length`/`running` 是瞬时值，用来看趋势不是用来审计的。
+
+### 调度总开关
+
+```json
+POST /admin/scheduler/suspend     # 挂起：不再弹出任何到期任务
+POST /admin/scheduler/unsuspend   # 恢复
+```
+
+两者都返回 `{"suspended": true|false}`，重复调用幂等。
+挂起只停"取任务"：已在执行的任务照常跑完，堆与存储都不改动，
+挂起期间 `POST /jobs` 仍然可用（任务进堆，只是暂不触发），恢复后一并生效。
+
+**状态是进程内的，重启即解除**——维护窗口不该跨一次重启悄悄生效。
+
+### 清空事件缓冲
+
+```json
+DELETE /admin/events
+```
+
+返回 `{"cleared": 118}`（被清掉的条数）。之后各详情页时间线从当前时刻重新开始，
+任务本身与存储记录不受影响。
+
 ## 统计与监控 API
 
 ### 获取统计信息
@@ -402,6 +629,7 @@ GET /stats
 {
   "pending": 12,
   "running": 3,
+  "paused": 1,
   "completed": 1542,
   "failed": 8,
   "heap_size": 15,
@@ -413,13 +641,15 @@ GET /stats
 
 | 字段 | 来源 | 说明 |
 | --- | --- | --- |
-| pending / completed / failed | 存储快照按状态计数 | completed/failed 依赖终态留痕，关闭留痕后恒 0 |
+| pending / paused / completed / failed | 存储快照按状态计数 | completed/failed 依赖终态留痕，关闭留痕后恒 0 |
 | running | 进程内实时执行数 | 已进入 Handler、尚未返回的任务数 |
 | heap_size | 调度堆长度 | 仍在堆里等待的任务数 |
 | uptime | 进程启动至今 | 计数器不跨重启，completed/failed 随存储恢复而继续累计 |
 
 `pending` 与 `heap_size` 通常相等，差值来自"已出堆、还在执行队列里排队"的那一小段：
 它的快照仍是 `pending`，但已不在堆里，也未进入 Handler。`running` 只统计已进入 Handler 的任务。
+`paused` 既不在 `pending` 里也不在 `heap_size` 里（暂停的任务已被取出堆），
+所以概览页要单独显示它，不然"还剩多少要跑"会算多。
 
 ### 健康检查
 
