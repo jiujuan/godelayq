@@ -366,6 +366,130 @@ func (s *APITestSuite) TestUpdateJobEditsPendingJobInPlace() {
 	assert.Equal(s.T(), 404, missing.Code)
 }
 
+// doJSON 发送一个请求并按 out 解析响应体；out 为 nil 表示只看状态码。
+func (s *APITestSuite) doJSON(method, path string, body any, out any) int {
+	s.T().Helper()
+
+	var reader io.Reader
+	if body != nil {
+		raw, err := json.Marshal(body)
+		require.NoError(s.T(), err)
+		reader = bytes.NewBuffer(raw)
+	}
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest(method, path, reader)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	s.router.ServeHTTP(w, req)
+
+	if out != nil && w.Body.Len() > 0 {
+		require.NoError(s.T(), json.Unmarshal(w.Body.Bytes(), out), w.Body.String())
+	}
+	return w.Code
+}
+
+func (s *APITestSuite) TestCreateJobCarriesGroupIntoStorage() {
+	s.registerPaymentHandler()
+
+	var created JobResponse
+	code := s.doJSON("POST", "/api/v1/jobs",
+		CreateJobRequest{Name: "payment_check", Delay: "2h", Group: "nightly"}, &created)
+	require.Equal(s.T(), 201, code)
+	assert.Equal(s.T(), "nightly", created.Group)
+
+	// 从存储回读：分组不能只是响应里好看，必须跟着快照走
+	var reread JobResponse
+	require.Equal(s.T(), 200, s.doJSON("GET", "/api/v1/jobs/"+created.ID, nil, &reread))
+	assert.Equal(s.T(), "nightly", reread.Group)
+}
+
+func (s *APITestSuite) TestCreateJobRejectsIllegalGroupName() {
+	s.registerPaymentHandler()
+
+	// 分组名会进 URL 查询参数，规则由 core 定义（core/group_store.go）
+	var resp ErrorResponse
+	code := s.doJSON("POST", "/api/v1/jobs",
+		CreateJobRequest{Name: "payment_check", Delay: "2h", Group: "运维 组"}, &resp)
+	assert.Equal(s.T(), 400, code)
+	assert.Equal(s.T(), "invalid group name", resp.Message)
+	assert.Equal(s.T(), 0, s.scheduler.HeapLen(), "被拒绝的请求不该留下半个任务")
+}
+
+// TestListJobsFiltersByGroup 覆盖 §5.4：省略 group 与 group=（未分组）是两回事。
+func (s *APITestSuite) TestListJobsFiltersByGroup() {
+	now := time.Now()
+	s.seedSnapshots(
+		core.JobSnapshot{ID: "g1", Name: "nightly", TriggerAt: now, Group: "nightly", Status: int(core.StatusPending), UpdatedAt: now},
+		core.JobSnapshot{ID: "g2", Name: "nightly", TriggerAt: now, Group: "Nightly", Status: int(core.StatusPending), UpdatedAt: now},
+		core.JobSnapshot{ID: "g3", Name: "weekend", TriggerAt: now, Group: "weekend", Status: int(core.StatusPending), UpdatedAt: now},
+		core.JobSnapshot{ID: "g4", Name: "loose", TriggerAt: now, Status: int(core.StatusPending), UpdatedAt: now},
+	)
+
+	code, all := s.listJobs("")
+	require.Equal(s.T(), 200, code)
+	assert.Equal(s.T(), 4, all.Total, "不给 group 就是不过滤")
+
+	_, nightly := s.listJobs("?group=nightly")
+	require.Equal(s.T(), 2, nightly.Total, "分组匹配忽略大小写，与注册表主键口径一致")
+
+	_, unassigned := s.listJobs("?group=")
+	require.Equal(s.T(), 1, unassigned.Total, "group= 空值只取未分组")
+	assert.Equal(s.T(), "g4", unassigned.Items[0].ID)
+
+	_, none := s.listJobs("?group=nope")
+	assert.Zero(s.T(), none.Total)
+}
+
+func (s *APITestSuite) TestUpdateJobMovesJobBetweenGroups() {
+	s.registerPaymentHandler()
+
+	var created JobResponse
+	require.Equal(s.T(), 201, s.doJSON("POST", "/api/v1/jobs",
+		CreateJobRequest{Name: "payment_check", Delay: "2h", Group: "nightly"}, &created))
+
+	moved := "weekend"
+	var updated JobResponse
+	require.Equal(s.T(), 200, s.doJSON("PUT", "/api/v1/jobs/"+created.ID,
+		UpdateJobRequest{Group: &moved}, &updated))
+	assert.Equal(s.T(), "weekend", updated.Group)
+	assert.Equal(s.T(), 1, s.scheduler.HeapLen(), "移组不该重排任务")
+
+	// 传空串是明确的"取消分组"，与省略这个字段不同
+	detached := ""
+	var afterDetach JobResponse
+	require.Equal(s.T(), 200, s.doJSON("PUT", "/api/v1/jobs/"+created.ID,
+		UpdateJobRequest{Group: &detached}, &afterDetach))
+	assert.Empty(s.T(), afterDetach.Group)
+
+	var rejected ErrorResponse
+	assert.Equal(s.T(), 400, s.doJSON("PUT", "/api/v1/jobs/"+created.ID,
+		UpdateJobRequest{Group: ptrString("bad name")}, &rejected))
+
+	var unchanged JobResponse
+	require.Equal(s.T(), 200, s.doJSON("GET", "/api/v1/jobs/"+created.ID, nil, &unchanged))
+	assert.Empty(s.T(), unchanged.Group, "校验失败的改动必须整个不生效")
+}
+
+// TestStatsCountsPausedSeparately 覆盖 §5.4：paused 既不属于 pending 也不属于 completed。
+func (s *APITestSuite) TestStatsCountsPausedSeparately() {
+	now := time.Now()
+	s.seedSnapshots(
+		core.JobSnapshot{ID: "st-p", Name: "nightly", TriggerAt: now, Status: int(core.StatusPending), UpdatedAt: now},
+		core.JobSnapshot{ID: "st-x", Name: "nightly", TriggerAt: now, Status: int(core.StatusPaused), UpdatedAt: now},
+	)
+
+	var stats StatsResponse
+	require.Equal(s.T(), 200, s.doJSON("GET", "/api/v1/stats", nil, &stats))
+	assert.Equal(s.T(), 1, stats.Pending)
+	assert.Equal(s.T(), 1, stats.Paused)
+
+	_, paused := s.listJobs("?status=paused")
+	require.Equal(s.T(), 1, paused.Total, "paused 也是可查询的状态名")
+	assert.Equal(s.T(), "paused", paused.Items[0].Status)
+}
+
 // postBatch 提交批量创建请求并解析响应
 func (s *APITestSuite) postBatch(body any) (int, BatchCreateJobsResponse) {
 	s.T().Helper()
@@ -511,6 +635,11 @@ func TestAPISuite(t *testing.T) {
 
 // ptrTime 便于在请求体里填 *time.Time 字段。
 func ptrTime(value time.Time) *time.Time {
+	return &value
+}
+
+// ptrString 给可空字符串字段取值（区分"没传"与"传了空串"）。
+func ptrString(value string) *string {
 	return &value
 }
 

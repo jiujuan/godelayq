@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -19,6 +20,28 @@ const (
 
 // maxBatchCreateSize 是 POST /jobs/batch 单请求允许的任务数。
 const maxBatchCreateSize = 100
+
+// validateJobGroup 校验任务上的分组标签。空串表示未分组，始终合法；
+// 名称规则由 core 定义，因为分组名会进 URL 查询参数与列表页筛选。
+func validateJobGroup(group string) *ErrorResponse {
+	if group == "" {
+		return nil
+	}
+	if err := core.ValidateGroupName(group); err != nil {
+		return &ErrorResponse{Code: 400, Message: "invalid group name", Details: err.Error()}
+	}
+	return nil
+}
+
+// parseGroupFilter 区分 "?group="（含空值：精确筛未分组）与完全省略（不筛）。
+// 两者用 c.Query 看不出来，会把"未分组"和"全部分组"混成一回事。
+func parseGroupFilter(c *gin.Context) (string, bool) {
+	value, present := c.GetQuery("group")
+	if !present {
+		return "", false
+	}
+	return value, true
+}
 
 // CreateJob 创建任务
 func (s *Server) CreateJob(c *gin.Context) {
@@ -60,6 +83,10 @@ func (s *Server) createJobFromRequest(req CreateJobRequest) (*core.Job, *ErrorRe
 		}
 	}
 
+	if failure := validateJobGroup(req.Group); failure != nil {
+		return nil, failure
+	}
+
 	// 解析重试延迟
 	retryDelay := 1 * time.Minute
 	if req.RetryDelay != "" {
@@ -83,6 +110,7 @@ func (s *Server) createJobFromRequest(req CreateJobRequest) (*core.Job, *ErrorRe
 		Name:       req.Name,
 		Payload:    []byte(req.Payload),
 		TriggerAt:  triggerAt,
+		Group:      req.Group,
 		CronExpr:   req.CronExpr,
 		IsRepeat:   req.IsRepeat,
 		Timeout:    timeout,
@@ -106,8 +134,9 @@ func (s *Server) createJobFromRequest(req CreateJobRequest) (*core.Job, *ErrorRe
 
 // ListJobs 获取任务列表
 func (s *Server) ListJobs(c *gin.Context) {
-	status := c.Query("status") // 状态名过滤，如 pending/running/success/failed/cancelled
+	status := c.Query("status") // 状态名过滤，如 pending/running/success/failed/cancelled/paused
 	name := c.Query("name")     // 名称过滤
+	groupFilter, filterByGroup := parseGroupFilter(c)
 	limit := parseListJobsLimit(c.Query("limit"))
 	offset := parseListJobsOffset(c.Query("offset"))
 
@@ -119,7 +148,7 @@ func (s *Server) ListJobs(c *gin.Context) {
 			c.JSON(400, ErrorResponse{
 				Code:    400,
 				Message: "invalid status filter",
-				Details: "expected one of pending, running, success, failed, cancelled",
+				Details: "expected one of pending, running, success, failed, cancelled, paused",
 			})
 			return
 		}
@@ -143,6 +172,11 @@ func (s *Server) ListJobs(c *gin.Context) {
 			continue
 		}
 		if name != "" && snap.Name != name {
+			continue
+		}
+		// 分组匹配忽略大小写：注册表的主键就是这个口径（core/group_store.go），
+		// 两套大小写规则会让"看着是同一个组"筛出两种结果。
+		if filterByGroup && !strings.EqualFold(snap.Group, groupFilter) {
 			continue
 		}
 		matched = append(matched, snap)
@@ -261,6 +295,14 @@ func (s *Server) UpdateJob(c *gin.Context) {
 		}
 		timeout = d
 	}
+	// 分组同样在这里校验：apply 里返回的错误会被当成 500，
+	// 而"组名不合法"明明是调用方的问题
+	if req.Group != nil {
+		if failure := validateJobGroup(*req.Group); failure != nil {
+			c.JSON(failure.Code, *failure)
+			return
+		}
+	}
 
 	// 原地更新：不再走 Cancel→Schedule，避免两步之间失败导致任务丢失
 	job, err := s.scheduler.UpdatePending(id, func(j *core.Job) error {
@@ -275,6 +317,9 @@ func (s *Server) UpdateJob(c *gin.Context) {
 		}
 		if req.Timeout != "" {
 			j.Timeout = timeout
+		}
+		if req.Group != nil {
+			j.Group = *req.Group
 		}
 		return nil
 	})
@@ -387,6 +432,10 @@ func (s *Server) GetStats(c *gin.Context) {
 		switch core.JobStatus(snap.Status) {
 		case core.StatusPending:
 			stats.Pending++
+		case core.StatusPaused:
+			// 暂停单独计数：它既不在堆里也不算完成，混进 pending 会让
+			// "我以为还有 10 个任务要跑"变成谎话
+			stats.Paused++
 		case core.StatusSuccess:
 			stats.Completed++
 		case core.StatusFailed:
@@ -511,6 +560,7 @@ func (s *Server) toJobResponse(job *core.Job) JobResponse {
 		ID:         job.ID,
 		Name:       job.Name,
 		Status:     job.Status.String(),
+		Group:      job.Group,
 		TriggerAt:  job.TriggerAt,
 		Payload:    job.Payload,
 		RetryCount: job.RetryCount,

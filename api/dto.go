@@ -19,6 +19,10 @@ type CreateJobRequest struct {
 	Payload  json.RawMessage `json:"payload,omitempty" swaggertype:"object"` // 任务数据
 	IsRepeat bool            `json:"is_repeat,omitempty"`                    // 是否重复执行（Cron任务）
 
+	// Group 分组标签，可留空。不要求分组已在 /groups 注册（见 docs/design/web-console-design.md §5.3），
+	// 取值受 core 的名称规则约束，因为它会出现在 URL 查询参数里。
+	Group string `json:"group,omitempty" example:"nightly"`
+
 	// 单次执行超时，如 "30s"；为空表示不限制（Handler 需检查 ctx 才能被中止）
 	Timeout string `json:"timeout,omitempty" example:"30s"`
 
@@ -34,6 +38,9 @@ type UpdateJobRequest struct {
 	MaxRetries *int            `json:"max_retries,omitempty"`
 	// Timeout 单次执行超时，如 "30s"；传 "0s" 可取消限制
 	Timeout string `json:"timeout,omitempty"`
+	// Group 分组标签。用指针区分"没传"与"传了空串"：
+	// 后者是明确的取消分组动作，不能当成前者忽略掉。
+	Group *string `json:"group,omitempty" example:"nightly"`
 }
 
 // BatchCreateJobsResponse POST /jobs/batch 的混合结果。
@@ -56,7 +63,8 @@ type BatchItemError struct {
 type JobResponse struct {
 	ID        string          `json:"id" example:"0198a2e3-7d4f-7abc-9def-0123456789ab"`
 	Name      string          `json:"name" example:"payment_check"`
-	Status    string          `json:"status" example:"pending" enums:"pending,running,success,failed,cancelled"`
+	Status    string          `json:"status" example:"pending" enums:"pending,running,success,failed,cancelled,paused"`
+	Group     string          `json:"group,omitempty" example:"nightly"`
 	TriggerAt time.Time       `json:"trigger_at" format:"date-time"`
 	Payload   json.RawMessage `json:"payload,omitempty"`
 
@@ -85,6 +93,7 @@ type ListJobsResponse struct {
 type StatsResponse struct {
 	Pending   int `json:"pending" example:"10"`   // 等待中
 	Running   int `json:"running" example:"2"`    // 执行中
+	Paused    int `json:"paused" example:"1"`     // 暂停中（含被强制暂停）
 	Completed int `json:"completed" example:"50"` // 已完成
 	Failed    int `json:"failed" example:"3"`     // 失败
 
