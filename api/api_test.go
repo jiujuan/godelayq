@@ -34,7 +34,7 @@ func (s *APITestSuite) SetupTest() {
 	require.NoError(s.T(), err)
 
 	s.scheduler = core.NewScheduler(store, nil, nil)
-	s.server = NewServer(s.scheduler, store, "8080")
+	s.server = NewServer(s.scheduler, store, "8080", Security{})
 	s.router = s.server.engine
 }
 

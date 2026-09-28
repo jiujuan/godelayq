@@ -6,6 +6,8 @@
         body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
         #status { display: flex; gap: 20px; margin-bottom: 20px; }
         .stat-box { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        #auth { background: white; padding: 12px 20px; border-radius: 8px; margin-bottom: 20px; }
+        #auth input { margin: 0 8px; padding: 4px; }
         #events { background: white; padding: 20px; border-radius: 8px; height: 500px; overflow-y: auto; }
         .event { padding: 10px; margin: 5px 0; border-left: 4px solid #ccc; background: #f9f9f9; }
         .event.scheduled { border-color: #3498db; }
@@ -33,6 +35,12 @@
             <p id="running-count">0</p>
         </div>
     </div>
+
+    <div id="auth">
+        <label>访问 Token：<input type="password" id="token" size="32" placeholder="服务端未启用鉴权时留空"></label>
+        <button id="reconnect">保存并重连</button>
+        <span class="timestamp">浏览器 WebSocket 不能自定义请求头，启用鉴权后只能通过 ?token= 传入</span>
+    </div>
     
     <div>
         <h3>过滤条件：</h3>
@@ -45,60 +53,78 @@
     <div id="events"></div>
 
     <script>
-        const ws = new WebSocket('ws://localhost:8080/ws');
         const eventsDiv = document.getElementById('events');
-        
-        ws.onopen = () => {
-            document.getElementById('ws-status').textContent = 'Connected';
-            document.getElementById('ws-status').style.color = 'green';
-            
-            // 发送订阅消息（关注 payment_check 类型任务）
-            ws.send(JSON.stringify({
-                action: 'subscribe',
-                filter: {
-                    job_types: ['payment_check', 'email_send'],
-                    event_types: ['job.scheduled', 'job.started', 'job.completed', 'job.failed']
+        const tokenInput = document.getElementById('token');
+        const TOKEN_KEY = 'godelayq_token';
+        tokenInput.value = localStorage.getItem(TOKEN_KEY) || '';
+
+        // 服务端配置了 server.auth.token 时，握手需带 token，否则收到 401 直接断开
+        let ws = null;
+
+        function connect() {
+            const token = tokenInput.value.trim();
+            const url = 'ws://localhost:8080/ws' + (token ? '?token=' + encodeURIComponent(token) : '');
+            ws = new WebSocket(url);
+
+            ws.onopen = () => {
+                document.getElementById('ws-status').textContent = 'Connected';
+                document.getElementById('ws-status').style.color = 'green';
+                
+                // 发送订阅消息（关注 payment_check 类型任务）
+                ws.send(JSON.stringify({
+                    action: 'subscribe',
+                    filter: {
+                        job_types: ['payment_check', 'email_send'],
+                        event_types: ['job.scheduled', 'job.started', 'job.completed', 'job.failed']
+                    }
+                }));
+            };
+
+            ws.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                // 服务端控制帧（subscribed / pong / stats）没有事件字段，直接忽略
+                if (!data || !data.type) return;
+                console.log('Received:', data);
+                
+                // 创建事件卡片
+                const div = document.createElement('div');
+                div.className = `event ${data.type.replace('job.', '')}`;
+                
+                const time = new Date(data.timestamp).toLocaleTimeString();
+                div.innerHTML = `
+                    <div class="timestamp">${time}</div>
+                    <strong>[${data.type}]</strong> ${data.job_name} 
+                    (ID: ${data.job_id.substring(0, 8)}...)
+                    ${data.metadata ? `<pre>${JSON.stringify(data.metadata, null, 2)}</pre>` : ''}
+                `;
+                
+                eventsDiv.insertBefore(div, eventsDiv.firstChild);
+                
+                // 限制显示数量
+                if (eventsDiv.children.length > 100) {
+                    eventsDiv.removeChild(eventsDiv.lastChild);
                 }
-            }));
-        };
-        
-        ws.onmessage = (event) => {
-            const data = JSON.parse(event.data);
-            // 服务端控制帧（subscribed / pong / stats）没有事件字段，直接忽略
-            if (!data || !data.type) return;
-            console.log('Received:', data);
-            
-            // 创建事件卡片
-            const div = document.createElement('div');
-            div.className = `event ${data.type.replace('job.', '')}`;
-            
-            const time = new Date(data.timestamp).toLocaleTimeString();
-            div.innerHTML = `
-                <div class="timestamp">${time}</div>
-                <strong>[${data.type}]</strong> ${data.job_name} 
-                (ID: ${data.job_id.substring(0, 8)}...)
-                ${data.metadata ? `<pre>${JSON.stringify(data.metadata, null, 2)}</pre>` : ''}
-            `;
-            
-            eventsDiv.insertBefore(div, eventsDiv.firstChild);
-            
-            // 限制显示数量
-            if (eventsDiv.children.length > 100) {
-                eventsDiv.removeChild(eventsDiv.lastChild);
-            }
-            
-            // 更新统计（实际应从stats API获取）
-            updateStats(data);
-        };
-        
-        ws.onclose = () => {
-            document.getElementById('ws-status').textContent = 'Disconnected';
-            document.getElementById('ws-status').style.color = 'red';
-        };
-        
+                
+                // 更新统计（实际应从stats API获取）
+                updateStats(data);
+            };
+
+            ws.onclose = () => {
+                const el = document.getElementById('ws-status');
+                el.textContent = token ? 'Disconnected（token 可能无效）' : 'Disconnected';
+                el.style.color = 'red';
+            };
+        }
+
+        document.getElementById('reconnect').addEventListener('click', () => {
+            localStorage.setItem(TOKEN_KEY, tokenInput.value.trim());
+            if (ws && ws.readyState <= WebSocket.OPEN) ws.close();
+            connect();
+        });
+
         // 心跳保活
         setInterval(() => {
-            if (ws.readyState === WebSocket.OPEN) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({action: 'ping'}));
             }
         }, 30000);
@@ -114,6 +140,7 @@
         // 客户端过滤（根据复选框）
         document.querySelectorAll('.filter').forEach(cb => {
             cb.addEventListener('change', () => {
+                if (!ws || ws.readyState !== WebSocket.OPEN) return;
                 const selected = Array.from(document.querySelectorAll('.filter:checked')).map(c => c.value);
                 ws.send(JSON.stringify({
                     action: 'subscribe',
@@ -121,6 +148,8 @@
                 }));
             });
         });
+
+        connect();
     </script>
 </body>
 </html>

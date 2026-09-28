@@ -55,7 +55,12 @@ func defaultRuntimeDeps(cfg core.Config) runtimeDeps {
 			if !ok {
 				return nil, fmt.Errorf("default server requires *core.Scheduler, got %T", scheduler)
 			}
-			return api.NewServer(coreScheduler, store, port), nil
+			security := api.Security{
+				AuthToken:        cfg.Server.Auth.Token,
+				AllowOrigins:     cfg.Server.CORS.AllowOrigins,
+				AllowCredentials: cfg.Server.CORS.AllowCredentials,
+			}
+			return api.NewServer(coreScheduler, store, port, security), nil
 		},
 		notifySignals: signal.Notify,
 		timeout:       cfg.Scheduler.ShutdownTimeout,

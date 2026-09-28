@@ -22,6 +22,7 @@ type Server struct {
 	wsServer  *core.WSServer
 	httpSrv   *http.Server
 	port      string
+	sec       Security
 	startTime time.Time
 
 	// baseCtx 传给每个请求；Stop 取消它即可让 SSE 等长连接立即收尾
@@ -67,8 +68,8 @@ func (r *JobRegistry) List() []string {
 	return names
 }
 
-// NewServer 创建API服务器
-func NewServer(scheduler *core.Scheduler, store core.Store, port string) *Server {
+// NewServer 创建API服务器。sec 为零值时不鉴权、接受任意跨域来源。
+func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Security) *Server {
 	if port == "" {
 		port = "8080"
 	}
@@ -80,8 +81,9 @@ func NewServer(scheduler *core.Scheduler, store core.Store, port string) *Server
 		store:      store,
 		registry:   NewJobRegistry(),
 		engine:     gin.New(),
-		wsServer:   core.NewWSServer(scheduler.GetEventBus()),
+		wsServer:   core.NewWSServer(scheduler.GetEventBus(), sec.AllowOrigins...),
 		port:       port,
+		sec:        sec,
 		startTime:  time.Now(),
 		baseCtx:    baseCtx,
 		baseCancel: baseCancel,
@@ -129,18 +131,12 @@ func (s *Server) setupMiddleware() {
 		)
 	}))
 
-	// CORS
-	s.engine.Use(func(c *gin.Context) {
-		c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
-		c.Writer.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		c.Writer.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+	// CORS（同时负责预检，故必须早于鉴权中间件）
+	s.engine.Use(corsMiddleware(s.sec))
 
-		if c.Request.Method == "OPTIONS" {
-			c.AbortWithStatus(204)
-			return
-		}
-		c.Next()
-	})
+	// 鉴权覆盖全部端点，含 /ws 与 /sse/events；预检请求已由上面的 CORS 短路。
+	// 未配置 token 时该中间件直接放行。
+	s.engine.Use(s.authMiddleware())
 }
 
 func (s *Server) setupRoutes() {
