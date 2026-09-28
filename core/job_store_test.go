@@ -67,7 +67,7 @@ func (s *JobTestSuite) TestJobSnapshotRoundTrip() {
 
 	assert.Equal(s.T(), original.ID, restored.ID)
 	assert.Equal(s.T(), original.Name, restored.Name)
-	assert.Equal(s.T(), StatusPending, restored.Status) // 恢复后重置为pending
+	assert.Equal(s.T(), original.Status, restored.Status) // 快照原样还原，复位由 Restore 负责
 }
 
 func TestJobSuite(t *testing.T) {
@@ -135,7 +135,8 @@ func (s *StoreTestSuite) TestUpdate() {
 	assert.NoError(s.T(), err)
 
 	loaded, _ := s.store.LoadAll()
-	assert.Len(s.T(), loaded, 0)
+	require.Len(s.T(), loaded, 1)
+	assert.Equal(s.T(), int(StatusFailed), loaded[0].Status, "终态快照留在存储里，供列表与统计读取")
 }
 
 func (s *StoreTestSuite) TestDelete() {
@@ -149,7 +150,7 @@ func (s *StoreTestSuite) TestDelete() {
 	assert.Len(s.T(), loaded, 0)
 }
 
-func (s *StoreTestSuite) TestLoadOnlyPendingAndRunning() {
+func (s *StoreTestSuite) TestLoadAllIncludesTerminalSnapshots() {
 	jobs := []*Job{
 		{ID: "1", Status: StatusPending},
 		{ID: "2", Status: StatusRunning},
@@ -164,14 +165,16 @@ func (s *StoreTestSuite) TestLoadOnlyPendingAndRunning() {
 	loaded, err := s.store.LoadAll()
 	assert.NoError(s.T(), err)
 
-	// 只加载pending和running
-	assert.Len(s.T(), loaded, 2)
+	// 全量返回：恢复逻辑自己过滤终态，列表与统计接口需要看到历史
+	assert.Len(s.T(), loaded, 4)
 	ids := make(map[string]bool)
-	for _, s := range loaded {
-		ids[s.ID] = true
+	for _, snapshot := range loaded {
+		ids[snapshot.ID] = true
 	}
 	assert.True(s.T(), ids["1"])
 	assert.True(s.T(), ids["2"])
+	assert.True(s.T(), ids["3"])
+	assert.True(s.T(), ids["4"])
 }
 
 func (s *StoreTestSuite) TestConcurrentSave() {

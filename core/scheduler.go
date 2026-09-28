@@ -7,6 +7,7 @@ import (
 	"log"
 	rand "math/rand/v2"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -40,6 +41,9 @@ type Scheduler struct {
 
 	// 取消控制（与 handlers 一样受 s.mu 保护）
 	cancelMap map[string]context.CancelFunc
+
+	// inFlight 已进入 Handler 执行、尚未返回的任务数，供统计接口读取
+	inFlight atomic.Int32
 
 	eventBus *EventBus // 新增
 }
@@ -294,19 +298,34 @@ func (s *Scheduler) Restore() error {
 	if err != nil {
 		return err
 	}
+
+	restored := 0
 	for _, snap := range snapshots {
+		// 存储现在同时保存终态留痕，恢复时只关心未完成的任务
+		status := JobStatus(snap.Status)
+		if status.IsTerminal() {
+			continue
+		}
 		if s.heap.Get(snap.ID) != nil {
 			continue
 		}
 		job := &Job{}
 		job.FromSnapshot(snap)
+		// 上次崩溃时处于 Running 的任务在此复位为待执行
+		job.Status = StatusPending
 		// TriggerAt 已过期的任务直接入队，由调度循环立即补跑
 		s.heap.PushItem(job)
+		restored++
 	}
-	if len(snapshots) > 0 {
-		log.Printf("Restored %d job(s) from store", len(snapshots))
+	if restored > 0 {
+		log.Printf("Restored %d job(s) from store", restored)
 	}
 	return nil
+}
+
+// RunningCount 返回正在执行（已进入 Handler）的任务数。
+func (s *Scheduler) RunningCount() int {
+	return int(s.inFlight.Load())
 }
 
 // Start 启动调度器。可重复调用：每次启动都会复位停止信号与执行队列。
@@ -441,6 +460,9 @@ func (s *Scheduler) dispatch(job *Job) bool {
 
 // 执行任务（由 worker 协程调用，阻塞直到 Handler 返回）
 func (s *Scheduler) executeJob(job *Job) {
+	s.inFlight.Add(1)
+	defer s.inFlight.Add(-1)
+
 	// 发布开始事件
 	s.eventBus.Publish(Event{
 		Type:      EventJobStarted,
@@ -515,6 +537,14 @@ func (s *Scheduler) executeJob(job *Job) {
 	job.Status = StatusRunning
 	job.Attempts++
 	job.UpdatedAt = time.Now()
+
+	// 落盘运行态：崩溃后重启能看出哪些任务当时在执行（由 Restore 复位为待执行），
+	// 统计接口也不再依赖进程内状态。写入会被合并落盘吸收，不增加每次一写。
+	if s.store != nil {
+		if err := s.store.Update(job.ToSnapshot()); err != nil {
+			log.Printf("Failed to persist running job %s: %v", job.ID, err)
+		}
+	}
 
 	err := job.Handler(execCtx, job)
 
@@ -603,6 +633,7 @@ func (s *Scheduler) handleInterrupted(job *Job) {
 // 处理成功
 func (s *Scheduler) handleSuccess(job *Job) {
 	job.Status = StatusSuccess
+	job.UpdatedAt = time.Now()
 
 	// 如果是重复任务，计算下次执行时间并重新入队
 	if job.IsRepeat && job.CronExpr != "" {
@@ -618,6 +649,7 @@ func (s *Scheduler) handleSuccess(job *Job) {
 				CronExpr:   job.CronExpr,
 				IsRepeat:   true,
 				MaxRetries: job.MaxRetries,
+				Timeout:    job.Timeout,
 				Status:     StatusPending,
 				CreatedAt:  job.CreatedAt,
 				UpdatedAt:  time.Now(),
@@ -625,11 +657,14 @@ func (s *Scheduler) handleSuccess(job *Job) {
 			s.Schedule(newJob)
 			return
 		}
+		log.Printf("Failed to compute next run for cron job %s (expr=%s): %v", job.ID, job.CronExpr, err)
 	}
 
-	// 清理存储
+	// 终态留痕：写入成功快照，是否长期保留由存储的保留策略决定
 	if s.store != nil {
-		s.store.Delete(job.ID)
+		if err := s.store.Update(job.ToSnapshot()); err != nil {
+			log.Printf("Failed to persist completed job %s: %v", job.ID, err)
+		}
 	}
 }
 
@@ -658,8 +693,11 @@ func (s *Scheduler) handleFailure(job *Job) {
 		s.Schedule(retryJob)
 	} else {
 		job.Status = StatusFailed
+		job.UpdatedAt = time.Now()
 		if s.store != nil {
-			s.store.Update(job.ToSnapshot())
+			if err := s.store.Update(job.ToSnapshot()); err != nil {
+				log.Printf("Failed to persist failed job %s: %v", job.ID, err)
+			}
 		}
 	}
 }

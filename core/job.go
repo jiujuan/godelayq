@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"strings"
 	"time"
 )
 
@@ -15,6 +16,39 @@ const (
 	StatusFailed
 	StatusCancelled
 )
+
+// String 返回状态的规范名，与 HTTP API 的 status 取值一致。
+func (s JobStatus) String() string {
+	switch s {
+	case StatusPending:
+		return "pending"
+	case StatusRunning:
+		return "running"
+	case StatusSuccess:
+		return "success"
+	case StatusFailed:
+		return "failed"
+	case StatusCancelled:
+		return "cancelled"
+	default:
+		return "unknown"
+	}
+}
+
+// ParseJobStatus 按规范名解析状态（大小写不敏感），未知名称返回 false。
+func ParseJobStatus(name string) (JobStatus, bool) {
+	for _, status := range []JobStatus{StatusPending, StatusRunning, StatusSuccess, StatusFailed, StatusCancelled} {
+		if strings.EqualFold(status.String(), name) {
+			return status, true
+		}
+	}
+	return 0, false
+}
+
+// IsTerminal 表示任务已结束：既不会被调度，也不应被崩溃恢复重新入队。
+func (s JobStatus) IsTerminal() bool {
+	return s == StatusSuccess || s == StatusFailed || s == StatusCancelled
+}
 
 // Job 延迟任务结构
 type Job struct {
@@ -134,7 +168,8 @@ func (j *Job) ToSnapshot() JobSnapshot {
 	}
 }
 
-// FromSnapshot 从快照恢复（需重新注册Handler）
+// FromSnapshot 从快照恢复（需重新注册Handler）。状态按快照原样还原：
+// 崩溃恢复时由 Scheduler.Restore 显式把未完成任务复位为待处理。
 func (j *Job) FromSnapshot(s JobSnapshot) {
 	j.ID = s.ID
 	j.Name = s.Name
@@ -151,5 +186,4 @@ func (j *Job) FromSnapshot(s JobSnapshot) {
 	j.CreatedAt = s.CreatedAt
 	j.UpdatedAt = s.UpdatedAt
 	j.Attempts = s.Attempts
-	j.Status = StatusPending // 恢复后重置为待处理
 }

@@ -55,7 +55,7 @@ func TestJob_GetID(t *testing.T) {
 func TestJob_CloneForRetry(t *testing.T) {
 	originalTime := time.Now()
 	nextTime := originalTime.Add(5 * time.Minute)
-	
+
 	handler := func(ctx context.Context, job *Job) error {
 		return nil
 	}
@@ -260,9 +260,9 @@ func TestJob_FromSnapshot(t *testing.T) {
 		t.Errorf("Expected Attempts %d, got %d", snapshot.Attempts, job.Attempts)
 	}
 
-	// Verify status is reset to pending
-	if job.Status != StatusPending {
-		t.Errorf("Expected Status to be reset to %v, got %v", StatusPending, job.Status)
+	// 状态按快照原样还原：列表与详情接口靠它显示真实终态
+	if job.Status != StatusFailed {
+		t.Errorf("Expected Status %v, got %v", StatusFailed, job.Status)
 	}
 }
 
@@ -289,7 +289,7 @@ func TestJob_SnapshotRoundTrip(t *testing.T) {
 	restored := &Job{}
 	restored.FromSnapshot(snapshot)
 
-	// Verify key fields match (except Status which is reset)
+	// Verify key fields match (Status included)
 	if restored.ID != original.ID {
 		t.Errorf("ID mismatch: expected %s, got %s", original.ID, restored.ID)
 	}
@@ -305,8 +305,8 @@ func TestJob_SnapshotRoundTrip(t *testing.T) {
 	if restored.RetryDelay != original.RetryDelay {
 		t.Errorf("RetryDelay mismatch: expected %v, got %v", original.RetryDelay, restored.RetryDelay)
 	}
-	if restored.Status != StatusPending {
-		t.Errorf("Status should be reset to Pending, got %v", restored.Status)
+	if restored.Status != original.Status {
+		t.Errorf("Status should survive the round trip, got %v", restored.Status)
 	}
 }
 
@@ -354,7 +354,7 @@ func TestJob_EmptyPayload(t *testing.T) {
 
 func TestJob_ZeroValues(t *testing.T) {
 	job := &Job{}
-	
+
 	if job.ID != "" {
 		t.Error("Expected empty ID")
 	}

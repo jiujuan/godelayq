@@ -45,7 +45,11 @@ func defaultRuntimeDeps(cfg core.Config) runtimeDeps {
 	return runtimeDeps{
 		config: cfg,
 		newStore: func() (core.Store, error) {
-			return core.NewJSONFileStoreWithInterval(cfg.Store.Path, cfg.Store.FlushInterval)
+			return core.NewJSONFileStoreWithOptions(cfg.Store.Path, core.StoreOptions{
+				Interval:     cfg.Store.FlushInterval,
+				HistoryLimit: cfg.Store.HistoryLimit,
+				HistoryTTL:   cfg.Store.HistoryTTL,
+			})
 		},
 		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
 			return core.NewScheduler(store, retryPolicy, eventBus)

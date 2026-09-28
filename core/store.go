@@ -6,6 +6,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -17,11 +18,16 @@ var ErrJobNotFound = errors.New("job not found")
 // 代价是崩溃时最多丢失一个周期的状态，需要更强保证的调用方可显式 Flush。
 const DefaultFlushInterval = 200 * time.Millisecond
 
+// DefaultHistoryLimit 是终态（成功/失败/取消）快照的默认保留条数。
+const DefaultHistoryLimit = 1000
+
 // Store 持久化接口
 type Store interface {
 	Save(job *Job) error
 	Update(snapshot JobSnapshot) error
 	Delete(jobID string) error
+	// LoadAll 返回存储中的全部快照，包含已结束的终态记录；
+	// 只想恢复未完成任务的调用方需自行按状态过滤。
 	LoadAll() ([]JobSnapshot, error)
 	// Flush 立即把内存状态写入存储（无变更时不产生写入）
 	Flush() error
@@ -29,10 +35,26 @@ type Store interface {
 	Close() error
 }
 
-// JSONFileStore 基于JSON文件的存储，写入按 DefaultFlushInterval 合并
+// StoreOptions 存储构造参数，零值即使用各项默认。
+type StoreOptions struct {
+	// Interval 合并落盘周期，<=0 使用 DefaultFlushInterval
+	Interval time.Duration
+	// HistoryLimit 终态快照保留条数：0 使用 DefaultHistoryLimit，
+	// 负数表示不保留终态记录（写入即删除）
+	HistoryLimit int
+	// HistoryTTL 终态快照保留时长，<=0 表示不按时间淘汰
+	HistoryTTL time.Duration
+}
+
+// JSONFileStore 基于JSON文件的存储，写入按 Interval 合并
 type JSONFileStore struct {
 	filePath string
 	interval time.Duration
+
+	// 终态留痕策略
+	historyLimit int
+	historyTTL   time.Duration
+
 	mu       sync.RWMutex
 	data     map[string]JobSnapshot // 内存缓存
 	dirty    bool
@@ -44,21 +66,33 @@ type JSONFileStore struct {
 }
 
 func NewJSONFileStore(path string) (*JSONFileStore, error) {
-	return NewJSONFileStoreWithInterval(path, DefaultFlushInterval)
+	return NewJSONFileStoreWithOptions(path, StoreOptions{})
 }
 
 // NewJSONFileStoreWithInterval 自定义合并落盘周期；非正数回退到默认值。
 func NewJSONFileStoreWithInterval(path string, interval time.Duration) (*JSONFileStore, error) {
+	return NewJSONFileStoreWithOptions(path, StoreOptions{Interval: interval})
+}
+
+// NewJSONFileStoreWithOptions 按完整选项创建存储。
+func NewJSONFileStoreWithOptions(path string, opts StoreOptions) (*JSONFileStore, error) {
+	interval := opts.Interval
 	if interval <= 0 {
 		interval = DefaultFlushInterval
 	}
+	historyLimit := opts.HistoryLimit
+	if historyLimit == 0 {
+		historyLimit = DefaultHistoryLimit
+	}
 
 	s := &JSONFileStore{
-		filePath: path,
-		interval: interval,
-		data:     make(map[string]JobSnapshot),
-		stopCh:   make(chan struct{}),
-		doneCh:   make(chan struct{}),
+		filePath:     path,
+		interval:     interval,
+		historyLimit: historyLimit,
+		historyTTL:   opts.HistoryTTL,
+		data:         make(map[string]JobSnapshot),
+		stopCh:       make(chan struct{}),
+		doneCh:       make(chan struct{}),
 	}
 
 	// 确保目录存在
@@ -77,8 +111,10 @@ func NewJSONFileStoreWithInterval(path string, interval time.Duration) (*JSONFil
 func (s *JSONFileStore) Save(job *Job) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.data[job.ID] = job.ToSnapshot()
+	snapshot := job.ToSnapshot()
+	s.data[snapshot.ID] = snapshot
 	s.dirty = true
+	s.trimAfterWriteLocked(snapshot)
 	return nil
 }
 
@@ -87,7 +123,15 @@ func (s *JSONFileStore) Update(snapshot JobSnapshot) error {
 	defer s.mu.Unlock()
 	s.data[snapshot.ID] = snapshot
 	s.dirty = true
+	s.trimAfterWriteLocked(snapshot)
 	return nil
+}
+
+// trimAfterWriteLocked 在写入终态快照后套用留痕策略
+func (s *JSONFileStore) trimAfterWriteLocked(snapshot JobSnapshot) {
+	if JobStatus(snapshot.Status).IsTerminal() {
+		s.trimTerminalLocked()
+	}
 }
 
 func (s *JSONFileStore) Delete(jobID string) error {
@@ -98,18 +142,47 @@ func (s *JSONFileStore) Delete(jobID string) error {
 	return nil
 }
 
+// LoadAll 返回全部快照，含已结束的终态记录（受保留策略约束）。
 func (s *JSONFileStore) LoadAll() ([]JobSnapshot, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	jobs := make([]JobSnapshot, 0, len(s.data))
 	for _, v := range s.data {
-		// 只加载待处理的任务
-		if v.Status == int(StatusPending) || v.Status == int(StatusRunning) {
-			jobs = append(jobs, v)
-		}
+		jobs = append(jobs, v)
 	}
 	return jobs, nil
+}
+
+// trimTerminalLocked 按保留策略清理终态快照，Pending/Running 永不淘汰。
+// historyLimit < 0 表示不留痕；0 已在构造时替换为 DefaultHistoryLimit。
+func (s *JSONFileStore) trimTerminalLocked() {
+	now := time.Now()
+	terminal := make([]JobSnapshot, 0, len(s.data))
+
+	for id, snap := range s.data {
+		if !JobStatus(snap.Status).IsTerminal() {
+			continue
+		}
+		if s.historyLimit < 0 || (s.historyTTL > 0 && now.Sub(snap.UpdatedAt) > s.historyTTL) {
+			delete(s.data, id)
+			continue
+		}
+		terminal = append(terminal, snap)
+	}
+
+	if s.historyLimit >= 0 && len(terminal) > s.historyLimit {
+		sort.Slice(terminal, func(i, j int) bool {
+			if !terminal[i].UpdatedAt.Equal(terminal[j].UpdatedAt) {
+				return terminal[i].UpdatedAt.After(terminal[j].UpdatedAt)
+			}
+			// 同一时刻写入时按 ID 稳定排序，避免淘汰结果随遍历顺序漂移
+			return terminal[i].ID < terminal[j].ID
+		})
+		for _, snap := range terminal[s.historyLimit:] {
+			delete(s.data, snap.ID)
+		}
+	}
 }
 
 // Flush 强制落盘；脏标记未置位时不写文件

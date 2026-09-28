@@ -255,3 +255,118 @@ func TestScheduler_CancelRunningJobCancelsContext(t *testing.T) {
 		t.Fatal("Expected running job context to be cancelled")
 	}
 }
+
+// TestScheduler_RestoreSkipsTerminalRecords 存储现在同时留有终态记录，
+// 恢复只能重建未完成任务，并把上次崩溃时的 Running 复位为 Pending。
+func TestScheduler_RestoreSkipsTerminalRecords(t *testing.T) {
+	store := newMockStore()
+	trigger := time.Now().Add(time.Hour)
+
+	seed := []JobSnapshot{
+		{ID: "pending-one", Name: "task", TriggerAt: trigger, Status: int(StatusPending)},
+		{ID: "running-one", Name: "task", TriggerAt: trigger, Status: int(StatusRunning)},
+		{ID: "success-one", Name: "task", TriggerAt: trigger, Status: int(StatusSuccess)},
+		{ID: "failed-one", Name: "task", TriggerAt: trigger, Status: int(StatusFailed)},
+	}
+	for _, snapshot := range seed {
+		if err := store.Update(snapshot); err != nil {
+			t.Fatalf("seed store failed: %v", err)
+		}
+	}
+
+	scheduler := NewScheduler(store, nil, nil)
+	if err := scheduler.Restore(); err != nil {
+		t.Fatalf("Restore failed: %v", err)
+	}
+
+	if got := scheduler.heap.Len(); got != 2 {
+		t.Fatalf("Expected only the two unfinished jobs re-armed, got %d", got)
+	}
+	if scheduler.heap.Get("success-one") != nil || scheduler.heap.Get("failed-one") != nil {
+		t.Error("Expected terminal records to stay out of the scheduling queue")
+	}
+
+	rearmed := scheduler.heap.Get("running-one").(*Job)
+	if rearmed.Status != StatusPending {
+		t.Errorf("Expected a crashed running job to be reset to pending, got %v", rearmed.Status)
+	}
+}
+
+// TestScheduler_PersistsRunningWhileExecuting 执行期间快照必须是 Running，
+// 这样崩溃后的存储能看出任务当时在跑，统计接口也不依赖进程内状态。
+func TestScheduler_PersistsRunningWhileExecuting(t *testing.T) {
+	store := newMockStore()
+	observed := make(chan int, 1)
+
+	scheduler := NewScheduler(store, nil, nil)
+	scheduler.RegisterHandler("probe", func(ctx context.Context, job *Job) error {
+		snapshot, ok := store.snapshotOf(job.ID)
+		if !ok {
+			observed <- -1
+			return nil
+		}
+		observed <- snapshot.Status
+		return nil
+	})
+
+	if err := scheduler.Schedule(&Job{ID: "watched", Name: "probe", TriggerAt: time.Now()}); err != nil {
+		t.Fatalf("Schedule failed: %v", err)
+	}
+	if snapshot, ok := store.snapshotOf("watched"); !ok || snapshot.Status != int(StatusPending) {
+		t.Fatalf("Expected a pending snapshot before execution, got %+v", snapshot)
+	}
+
+	scheduler.executeJob(scheduler.heap.Get("watched").(*Job))
+
+	select {
+	case status := <-observed:
+		if status != int(StatusRunning) {
+			t.Errorf("Expected the handler to observe a running snapshot, got %d", status)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Expected the handler to run")
+	}
+
+	if got := scheduler.RunningCount(); got != 0 {
+		t.Errorf("Expected no in-flight jobs after execution, got %d", got)
+	}
+	if snapshot, _ := store.snapshotOf("watched"); snapshot.Status != int(StatusSuccess) {
+		t.Errorf("Expected a terminal success snapshot, got %d", snapshot.Status)
+	}
+}
+
+// TestScheduler_RunningCountTracksInFlight 执行中的计数随执行开始/结束变化。
+func TestScheduler_RunningCountTracksInFlight(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	counts := make(chan int, 1)
+
+	scheduler := NewScheduler(nil, nil, nil)
+	scheduler.RegisterHandler("blocker", func(ctx context.Context, job *Job) error {
+		entered <- struct{}{}
+		counts <- scheduler.RunningCount()
+		<-release
+		return ctx.Err()
+	})
+
+	go scheduler.executeJob(&Job{ID: "busy", Name: "blocker", TriggerAt: time.Now()})
+
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Expected the handler to start")
+	}
+
+	if got := <-counts; got != 1 {
+		t.Errorf("Expected the running handler to see 1 in-flight job, got %d", got)
+	}
+	close(release)
+	// 等 executeJob 走完 defer 归零
+	for i := 0; i < 40; i++ {
+		if scheduler.RunningCount() == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Errorf("Expected the in-flight counter to drop back to 0, got %d", scheduler.RunningCount())
+}

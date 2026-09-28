@@ -31,3 +31,7 @@ store:
   type: json            # 存储后端，目前仅支持 json
   path: ./data/jobs.json
   flush_interval: 200ms # 合并落盘周期；崩溃时最多丢失一个周期的状态变更
+  # 终态（成功/失败/取消）快照留痕策略：ListJobs?status=success|failed 与
+  # /api/v1/stats 的 completed/failed 计数都来自这份留痕。待执行任务不受影响。
+  history_limit: 1000   # 保留条数；0=用默认值，-1=不留痕（写入即删除，文件最小）
+  history_ttl: 0s       # 保留时长，如 24h；0 表示不按时间淘汰

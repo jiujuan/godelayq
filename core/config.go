@@ -65,6 +65,11 @@ type StoreConfig struct {
 	Path string `mapstructure:"path"`
 	// FlushInterval 合并落盘周期，0 表示 DefaultFlushInterval
 	FlushInterval time.Duration `mapstructure:"flush_interval"`
+	// HistoryLimit 终态（成功/失败/取消）快照保留条数，
+	// 0 表示 DefaultHistoryLimit，-1 表示不留痕（写入即删除）
+	HistoryLimit int `mapstructure:"history_limit"`
+	// HistoryTTL 终态快照保留时长，0 表示不按时间淘汰
+	HistoryTTL time.Duration `mapstructure:"history_ttl"`
 }
 
 // DefaultConfig 返回与代码内置默认值一致的配置
@@ -90,6 +95,8 @@ func DefaultConfig() Config {
 			Type:          "json",
 			Path:          "./data/jobs.json",
 			FlushInterval: DefaultFlushInterval,
+			HistoryLimit:  DefaultHistoryLimit,
+			HistoryTTL:    0,
 		},
 	}
 }
@@ -124,6 +131,8 @@ func LoadConfig(path string) (Config, error) {
 		"store.type",
 		"store.path",
 		"store.flush_interval",
+		"store.history_limit",
+		"store.history_ttl",
 	} {
 		if err := v.BindEnv(key, "GODELAYQ_"+strings.ToUpper(strings.ReplaceAll(key, ".", "_"))); err != nil {
 			return cfg, fmt.Errorf("bind env for %q failed: %w", key, err)
@@ -181,6 +190,13 @@ func (c Config) Validate() error {
 	if c.Store.FlushInterval < 0 {
 		return fmt.Errorf("store.flush_interval must not be negative, got %v", c.Store.FlushInterval)
 	}
+	// -1 是"不留痕"的哨兵值，比 -1 更小没有含义；0 表示使用默认条数
+	if c.Store.HistoryLimit < -1 {
+		return fmt.Errorf("store.history_limit must be -1 (keep nothing), 0 (default) or positive, got %d", c.Store.HistoryLimit)
+	}
+	if c.Store.HistoryTTL < 0 {
+		return fmt.Errorf("store.history_ttl must not be negative, got %v", c.Store.HistoryTTL)
+	}
 
 	for _, origin := range c.Server.CORS.AllowOrigins {
 		if strings.TrimSpace(origin) == "" {
@@ -229,6 +245,9 @@ func (c Config) Normalized() Config {
 	}
 	if c.Store.FlushInterval == 0 {
 		c.Store.FlushInterval = defaults.Store.FlushInterval
+	}
+	if c.Store.HistoryLimit == 0 {
+		c.Store.HistoryLimit = defaults.Store.HistoryLimit
 	}
 	return c
 }

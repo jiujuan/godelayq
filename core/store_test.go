@@ -333,6 +333,7 @@ func TestJSONFileStore_LoadAll(t *testing.T) {
 
 	store, err := NewJSONFileStore(storePath)
 	require.NoError(t, err)
+	defer store.Close()
 
 	// Save jobs with different statuses
 	jobs := []*Job{
@@ -351,9 +352,9 @@ func TestJSONFileStore_LoadAll(t *testing.T) {
 	loaded, err := store.LoadAll()
 
 	require.NoError(t, err, "LoadAll should not return error")
-	
-	// Should only load Pending and Running jobs
-	assert.Len(t, loaded, 3, "Should load only Pending and Running jobs")
+
+	// 终态留痕也在其中：状态过滤由调用方负责
+	assert.Len(t, loaded, len(jobs), "LoadAll must return every stored snapshot")
 
 	// Verify loaded jobs
 	loadedIDs := make(map[string]bool)
@@ -364,8 +365,8 @@ func TestJSONFileStore_LoadAll(t *testing.T) {
 	assert.True(t, loadedIDs["pending1"], "Should load pending job 1")
 	assert.True(t, loadedIDs["running1"], "Should load running job")
 	assert.True(t, loadedIDs["pending2"], "Should load pending job 2")
-	assert.False(t, loadedIDs["success1"], "Should not load success job")
-	assert.False(t, loadedIDs["failed1"], "Should not load failed job")
+	assert.True(t, loadedIDs["success1"], "Should load completed job for history")
+	assert.True(t, loadedIDs["failed1"], "Should load failed job for history")
 }
 
 func TestJSONFileStore_LoadAll_Empty(t *testing.T) {
@@ -623,7 +624,7 @@ func TestJSONFileStore_LoadFromDisk_Permissions(t *testing.T) {
 	// Verify file has correct permissions
 	info, err := os.Stat(storePath)
 	require.NoError(t, err)
-	
+
 	// File should be readable and writable
 	mode := info.Mode()
 	assert.True(t, mode&0600 != 0, "File should have read/write permissions")

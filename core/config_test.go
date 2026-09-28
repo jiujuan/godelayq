@@ -29,6 +29,8 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, "json", cfg.Store.Type)
 	assert.Equal(t, "./data/jobs.json", cfg.Store.Path)
 	assert.Equal(t, DefaultFlushInterval, cfg.Store.FlushInterval)
+	assert.Equal(t, DefaultHistoryLimit, cfg.Store.HistoryLimit)
+	assert.Zero(t, cfg.Store.HistoryTTL)
 	assert.Empty(t, cfg.Server.Auth.Token, "auth must stay off until a token is configured")
 	assert.Equal(t, []string{"*"}, cfg.Server.CORS.AllowOrigins)
 	assert.False(t, cfg.Server.CORS.AllowCredentials)
@@ -84,6 +86,21 @@ server:
 	assert.True(t, cfg.Server.CORS.AllowCredentials)
 }
 
+func TestLoadConfig_StoreHistory(t *testing.T) {
+	path := writeConfigFile(t, "store:\n  type: json\n  path: ./data/jobs.json\n  history_limit: 5\n  history_ttl: 24h\n")
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	assert.Equal(t, 5, cfg.Store.HistoryLimit)
+	assert.Equal(t, 24*time.Hour, cfg.Store.HistoryTTL)
+
+	// 关闭留痕的哨兵值必须能通过校验，并在归一化后保持原样
+	off := writeConfigFile(t, "store:\n  type: json\n  path: ./data/jobs.json\n  history_limit: -1\n")
+	offCfg, err := LoadConfig(off)
+	require.NoError(t, err)
+	assert.Equal(t, -1, offCfg.Normalized().Store.HistoryLimit, "0 才表示默认值，-1 不能被改写")
+}
+
 func TestLoadConfig_PartialFileKeepsDefaults(t *testing.T) {
 	path := writeConfigFile(t, "scheduler:\n  workers: 5\n")
 
@@ -132,6 +149,8 @@ func TestLoadConfig_RejectsInvalidValues(t *testing.T) {
 		"credentials with wildcard":        "server:\n  cors:\n    allow_origins: [\"*\"]\n    allow_credentials: true\n",
 		"credentials with default origins": "server:\n  auth:\n    token: x\n  cors:\n    allow_credentials: true\n",
 		"empty origin entry":               "server:\n  cors:\n    allow_origins: [\"https://a.example\", \"\"]\n",
+		"history limit below sentinel":     "store:\n  history_limit: -2\n",
+		"negative history ttl":             "store:\n  history_ttl: -1s\n",
 	}
 
 	for name, content := range cases {
@@ -149,6 +168,8 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("GODELAYQ_SCHEDULER_WORKERS", "13")
 	t.Setenv("GODELAYQ_SERVER_AUTH_TOKEN", "env-token")
 	t.Setenv("GODELAYQ_SERVER_CORS_ALLOW_ORIGINS", "https://a.example,https://b.example")
+	t.Setenv("GODELAYQ_STORE_HISTORY_LIMIT", "7")
+	t.Setenv("GODELAYQ_STORE_HISTORY_TTL", "6h")
 
 	cfg, err := LoadConfig(path)
 	require.NoError(t, err)
@@ -157,6 +178,8 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	assert.Equal(t, "env-token", cfg.Server.Auth.Token)
 	assert.Equal(t, []string{"https://a.example", "https://b.example"}, cfg.Server.CORS.AllowOrigins,
 		"list keys come from a comma-separated env value")
+	assert.Equal(t, 7, cfg.Store.HistoryLimit)
+	assert.Equal(t, 6*time.Hour, cfg.Store.HistoryTTL)
 }
 
 func TestConfig_Normalized(t *testing.T) {
@@ -172,6 +195,7 @@ func TestConfig_Normalized(t *testing.T) {
 	assert.Equal(t, defaults.Store.Type, cfg.Store.Type)
 	assert.Equal(t, defaults.Store.Path, cfg.Store.Path)
 	assert.Equal(t, defaults.Store.FlushInterval, cfg.Store.FlushInterval)
+	assert.Equal(t, defaults.Store.HistoryLimit, cfg.Store.HistoryLimit, "0 表示使用默认留痕条数")
 
 	// 显式设置的值不被覆盖
 	kept := Config{}
@@ -186,14 +210,22 @@ func TestConfig_ThreadsIntoComponents(t *testing.T) {
 	cfg.Scheduler.Workers = 3
 	cfg.Scheduler.QueueCapacity = 9
 	cfg.Store.FlushInterval = 15 * time.Millisecond
+	cfg.Store.HistoryLimit = 2
+	cfg.Store.HistoryTTL = time.Hour
 
 	storePath := filepath.Join(t.TempDir(), "jobs.json")
 	cfg.Store.Path = storePath
 
-	store, err := NewJSONFileStoreWithInterval(cfg.Store.Path, cfg.Store.FlushInterval)
+	store, err := NewJSONFileStoreWithOptions(cfg.Store.Path, StoreOptions{
+		Interval:     cfg.Store.FlushInterval,
+		HistoryLimit: cfg.Store.HistoryLimit,
+		HistoryTTL:   cfg.Store.HistoryTTL,
+	})
 	require.NoError(t, err)
 	defer store.Close()
 	assert.Equal(t, 15*time.Millisecond, store.interval)
+	assert.Equal(t, 2, store.historyLimit)
+	assert.Equal(t, time.Hour, store.historyTTL)
 
 	scheduler := NewScheduler(store, nil, nil)
 	scheduler.SetConcurrency(cfg.Scheduler.Workers)
