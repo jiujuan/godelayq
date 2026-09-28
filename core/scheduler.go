@@ -43,6 +43,10 @@ type Scheduler struct {
 
 	// 取消控制（与 handlers 一样受 s.mu 保护）
 	cancelMap map[string]context.CancelFunc
+	// forcedPause 记下"已请求强制暂停、等待执行收尾认领"的任务 ID。
+	// 用集合而不是存指针：中止是异步的，标记由 handleInterrupted/handleSuccess/
+	// handleFailure 三条收尾路径之一消费，谁先回来谁负责把任务停在 paused。
+	forcedPause map[string]struct{}
 
 	// inFlight 已进入 Handler 执行、尚未返回的任务数，供统计接口读取
 	inFlight atomic.Int32
@@ -75,6 +79,7 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 		concurrency: DefaultConcurrency,
 		handlers:    make(map[string]Handler),
 		cancelMap:   make(map[string]context.CancelFunc),
+		forcedPause: make(map[string]struct{}),
 		eventBus:    eventBus,
 		logger:      resolveLogger(settings.logger),
 	}
@@ -280,7 +285,12 @@ func (s *Scheduler) Pause(jobID string) (*Job, error) {
 		return nil, ErrJobNotFound
 	}
 
-	job := item.(*Job)
+	return s.pausePendingJob(item.(*Job), false)
+}
+
+// pausePendingJob 把一个刚从堆里摘下的任务落成 paused：落盘 + 唤醒循环 + 广播。
+// forced 只影响事件里的标记位，状态迁移两条路径完全一致。
+func (s *Scheduler) pausePendingJob(job *Job, forced bool) (*Job, error) {
 	job.Status = StatusPaused
 	job.UpdatedAt = time.Now()
 
@@ -288,7 +298,7 @@ func (s *Scheduler) Pause(jobID string) (*Job, error) {
 		if err := s.store.Update(job.ToSnapshot()); err != nil {
 			// 堆里已经取走了，落盘失败只可能让重启后的恢复口径不一致：
 			// 记日志并继续，任务此刻确实处于暂停中。
-			s.logger.Error("failed to persist paused job", "job_id", jobID, "error", err)
+			s.logger.Error("failed to persist paused job", "job_id", job.ID, "error", err)
 		}
 	}
 
@@ -303,7 +313,7 @@ func (s *Scheduler) Pause(jobID string) (*Job, error) {
 		Timestamp: time.Now(),
 		Metadata: map[string]interface{}{
 			"trigger_at": job.TriggerAt,
-			"forced":     false,
+			"forced":     forced,
 		},
 	})
 
@@ -322,6 +332,12 @@ func (s *Scheduler) Resume(jobID string) (*Job, error) {
 	}
 	if JobStatus(snap.Status) != StatusPaused {
 		return nil, ErrJobNotPaused
+	}
+	// 强制暂停的落盘发生在取消上下文之前，Handler 可能还在收尾。此刻恢复会与
+	// "即将把状态钉回 paused"的守卫打架，于是任务看起来自己又停了：直接拒绝，
+	// 让调用方等它停稳（UI 的"暂停中"态就是为这段时间准备的）。
+	if s.isRunning(jobID) {
+		return nil, ErrJobNotPending
 	}
 
 	job := &Job{}
@@ -351,6 +367,111 @@ func (s *Scheduler) Resume(jobID string) (*Job, error) {
 	})
 
 	return job, nil
+}
+
+// ForcePause 强制暂停一个正在执行的任务：中止当前 attempt，不计失败、不消耗重试，
+// 停在 paused（限 admin/ops 档调用，授权在 api 层，core 不感知角色）。
+//
+// 与 Pause 的分工：Pause 只管还没出堆的任务；已经交给 worker 的任务只能靠取消上下文
+// 让它自己停下来。因此这里只登记标记 + 取消 ctx，真正把状态落盘由执行收尾完成
+// （见 parkForcedPause）——同一条 job.paused 事件对应"确实停住了"这个事实，
+// UI 才能诚实地区分"暂停中"和"已暂停"。
+func (s *Scheduler) ForcePause(jobID string) (*Job, error) {
+	// 竞态下任务可能还在堆里没被弹出：那时取消上下文没有意义，直接从堆里摘掉，
+	// 语义与普通暂停一致且更强（保证不会再执行一次）。
+	if item := s.heap.Remove(jobID); item != nil {
+		return s.pausePendingJob(item.(*Job), true)
+	}
+
+	s.mu.Lock()
+	cancel, running := s.cancelMap[jobID]
+	if running {
+		s.forcedPause[jobID] = struct{}{}
+	}
+	s.mu.Unlock()
+
+	if !running {
+		if _, ok := s.findSnapshot(jobID); !ok {
+			return nil, ErrJobNotFound
+		}
+		// 快照存在但既不在堆里也不在执行中：要么已暂停（交给 Pause 的幂等路径），
+		// 要么已结束/正在收尾，两者都不能被"强制暂停"
+		paused, err := s.Pause(jobID)
+		if err == nil {
+			return paused, nil
+		}
+		return nil, ErrJobNotPending
+	}
+
+	// 先把期望状态落盘，再取消：即便 Handler 完全不响应取消，
+	// 收尾路径也会在它返回时把状态钉回 paused（见 handleSuccess 等处的守卫）。
+	//
+	// 只在真的取到快照时才改写它：纯内存部署（store 为 nil）没有可写的记录，
+	// 而"store 非空却查不到"的极端竞态下用零值快照覆盖，会把任务内容抹平。
+	job := &Job{ID: jobID, Status: StatusPaused, UpdatedAt: time.Now()}
+	if snap, found := s.findSnapshot(jobID); found {
+		snap.Status = int(StatusPaused)
+		snap.UpdatedAt = job.UpdatedAt
+		if s.store != nil {
+			if err := s.store.Update(snap); err != nil {
+				s.logger.Error("failed to persist force-paused job", "job_id", jobID, "error", err)
+			}
+		}
+		job.FromSnapshot(snap) // 快照里的 status 已被置为 paused
+	}
+
+	cancel()
+
+	return job, nil
+}
+
+// takeForcedPause 消费一个强制暂停标记（一次性），返回它是否存在。
+func (s *Scheduler) takeForcedPause(jobID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.forcedPause[jobID]; !ok {
+		return false
+	}
+	delete(s.forcedPause, jobID)
+	return true
+}
+
+// parkForcedPause 由执行收尾调用：若该任务被请求过强制暂停，就把它钉在 paused 上
+// 并广播 job.paused，返回 true 表示调用方应当放弃自己原有的收尾逻辑
+// （不再记成功、不再计重试、不再重排 Cron 的下一轮）。
+//
+// 这是"不检查 ctx 的 Handler"唯一的兜底：本仓库一直承认这类处理器存在
+// （见 executeJob 的超时注释），它可能压根没注意到上下文已被取消，
+// 于是照常返回 nil 或 error。没有这层守卫，一次强制暂停会被随后的
+// Cron 重排悄悄复活。
+func (s *Scheduler) parkForcedPause(job *Job, note string) bool {
+	if !s.takeForcedPause(job.ID) {
+		return false
+	}
+
+	job.Status = StatusPaused
+	job.UpdatedAt = time.Now()
+	if s.store != nil {
+		if err := s.store.Update(job.ToSnapshot()); err != nil {
+			s.logger.Error("failed to persist force-paused job", "job_id", job.ID, "error", err)
+		}
+	}
+
+	s.eventBus.Publish(Event{
+		Type:      EventJobPaused,
+		JobID:     job.ID,
+		JobName:   job.Name,
+		Status:    StatusPaused,
+		Timestamp: time.Now(),
+		Metadata: map[string]interface{}{
+			"forced":     true,
+			"note":       note,
+			"retry_used": job.RetryCount,
+			"attempts":   job.Attempts,
+		},
+	})
+	s.logger.Info("job force-paused", "job_id", job.ID, "note", note)
+	return true
 }
 
 // isRunning 判断任务是否已被 worker 取出、尚未返回。
@@ -770,6 +891,12 @@ func (s *Scheduler) executeJob(job *Job) {
 // Pending 落盘，交由下次 Start 的 Restore 重新入队（至少一次语义，
 // 副作用可能重复，Handler 需自行保证幂等）。
 func (s *Scheduler) handleInterrupted(job *Job) {
+	// 强制暂停优先于关停恢复：否则"取消上下文"会被当成关停打断，
+	// 任务被复位成 pending 重新排期，暂停请求当场失效。
+	if s.parkForcedPause(job, "interrupted") {
+		return
+	}
+
 	s.mu.RLock()
 	running := s.running
 	s.mu.RUnlock()
@@ -800,6 +927,13 @@ func (s *Scheduler) handleInterrupted(job *Job) {
 
 // 处理成功
 func (s *Scheduler) handleSuccess(job *Job) {
+	// 被请求过强制暂停的任务即便"成功返回"也要停在 paused：
+	// 不检查 ctx 的 Handler 会走到这里，若不拦下来，Cron 的下一轮会被悄悄排上，
+	// 暂停看起来像只生效了几秒钟。
+	if s.parkForcedPause(job, "handler_completed_despite_cancel") {
+		return
+	}
+
 	job.Status = StatusSuccess
 	job.UpdatedAt = time.Now()
 
@@ -812,6 +946,7 @@ func (s *Scheduler) handleSuccess(job *Job) {
 				Name:       job.Name,
 				Type:       job.Type,
 				Payload:    job.Payload,
+				Group:      job.Group, // 重排是同一逻辑任务的下一轮，丢分组等于凭空换组
 				TriggerAt:  next,
 				Handler:    job.Handler,
 				CronExpr:   job.CronExpr,
@@ -838,6 +973,12 @@ func (s *Scheduler) handleSuccess(job *Job) {
 
 // 处理失败与重试
 func (s *Scheduler) handleFailure(job *Job) {
+	// 同 handleSuccess：中止期间 Handler 自己报了错，也按用户意图停在 paused，
+	// 不再消耗重试次数、不再重新排期。
+	if s.parkForcedPause(job, "handler_failed_despite_cancel") {
+		return
+	}
+
 	if job.RetryCount < job.MaxRetries {
 		// 计算下次重试时间
 		nextTime := s.retryPolicy.NextRetry(job)

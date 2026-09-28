@@ -41,6 +41,21 @@ func (l *eventLog) has(eventType EventType, jobID string) bool {
 	return false
 }
 
+// last 返回最后一次出现的某类事件。
+func (l *eventLog) last(eventType EventType, jobID string) (Event, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	var found Event
+	matched := false
+	for _, event := range l.items {
+		if event.Type == eventType && event.JobID == jobID {
+			found = event
+			matched = true
+		}
+	}
+	return found, matched
+}
+
 // waitFor 在超时内等待某类事件出现。
 func (l *eventLog) waitFor(t *testing.T, eventType EventType, jobID string, timeout time.Duration) {
 	t.Helper()
@@ -376,5 +391,244 @@ func TestScheduler_Restore_KeepsPausedJobsParked(t *testing.T) {
 	defer mu.Unlock()
 	if executed != 0 {
 		t.Errorf("两个任务都排在将来，不应有执行发生，实际执行 %d 次", executed)
+	}
+}
+
+// waitRunning 等待任务进入执行（cancelMap 登记完成），避免和调度竞态。
+func (s *Scheduler) waitRunning(t *testing.T, jobID string, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if s.isRunning(jobID) {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("任务 %s 在 %v 内没有进入执行", jobID, timeout)
+}
+
+func TestScheduler_ForcePause_StopsRunningJobWithoutCountingRetry(t *testing.T) {
+	store := newMockStore()
+	scheduler := NewScheduler(store, nil, nil)
+	events := collectEvents(scheduler.GetEventBus())
+	scheduler.SetConcurrency(1)
+
+	blocked := make(chan struct{})
+	scheduler.RegisterHandler("coop", func(ctx context.Context, job *Job) error {
+		close(blocked)
+		<-ctx.Done() // 守规矩的 Handler：取消即返回
+		return ctx.Err()
+	})
+
+	if err := scheduler.Schedule(&Job{
+		ID: "fp-coop", Name: "coop", Type: "coop",
+		TriggerAt:  time.Now(),
+		MaxRetries: 3,
+		RetryDelay: time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Schedule 失败: %v", err)
+	}
+
+	scheduler.Start()
+	defer scheduler.Stop()
+
+	select {
+	case <-blocked:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handler 没有开始执行")
+	}
+
+	if _, err := scheduler.ForcePause("fp-coop"); err != nil {
+		t.Fatalf("ForcePause 失败: %v", err)
+	}
+	events.waitFor(t, EventJobPaused, "fp-coop", 2*time.Second)
+
+	snap, ok := store.snapshotOf("fp-coop")
+	if !ok {
+		t.Fatal("强制暂停必须留下快照（不是删除）")
+	}
+	if JobStatus(snap.Status) != StatusPaused {
+		t.Errorf("状态应为 paused，实际 %s", JobStatus(snap.Status))
+	}
+	// 核心承诺：中止不算失败，也不吃掉重试次数
+	if snap.RetryCount != 0 {
+		t.Errorf("强制暂停不应消耗重试次数，实际 retry_count=%d", snap.RetryCount)
+	}
+	if JobStatus(snap.Status) == StatusFailed {
+		t.Error("不应被判为失败")
+	}
+	if scheduler.heap.Len() != 0 {
+		t.Errorf("不应产生重试副本入堆，堆长度 %d", scheduler.heap.Len())
+	}
+}
+
+// 不检查 ctx 的 Handler 是本仓库一直承认的现实：它会在被取消后照常返回 nil。
+// 没有收尾守卫的话，Cron 的下一轮会被 handleSuccess 悄悄排上，暂停像只生效了几秒。
+func TestScheduler_ForcePause_HandlerIgnoringCancelStillParksCron(t *testing.T) {
+	store := newMockStore()
+	scheduler := NewScheduler(store, nil, nil)
+	events := collectEvents(scheduler.GetEventBus())
+	scheduler.SetConcurrency(1)
+
+	returned := make(chan struct{})
+	scheduler.RegisterHandler("stubborn", func(ctx context.Context, job *Job) error {
+		time.Sleep(80 * time.Millisecond) // 完全不看 ctx
+		close(returned)
+		return nil
+	})
+
+	if err := scheduler.Schedule(&Job{
+		ID: "fp-stubborn", Name: "stubborn", Type: "stubborn",
+		// 每秒一轮：Schedule 会把 Cron 任务的触发点重算到下一个边界，
+		// 用 */5 会让"等它进入执行"白等五秒
+		TriggerAt: time.Now(), CronExpr: "* * * * * *", IsRepeat: true,
+	}); err != nil {
+		t.Fatalf("Schedule 失败: %v", err)
+	}
+
+	scheduler.Start()
+	defer scheduler.Stop()
+
+	scheduler.waitRunning(t, "fp-stubborn", 3*time.Second)
+	if _, err := scheduler.ForcePause("fp-stubborn"); err != nil {
+		t.Fatalf("ForcePause 失败: %v", err)
+	}
+
+	select {
+	case <-returned:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Handler 没有返回")
+	}
+	events.waitFor(t, EventJobPaused, "fp-stubborn", 2*time.Second)
+
+	// 给守卫一点时间跑完收尾
+	time.Sleep(100 * time.Millisecond)
+
+	// 事件必须由成功收尾的守卫发出（而不是"看起来像正常取消"），且只发一次：
+	// 重复的 job.paused 会让前端时间线出现两个暂停点，掩盖真实的中止耗时
+	event, ok := events.last(EventJobPaused, "fp-stubborn")
+	if !ok {
+		t.Fatal("没有取到 job.paused 事件")
+	}
+	if event.Metadata["forced"] != true {
+		t.Errorf("强制暂停的事件应标记 forced，实际 %+v", event.Metadata)
+	}
+	if event.Metadata["note"] != "handler_completed_despite_cancel" {
+		t.Errorf("应由成功收尾守卫兜底，实际 note=%v", event.Metadata["note"])
+	}
+
+	if scheduler.heap.Len() != 0 {
+		t.Errorf("被强制暂停的 Cron 任务不该再排下一轮，堆长度 %d", scheduler.heap.Len())
+	}
+	snap, ok := store.snapshotOf("fp-stubborn")
+	if !ok {
+		t.Fatal("快照应仍在存储里")
+	}
+	if JobStatus(snap.Status) != StatusPaused {
+		t.Errorf("收尾后状态应钉回 paused，实际 %s", JobStatus(snap.Status))
+	}
+}
+
+func TestScheduler_ForcePause_HandlerIgnoringErrorStillParks(t *testing.T) {
+	store := newMockStore()
+	scheduler := NewScheduler(store, nil, nil)
+	scheduler.SetConcurrency(1)
+
+	scheduler.RegisterHandler("loud", func(ctx context.Context, job *Job) error {
+		time.Sleep(60 * time.Millisecond)
+		return errors.New("boom") // 被取消后仍自己报错：不该走重试
+	})
+
+	if err := scheduler.Schedule(&Job{
+		ID: "fp-error", Name: "loud", Type: "loud",
+		TriggerAt: time.Now(), MaxRetries: 3, RetryDelay: time.Millisecond,
+	}); err != nil {
+		t.Fatalf("Schedule 失败: %v", err)
+	}
+
+	scheduler.Start()
+	defer scheduler.Stop()
+
+	scheduler.waitRunning(t, "fp-error", 2*time.Second)
+	if _, err := scheduler.ForcePause("fp-error"); err != nil {
+		t.Fatalf("ForcePause 失败: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if snap, ok := store.snapshotOf("fp-error"); ok && JobStatus(snap.Status) == StatusPaused {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	snap, _ := store.snapshotOf("fp-error")
+	if JobStatus(snap.Status) != StatusPaused {
+		t.Errorf("收尾应把状态钉在 paused，实际 %s", JobStatus(snap.Status))
+	}
+	if snap.RetryCount != 0 {
+		t.Errorf("不应消耗重试次数，实际 %d", snap.RetryCount)
+	}
+	if scheduler.heap.Len() != 0 {
+		t.Errorf("不该产生重试副本，堆长度 %d", scheduler.heap.Len())
+	}
+}
+
+func TestScheduler_ForcePause_PendingJobBehavesLikePause(t *testing.T) {
+	store := newMockStore()
+	scheduler := NewScheduler(store, nil, nil)
+	events := collectEvents(scheduler.GetEventBus())
+
+	if err := scheduler.Schedule(&Job{ID: "fp-pending", Name: "test-job", TriggerAt: time.Now().Add(time.Hour)}); err != nil {
+		t.Fatalf("Schedule 失败: %v", err)
+	}
+
+	// 竞态下任务还没出堆：强制暂停退化成"更强的普通暂停"，保证一次都不执行
+	if _, err := scheduler.ForcePause("fp-pending"); err != nil {
+		t.Fatalf("ForcePause 失败: %v", err)
+	}
+	if scheduler.heap.Len() != 0 {
+		t.Errorf("任务应离开堆，堆长度 %d", scheduler.heap.Len())
+	}
+	events.waitFor(t, EventJobPaused, "fp-pending", time.Second)
+}
+
+func TestScheduler_ForcePause_UnknownJobAndResumeRace(t *testing.T) {
+	scheduler := NewScheduler(nil, nil, nil)
+	if _, err := scheduler.ForcePause("ghost"); !errors.Is(err, ErrJobNotFound) {
+		t.Errorf("未知任务应返回 ErrJobNotFound，实际 %v", err)
+	}
+
+	store := newMockStore()
+	scheduler2 := NewScheduler(store, nil, nil)
+	scheduler2.SetConcurrency(1)
+
+	release := make(chan struct{})
+	scheduler2.RegisterHandler("stall", func(ctx context.Context, job *Job) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-release:
+			return nil
+		}
+	})
+	if err := scheduler2.Schedule(&Job{ID: "fp-race", Name: "stall", Type: "stall", TriggerAt: time.Now()}); err != nil {
+		t.Fatalf("Schedule 失败: %v", err)
+	}
+	scheduler2.Start()
+	defer func() {
+		close(release)
+		scheduler2.Stop()
+	}()
+
+	scheduler2.waitRunning(t, "fp-race", 2*time.Second)
+	if _, err := scheduler2.ForcePause("fp-race"); err != nil {
+		t.Fatalf("ForcePause 失败: %v", err)
+	}
+
+	// Handler 还没返回时恢复：会与"即将钉回 paused"的守卫打架，必须被拒绝
+	if _, err := scheduler2.Resume("fp-race"); !errors.Is(err, ErrJobNotPending) {
+		t.Errorf("强制暂停未落定时恢复应返回 ErrJobNotPending，实际 %v", err)
 	}
 }
