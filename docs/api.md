@@ -349,6 +349,7 @@ GET /job-types
   "filter": {
     "job_types": ["payment_check", "email_send"],
     "event_types": ["job.scheduled", "job.started", "job.completed", "job.failed"],
+    "status": ["failed", "cancelled"],  // 可选：按任务状态名过滤
     "job_ids": ["job_xxx"]  // 可选：关注特定任务
   }
 }
@@ -368,6 +369,10 @@ GET /job-types
   "action": "unsubscribe"
 }
 ```
+
+过滤条件之间的关系：同一列表内是“命中任一即可”，不同列表之间是“同时满足”；
+某一项留空（或省略）表示该项不参与过滤。`status` 比较的是状态名
+（`pending`/`running`/`success`/`failed`/`cancelled`），`job_types` 比较事件里的任务名。
 
 服务端除事件外还会回送**控制帧**，它们没有 `type` / `job_id` 字段，客户端需先判断再解析：
 
