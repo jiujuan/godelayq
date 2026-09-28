@@ -124,8 +124,185 @@ func (s *APITestSuite) TestGetStatsReportsHeapSize() {
 	assert.Equal(s.T(), 3, stats.Pending)
 }
 
-// TestUpdateJobEditsPendingJobInPlace 覆盖 #15：更新不再走 Cancel→Schedule，
-// 任务 ID 与堆内条目保持不变。
+// listJobs 调用 GET /jobs 并解析响应
+func (s *APITestSuite) listJobs(query string) (int, ListJobsResponse) {
+	s.T().Helper()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/api/v1/jobs"+query, nil)
+	s.router.ServeHTTP(w, req)
+
+	var resp ListJobsResponse
+	require.NoError(s.T(), json.Unmarshal(w.Body.Bytes(), &resp))
+
+	return w.Code, resp
+}
+
+func (s *APITestSuite) seedSnapshots(snapshots ...core.JobSnapshot) {
+	s.T().Helper()
+
+	for _, snap := range snapshots {
+		require.NoError(s.T(), s.server.store.Update(snap))
+	}
+}
+
+// TestListJobsFiltersByStatusName 覆盖 #12：终态记录可查，过滤按状态名而非数字。
+func (s *APITestSuite) TestListJobsFiltersByStatusName() {
+	now := time.Now()
+	s.seedSnapshots(
+		core.JobSnapshot{ID: "p1", Name: "nightly", TriggerAt: now.Add(time.Hour), Status: int(core.StatusPending), UpdatedAt: now},
+		core.JobSnapshot{ID: "s1", Name: "nightly", TriggerAt: now, Status: int(core.StatusSuccess), UpdatedAt: now.Add(time.Minute)},
+		core.JobSnapshot{ID: "f1", Name: "nightly", TriggerAt: now, Status: int(core.StatusFailed), UpdatedAt: now.Add(2 * time.Minute)},
+	)
+
+	code, all := s.listJobs("")
+	require.Equal(s.T(), 200, code)
+	require.Equal(s.T(), 3, all.Total)
+	// 存储是 map，必须按更新时间稳定排序，否则带 limit 时结果会漂移
+	assert.Equal(s.T(), []string{"f1", "s1", "p1"}, []string{all.Items[0].ID, all.Items[1].ID, all.Items[2].ID})
+
+	for _, tc := range []struct {
+		query      string
+		wantID     string
+		wantStatus string
+	}{
+		{"?status=success", "s1", "success"},
+		{"?status=failed", "f1", "failed"},
+		{"?status=pending", "p1", "pending"},
+		{"?status=SUCCESS", "s1", "success"},
+	} {
+		code, filtered := s.listJobs(tc.query)
+		require.Equal(s.T(), 200, code, tc.query)
+		require.Len(s.T(), filtered.Items, 1, tc.query)
+		assert.Equal(s.T(), tc.wantID, filtered.Items[0].ID)
+		assert.Equal(s.T(), tc.wantStatus, filtered.Items[0].Status, "响应里的状态必须是快照真实状态")
+		assert.Equal(s.T(), 1, filtered.Total)
+	}
+
+	code, bad := s.listJobs("?status=3")
+	assert.Equal(s.T(), 400, code, "数字状态码不再是合法的过滤值")
+	assert.Empty(s.T(), bad.Items)
+
+	code, limited := s.listJobs("?limit=1")
+	require.Equal(s.T(), 200, code)
+	assert.Equal(s.T(), 3, limited.Total, "total 是匹配总数，不受 limit 截断影响")
+	assert.Len(s.T(), limited.Items, 1)
+
+	code, secondPage := s.listJobs("?limit=1&offset=1")
+	require.Equal(s.T(), 200, code)
+	require.Len(s.T(), secondPage.Items, 1)
+	assert.Equal(s.T(), "s1", secondPage.Items[0].ID, "offset 必须真实生效，否则翻页会重复读同一页")
+
+	code, beyondEnd := s.listJobs("?offset=99")
+	require.Equal(s.T(), 200, code)
+	assert.Equal(s.T(), 3, beyondEnd.Total)
+	assert.Empty(s.T(), beyondEnd.Items)
+
+	code, none := s.listJobs("?name=other")
+	require.Equal(s.T(), 200, code)
+	assert.Equal(s.T(), 0, none.Total)
+}
+
+// TestParseListJobsPaging 分页参数的容错口径。
+func TestParseListJobsPaging(t *testing.T) {
+	assert.Equal(t, defaultListJobsLimit, parseListJobsLimit(""))
+	assert.Equal(t, defaultListJobsLimit, parseListJobsLimit("abc"))
+	assert.Equal(t, defaultListJobsLimit, parseListJobsLimit("0"))
+	assert.Equal(t, defaultListJobsLimit, parseListJobsLimit("-5"))
+	assert.Equal(t, 20, parseListJobsLimit("20"))
+	assert.Equal(t, maxListJobsLimit, parseListJobsLimit("100000"), "超过硬上限要截断而不是把整个存储吐出去")
+
+	assert.Equal(t, 0, parseListJobsOffset(""))
+	assert.Equal(t, 0, parseListJobsOffset("abc"))
+	assert.Equal(t, 0, parseListJobsOffset("-1"))
+	assert.Equal(t, 40, parseListJobsOffset("40"))
+}
+
+// TestGetStatsCountsTerminalAndLiveRunning 覆盖 #12：completed/failed 不再恒 0，
+// running 取实时执行数。
+func (s *APITestSuite) TestGetStatsCountsTerminalAndLiveRunning() {
+	now := time.Now()
+	s.seedSnapshots(
+		core.JobSnapshot{ID: "done", Name: "nightly", TriggerAt: now, Status: int(core.StatusSuccess), UpdatedAt: now},
+		core.JobSnapshot{ID: "broken", Name: "nightly", TriggerAt: now, Status: int(core.StatusFailed), UpdatedAt: now},
+	)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("GET", "/api/v1/stats", nil)
+	s.router.ServeHTTP(w, req)
+
+	var stats StatsResponse
+	require.NoError(s.T(), json.Unmarshal(w.Body.Bytes(), &stats))
+	assert.Equal(s.T(), 1, stats.Completed)
+	assert.Equal(s.T(), 1, stats.Failed)
+	assert.Equal(s.T(), 0, stats.Running)
+
+	running := make(chan int, 1)
+	s.server.RegisterJobHandler("nightly", func(ctx context.Context, job *core.Job) error {
+		running <- 1
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	require.NoError(s.T(), s.scheduler.Schedule(&core.Job{
+		ID: "in-flight", Name: "nightly", TriggerAt: time.Now().Add(-time.Second),
+	}))
+
+	s.scheduler.Start()
+	defer s.scheduler.Stop()
+
+	<-running
+	w = httptest.NewRecorder()
+	req, _ = http.NewRequest("GET", "/api/v1/stats", nil)
+	s.router.ServeHTTP(w, req)
+	statsWhileRunning := StatsResponse{}
+	require.NoError(s.T(), json.Unmarshal(w.Body.Bytes(), &statsWhileRunning))
+	assert.Equal(s.T(), 1, statsWhileRunning.Running, "running 必须反映正在执行的任务")
+}
+
+// TestRetryJobSeesFailedSnapshot 记录失败任务此前被 LoadAll 过滤掉，
+// 手动重试端点因此永远找不到目标。
+func (s *APITestSuite) TestRetryJobSeesFailedSnapshot() {
+	now := time.Now()
+	s.seedSnapshots(core.JobSnapshot{
+		ID: "retry-me", Name: "nightly", TriggerAt: now.Add(-time.Hour),
+		Status: int(core.StatusFailed), UpdatedAt: now,
+	})
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/jobs/retry-me/retry", nil)
+	s.router.ServeHTTP(w, req)
+
+	require.Equal(s.T(), 200, w.Code)
+	var resp JobResponse
+	require.NoError(s.T(), json.Unmarshal(w.Body.Bytes(), &resp))
+	assert.Equal(s.T(), "retry-me", resp.ID)
+	assert.Equal(s.T(), "pending", resp.Status)
+	assert.Equal(s.T(), 1, s.scheduler.HeapLen())
+}
+
+// TestJobResponseSurfacesTimeout 响应里要能看到执行超时配置。
+func (s *APITestSuite) TestJobResponseSurfacesTimeout() {
+	s.server.RegisterJobHandler("payment_check", func(ctx context.Context, job *core.Job) error {
+		return nil
+	})
+
+	body, _ := json.Marshal(CreateJobRequest{Name: "payment_check", Delay: "10m", Timeout: "45s"})
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/jobs", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	s.router.ServeHTTP(w, req)
+
+	require.Equal(s.T(), 201, w.Code)
+	var created JobResponse
+	require.NoError(s.T(), json.Unmarshal(w.Body.Bytes(), &created))
+	assert.Equal(s.T(), "45s", created.Timeout)
+
+	code, listed := s.listJobs("?status=pending")
+	require.Equal(s.T(), 200, code)
+	require.Len(s.T(), listed.Items, 1)
+	assert.Equal(s.T(), "45s", listed.Items[0].Timeout)
+}
+
 func (s *APITestSuite) TestUpdateJobEditsPendingJobInPlace() {
 	s.server.RegisterJobHandler("payment_check", func(ctx context.Context, job *core.Job) error {
 		return nil
@@ -149,6 +326,7 @@ func (s *APITestSuite) TestUpdateJobEditsPendingJobInPlace() {
 	updateBody, _ := json.Marshal(UpdateJobRequest{
 		TriggerAt: &newTrigger,
 		Payload:   json.RawMessage(`{"order":"new"}`),
+		Timeout:   "45s",
 	})
 	updated := httptest.NewRecorder()
 	req, _ = http.NewRequest("PUT", "/api/v1/jobs/"+createdJob.ID, bytes.NewBuffer(updateBody))
@@ -160,6 +338,7 @@ func (s *APITestSuite) TestUpdateJobEditsPendingJobInPlace() {
 	require.NoError(s.T(), json.Unmarshal(updated.Body.Bytes(), &updatedJob))
 	assert.Equal(s.T(), createdJob.ID, updatedJob.ID, "an in-place update must keep the job id")
 	assert.Equal(s.T(), `{"order":"new"}`, string(updatedJob.Payload))
+	assert.Equal(s.T(), "45s", updatedJob.Timeout, "timeout 也应能被更新")
 	assert.True(s.T(), updatedJob.TriggerAt.Equal(newTrigger), "got %v", updatedJob.TriggerAt)
 
 	// 没有"取消后重排"的空窗：堆里始终只有这一条

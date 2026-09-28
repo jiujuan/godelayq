@@ -3,10 +3,18 @@ package api
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"time"
 
-	"godelayq/core"
 	"github.com/gin-gonic/gin"
+	"godelayq/core"
+)
+
+// defaultListJobsLimit 是 GET /jobs 未显式给 limit 时返回的最大条数，
+// maxListJobsLimit 是可请求的硬上限（limit 超过它会被截断而不是报错）。
+const (
+	defaultListJobsLimit = 50
+	maxListJobsLimit     = 100
 )
 
 // CreateJob 创建任务
@@ -100,14 +108,27 @@ func (s *Server) CreateJob(c *gin.Context) {
 
 // ListJobs 获取任务列表
 func (s *Server) ListJobs(c *gin.Context) {
-	status := c.Query("status") // 状态过滤
+	status := c.Query("status") // 状态名过滤，如 pending/running/success/failed/cancelled
 	name := c.Query("name")     // 名称过滤
-	limit := 50                 // 默认分页
-	if l := c.Query("limit"); l != "" {
-		fmt.Sscanf(l, "%d", &limit)
+	limit := parseListJobsLimit(c.Query("limit"))
+	offset := parseListJobsOffset(c.Query("offset"))
+
+	var wantStatus core.JobStatus
+	filterByStatus := status != ""
+	if filterByStatus {
+		parsed, ok := core.ParseJobStatus(status)
+		if !ok {
+			c.JSON(400, ErrorResponse{
+				Code:    400,
+				Message: "invalid status filter",
+				Details: "expected one of pending, running, success, failed, cancelled",
+			})
+			return
+		}
+		wantStatus = parsed
 	}
 
-	// 从存储加载所有任务快照
+	// 从存储加载所有任务快照（含终态留痕）
 	snapshots, err := s.store.LoadAll()
 	if err != nil {
 		c.JSON(500, ErrorResponse{
@@ -118,30 +139,72 @@ func (s *Server) ListJobs(c *gin.Context) {
 		return
 	}
 
-	items := make([]JobResponse, 0)
+	matched := make([]core.JobSnapshot, 0, len(snapshots))
 	for _, snap := range snapshots {
-		// 过滤
-		if status != "" && fmt.Sprintf("%d", snap.Status) != status {
+		if filterByStatus && core.JobStatus(snap.Status) != wantStatus {
 			continue
 		}
 		if name != "" && snap.Name != name {
 			continue
 		}
+		matched = append(matched, snap)
+	}
 
-		// 转换为响应格式
+	// 存储是 map，遍历顺序随机；不排序的话带分页的每次请求结果都不同
+	sort.Slice(matched, func(i, j int) bool {
+		if !matched[i].UpdatedAt.Equal(matched[j].UpdatedAt) {
+			return matched[i].UpdatedAt.After(matched[j].UpdatedAt)
+		}
+		return matched[i].ID < matched[j].ID
+	})
+
+	total := len(matched)
+	if offset > total {
+		offset = total
+	}
+	page := matched[offset:]
+	if len(page) > limit {
+		page = page[:limit]
+	}
+
+	items := make([]JobResponse, 0, len(page))
+	for _, snap := range page {
 		job := &core.Job{}
 		job.FromSnapshot(snap)
 		items = append(items, s.toJobResponse(job))
-
-		if len(items) >= limit {
-			break
-		}
 	}
 
 	c.JSON(200, ListJobsResponse{
-		Total: len(items),
+		Total: total,
 		Items: items,
 	})
+}
+
+// parseListJobsLimit 解析 limit：非法或非正值取默认值，超过上限则截断。
+func parseListJobsLimit(raw string) int {
+	if raw == "" {
+		return defaultListJobsLimit
+	}
+
+	var limit int
+	if _, err := fmt.Sscanf(raw, "%d", &limit); err != nil || limit <= 0 {
+		return defaultListJobsLimit
+	}
+	if limit > maxListJobsLimit {
+		return maxListJobsLimit
+	}
+
+	return limit
+}
+
+// parseListJobsOffset 解析 offset，非法或负值按 0 处理。
+func parseListJobsOffset(raw string) int {
+	var offset int
+	if _, err := fmt.Sscanf(raw, "%d", &offset); err != nil || offset < 0 {
+		return 0
+	}
+
+	return offset
 }
 
 // GetJob 获取单个任务详情
@@ -186,6 +249,21 @@ func (s *Server) UpdateJob(c *gin.Context) {
 		payload = req.Payload
 	}
 
+	// 与 CreateJob 同口径：格式非法先拒绝，不静默忽略
+	var timeout time.Duration
+	if req.Timeout != "" {
+		d, err := time.ParseDuration(req.Timeout)
+		if err != nil {
+			c.JSON(400, ErrorResponse{
+				Code:    400,
+				Message: "invalid timeout format",
+				Details: err.Error(),
+			})
+			return
+		}
+		timeout = d
+	}
+
 	// 原地更新：不再走 Cancel→Schedule，避免两步之间失败导致任务丢失
 	job, err := s.scheduler.UpdatePending(id, func(j *core.Job) error {
 		if req.TriggerAt != nil {
@@ -196,6 +274,9 @@ func (s *Server) UpdateJob(c *gin.Context) {
 		}
 		if req.MaxRetries != nil {
 			j.MaxRetries = *req.MaxRetries
+		}
+		if req.Timeout != "" {
+			j.Timeout = timeout
 		}
 		return nil
 	})
@@ -302,12 +383,12 @@ func (s *Server) GetStats(c *gin.Context) {
 		Uptime: time.Since(s.startTime).String(),
 	}
 
+	// Pending/Completed/Failed 来自存储快照：它们描述"已落盘的状态"，
+	// 进程重启后依然可累计；Running 与 HeapSize 取实时值。
 	for _, snap := range snapshots {
 		switch core.JobStatus(snap.Status) {
 		case core.StatusPending:
 			stats.Pending++
-		case core.StatusRunning:
-			stats.Running++
 		case core.StatusSuccess:
 			stats.Completed++
 		case core.StatusFailed:
@@ -315,7 +396,7 @@ func (s *Server) GetStats(c *gin.Context) {
 		}
 	}
 
-	// 堆中待执行任务数（活跃任务）
+	stats.Running = s.scheduler.RunningCount()
 	stats.HeapSize = s.scheduler.HeapLen()
 
 	c.JSON(200, stats)
@@ -396,24 +477,10 @@ func (s *Server) calculateTriggerTime(req CreateJobRequest) (time.Time, error) {
 }
 
 func (s *Server) toJobResponse(job *core.Job) JobResponse {
-	status := "unknown"
-	switch job.Status {
-	case core.StatusPending:
-		status = "pending"
-	case core.StatusRunning:
-		status = "running"
-	case core.StatusSuccess:
-		status = "success"
-	case core.StatusFailed:
-		status = "failed"
-	case core.StatusCancelled:
-		status = "cancelled"
-	}
-
 	resp := JobResponse{
 		ID:         job.ID,
 		Name:       job.Name,
-		Status:     status,
+		Status:     job.Status.String(),
 		TriggerAt:  job.TriggerAt,
 		Payload:    job.Payload,
 		RetryCount: job.RetryCount,
@@ -422,6 +489,10 @@ func (s *Server) toJobResponse(job *core.Job) JobResponse {
 		CronExpr:   job.CronExpr,
 		CreatedAt:  job.CreatedAt,
 		UpdatedAt:  job.UpdatedAt,
+	}
+
+	if job.Timeout > 0 {
+		resp.Timeout = job.Timeout.String()
 	}
 
 	// 计算剩余时间

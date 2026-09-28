@@ -32,6 +32,8 @@ type UpdateJobRequest struct {
 	TriggerAt  *time.Time      `json:"trigger_at,omitempty"`
 	Payload    json.RawMessage `json:"payload,omitempty"`
 	MaxRetries *int            `json:"max_retries,omitempty"`
+	// Timeout 单次执行超时，如 "30s"；传 "0s" 可取消限制
+	Timeout string `json:"timeout,omitempty"`
 }
 
 // JobResponse 任务响应
@@ -45,6 +47,7 @@ type JobResponse struct {
 	// 执行信息
 	RetryCount int    `json:"retry_count" example:"0"`
 	MaxRetries int    `json:"max_retries" example:"3"`
+	Timeout    string `json:"timeout,omitempty" example:"30s"` // 单次执行超时，空表示不限制
 	IsRepeat   bool   `json:"is_repeat" example:"false"`
 	CronExpr   string `json:"cron_expr,omitempty"`
 
