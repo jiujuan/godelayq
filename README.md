@@ -163,6 +163,19 @@ godelayq/
 ├── dashboard/
 │   └── index.html            # 单文件监控页（浏览器直接打开，可填 token）
 │
+├── web/                      # Vue 3 控制台前端（npm 工程，尚未内嵌进二进制）
+│   ├── vite.config.ts        # dev 代理 /api、/sse、/ws → :8080
+│   ├── package.json          # 版本钉在设计文档 §4.1：Vite 7 / TS 5 / Pinia 3 / Router 4
+│   └── src/
+│       ├── api/              # types、client（401→刷新→重放一次）、auth、keys、stats
+│       ├── stores/           # auth（sessionStorage + 单飞刷新）、realtime（WS + 200 条事件缓冲）、toast
+│       ├── plugins/          # query 装配、realtime-effects（事件 → Query 失效，debounce 500ms）
+│       ├── router/           # 路由表派生菜单，守卫按 meta.minimumRole 拦截
+│       ├── composables/      # usePermission 能力表
+│       ├── components/       # layout（侧栏/顶栏/页头）与 ui（按钮/输入/徽标/空态/提示）
+│       ├── views/            # 登录、概览、实时、设置已实现；任务/分组/运维页属 M4
+│       └── styles/           # tokens.css：蓝白灰主题变量
+│
 ├── configs/
 │   └── config.yaml           # 运行配置样例
 │
@@ -250,6 +263,7 @@ godelayq/
 
 - Go 1.24+（与 `go.mod` 的 `go 1.24.13` 一致）
 - Linux/macOS/Windows
+- Node 20.19+（只在开发 `web/` 控制台时需要；Vite 7 的版本下限）
 
 ### 安装
 
@@ -270,6 +284,25 @@ go build -o godelayq-server ./cmd/server
 # 使用配置文件（留空则自动查找 configs/config.yaml，找不到就用代码默认值）
 ./godelayq-server -config=configs/config.yaml
 ```
+
+### 前端控制台（开发模式）
+
+`web/` 是独立的 npm 工程，开发期与 Go 进程分开跑，靠 Vite 代理同源访问后端：
+
+```bash
+# 终端 1：后端（默认 :8080）
+go build -o godelayq-server ./cmd/server && ./godelayq-server
+
+# 终端 2：前端
+cd web
+npm install
+npm run dev        # http://localhost:5173，端口被占用时 Vite 自动顺延到 5174
+```
+
+页面一律用相对路径请求 `/api`、`/ws`，所以顺延端口同样能用。校验命令：
+`npx vue-tsc --noEmit`（类型）与 `npm run build`（产物在 `web/dist`，已 gitignore）。
+**依赖版本钉在设计文档 §4.1**（Vite 7 / TS 5 / Pinia 3 / vue-router 4），
+`npm install` 时不要随手升到最新大版本。内嵌进单二进制（`embed`）与联调属 M5。
 
 ### 配置项
 
@@ -331,3 +364,4 @@ logging:
 - [用法示例](./docs/example.md)
 - [部署文档](./docs/deployment.md)
 - [核心模块设计分析](./docs/core-scheduler-heap-event-load-analysis.md)
+- [Web 控制台设计文档](./docs/design/web-console-design.md)（`web/` 的技术选型、页面与后端改造方案，含里程碑进度）

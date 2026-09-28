@@ -161,6 +161,13 @@ web/
 │  └─ styles/tokens.css      # 颜色/圆角/间距 CSS 变量
 ```
 
+M3 交付的是这张表的骨架层：`api/` 只有 types/client/auth/keys/stats（jobs、groups、
+events、admin 的调用随各自页面在 M4 落地），composables 只有 `usePermission`，
+`ui/` 只凑齐 layout 用得到的 Button/Input/Badge/EmptyState/Toast。
+新增 `api/keys.ts`（Query 键集中一处，失效管线与页面共用）与 `plugins/`
+（`query.ts` 装 QueryClient、`realtime-effects.ts` 把事件翻译成失效请求），
+目的是让 realtime store 不认识 QueryClient。
+
 ### 4.3 布局与视觉规范
 
 **双栏结构**：左栏固定导航（240px，可折叠到 64px 只留图标），右栏为内容区；
@@ -216,8 +223,10 @@ web/
 3. **退出**：调 `POST /api/v1/auth/logout`（服务端吊销该 refresh token，并把当前
    access token 的 jti 加入拒绝表，§5.7.4），随后清本地态 + 断 WS + 跳 `/login`。
    所以退出是"真注销"，不是只清本地。
-4. **路由守卫**：`router.beforeEach` 检查 auth store；受保护页未登录跳 `/login`；
-   `meta.roles: ['admin','ops']` 的页面（运维页、强制暂停入口）角色不足跳首页并 toast。
+4. **路由守卫**：`router.beforeEach` 检查 auth store；受保护页未登录跳 `/login?redirect=<原路径>`；
+   受控页面用 `meta.minimumRole: 'ops'`（运维页）这类**单一档位**声明，角色不足跳首页并 toast。
+   实现与本文原稿的 `meta.roles: ['admin','ops']` 列表写法不同：后端本就是一条阶梯
+   （`core.Role.AtLeast`），列档位集合只是在重复阶梯已经说过的事。
    **前端隐藏只是体验，不是安全边界**——同一规则必须在服务端 RBAC 中间件上再判一次
    （§5.7.3），验收项覆盖越权请求。
 5. **角色驱动 UI**：`usePermission()` composable 提供 `can('job.force_pause')` 之类判断，
@@ -230,6 +239,9 @@ web/
 
 - 单例 WS，登录后连接；连接前先 `POST /auth/ws-ticket` 取一次性 ticket（§5.7.5），
   避免 JWT 出现在 URL 与访问日志里；ticket 失效则重取，401 走刷新链路。
+  **未启用鉴权的部署同样走 ticket**：那时中间件给请求挂上匿名 ops 主体，
+  `/auth/ws-ticket` 返回 200 + 匿名票据（实测），因此前端没有"匿名直连"分支，
+  建连只有三种结局——拿到票据就连、401 判定离线、其余错误按退避重连。
 - 30s 发送 `{"action":"ping"}`（服务端 60s 空闲会断开，见 `docs/api.md` 协议说明）。
 - 断线指数退避重连（1s→2s→4s→…上限 30s）；`onclose` 更新 Topbar 徽标。
 - 收到的事件做两件事：
@@ -315,6 +327,10 @@ web/
 | `['job-events', id]` | GET /jobs/:id/events | 打开详情页拉一次；此后由 WS append，不轮询 |
 | `['groups']` | GET /groups | 组 CRUD 后 |
 | `['job-types']` | GET /job-types | 启动时拉一次，缓存 5min |
+
+实现落在 `api/keys.ts`（唯一出处，失效管线与页面共用一套键，否则 invalidate 打不中缓存）。
+与上表的差异只有两处：分页参数用 `offset`（后端列表就是 limit/offset，见 `docs/api.md`），
+另加一把 `['jobs']` 前缀键给事件的整体失效。
 
 ---
 
@@ -827,8 +843,8 @@ var dist embed.FS
 | M0 | 认证与角色 **已交付** | JWT 签发/校验、bcrypt 账号配置、`RequireRole`（machine 由阶梯天然排除）、RT 表 + jti 拒绝表 + ticket、`/auth/*` 五个端点、登录限流、写操作进访问日志（who/role）；httptest 覆盖三档角色越权、轮转、登出即失效、ticket 一次一用 | `core/auth.go`、`core/config.go`、`api/auth*.go`、`api/ratelimit.go`、`api/security.go`、`cmd/hashpassword` |
 | M1 | core：paused + group **已交付** | 状态枚举/Job/Snapshot/事件常量；`Scheduler.Pause/ForcePause/Resume`、`Suspend/Unsuspend`；`handleInterrupted`/`handleSuccess`/`handleFailure` 的强制暂停守卫；Restore/Cancel 修正；`GroupStore`（路径由构造传入，`store.groups_path` 配置键随 M2 消费者一起加）；SSE 类型白名单补 paused/resumed；单测（旧数据兼容、重启不解除暂停、暂停后可取消、Handler 忽略取消仍停在 paused、并发落盘完整性） | `core/*.go`、`api/sse.go` |
 | M2 | api：REST **已交付** | pause/force-pause/resume/groups/batch-ops/events/admin 端点 + DTO 扩展 + stats.paused；EventHistory 记录器；`store.groups_path` 配置键与生产装配；403 越权尝试进访问日志 | `api/*.go`、`core/scheduler.go`（RuntimeStats/SetGroup/RetagGroup）、`core/config.go`、`cmd/server/main.go` |
-| M3 | web 骨架 | Vite+TS+Tailwind+lucide 初始化、client(含刷新链路)/auth/permission/router/layout、登录流、WS store + Query 失效管线 | `web/` |
-| M4 | web 页面 | Jobs 列表+表单+详情（时间线）、Groups、Dashboard、Monitor、Admin、Settings | `web/src/views/*` |
+| M3 | web 骨架 **已交付** | Vite 7+TS 5+Tailwind 4+lucide 工程、token 样式层、`api/`（types/client 401→refresh→重放/auth/keys/stats）、auth store（sessionStorage + 单飞刷新）与 `usePermission` 能力表、路由守卫与角色过滤菜单、两栏 layout + 基础 UI 组件、登录流（含"未启用鉴权 直接进入"）、realtime store（ticket 建连/退避重连/200 条缓冲）与事件→Query 失效管线。**为把整条链路跑通验证，Dashboard/Monitor/Settings 三页按真页面实现**；Jobs/Groups/Admin/JobDetail 为 M4 占位 | `web/` |
+| M4 | web 页面 | Jobs 列表+表单+详情（时间线）、Groups、Admin 面板、Topbar 的 scheduling suspended 横幅、Monitor 的订阅过滤与后端缓冲回填 | `web/src/views/*`、`web/src/components/{jobs,groups}/*` |
 | M5 | 集成与发布 | vite proxy 联调、embed 单二进制、`docs/api.md` 与 README/deployment 更新（鉴权章节重写）、（可选）旧 dashboard/index.html 改为跳转页 | `docs/`、`api/server.go` |
 
 后端 M0+M1+M2 约 6-8 天（M0 的 JWT/RBAC 比原 token 方案多约 2 天），
@@ -843,12 +859,17 @@ var dist embed.FS
 - [x] 未认证访问任意业务端点 → 401；`viewer` 调写端点 → 403；`operator` 调强制暂停/删组 → 403
       （`api/auth_test.go`、`api/handlers_lifecycle_test.go`、`api/handlers_groups_test.go`、`api/handlers_admin_test.go`）
 - [x] 错误密码与不存在的账号返回同一状态码与文案（不可枚举账号）；连续失败触发限流（`TestLoginFailureIsIndistinguishable`、`TestLoginRateLimitedAfterFailures`）
-- [ ] access token 过期后前端静默刷新并重放成功；logout 后旧 access token 立即 401（jti 拒绝表）、
+- [x] access token 过期后前端静默刷新并重放成功；logout 后旧 access token 立即 401（jti 拒绝表）、
       refresh token 立即失效（后端轮转/吊销已覆盖：`TestRefreshRotatesRefreshToken`、
-      `TestLogoutRevokesAccessTokenAndRefreshToken`；前端重放链路属 M3）
+      `TestLogoutRevokesAccessTokenAndRefreshToken`；前端侧在浏览器实测：把 `access_ttl` 调到 20s
+      后不刷新页面跑完一轮任务，服务端访问日志出现 4 次 `/auth/refresh` 且其间无 401 冒泡；
+      退出后 sessionStorage 清空并回到 `/login`（按钮是显式跳转，凭据彻底失效时由
+      sessionLost 带 `?redirect=` 送回）；"登录已过期"那条 toast 文案在未显示的标签页里
+      被定时器节流挡住，本轮没观测到，不做已验证的声明）
 - [x] WS/SSE 通过一次性 ticket 建连；ticket 复用第二次被拒；URL 与访问日志中不出现长期凭据
       （`TestWSTicketIsSingleUseAndScopedToRealtimeChannels`、`TestAccessTokenIsRejectedInQueryString`；
-      浏览器实际建连在 M3 联调时复核）
+      浏览器复核：启用鉴权与未启用鉴权两种部署下 Topbar 徽标均进入"实时连接"，
+      未启用鉴权时 `/auth/ws-ticket` 由匿名 ops 主体签发票据，前端因此不设匿名直连分支）
 - [x] pending job 暂停 → 列表显示 paused、不再触发、重启后仍 paused；恢复后 cron 任务按新周期排期，
       一次性过期任务立即补跑（`core/pause_test.go`、`TestPauseAndResumeOverHTTP`）
 - [x] running job 强制暂停 → 当前 attempt 被中止、不计入 `retry_count`、状态停在 paused、
@@ -864,7 +885,9 @@ var dist embed.FS
       `TestScheduler_SetGroup_KeepsNewGroupAfterTheJobRuns`）
 - [ ] 详情页时间线展示最近事件（含 paused/force-paused/resumed/retrying/failed 与 timeout 标记）
       （端点已就绪：`GET /jobs/:id/events`，见 `TestJobEventsEndpointServesTimeline`；UI 属 M4）
-- [ ] WS 事件触发列表/统计自动刷新；断线显示黄色徽标并自动重连（属 M3/M4）
+- [ ] WS 事件触发列表/统计自动刷新；断线显示黄色徽标并自动重连。**统计侧已实测**：
+      不刷新页面用 `POST /jobs` 建一个任务，概览的"已完成"从 0 变 1（事件→debounce→失效→重取）；
+      列表侧与"断线重连徽标"待 M4（JobsView 尚无列表，重连退避也未在浏览器里触发过）
 - [x] 旧 `data/jobs.json`（无 group、状态 0-4）直接升级运行无报错；配置中写非法 role 或
       缺 jwt.secret 时启动即报错（`core/job_status_test.go`、`core/config_test.go`、
       `TestStartFailsWhenAuthMisconfigured`）
