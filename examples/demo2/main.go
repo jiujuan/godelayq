@@ -80,7 +80,6 @@ func exampleJob() []byte {
     "currency": "CNY"
   },
   "max_retries": 3,
-  "retry_delay": "5m",
-  "description": "10分钟后检查订单支付状态"
+  "retry_delay": "5m"
 }`)
 }

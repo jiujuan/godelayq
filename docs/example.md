@@ -104,12 +104,24 @@ curl -X POST http://localhost:8080/api/v1/jobs \
     "user_id": "U789012"
   },
   "max_retries": 2,
-  "retry_delay": "5m",
-  "description": "批量导入的订单超时任务"
+  "retry_delay": "5m"
 }
 ```
 
-`timeout` 可选，是单次执行超时（`time.ParseDuration` 格式）；省略则不限制。
+字段约定：
+
+- `name` **必填**：既是任务名，也是 Handler 查找键（`type` 为空时回退到它）。
+  留空（或只有空白）的文件在加载即判为格式错误，会记 `error` 日志并在配置了
+  `error_dir` 时归档到 `<文件名>.error`，不会进入调度队列。
+- `id` 可省略，省略时由调度器生成 UUIDv7。
+- `trigger_at`（RFC3339 绝对时间）与 `delay`（`time.ParseDuration`）二选一，
+  前者优先；两者都不写则 1 秒后立即执行。
+- `max_retries`：不写取默认 3；**写 `0` 就是不重试**（历史版本会把 0 抬回 3，
+  现在按字面值处理，与 `POST /jobs` 一致）；负数报错。
+- `timeout` 可选，是单次执行超时（`time.ParseDuration` 格式）；省略则不限制。
+- 文件里的 `tags`、`description` 一类的额外键不再被解析（此前也是解析后即丢弃），
+  加载时会被忽略，不影响任务入队。
+
 Handler 必须检查传入的 `ctx`，否则超时只能被记录为失败、无法真正中止执行。
 
 配置目录加载器自动监控：
@@ -121,6 +133,7 @@ loader, err := godelayq.NewDirectoryLoader(scheduler, godelayq.LoaderOptions{
     PostLoadAction: godelayq.ArchiveAfterLoad,
     ArchiveDir:     "./jobs/archive",
     EnableWatcher:  true,  // 实时监控新文件
+    Logger:         logger, // 可选，nil 用 slog.Default()
 })
 if err != nil {
     log.Fatal(err)
@@ -129,7 +142,12 @@ if err != nil {
 if err := loader.Start(); err != nil {
     log.Fatal(err)
 }
+defer loader.Stop()
 ```
+
+监控模式下同一文件的连续写入会合并成一次加载：事件到达后等 100ms 静默窗口，
+窗口内的重复事件只排一次队，因此读到最后一次写入的内容，也不会读到半截 JSON。
+`Stop()` 会取消尚未触发的排队加载。
 ## 示例 3：实时监控 Dashboard
 
 前端 JavaScript 连接 WebSocket：
