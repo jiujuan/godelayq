@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -351,6 +352,122 @@ func (s *APITestSuite) TestUpdateJobEditsPendingJobInPlace() {
 	assert.Equal(s.T(), 404, missing.Code)
 }
 
+// postBatch 提交批量创建请求并解析响应
+func (s *APITestSuite) postBatch(body any) (int, BatchCreateJobsResponse) {
+	s.T().Helper()
+
+	raw, err := json.Marshal(body)
+	require.NoError(s.T(), err)
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/jobs/batch", bytes.NewBuffer(raw))
+	req.Header.Set("Content-Type", "application/json")
+	s.router.ServeHTTP(w, req)
+
+	var resp BatchCreateJobsResponse
+	if w.Code == 207 {
+		require.NoError(s.T(), json.Unmarshal(w.Body.Bytes(), &resp))
+	}
+
+	return w.Code, resp
+}
+
+func (s *APITestSuite) registerPaymentHandler() {
+	s.T().Helper()
+
+	s.server.RegisterJobHandler("payment_check", func(ctx context.Context, job *core.Job) error {
+		return nil
+	})
+}
+
+// TestBatchCreateAllSucceed 覆盖 #13：批量端点不再是空壳，条目逐条入队。
+func (s *APITestSuite) TestBatchCreateAllSucceed() {
+	s.registerPaymentHandler()
+
+	code, resp := s.postBatch([]CreateJobRequest{
+		{Name: "payment_check", Delay: "1m"},
+		{Name: "payment_check", Delay: "2m", Timeout: "30s", MaxRetries: 2},
+		{Name: "payment_check", TriggerAt: ptrTime(time.Now().Add(3 * time.Hour))},
+	})
+
+	require.Equal(s.T(), 207, code)
+	assert.Equal(s.T(), 3, resp.Succeeded)
+	assert.Zero(s.T(), resp.Failed)
+	assert.Empty(s.T(), resp.Errors)
+	assert.Len(s.T(), resp.Items, 3)
+	assert.Equal(s.T(), "30s", resp.Items[1].Timeout)
+	assert.Equal(s.T(), 2, resp.Items[1].MaxRetries)
+
+	ids := make(map[string]struct{}, 3)
+	for _, item := range resp.Items {
+		require.Len(s.T(), item.ID, 36, "batch ids must be UUIDv7: %q", item.ID)
+		ids[item.ID] = struct{}{}
+	}
+	assert.Len(s.T(), ids, 3, "each batch item needs its own id")
+	assert.Equal(s.T(), 3, s.scheduler.HeapLen())
+}
+
+// TestBatchCreatePartialFailure 一条失败不影响其它条目，错误按下标返回。
+func (s *APITestSuite) TestBatchCreatePartialFailure() {
+	s.registerPaymentHandler()
+
+	code, resp := s.postBatch([]CreateJobRequest{
+		{Name: "payment_check", Delay: "1m"},
+		{Name: "nope_not_registered", Delay: "1m"},
+		{Name: "payment_check", Delay: "yesterday"},
+		{Name: "payment_check", Timeout: "soon"},
+		{Name: "payment_check", Delay: "5m"},
+	})
+
+	require.Equal(s.T(), 207, code)
+	assert.Equal(s.T(), 2, resp.Succeeded)
+	assert.Equal(s.T(), 3, resp.Failed)
+	assert.Len(s.T(), resp.Errors, 3)
+
+	indexes := make([]int, 0, len(resp.Errors))
+	for _, failure := range resp.Errors {
+		indexes = append(indexes, failure.Index)
+		assert.NotEmpty(s.T(), failure.Message)
+		assert.NotEmpty(s.T(), failure.Details)
+	}
+	assert.Equal(s.T(), []int{1, 2, 3}, indexes)
+	assert.Equal(s.T(), "unknown job type", resp.Errors[0].Message)
+	assert.Equal(s.T(), 400, resp.Errors[0].Code)
+	assert.Equal(s.T(), 2, s.scheduler.HeapLen(), "只有校验通过的条目会进入调度堆")
+}
+
+func (s *APITestSuite) TestBatchCreateRejectsEmptyAndOversized() {
+	s.registerPaymentHandler()
+
+	code, _ := s.postBatch([]CreateJobRequest{})
+	assert.Equal(s.T(), 400, code)
+
+	tooMany := make([]CreateJobRequest, maxBatchCreateSize+1)
+	for i := range tooMany {
+		tooMany[i] = CreateJobRequest{Name: "payment_check", Delay: "10m"}
+	}
+	code, _ = s.postBatch(tooMany)
+	assert.Equal(s.T(), 400, code)
+
+	// 上限本身可用
+	code, resp := s.postBatch(tooMany[:maxBatchCreateSize])
+	require.Equal(s.T(), 207, code)
+	assert.Equal(s.T(), maxBatchCreateSize, resp.Succeeded)
+	assert.Zero(s.T(), resp.Failed)
+}
+
+func (s *APITestSuite) TestBatchCreateRejectsNonArrayBody() {
+	s.registerPaymentHandler()
+
+	w := httptest.NewRecorder()
+	req, _ := http.NewRequest("POST", "/api/v1/jobs/batch", strings.NewReader(`{"name":"payment_check"}`))
+	req.Header.Set("Content-Type", "application/json")
+	s.router.ServeHTTP(w, req)
+
+	assert.Equal(s.T(), 400, w.Code)
+	assert.Contains(s.T(), w.Body.String(), "invalid batch format")
+}
+
 func (s *APITestSuite) TestCalculateTriggerTime() {
 	now := time.Now()
 
@@ -376,4 +493,9 @@ func (s *APITestSuite) TestCalculateTriggerTime() {
 
 func TestAPISuite(t *testing.T) {
 	suite.Run(t, new(APITestSuite))
+}
+
+// ptrTime 便于在请求体里填 *time.Time 字段。
+func ptrTime(value time.Time) *time.Time {
+	return &value
 }

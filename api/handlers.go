@@ -17,6 +17,9 @@ const (
 	maxListJobsLimit     = 100
 )
 
+// maxBatchCreateSize 是 POST /jobs/batch 单请求允许的任务数。
+const maxBatchCreateSize = 100
+
 // CreateJob 创建任务
 func (s *Server) CreateJob(c *gin.Context) {
 	var req CreateJobRequest
@@ -29,25 +32,31 @@ func (s *Server) CreateJob(c *gin.Context) {
 		return
 	}
 
+	job, failure := s.createJobFromRequest(req)
+	if failure != nil {
+		c.JSON(failure.Code, *failure)
+		return
+	}
+
+	c.JSON(201, s.toJobResponse(job))
+}
+
+// createJobFromRequest 校验请求并把任务交给调度器，供单条与批量创建共用。
+// 返回非 nil 的 ErrorResponse 表示失败，调用方决定如何呈现（400/500 或批量里的逐条错误）。
+func (s *Server) createJobFromRequest(req CreateJobRequest) (*core.Job, *ErrorResponse) {
 	// 计算触发时间
 	triggerAt, err := s.calculateTriggerTime(req)
 	if err != nil {
-		c.JSON(400, ErrorResponse{
-			Code:    400,
-			Message: "invalid time format",
-			Details: err.Error(),
-		})
-		return
+		return nil, &ErrorResponse{Code: 400, Message: "invalid time format", Details: err.Error()}
 	}
 
 	// 检查Handler是否存在（仅用于验证，实际执行时从registry获取）
 	if _, ok := s.registry.Get(req.Name); !ok {
-		c.JSON(400, ErrorResponse{
+		return nil, &ErrorResponse{
 			Code:    400,
 			Message: "unknown job type",
 			Details: fmt.Sprintf("job type '%s' not registered", req.Name),
-		})
-		return
+		}
 	}
 
 	// 解析重试延迟
@@ -63,12 +72,7 @@ func (s *Server) CreateJob(c *gin.Context) {
 	if req.Timeout != "" {
 		d, err := time.ParseDuration(req.Timeout)
 		if err != nil {
-			c.JSON(400, ErrorResponse{
-				Code:    400,
-				Message: "invalid timeout format",
-				Details: err.Error(),
-			})
-			return
+			return nil, &ErrorResponse{Code: 400, Message: "invalid timeout format", Details: err.Error()}
 		}
 		timeout = d
 	}
@@ -95,15 +99,10 @@ func (s *Server) CreateJob(c *gin.Context) {
 
 	// 添加到调度器
 	if err := s.scheduler.Schedule(job); err != nil {
-		c.JSON(500, ErrorResponse{
-			Code:    500,
-			Message: "failed to schedule job",
-			Details: err.Error(),
-		})
-		return
+		return nil, &ErrorResponse{Code: 500, Message: "failed to schedule job", Details: err.Error()}
 	}
 
-	c.JSON(201, s.toJobResponse(job))
+	return job, nil
 }
 
 // ListJobs 获取任务列表
@@ -417,27 +416,59 @@ func (s *Server) ListJobTypes(c *gin.Context) {
 	})
 }
 
-// POST /api/v1/jobs/batch
+// BatchCreateJobs POST /api/v1/jobs/batch
+// 逐条独立处理：某条失败不影响其他条入队，失败原因按原始下标返回。
 func (s *Server) BatchCreateJobs(c *gin.Context) {
 	var reqs []CreateJobRequest
 	if err := c.ShouldBindJSON(&reqs); err != nil {
-		c.JSON(400, ErrorResponse{Code: 400, Message: "invalid batch format"})
+		c.JSON(400, ErrorResponse{
+			Code:    400,
+			Message: "invalid batch format",
+			Details: "expected a JSON array of job definitions: " + err.Error(),
+		})
 		return
 	}
 
-	results := make([]JobResponse, 0, len(reqs))
-	errors := make([]string, 0)
-
-	for _, _ = range reqs {
-		// TODO: 复用单个创建逻辑...
-		// 记录成功和失败
+	if len(reqs) == 0 {
+		c.JSON(400, ErrorResponse{
+			Code:    400,
+			Message: "empty batch",
+			Details: "the request body must contain at least one job",
+		})
+		return
+	}
+	if len(reqs) > maxBatchCreateSize {
+		c.JSON(400, ErrorResponse{
+			Code:    400,
+			Message: "batch too large",
+			Details: fmt.Sprintf("got %d jobs, at most %d per request", len(reqs), maxBatchCreateSize),
+		})
+		return
 	}
 
-	c.JSON(207, gin.H{
-		"succeeded": len(results),
-		"failed":    len(errors),
-		"items":     results,
-		"errors":    errors,
+	items := make([]JobResponse, 0, len(reqs))
+	failures := make([]BatchItemError, 0)
+
+	for index, req := range reqs {
+		job, failure := s.createJobFromRequest(req)
+		if failure != nil {
+			failures = append(failures, BatchItemError{
+				Index:   index,
+				Code:    failure.Code,
+				Message: failure.Message,
+				Details: failure.Details,
+			})
+			continue
+		}
+		items = append(items, s.toJobResponse(job))
+	}
+
+	// 混合结果用 207 表达；即使全部失败也是 207 + errors，调用方看 errors 定位
+	c.JSON(207, BatchCreateJobsResponse{
+		Succeeded: len(items),
+		Failed:    len(failures),
+		Items:     items,
+		Errors:    failures,
 	})
 }
 

@@ -36,6 +36,22 @@ type UpdateJobRequest struct {
 	Timeout string `json:"timeout,omitempty"`
 }
 
+// BatchCreateJobsResponse POST /jobs/batch 的混合结果。
+type BatchCreateJobsResponse struct {
+	Succeeded int              `json:"succeeded" example:"2"`
+	Failed    int              `json:"failed" example:"1"`
+	Items     []JobResponse    `json:"items"`
+	Errors    []BatchItemError `json:"errors"`
+}
+
+// BatchItemError 批量创建里单条失败的原因，Index 指向请求数组的下标。
+type BatchItemError struct {
+	Index   int    `json:"index" example:"1"`
+	Code    int    `json:"code" example:"400"`
+	Message string `json:"message" example:"unknown job type"`
+	Details string `json:"details,omitempty" example:"job type 'nope' not registered"`
+}
+
 // JobResponse 任务响应
 type JobResponse struct {
 	ID        string          `json:"id" example:"0198a2e3-7d4f-7abc-9def-0123456789ab"`
