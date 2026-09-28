@@ -77,13 +77,16 @@ Content-Type: application/json
 | payload      | object | ❌  | 任务数据，JSON 对象，会透传给 Handler                           |
 | is\_repeat   | bool   | ❌  | 是否重复执行（Cron 任务需设为 true）                             |
 | timeout      | string | ❌  | 单次执行超时，如 "30s"；为空不限制。Handler 需检查 ctx 才能被按时中止      |
-| max\_retries | int    | ❌  | 最大重试次数，默认 3                                         |
+| max\_retries | int    | ❌  | 最大重试次数。**省略即 0（不重试）**，想要重试必须显式给值                |
 | retry\_delay | string | ❌  | 基础重试间隔，默认 "1m"                                      |
 
 `timeout` 格式非法会直接返回 400（`invalid timeout format`），不会被静默忽略。
 
+> 与任务文件的差别：文件里的 `max_retries` 是可选整数，**不写取默认 3**、写 `0` 才是 0
+> （见 [示例文档](./example.md) 的字段约定）；HTTP 请求体无法区分"未写"与"写 0"，所以一律按 0 处理。
 
-**响应**：
+
+**响应**（`201 Created`）：
 
 ```json
 {
@@ -91,13 +94,23 @@ Content-Type: application/json
   "name": "payment_check",
   "status": "pending",
   "trigger_at": "2024-01-02T15:30:00+08:00",
+  "payload": {
+    "order_id": "ORD-2024-001",
+    "amount": 199.99,
+    "user_id": "U123456"
+  },
   "next_run_in": "10m0s",
   "retry_count": 0,
   "max_retries": 3,
+  "is_repeat": false,
   "created_at": "2024-01-02T15:20:00+08:00",
   "updated_at": "2024-01-02T15:20:00+08:00"
 }
 ```
+
+`next_run_in` 只对 `pending` 任务计算：距触发时间还有多久，已过期则写作 `imminent`，
+其它状态下该字段省略。`timeout` 只在任务设置了执行超时时出现（与是否真的超时无关），
+`payload` 为空时省略。
 
 ### 2. 创建 Cron 重复任务
 
@@ -182,12 +195,18 @@ GET /jobs?status=pending&name=payment_check&limit=20&offset=0
 
 任务列表来自存储：未完成任务（pending/running）加上按保留策略留痕的终态记录，
 因此 `status=success|failed` 能查到历史（见部署文档的 `store.history_*`）。
-`timeout` 在执行超时时才出现，未设置时字段省略。
+条目字段与单个任务视图一致（含 `updated_at`）。
 
 ### 4. 获取任务详情
 
 ```json
 GET /jobs/:id
+```
+
+返回单个任务视图（字段同上）。ID 不存在时返回 404：
+
+```json
+{ "code": 404, "message": "job not found" }
 ```
 
 ### 5. 更新任务（仅 pending 状态）
@@ -218,6 +237,15 @@ DELETE /jobs/:id
 POST /jobs/:id/cancel
 ```
 
+成功返回 `204 No Content`（无响应体）。任务不在堆里（已弹出执行、已结束或从未存在）返回 404：
+
+```json
+{ "code": 404, "message": "job not found or already executed" }
+```
+
+正在执行的任务会连同其 `context` 一起被取消，Handler 收到 `context.Canceled`，
+这类中断不计入失败与重试。
+
 ### 7. 手动重试失败任务
 
 ```json
@@ -225,8 +253,13 @@ POST /jobs/:id/retry
 ```
 
 在存储中查找该 ID 且状态为 `failed` 的记录，重置 `retry_count` 并在 1 秒后重新入队，
-返回新的任务视图（状态 `pending`）。这条路径依赖终态留痕：若已关闭留痕
-（`store.history_limit: -1`）或该记录已被保留策略淘汰，则返回 404。
+返回新的任务视图（`200`，状态 `pending`）。找不到符合条件的记录返回 404：
+
+```json
+{ "code": 404, "message": "failed job not found" }
+```
+
+这条路径依赖终态留痕：若已关闭留痕（`store.history_limit: -1`）或该记录已被保留策略淘汰，则 404。
 
 ### 8. 批量创建任务
 
@@ -307,10 +340,11 @@ GET /health
 ```json
 {
   "status": "healthy",
-  "time": "2024-01-02T15:25:30+08:00",
-  "version": "v1.0.0"
+  "time": "2024-01-02T15:25:30+08:00"
 }
 ```
+
+只有这两个字段：探针可用 `status` 判活，版本号未对外暴露。
 
 ## 获取支持的 Job 类型
 
@@ -336,7 +370,9 @@ GET /job-types
 连接地址: ws://localhost:8080/ws
 
 启用鉴权后浏览器只能写 `ws://localhost:8080/ws?token=<token>`（握手前由 HTTP 中间件校验，
-凭据不对直接返回 401，不进入升级流程）；`server.cors.allow_origins` 白名单同时约束握手的 `Origin`。
+凭据不对直接返回 401，不进入升级流程）；`server.cors.allow_origins` 白名单同时约束握手的 `Origin`，
+来源不在白名单内返回 `403 Forbidden`（响应体是纯文本 `websocket origin not allowed`）；
+不带 `Origin` 头的客户端（Go/curl）不受白名单限制。
 
 **协议说明**
 
@@ -387,6 +423,20 @@ GET /job-types
 连接空闲 60 秒未收到客户端 pong 即被关闭，服务端每 30 秒发一次 ping。
 
 服务端推送事件
+
+事件里的 `status` 是**整数**（`JobStatus` 未实现自定义 JSON 编码），取值对照：
+
+| 数值 | 状态名 | 含义 |
+| --- | --- | --- |
+| 0 | `pending` | 待执行（重试排队中也是 0） |
+| 1 | `running` | 已进入 Handler 执行 |
+| 2 | `success` | 执行成功 |
+| 3 | `failed` | 执行失败 |
+| 4 | `cancelled` | 已取消 |
+
+注意两套写法不要混用：REST 响应里的 `status` 是状态**名**（`"pending"`），
+WS/SSE 推送事件里的 `status` 是**数字**；而 WS 订阅过滤的 `status` 列表按状态**名**匹配
+（`core/websocket.go` 用 `event.Status.String()` 比较）。
 
 
 ```json

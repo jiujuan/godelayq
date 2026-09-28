@@ -93,7 +93,7 @@ HTTP 访问日志与 panic 恢复由 `api/logging.go` 的中间件产出，替�
 
 已知边界：只有一个静态 token，因此**浏览器页面里的 WS/SSE 必须用 `?token=`**
 （`EventSource`/`WebSocket` 无法自定义请求头），token 会出现在访问日志与浏览器历史里；
-把该服务暴露给不可信网络前，请在反层把 `/ws`、`/sse/events` 的 query 记进日志的行为关掉，
+把该服务暴露给不可信网络前，请在反向代理层关掉 `/ws`、`/sse/events` 的 query 日志，
 或只在内网开放。健康检查 `/api/v1/health` 也在保护范围内，探针需要带 token。
 
 数据目录需提前创建并保证进程可写：
@@ -134,8 +134,13 @@ WantedBy=multi-user.target
 ```
 
 收到 `SIGTERM` 后进程按序关停：停止接受新连接 → 取消所有请求上下文（SSE 长连接随即返回）→
-关闭全部 WebSocket 客户端并等待读写协程退出。整个流程由 `cmd/server` 的 5 秒超时兜底，
-超时后强制关闭残留连接，因此 `TimeoutStopSec` 无需大于该值。
+关闭全部 WebSocket 客户端并等待读写协程退出 → 停调度器（取消在途任务的 `context`，等待 worker 返回）→
+最后一次落盘。
+
+其中**只有 HTTP/长连接这一段受 `scheduler.shutdown_timeout`（默认 5s）约束**：超时后强制关闭残留连接并继续收尾。
+`Scheduler.Stop()` 没有自己的超时——它依赖 Handler 检查传入的 `context`；
+一个无视取消的处理器会把关停无限期挂住，此时由 systemd 的 `TimeoutStopSec` 发 `SIGKILL` 兜底，
+因此 `TimeoutStopSec` 要留得比 `shutdown_timeout` 宽裕，并按最坏的 Handler 收尾时间设定。
 
 启用服务：
 
@@ -155,12 +160,26 @@ upstream godelayq {
 }
 
 server {
-    listen 443 ssl http2;
+    listen 443 ssl;
+    http2 on;                       # nginx 1.25+；旧版仍写 listen 443 ssl http2
     server_name scheduler.example.com;
-    
+
     ssl_certificate /path/to/cert.pem;
     ssl_certificate_key /path/to/key.pem;
-    
+
+    # SSE：必须关掉代理缓冲，否则事件会攒在 nginx 里不往外发
+    location /sse/ {
+        proxy_pass http://godelayq;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+        chunked_transfer_encoding on;
+        read_timeout 0;             # 长连接不主动掐断
+        access_log off;             # 避免 ?token= 进访问日志
+    }
+
     location / {
         proxy_pass http://godelayq;
         proxy_http_version 1.1;
@@ -168,7 +187,13 @@ server {
         proxy_set_header Connection "upgrade";
         proxy_set_header Host $host;
         proxy_set_header X-Real-IP $remote_addr;
-        proxy_read_timeout 86400;  # WebSocket 长连接
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_read_timeout 86400;   # WebSocket 长连接
+        access_log off;             # /ws 同理：握手带 ?token= 时不要落日志
     }
 }
 ```
+
+服务端只看 `Origin` 头做握手来源校验，因此 `allow_origins` 要写**面板自己的 origin**
+（如 `https://scheduler.example.com`），不要写成上游地址。

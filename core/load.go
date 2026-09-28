@@ -33,7 +33,8 @@ type FileJobFormat struct {
 	Timeout string `json:"timeout,omitempty"`
 
 	// 重试配置。MaxRetries 用指针区分"未写"与"写 0"：
-	// 未写取 DefaultLoaderMaxRetries，写 0 表示不重试（与 POST /jobs 口径一致）。
+	// 未写取 DefaultLoaderMaxRetries，写 0 表示不重试。
+	// 注意与 POST /jobs 不同：请求体里的 max_retries 是普通整数，省略即为 0。
 	MaxRetries *int   `json:"max_retries,omitempty"`
 	RetryDelay string `json:"retry_delay"` // 如 "30s", "5m"
 }
