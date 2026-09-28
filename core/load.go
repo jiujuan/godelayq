@@ -73,6 +73,11 @@ type LoaderOptions struct {
 // PostLoadAction 加载后动作
 type PostLoadAction int
 
+// loaderDebounceInterval 是监控模式下同一文件的静默窗口：
+// 写入往往被拆成 Create + 多次 Write，逐次加载会读到半截 JSON，
+// 也会让事件循环串行等待。窗口内的事件合并成一次加载。
+const loaderDebounceInterval = 100 * time.Millisecond
+
 const (
 	// DeleteAfterLoad 加载后删除源文件
 	DeleteAfterLoad PostLoadAction = iota
@@ -92,8 +97,10 @@ type DirectoryLoader struct {
 	mu      sync.RWMutex
 	// 记录已处理的文件（避免重复加载，当使用KeepAfterLoad时）
 	processedFiles map[string]time.Time
-	stopCh         chan struct{}
-	wg             sync.WaitGroup
+	// pendingLoads 按路径合并短时间内的重复写入事件，受 mu 保护
+	pendingLoads map[string]*time.Timer
+	stopCh       chan struct{}
+	wg           sync.WaitGroup
 }
 
 // NewDirectoryLoader 创建加载器
@@ -115,6 +122,7 @@ func NewDirectoryLoader(scheduler *Scheduler, options LoaderOptions) (*Directory
 		options:        options,
 		logger:         resolveLogger(options.Logger),
 		processedFiles: make(map[string]time.Time),
+		pendingLoads:   make(map[string]*time.Timer),
 		stopCh:         make(chan struct{}),
 	}
 
@@ -145,13 +153,53 @@ func (l *DirectoryLoader) Start() error {
 	return nil
 }
 
-// Stop 停止加载器
+// Stop 停止加载器：取消未触发的 debounce 加载，关闭监控与读写协程
 func (l *DirectoryLoader) Stop() {
 	close(l.stopCh)
 	if l.watcher != nil {
 		l.watcher.Close()
 	}
+
+	l.mu.Lock()
+	for path, timer := range l.pendingLoads {
+		timer.Stop()
+		delete(l.pendingLoads, path)
+	}
+	l.mu.Unlock()
+
 	l.wg.Wait()
+}
+
+// scheduleLoad 在静默窗口后加载该文件；窗口内的重复事件只保留一次加载。
+func (l *DirectoryLoader) scheduleLoad(path string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	if timer, ok := l.pendingLoads[path]; ok {
+		timer.Reset(loaderDebounceInterval)
+		return
+	}
+
+	l.pendingLoads[path] = time.AfterFunc(loaderDebounceInterval, func() {
+		l.forgetPending(path)
+
+		select {
+		case <-l.stopCh:
+			return // 已关停，不再起新加载
+		default:
+		}
+
+		if err := l.LoadFile(path); err != nil {
+			l.logger.Error("failed to load new file", "path", path, "error", err)
+		}
+	})
+}
+
+// forgetPending 在定时器触发后摘掉该路径的记录，允许下一轮写入重新排期
+func (l *DirectoryLoader) forgetPending(path string) {
+	l.mu.Lock()
+	delete(l.pendingLoads, path)
+	l.mu.Unlock()
 }
 
 // ScanAndLoad 扫描目录并加载所有匹配的任务文件
@@ -412,11 +460,8 @@ func (l *DirectoryLoader) startWatcher() error {
 					event.Op&fsnotify.Write == fsnotify.Write {
 					// 检查文件匹配
 					if matched, _ := filepath.Match(l.options.Pattern, filepath.Base(event.Name)); matched {
-						// 延迟一点加载，避免文件写入不完整
-						time.Sleep(100 * time.Millisecond)
-						if err := l.LoadFile(event.Name); err != nil {
-							l.logger.Error("failed to load new file", "path", event.Name, "error", err)
-						}
+						// 等静默窗口过去再读，既不阻塞事件循环也避免读到半截文件
+						l.scheduleLoad(event.Name)
 					}
 					// 如果是新目录且递归模式，添加监控
 					if l.options.Recursive {
