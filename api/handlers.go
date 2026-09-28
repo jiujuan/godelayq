@@ -50,8 +50,9 @@ func (s *Server) createJobFromRequest(req CreateJobRequest) (*core.Job, *ErrorRe
 		return nil, &ErrorResponse{Code: 400, Message: "invalid time format", Details: err.Error()}
 	}
 
-	// 检查Handler是否存在（仅用于验证，实际执行时从registry获取）
-	if _, ok := s.registry.Get(req.Name); !ok {
+	// 检查Handler是否存在（注册表在调度器，执行时按同一键回查）
+	handler, ok := s.scheduler.LookupHandler(req.Name)
+	if !ok {
 		return nil, &ErrorResponse{
 			Code:    400,
 			Message: "unknown job type",
@@ -92,10 +93,8 @@ func (s *Server) createJobFromRequest(req CreateJobRequest) (*core.Job, *ErrorRe
 		UpdatedAt:  time.Now(),
 	}
 
-	// 绑定Handler（从registry获取）
-	if h, ok := s.registry.Get(req.Name); ok {
-		job.Handler = h
-	}
+	// 绑定Handler（与执行侧回查用的是同一份注册表）
+	job.Handler = handler
 
 	// 添加到调度器
 	if err := s.scheduler.Schedule(job); err != nil {
@@ -359,7 +358,7 @@ func (s *Server) RetryJob(c *gin.Context) {
 	job.TriggerAt = time.Now().Add(1 * time.Second) // 1秒后执行
 	job.UpdatedAt = time.Now()
 
-	if h, ok := s.registry.Get(job.Name); ok {
+	if h, ok := s.scheduler.LookupHandler(job.HandlerKey()); ok {
 		job.Handler = h
 	}
 
@@ -409,10 +408,10 @@ func (s *Server) HealthCheck(c *gin.Context) {
 	})
 }
 
-// ListJobTypes 获取支持的Job类型
+// ListJobTypes 获取支持的Job类型（来自调度器注册表，按字典序）
 func (s *Server) ListJobTypes(c *gin.Context) {
 	c.JSON(200, gin.H{
-		"types": s.registry.List(),
+		"types": s.scheduler.HandlerNames(),
 	})
 }
 

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -116,6 +117,25 @@ func (s *Scheduler) RegisterHandler(jobType string, handler Handler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.handlers[jobType] = handler
+}
+
+// LookupHandler 按 Handler 键（Type 优先，回退 Name）查找已注册的处理函数。
+// 注册表只有调度器这一份，HTTP 层校验与执行侧绑定共用它。
+func (s *Scheduler) LookupHandler(key string) (Handler, bool) {
+	return s.lookupHandler(key)
+}
+
+// HandlerNames 返回全部已注册的 Handler 键，按字典序排列，供接口稳定输出。
+func (s *Scheduler) HandlerNames() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	names := make([]string, 0, len(s.handlers))
+	for name := range s.handlers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 // lookupHandler 按任务键查找已注册的Handler

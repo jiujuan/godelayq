@@ -513,3 +513,25 @@ func TestAPISuite(t *testing.T) {
 func ptrTime(value time.Time) *time.Time {
 	return &value
 }
+
+// TestJobTypesFromSchedulerRegistry 注册表只有一份：API 注册直接落到调度器，
+// /api/v1/job-types 列出的就是执行侧真正能查到的键，且顺序稳定。
+func (s *APITestSuite) TestJobTypesFromSchedulerRegistry() {
+	noop := func(ctx context.Context, job *core.Job) error { return nil }
+	s.server.RegisterJobHandler("report_generate", noop)
+	s.server.RegisterJobHandler("payment_check", noop)
+
+	h, ok := s.scheduler.LookupHandler("payment_check")
+	require.True(s.T(), ok)
+	require.NotNil(s.T(), h)
+
+	recorder := httptest.NewRecorder()
+	s.router.ServeHTTP(recorder, httptest.NewRequest("GET", "/api/v1/job-types", nil))
+	require.Equal(s.T(), 200, recorder.Code)
+
+	var body struct {
+		Types []string `json:"types"`
+	}
+	require.NoError(s.T(), json.Unmarshal(recorder.Body.Bytes(), &body))
+	assert.Equal(s.T(), []string{"payment_check", "report_generate"}, body.Types)
+}

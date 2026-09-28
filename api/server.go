@@ -18,7 +18,6 @@ import (
 type Server struct {
 	scheduler *core.Scheduler
 	store     core.Store
-	registry  *JobRegistry
 	engine    *gin.Engine
 	wsServer  *core.WSServer
 	httpSrv   *http.Server
@@ -36,41 +35,6 @@ type Server struct {
 	shutdown   bool
 }
 
-// JobRegistry 任务处理器注册表（用于API创建的任务自动绑定Handler）
-type JobRegistry struct {
-	handlers map[string]core.Handler
-	mu       sync.RWMutex
-}
-
-func NewJobRegistry() *JobRegistry {
-	return &JobRegistry{
-		handlers: make(map[string]core.Handler),
-	}
-}
-
-func (r *JobRegistry) Register(name string, handler core.Handler) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.handlers[name] = handler
-}
-
-func (r *JobRegistry) Get(name string) (core.Handler, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	h, ok := r.handlers[name]
-	return h, ok
-}
-
-func (r *JobRegistry) List() []string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	names := make([]string, 0, len(r.handlers))
-	for name := range r.handlers {
-		names = append(names, name)
-	}
-	return names
-}
-
 // NewServer 创建API服务器。sec 为零值时不鉴权、接受任意跨域来源；
 // logger 为 nil 时使用 slog.Default()。
 func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Security, logger *slog.Logger) *Server {
@@ -86,7 +50,6 @@ func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Sec
 	s := &Server{
 		scheduler: scheduler,
 		store:     store,
-		registry:  NewJobRegistry(),
 		engine:    gin.New(),
 		wsServer: core.NewWSServer(scheduler.GetEventBus(), newWSUpgrader(),
 			core.WithAllowedOrigins(sec.AllowOrigins...),
@@ -115,10 +78,9 @@ func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Sec
 	return s
 }
 
-// RegisterJobHandler 注册任务处理器（需要在Start前调用）
+// RegisterJobHandler 注册任务处理器（需要在Start前调用）。
+// 注册表只在调度器那一份，HTTP 层只是转发入口。
 func (s *Server) RegisterJobHandler(name string, handler core.Handler) {
-	s.registry.Register(name, handler)
-	// 同时注册到scheduler（用于从持久化恢复）
 	s.scheduler.RegisterHandler(name, handler)
 }
 
