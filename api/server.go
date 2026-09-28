@@ -38,6 +38,13 @@ type Server struct {
 	// 但 NewServer 的签名不带 error（调用方遍布测试），因此在监听前统一抛出。
 	authErr error
 
+	// groups 是分组注册表；nil 表示这次部署没装配分组存储，
+	// /api/v1/groups 各端点据此返回 503（任务的 group 标签不受影响，
+	// 它本来就存在任务快照里）。
+	groups core.GroupStore
+	// history 是事件总线的内存订阅者，为详情页时间线与 Dashboard 提供最近事件
+	history *EventHistory
+
 	// baseCtx 传给每个请求；Stop 取消它即可让 SSE 等长连接立即收尾
 	baseCtx    context.Context
 	baseCancel context.CancelFunc
@@ -46,9 +53,19 @@ type Server struct {
 	shutdown   bool
 }
 
+// Option 是 NewServer 的可选依赖，形态与 core.NewScheduler 的 opts 一致：
+// 每加一个依赖就改一次位置参数列表，会连带惊动十几处测试调用。
+type Option func(*Server)
+
+// WithGroupStore 注入分组注册表。未注入时分组端点返回 503，
+// 但任务上的 group 标签照常读写——两者是两份数据，不要混用。
+func WithGroupStore(store core.GroupStore) Option {
+	return func(s *Server) { s.groups = store }
+}
+
 // NewServer 创建API服务器。sec 为零值时不鉴权、接受任意跨域来源；
 // logger 为 nil 时使用 slog.Default()。
-func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Security, logger *slog.Logger) *Server {
+func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Security, logger *slog.Logger, opts ...Option) *Server {
 	if port == "" {
 		port = "8080"
 	}
@@ -86,6 +103,13 @@ func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Sec
 	if auth != nil {
 		logger.Info("console accounts loaded", "count", len(auth.accountNames()))
 	}
+
+	for _, opt := range opts {
+		opt(s)
+	}
+	// 事件历史跟着服务器起：订阅在构造时建立，服务器活着期间的第一个事件就不会漏。
+	// 上限是常量（api/history.go），运维要看的只是"缓冲占用多少"，不配 knob。
+	s.history = NewEventHistory(scheduler.GetEventBus())
 
 	// 持有唯一的 http.Server 实例，Stop 才能真正关闭监听
 	s.httpSrv = &http.Server{
@@ -237,6 +261,8 @@ func (s *Server) Stop(ctx context.Context) error {
 
 	err := s.httpSrv.Shutdown(ctx)
 	s.wsServer.Stop()
+	// 撤掉事件订阅：drain 协程随之退出，测试里服务器停掉后不会再碰内存缓冲
+	s.history.Stop()
 
 	if err != nil {
 		// 超时后强制关闭残留连接

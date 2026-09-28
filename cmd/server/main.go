@@ -66,7 +66,14 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				AllowOrigins:     cfg.Server.CORS.AllowOrigins,
 				AllowCredentials: cfg.Server.CORS.AllowCredentials,
 			}
-			return api.NewServer(coreScheduler, store, port, security, logger), nil
+			// 分组注册表读不出来就别起服务：与其让 /groups 每个请求都 500，
+			// 不如在启动日志里就把文件权限/格式问题摆到眼前。
+			groups, err := core.NewJSONFileGroupStore(cfg.Store.GroupsPath)
+			if err != nil {
+				return nil, err
+			}
+			return api.NewServer(coreScheduler, store, port, security, logger,
+				api.WithGroupStore(groups)), nil
 		},
 		notifySignals: signal.Notify,
 		timeout:       cfg.Scheduler.ShutdownTimeout,

@@ -19,7 +19,7 @@ import (
 const testToken = "s3cret-token"
 
 // newSecurityServer 构造只用于 ServeHTTP 的服务器，不监听端口
-func newSecurityServer(t *testing.T, sec Security) *Server {
+func newSecurityServer(t *testing.T, sec Security, opts ...Option) *Server {
 	t.Helper()
 
 	gin.SetMode(gin.TestMode)
@@ -30,7 +30,7 @@ func newSecurityServer(t *testing.T, sec Security) *Server {
 	// 否则协程会往已被删除的目录写临时文件并刷出 flush failed。
 	t.Cleanup(func() { _ = store.Close() })
 
-	return NewServer(core.NewScheduler(store, nil, nil), store, "0", sec, newTestLogger())
+	return NewServer(core.NewScheduler(store, nil, nil), store, "0", sec, newTestLogger(), opts...)
 }
 
 func doGet(t *testing.T, srv *Server, target string, header http.Header) *httptest.ResponseRecorder {
