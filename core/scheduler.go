@@ -212,6 +212,77 @@ func (s *Scheduler) Cancel(jobID string) error {
 	return nil
 }
 
+// ErrJobNotPending 表示任务已不在待执行队列中（已被弹出执行、已结束或不存在），
+// 因此无法原地更新。
+var ErrJobNotPending = errors.New("job is not pending")
+
+// UpdatePending 原地修改一个待执行任务：apply 在任务的副本上生效，
+// 只有堆内条目被成功替换后才落盘，避免"取消成功但重排失败"丢任务。
+// apply 返回错误则不做任何改动；任务在检查后被调度弹出时返回 ErrJobNotPending。
+func (s *Scheduler) UpdatePending(jobID string, apply func(*Job) error) (*Job, error) {
+	item := s.heap.Get(jobID)
+	if item == nil {
+		// 堆里没有不等于任务不存在：正在执行或已结束的条目会返回 409 而非 404
+		if s.hasStoredJob(jobID) {
+			return nil, ErrJobNotPending
+		}
+		return nil, ErrJobNotFound
+	}
+	current := item.(*Job)
+
+	// 复制后修改：失败或竞态时堆里的原条目不受影响
+	updated := *current
+	if current.Payload != nil {
+		updated.Payload = append([]byte(nil), current.Payload...)
+	}
+
+	if apply != nil {
+		if err := apply(&updated); err != nil {
+			return nil, err
+		}
+	}
+	updated.Status = StatusPending
+	updated.UpdatedAt = time.Now()
+
+	if !s.heap.Update(&updated) {
+		// 取到条目之后被调度循环弹出了，交给执行侧而不是原地更新
+		return nil, ErrJobNotPending
+	}
+
+	if s.store != nil {
+		if err := s.store.Update(updated.ToSnapshot()); err != nil {
+			log.Printf("Failed to persist updated job %s: %v", updated.ID, err)
+		}
+	}
+
+	// 触发时间可能提前，唤醒调度循环重算等待时长
+	select {
+	case s.newJobCh <- struct{}{}:
+	default:
+	}
+
+	return &updated, nil
+}
+
+// hasStoredJob 判断存储中是否仍有该任务的记录，用于区分"从未存在"与"已不可修改"。
+func (s *Scheduler) hasStoredJob(jobID string) bool {
+	if s.store == nil {
+		return false
+	}
+
+	snapshots, err := s.store.LoadAll()
+	if err != nil {
+		log.Printf("Failed to load jobs while checking %s: %v", jobID, err)
+		return false
+	}
+	for _, snap := range snapshots {
+		if snap.ID == jobID {
+			return true
+		}
+	}
+	return false
+}
+
 // Restore 从持久化存储重建调度队列（崩溃/重启恢复）。
 // 快照中仅 Pending/Running 状态的任务会被重新入队，状态重置为 Pending；
 // Handler 在执行前按 HandlerKey 从注册表绑定。

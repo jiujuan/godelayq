@@ -124,6 +124,54 @@ func (s *APITestSuite) TestGetStatsReportsHeapSize() {
 	assert.Equal(s.T(), 3, stats.Pending)
 }
 
+// TestUpdateJobEditsPendingJobInPlace 覆盖 #15：更新不再走 Cancel→Schedule，
+// 任务 ID 与堆内条目保持不变。
+func (s *APITestSuite) TestUpdateJobEditsPendingJobInPlace() {
+	s.server.RegisterJobHandler("payment_check", func(ctx context.Context, job *core.Job) error {
+		return nil
+	})
+
+	created := httptest.NewRecorder()
+	body, _ := json.Marshal(CreateJobRequest{
+		Name:    "payment_check",
+		Delay:   "2h",
+		Payload: json.RawMessage(`{"order":"old"}`),
+	})
+	req, _ := http.NewRequest("POST", "/api/v1/jobs", bytes.NewBuffer(body))
+	req.Header.Set("Content-Type", "application/json")
+	s.router.ServeHTTP(created, req)
+	require.Equal(s.T(), 201, created.Code)
+
+	var createdJob JobResponse
+	require.NoError(s.T(), json.Unmarshal(created.Body.Bytes(), &createdJob))
+
+	newTrigger := time.Now().UTC().Add(6 * time.Hour).Truncate(time.Second)
+	updateBody, _ := json.Marshal(UpdateJobRequest{
+		TriggerAt: &newTrigger,
+		Payload:   json.RawMessage(`{"order":"new"}`),
+	})
+	updated := httptest.NewRecorder()
+	req, _ = http.NewRequest("PUT", "/api/v1/jobs/"+createdJob.ID, bytes.NewBuffer(updateBody))
+	req.Header.Set("Content-Type", "application/json")
+	s.router.ServeHTTP(updated, req)
+
+	require.Equal(s.T(), 200, updated.Code)
+	var updatedJob JobResponse
+	require.NoError(s.T(), json.Unmarshal(updated.Body.Bytes(), &updatedJob))
+	assert.Equal(s.T(), createdJob.ID, updatedJob.ID, "an in-place update must keep the job id")
+	assert.Equal(s.T(), `{"order":"new"}`, string(updatedJob.Payload))
+	assert.True(s.T(), updatedJob.TriggerAt.Equal(newTrigger), "got %v", updatedJob.TriggerAt)
+
+	// 没有"取消后重排"的空窗：堆里始终只有这一条
+	assert.Equal(s.T(), 1, s.scheduler.HeapLen())
+
+	missing := httptest.NewRecorder()
+	req, _ = http.NewRequest("PUT", "/api/v1/jobs/nope", bytes.NewBuffer(updateBody))
+	req.Header.Set("Content-Type", "application/json")
+	s.router.ServeHTTP(missing, req)
+	assert.Equal(s.T(), 404, missing.Code)
+}
+
 func (s *APITestSuite) TestCalculateTriggerTime() {
 	now := time.Now()
 

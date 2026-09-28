@@ -114,13 +114,18 @@ func (h *QuaternaryHeap) Remove(id string) Item {
 }
 
 // Update 用新元素替换同ID元素并重新堆化
-func (h *QuaternaryHeap) Update(item Item) {
+// Update 用 item 替换同 ID 的条目并重新定位。
+// 返回 false 表示该 ID 已不在堆中（例如已被弹出执行），调用方据此判断是否成功。
+func (h *QuaternaryHeap) Update(item Item) bool {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if idx, ok := h.indexMap[item.GetID()]; ok {
-		h.items[idx] = item
-		h.siftRange(idx)
+	idx, ok := h.indexMap[item.GetID()]
+	if !ok {
+		return false
 	}
+	h.items[idx] = item
+	h.siftRange(idx)
+	return true
 }
 
 // popRoot 弹出堆顶，调用方须持有写锁

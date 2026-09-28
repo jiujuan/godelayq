@@ -179,7 +179,9 @@ func TestQuaternaryHeap_Update(t *testing.T) {
 	
 	// Update item2 to have earliest time
 	updatedItem := &mockItem{id: "item2", triggerAt: now.Add(1 * time.Minute)}
-	h.Update(updatedItem)
+	if !h.Update(updatedItem) {
+		t.Error("Expected Update of a present item to report success")
+	}
 	
 	// item2 should now be at top
 	top := h.Peek()
@@ -187,8 +189,10 @@ func TestQuaternaryHeap_Update(t *testing.T) {
 		t.Errorf("Expected item2 at top after update, got %s", top.GetID())
 	}
 	
-	// Update non-existent item (should not panic)
-	h.Update(&mockItem{id: "nonexistent", triggerAt: now})
+	// Update non-existent item: reports failure and leaves the heap untouched
+	if h.Update(&mockItem{id: "nonexistent", triggerAt: now}) {
+		t.Error("Expected Update of a missing item to report failure")
+	}
 	
 	// Verify heap still works
 	if h.Len() != 3 {

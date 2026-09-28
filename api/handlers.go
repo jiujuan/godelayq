@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"fmt"
 	"time"
 
@@ -180,66 +181,44 @@ func (s *Server) UpdateJob(c *gin.Context) {
 		return
 	}
 
-	// 获取现有任务
-	snapshots, _ := s.store.LoadAll()
-	var targetSnap core.JobSnapshot
-	found := false
-
-	for _, snap := range snapshots {
-		if snap.ID == id {
-			targetSnap = snap
-			found = true
-			break
-		}
+	var payload []byte
+	if len(req.Payload) > 0 {
+		payload = req.Payload
 	}
 
-	if !found {
+	// 原地更新：不再走 Cancel→Schedule，避免两步之间失败导致任务丢失
+	job, err := s.scheduler.UpdatePending(id, func(j *core.Job) error {
+		if req.TriggerAt != nil {
+			j.TriggerAt = *req.TriggerAt
+		}
+		if payload != nil {
+			j.Payload = payload
+		}
+		if req.MaxRetries != nil {
+			j.MaxRetries = *req.MaxRetries
+		}
+		return nil
+	})
+
+	switch {
+	case errors.Is(err, core.ErrJobNotFound):
 		c.JSON(404, ErrorResponse{
 			Code:    404,
 			Message: "job not found",
 		})
 		return
-	}
-
-	// 检查状态
-	if core.JobStatus(targetSnap.Status) != core.StatusPending {
+	case errors.Is(err, core.ErrJobNotPending):
 		c.JSON(409, ErrorResponse{
 			Code:    409,
 			Message: "job cannot be modified",
 			Details: "only pending jobs can be updated",
 		})
 		return
-	}
-
-	// 更新字段
-	if req.TriggerAt != nil {
-		targetSnap.TriggerAt = *req.TriggerAt
-	}
-	if req.Payload != nil {
-		targetSnap.Payload = req.Payload
-	}
-	if req.MaxRetries != nil {
-		targetSnap.MaxRetries = *req.MaxRetries
-	}
-	targetSnap.UpdatedAt = time.Now()
-
-	// 删除旧任务并重新调度（因为堆需要重新排序）
-	// 这里假设scheduler有Update方法，或者先Cancel再Schedule
-	if err := s.scheduler.Cancel(id); err != nil {
-		// 可能已经在执行，忽略错误
-	}
-
-	// 转换为Job并重新调度
-	job := &core.Job{}
-	job.FromSnapshot(targetSnap)
-	if h, ok := s.registry.Get(job.Name); ok {
-		job.Handler = h
-	}
-
-	if err := s.scheduler.Schedule(job); err != nil {
+	case err != nil:
 		c.JSON(500, ErrorResponse{
 			Code:    500,
-			Message: "failed to reschedule job",
+			Message: "failed to update job",
+			Details: err.Error(),
 		})
 		return
 	}
