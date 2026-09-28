@@ -30,6 +30,10 @@ store:
   flush_interval: 200ms       # 合并落盘周期；崩溃时最多丢失一个周期的状态
   history_limit: 1000         # 终态快照留痕条数；0 用默认值，-1 不留痕
   history_ttl: 0s             # 终态快照保留时长，如 24h；0 不按时间淘汰
+
+logging:
+  level: info                 # debug|info|warn|error
+  format: text                # text|json
 ```
 
 两点设计取舍，配置校验会直接拒绝未知键，因此不要照抄旧文档里的其它字段：
@@ -37,9 +41,26 @@ store:
 - **没有 `read_timeout` / `write_timeout`**：`http.Server` 的这两个超时是按连接生效的，
   而 `/ws`（hijack 后长连接）与 `/sse/events`（持续写）会被它们掐断。
   服务器只固定设置 `ReadHeaderTimeout: 10s`。
-- **`loader` / `websocket.max_connections` / `logging` 尚未实现为配置项**：
-  目录加载器需在代码中显式创建（见 `core/load.go`），WebSocket 缓冲区固定 256 条，
-  日志仍是标准库 `log` 输出到 stderr。
+- **`loader` / `websocket.max_connections` 尚未实现为配置项**：
+  目录加载器需在代码中显式创建（见 `core/load.go`），WebSocket 发送缓冲固定 256 条。
+
+### 日志
+
+全进程统一使用标准库 `log/slog`，输出到**标准输出**（systemd/docker 可直接采集），
+由 `logging.level` 与 `logging.format` 控制：
+
+- `level`：低于该级别的记录不写出。排障时临时设 `debug` 可见目录加载器等细粒度日志。
+- `format`：`text` 适合人读；`json` 适合日志采集端建索引（每行一个 JSON 对象）。
+- 非法取值在启动时就报错，不会静默退回默认。
+
+级别约定：任务生命周期与访问请求为 `info`，4xx 请求、重试排队、发送缓冲丢弃等
+可恢复异常为 `warn`，落盘失败、执行失败、panic 为 `error`。
+HTTP 访问日志与 panic 恢复由 `api/logging.go` 的中间件产出，替代了 gin 自带日志，
+因此 `GIN_MODE` 的 debug 启动横幅仍会打印，但每条请求只走 slog 一份。
+
+各组件（调度器、存储、加载器、WebSocket、API）都可接收注入的 `*slog.Logger`，
+未注入时回退到 `slog.Default()`；`cmd/server` 启动时会把按配置构建的日志器设为进程默认，
+因此自定义 Handler 里直接用 `slog.Info(...)` 即可与主日志同格式。
 
 ### 终态留痕与容量
 

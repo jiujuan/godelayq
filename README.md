@@ -134,6 +134,7 @@ godelayq/
 │   ├── cron_test.go          # Cron测试
 │   ├── event.go              # 事件总线
 │   ├── event_test.go         # 事件总线测试
+│   ├── logging.go            # slog 日志器构造与组件可选项
 │   ├── load.go             # 目录任务加载器
 │   ├── load_test.go        # 加载器测试
 │   └── websocket.go          # WebSocket服务器（只依赖连接/升级接口，不绑定具体协议库）
@@ -142,7 +143,7 @@ godelayq/
 │   ├── server.go             # Gin服务器与路由
 │   ├── handlers.go           # HTTP处理器实现
 │   ├── dto.go                # 请求/响应数据结构
-│   ├── middleware.go         # 中间件（日志、恢复、CORS）
+│   ├── logging.go          # 访问日志与 panic 恢复中间件（slog）
 │   ├── security.go           # Token 鉴权与跨域来源策略
 │   ├── websocket.go          # WebSocket升级处理（gorilla 适配器）
 │   ├── sse.go                # Server-Sent Events
@@ -262,12 +263,18 @@ store:
   flush_interval: 200ms       # 合并落盘周期
   history_limit: 1000         # 终态快照留痕条数；-1 表示不留痕
   history_ttl: 0s             # 终态快照保留时长，如 24h；0 不按时间淘汰
+logging:
+  level: info                 # debug|info|warn|error
+  format: text                # text|json（输出固定为标准输出）
 ```
 
 设置 `server.auth.token` 后，全部端点（含 `/ws`、`/sse/events`、`/api/v1/health`）都要凭据，
 支持 `Authorization: Bearer <token>`、`X-Auth-Token` 与浏览器专用的 `?token=`；
 `server.cors.allow_origins` 控制跨域来源，同时约束 WebSocket 握手 `Origin`。
 默认不启用鉴权，公网或多团队环境必须显式配置，详见 [部署文档](./docs/deployment.md)。
+
+日志统一走标准库 `log/slog`：调度器、存储、加载器、WebSocket 与 HTTP 访问日志
+共享同一级别与格式，可按 `logging.*` 配置或注入自定义 `*slog.Logger`。
 
 完整说明与取舍见 [部署文档](./docs/deployment.md)。
 

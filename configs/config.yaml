@@ -35,3 +35,7 @@ store:
   # /api/v1/stats 的 completed/failed 计数都来自这份留痕。待执行任务不受影响。
   history_limit: 1000   # 保留条数；0=用默认值，-1=不留痕（写入即删除，文件最小）
   history_ttl: 0s       # 保留时长，如 24h；0 表示不按时间淘汰
+
+logging:
+  level: info           # debug|info|warn|error；排障时可临时改 debug
+  format: text          # text=人读友好，json=便于日志采集端索引
