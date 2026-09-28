@@ -63,6 +63,14 @@ func (m *mockStore) LoadAll() ([]JobSnapshot, error) {
 	return result, nil
 }
 
+func (m *mockStore) Flush() error {
+	return nil
+}
+
+func (m *mockStore) Close() error {
+	return nil
+}
+
 func (m *mockStore) GetSaveCalls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -311,9 +319,9 @@ func TestScheduler_ExecuteJob_Success(t *testing.T) {
 	eventBus := NewEventBus(10)
 	scheduler := NewScheduler(store, nil, eventBus)
 	
-	executed := false
+	executed := make(chan struct{})
 	handler := func(ctx context.Context, job *Job) error {
-		executed = true
+		close(executed)
 		return nil
 	}
 	
@@ -330,9 +338,9 @@ func TestScheduler_ExecuteJob_Success(t *testing.T) {
 	scheduler.executeJob(job)
 	
 	// Wait for execution
-	time.Sleep(50 * time.Millisecond)
-	
-	if !executed {
+	select {
+	case <-executed:
+	case <-time.After(2 * time.Second):
 		t.Error("Expected handler to be executed")
 	}
 	
@@ -540,9 +548,9 @@ func TestScheduler_Integration_ExecuteAtTime(t *testing.T) {
 	eventBus := NewEventBus(10)
 	scheduler := NewScheduler(store, nil, eventBus)
 	
-	executed := false
+	executed := make(chan struct{})
 	handler := func(ctx context.Context, job *Job) error {
-		executed = true
+		close(executed)
 		return nil
 	}
 	
@@ -559,13 +567,12 @@ func TestScheduler_Integration_ExecuteAtTime(t *testing.T) {
 	defer scheduler.Stop()
 	
 	// Wait for execution
-	time.Sleep(200 * time.Millisecond)
-	
-	if !executed {
+	select {
+	case <-executed:
+	case <-time.After(2 * time.Second):
 		t.Error("Expected job to be executed")
 	}
 	
-	// Verify heap is empty after execution
 	if scheduler.HeapLen() != 0 {
 		t.Errorf("Expected heap to be empty, got length %d", scheduler.HeapLen())
 	}
@@ -620,41 +627,48 @@ func TestScheduler_Integration_MultipleJobs(t *testing.T) {
 }
 
 func TestScheduler_CancelRunningJob(t *testing.T) {
-	t.Skip("Skipping flaky test - requires proper context cancellation handling")
-	
 	scheduler := NewScheduler(nil, nil, nil)
-	
+	scheduler.RegisterHandler("long-job", func(ctx context.Context, job *Job) error { return nil })
+
 	jobStarted := make(chan struct{})
-	jobCancelled := false
-	
+	cancelObserved := make(chan error, 1)
+
 	handler := func(ctx context.Context, job *Job) error {
 		close(jobStarted)
 		<-ctx.Done()
-		jobCancelled = true
+		cancelObserved <- ctx.Err()
 		return ctx.Err()
 	}
-	
+
 	job := &Job{
 		ID:        "cancel-running",
 		Name:      "long-job",
 		Handler:   handler,
 		TriggerAt: time.Now(),
 	}
-	
+
 	scheduler.Schedule(job)
 	scheduler.Start()
 	defer scheduler.Stop()
-	
+
 	// Wait for job to start
-	<-jobStarted
-	
+	select {
+	case <-jobStarted:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Expected job to start")
+	}
+
 	// Cancel the job
-	scheduler.Cancel("cancel-running")
-	
-	// Wait a bit for cancellation to propagate
-	time.Sleep(50 * time.Millisecond)
-	
-	if !jobCancelled {
+	if err := scheduler.Cancel("cancel-running"); err != nil {
+		t.Fatalf("Cancel failed: %v", err)
+	}
+
+	select {
+	case err := <-cancelObserved:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("Expected context.Canceled, got %v", err)
+		}
+	case <-time.After(2 * time.Second):
 		t.Error("Expected job to be cancelled")
 	}
 }
@@ -667,9 +681,8 @@ func TestGenerateID(t *testing.T) {
 	if id1 == "" {
 		t.Error("Expected non-empty ID")
 	}
-	
-	// IDs may be same due to time-based generation, just verify format
-	// Verify format (should contain timestamp and random string)
+
+	// Verify format (timestamp + random suffix)
 	if len(id1) < 15 {
 		t.Errorf("Expected ID length >= 15, got %d", len(id1))
 	}
@@ -682,15 +695,49 @@ func TestGenerateID(t *testing.T) {
 func TestRandomString(t *testing.T) {
 	str1 := randomString(8)
 	str2 := randomString(8)
-	
+
 	if len(str1) != 8 {
 		t.Errorf("Expected length 8, got %d", len(str1))
 	}
-	
+
 	if len(str2) != 8 {
 		t.Errorf("Expected length 8, got %d", len(str2))
 	}
-	
-	// Note: randomString may produce same result due to time-based seed
-	// This is a known limitation in the implementation
+
+	// 后缀必须真正随机：早期实现同一次调用内 8 个字符完全相同，
+	// 导致同秒创建的任务 ID 碰撞并互相覆盖。
+	seen := make(map[string]bool, 1000)
+	for i := 0; i < 1000; i++ {
+		s := randomString(8)
+		if len(s) != 8 {
+			t.Fatalf("Expected length 8, got %d", len(s))
+		}
+		if !allDistinctRunes(s) {
+			t.Fatalf("Expected varied characters in suffix, got %q", s)
+		}
+		seen[s] = true
+	}
+	if len(seen) < 990 {
+		t.Errorf("Suffix entropy too low: %d unique out of 1000", len(seen))
+	}
+}
+
+func allDistinctRunes(s string) bool {
+	counts := make(map[rune]int)
+	for _, r := range s {
+		counts[r]++
+	}
+	return len(counts) > 1
+}
+
+func TestGenerateID_UniqueWithinSecond(t *testing.T) {
+	const n = 2000
+	seen := make(map[string]struct{}, n)
+	for i := 0; i < n; i++ {
+		id := generateID()
+		if _, dup := seen[id]; dup {
+			t.Fatalf("Duplicate job ID generated: %s", id)
+		}
+		seen[id] = struct{}{}
+	}
 }

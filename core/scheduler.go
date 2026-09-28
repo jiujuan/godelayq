@@ -3,10 +3,16 @@ package core
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log"
+	rand "math/rand/v2"
 	"sync"
 	"time"
 )
+
+// DefaultConcurrency 默认的并发执行 worker 数量，与 docs/deployment.md 中的
+// workers 配置口径一致。
+const DefaultConcurrency = 100
 
 // Scheduler 任务调度器
 type Scheduler struct {
@@ -24,10 +30,15 @@ type Scheduler struct {
 	// 信号通知有新任务加入（用于提前唤醒定时器）
 	newJobCh chan struct{}
 
-	// 任务注册表（用于从持久化恢复时绑定Handler）
+	// 执行侧：有界队列 + 固定 worker 池，避免到期风暴时无限起协程
+	concurrency   int
+	queueCapacity int // 0 表示与 concurrency 相等
+	workCh        chan *Job
+
+	// 任务注册表，按 HandlerKey（Type，回退 Name）绑定Handler（用于从持久化恢复）
 	handlers map[string]Handler
 
-	// 取消控制
+	// 取消控制（与 handlers 一样受 s.mu 保护）
 	cancelMap map[string]context.CancelFunc
 
 	eventBus *EventBus // 新增
@@ -50,10 +61,43 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus) *Sch
 		cronParser:  NewCronParser(),
 		stopCh:      make(chan struct{}),
 		newJobCh:    make(chan struct{}, 1),
+		concurrency: DefaultConcurrency,
 		handlers:    make(map[string]Handler),
 		cancelMap:   make(map[string]context.CancelFunc),
 		eventBus:    eventBus,
 	}
+}
+
+// SetConcurrency 设置执行 worker 数量，需在 Start 之前调用。
+// 传入非正数时回退到 DefaultConcurrency；Start 之后调用不生效并记录日志。
+func (s *Scheduler) SetConcurrency(n int) {
+	if n <= 0 {
+		n = DefaultConcurrency
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		log.Printf("SetConcurrency(%d) ignored: scheduler already running", n)
+		return
+	}
+	s.concurrency = n
+}
+
+// SetQueueCapacity 设置执行队列容量，需在 Start 之前调用。
+// 0 或负数表示与 worker 数相等；队列满时调度循环阻塞入队（背压）。
+func (s *Scheduler) SetQueueCapacity(n int) {
+	if n < 0 {
+		n = 0
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		log.Printf("SetQueueCapacity(%d) ignored: scheduler already running", n)
+		return
+	}
+	s.queueCapacity = n
 }
 
 // RegisterHandler 注册任务类型对应的处理函数
@@ -61,6 +105,14 @@ func (s *Scheduler) RegisterHandler(jobType string, handler Handler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.handlers[jobType] = handler
+}
+
+// lookupHandler 按任务键查找已注册的Handler
+func (s *Scheduler) lookupHandler(key string) (Handler, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	h, ok := s.handlers[key]
+	return h, ok
 }
 
 // Schedule 添加延迟任务
@@ -115,34 +167,78 @@ func (s *Scheduler) Schedule(job *Job) error {
 	return nil
 }
 
-// Cancel 取消任务
-func (s *Scheduler) Cancel(jobID string) error {
-	job := s.heap.Remove(jobID)
-	if job != nil {
-		j := job.(*Job)
-		j.Status = StatusCancelled
-		if s.store != nil {
-			s.store.Delete(j.ID)
-		}
-		// 取消正在执行的上下文
-		if cancel, ok := s.cancelMap[jobID]; ok {
-			cancel()
-		}
-
-		// Cancel 中发布取消事件
-		s.eventBus.Publish(Event{
-			Type:      EventJobCancelled,
-			JobID:     jobID,
-			Status:    StatusCancelled,
-			Timestamp: time.Now(),
-		})
-
-		return nil
+// CancelRunning 取消正在执行的任务上下文。
+// 返回 true 表示找到并取消了执行中的任务。
+func (s *Scheduler) CancelRunning(jobID string) bool {
+	s.mu.Lock()
+	cancel, ok := s.cancelMap[jobID]
+	s.mu.Unlock()
+	if !ok {
+		return false
 	}
-	return ErrJobNotFound
+	cancel()
+	return true
 }
 
-// Start 启动调度器
+// Cancel 取消任务：待执行任务从堆中移除，已出堆正在执行的任务取消其执行上下文。
+// 两种情况都会清理存储，避免下次启动时被 Restore 重新入队。
+func (s *Scheduler) Cancel(jobID string) error {
+	cancelled := false
+
+	if job := s.heap.Remove(jobID); job != nil {
+		job.(*Job).Status = StatusCancelled
+		cancelled = true
+	}
+	if s.CancelRunning(jobID) {
+		cancelled = true
+	}
+
+	if !cancelled {
+		return ErrJobNotFound
+	}
+
+	if s.store != nil {
+		if err := s.store.Delete(jobID); err != nil {
+			log.Printf("Failed to delete cancelled job %s: %v", jobID, err)
+		}
+	}
+
+	s.eventBus.Publish(Event{
+		Type:      EventJobCancelled,
+		JobID:     jobID,
+		Status:    StatusCancelled,
+		Timestamp: time.Now(),
+	})
+	return nil
+}
+
+// Restore 从持久化存储重建调度队列（崩溃/重启恢复）。
+// 快照中仅 Pending/Running 状态的任务会被重新入队，状态重置为 Pending；
+// Handler 在执行前按 HandlerKey 从注册表绑定。
+func (s *Scheduler) Restore() error {
+	if s.store == nil {
+		return nil
+	}
+	snapshots, err := s.store.LoadAll()
+	if err != nil {
+		return err
+	}
+	for _, snap := range snapshots {
+		if s.heap.Get(snap.ID) != nil {
+			continue
+		}
+		job := &Job{}
+		job.FromSnapshot(snap)
+		// TriggerAt 已过期的任务直接入队，由调度循环立即补跑
+		s.heap.PushItem(job)
+	}
+	if len(snapshots) > 0 {
+		log.Printf("Restored %d job(s) from store", len(snapshots))
+	}
+	return nil
+}
+
+// Start 启动调度器。可重复调用：每次启动都会复位停止信号与执行队列。
 func (s *Scheduler) Start() {
 	s.mu.Lock()
 	if s.running {
@@ -150,13 +246,42 @@ func (s *Scheduler) Start() {
 		return
 	}
 	s.running = true
+	// 复位停止信号，否则 Start→Stop→Start 的新协程会立刻撞上已关闭的通道
+	s.stopCh = make(chan struct{})
+	workers := s.concurrency
+	queueCap := s.queueCapacity
+	if queueCap <= 0 {
+		queueCap = workers
+	}
+	s.workCh = make(chan *Job, queueCap)
 	s.mu.Unlock()
 
-	s.wg.Add(1)
+	if err := s.Restore(); err != nil {
+		log.Printf("Failed to restore jobs on start: %v", err)
+	}
+
+	s.wg.Add(1 + workers)
 	go s.scheduleLoop()
+	for i := 0; i < workers; i++ {
+		go s.worker()
+	}
 }
 
-// Stop 停止调度器
+// worker 从执行队列取任务执行，队列与 worker 数量共同构成并发上限
+func (s *Scheduler) worker() {
+	defer s.wg.Done()
+
+	for {
+		select {
+		case <-s.stopCh:
+			return
+		case job := <-s.workCh:
+			s.executeJob(job)
+		}
+	}
+}
+
+// Stop 停止调度器：不再投递新任务，取消在途任务的上下文，并等待执行协程退出。
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
 	if !s.running {
@@ -165,7 +290,17 @@ func (s *Scheduler) Stop() {
 	}
 	s.running = false
 	close(s.stopCh)
+	// 在途任务收到 ctx.Done 后返回，wg 才可能收敛；
+	// 否则一个不检查上下文的处理器会把关停无限期挂住。
+	cancels := make([]context.CancelFunc, 0, len(s.cancelMap))
+	for _, cancel := range s.cancelMap {
+		cancels = append(cancels, cancel)
+	}
 	s.mu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
 
 	s.wg.Wait()
 }
@@ -182,8 +317,16 @@ func (s *Scheduler) scheduleLoop() {
 		}
 
 		now := time.Now()
-		item := s.heap.Peek()
 
+		// 原子地取出所有已到期任务（避免 Peek 与 Pop 之间被 Cancel 的竞态）
+		if job := s.heap.PopIfDue(now); job != nil {
+			if !s.dispatch(job.(*Job)) {
+				return
+			}
+			continue
+		}
+
+		item := s.heap.Peek()
 		if item == nil {
 			// 堆为空，等待新任务信号或超时检查
 			select {
@@ -197,17 +340,9 @@ func (s *Scheduler) scheduleLoop() {
 		}
 
 		job := item.(*Job)
-		waitTime := job.TriggerAt.Sub(now)
-
-		if waitTime <= 0 {
-			// 任务到期，弹出执行
-			s.heap.PopItem()
-			s.executeJob(job)
-			continue
-		}
 
 		// 等待直到触发时间或新任务插入
-		timer := time.NewTimer(waitTime)
+		timer := time.NewTimer(job.TriggerAt.Sub(now))
 		select {
 		case <-s.stopCh:
 			timer.Stop()
@@ -222,7 +357,18 @@ func (s *Scheduler) scheduleLoop() {
 	}
 }
 
-// 执行任务
+// dispatch 把到期任务投入执行队列。队列满时阻塞等待空位（背压由 worker 池消化），
+// 关停信号到来时放弃投递并返回 false。
+func (s *Scheduler) dispatch(job *Job) bool {
+	select {
+	case <-s.stopCh:
+		return false
+	case s.workCh <- job:
+		return true
+	}
+}
+
+// 执行任务（由 worker 协程调用，阻塞直到 Handler 返回）
 func (s *Scheduler) executeJob(job *Job) {
 	// 发布开始事件
 	s.eventBus.Publish(Event{
@@ -236,36 +382,20 @@ func (s *Scheduler) executeJob(job *Job) {
 		},
 	})
 
-	// 创建可取消的上下文
-	ctx, cancel := context.WithCancel(context.Background())
-	s.cancelMap[job.ID] = cancel
-	defer delete(s.cancelMap, job.ID)
-
-	// 恢复Handler（如果是从持久化加载的）
+	// 恢复/补齐Handler（Type 优先，回退 Name）；显式绑定的 Handler 优先
 	if job.Handler == nil {
-		if h, ok := s.handlers[job.Name]; ok {
+		key := job.HandlerKey()
+		if h, ok := s.lookupHandler(key); ok {
 			job.Handler = h
-		} else {
-			log.Printf("No handler registered for job %s", job.Name)
-			job.Status = StatusFailed
-			return
 		}
-	}
-
-	job.Status = StatusRunning
-	job.Attempts++
-	job.UpdatedAt = time.Now()
-
-	// 异步执行避免阻塞调度循环
-	s.wg.Add(1)
-	go func() {
-		defer s.wg.Done()
-
-		err := job.Handler(ctx, job)
-
-		if err != nil {
-			// 发布失败事件
-			errData, _ := json.Marshal(map[string]string{"error": err.Error()})
+		if job.Handler == nil {
+			log.Printf("No handler registered for job %s (key=%s)", job.ID, key)
+			job.Status = StatusFailed
+			job.UpdatedAt = time.Now()
+			if s.store != nil {
+				s.store.Update(job.ToSnapshot())
+			}
+			errData, _ := json.Marshal(map[string]string{"error": "no handler registered"})
 			s.eventBus.Publish(Event{
 				Type:      EventJobFailed,
 				JobID:     job.ID,
@@ -273,30 +403,130 @@ func (s *Scheduler) executeJob(job *Job) {
 				Status:    StatusFailed,
 				Timestamp: time.Now(),
 				Data:      errData,
-				Metadata: map[string]interface{}{
-					"retry_count": job.RetryCount,
-					"max_retries": job.MaxRetries,
-				},
 			})
-
-			log.Printf("Job %s failed: %v", job.ID, err)
-			s.handleFailure(job)
-		} else {
-			// 发布成功事件
-			s.eventBus.Publish(Event{
-				Type:      EventJobCompleted,
-				JobID:     job.ID,
-				JobName:   job.Name,
-				Status:    StatusSuccess,
-				Timestamp: time.Now(),
-				Metadata: map[string]interface{}{
-					"duration_ms": time.Since(job.UpdatedAt).Milliseconds(),
-				},
-			})
-
-			s.handleSuccess(job)
+			return
 		}
+	}
+
+	// 创建可取消的上下文；条目生命周期与实际执行一致，
+	// 否则 Cancel 在任务真正运行前就查不到取消函数。
+	cancelCtx, cancel := context.WithCancel(context.Background())
+	s.mu.Lock()
+	s.cancelMap[job.ID] = cancel
+	// 与 Stop 的取消快照互斥：要么 Stop 之后能看到这条登记并取消它，
+	// 要么这里已察觉关停、自行取消，避免在关停竞态中启动无人取消的任务。
+	stopping := false
+	select {
+	case <-s.stopCh:
+		stopping = true
+	default:
+	}
+	s.mu.Unlock()
+	if stopping {
+		cancel()
+	}
+	defer func() {
+		s.mu.Lock()
+		delete(s.cancelMap, job.ID)
+		s.mu.Unlock()
+		cancel()
 	}()
+
+	// 单次执行超时：Handler 需检查 ctx 才能被按时中止；
+	// 不检查 ctx 的处理器仍会占住 worker 名额，超时只能作为失败被观测。
+	execCtx := cancelCtx
+	if job.Timeout > 0 {
+		withTimeout, cancelTimeout := context.WithTimeout(cancelCtx, job.Timeout)
+		defer cancelTimeout()
+		execCtx = withTimeout
+	}
+
+	job.Status = StatusRunning
+	job.Attempts++
+	job.UpdatedAt = time.Now()
+
+	err := job.Handler(execCtx, job)
+
+	if err == nil {
+		// 发布成功事件
+		s.eventBus.Publish(Event{
+			Type:      EventJobCompleted,
+			JobID:     job.ID,
+			JobName:   job.Name,
+			Status:    StatusSuccess,
+			Timestamp: time.Now(),
+			Metadata: map[string]interface{}{
+				"duration_ms": time.Since(job.UpdatedAt).Milliseconds(),
+			},
+		})
+
+		s.handleSuccess(job)
+		return
+	}
+
+	// 父上下文被取消：用户 Cancel 或关停打断，不属于任务自身失败，不消耗重试次数
+	if errors.Is(err, context.Canceled) || errors.Is(cancelCtx.Err(), context.Canceled) {
+		s.handleInterrupted(job)
+		return
+	}
+
+	timedOut := errors.Is(err, context.DeadlineExceeded) || errors.Is(execCtx.Err(), context.DeadlineExceeded)
+
+	// 发布失败事件
+	errData, _ := json.Marshal(map[string]string{"error": err.Error()})
+	s.eventBus.Publish(Event{
+		Type:      EventJobFailed,
+		JobID:     job.ID,
+		JobName:   job.Name,
+		Status:    StatusFailed,
+		Timestamp: time.Now(),
+		Data:      errData,
+		Metadata: map[string]interface{}{
+			"retry_count": job.RetryCount,
+			"max_retries": job.MaxRetries,
+			"timeout":     timedOut,
+		},
+	})
+
+	if timedOut {
+		log.Printf("Job %s timed out after %v: %v", job.ID, job.Timeout, err)
+	} else {
+		log.Printf("Job %s failed: %v", job.ID, err)
+	}
+	s.handleFailure(job)
+}
+
+// handleInterrupted 处理"执行被打断"：既不记为失败，也不消耗重试次数。
+// 用户主动取消时，事件与存储清理由 Cancel 完成；关停打断时把任务保持为
+// Pending 落盘，交由下次 Start 的 Restore 重新入队（至少一次语义，
+// 副作用可能重复，Handler 需自行保证幂等）。
+func (s *Scheduler) handleInterrupted(job *Job) {
+	s.mu.RLock()
+	running := s.running
+	s.mu.RUnlock()
+
+	if running {
+		log.Printf("Job %s execution cancelled", job.ID)
+		return
+	}
+
+	job.Status = StatusPending
+	job.UpdatedAt = time.Now()
+	if s.store != nil {
+		if err := s.store.Update(job.ToSnapshot()); err != nil {
+			log.Printf("Failed to persist interrupted job %s: %v", job.ID, err)
+		}
+	}
+
+	s.eventBus.Publish(Event{
+		Type:      EventJobCancelled,
+		JobID:     job.ID,
+		JobName:   job.Name,
+		Status:    StatusPending,
+		Timestamp: time.Now(),
+		Metadata:  map[string]interface{}{"reason": "shutdown"},
+	})
+	log.Printf("Job %s interrupted by shutdown, kept pending for recovery", job.ID)
 }
 
 // 处理成功
@@ -310,6 +540,7 @@ func (s *Scheduler) handleSuccess(job *Job) {
 			newJob := &Job{
 				ID:         job.ID, // 保持相同ID会覆盖旧数据
 				Name:       job.Name,
+				Type:       job.Type,
 				Payload:    job.Payload,
 				TriggerAt:  next,
 				Handler:    job.Handler,
@@ -371,11 +602,14 @@ func generateID() string {
 	return time.Now().Format("20060102150405") + "-" + randomString(8)
 }
 
+// randomString 生成 n 位随机后缀。
+// 早期实现用 time.Now().UnixNano() 逐位取模，同一函数调用内几乎恒定，
+// 后缀实际只有 62 种取值，同秒提交的任务会因 ID 相同互相覆盖而丢失。
 func randomString(n int) string {
 	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	b := make([]byte, n)
 	for i := range b {
-		b[i] = letters[time.Now().UnixNano()%int64(len(letters))]
+		b[i] = letters[rand.IntN(len(letters))]
 	}
 	return string(b)
 }
