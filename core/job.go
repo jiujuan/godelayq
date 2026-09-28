@@ -15,6 +15,9 @@ const (
 	StatusSuccess
 	StatusFailed
 	StatusCancelled
+	// StatusPaused 只能追加在末尾：JobSnapshot.Status 以 int 落盘在既有的 jobs.json 里，
+	// 插在中间会让历史快照的状态集体错位。
+	StatusPaused
 )
 
 // String 返回状态的规范名，与 HTTP API 的 status 取值一致。
@@ -30,6 +33,8 @@ func (s JobStatus) String() string {
 		return "failed"
 	case StatusCancelled:
 		return "cancelled"
+	case StatusPaused:
+		return "paused"
 	default:
 		return "unknown"
 	}
@@ -37,7 +42,7 @@ func (s JobStatus) String() string {
 
 // ParseJobStatus 按规范名解析状态（大小写不敏感），未知名称返回 false。
 func ParseJobStatus(name string) (JobStatus, bool) {
-	for _, status := range []JobStatus{StatusPending, StatusRunning, StatusSuccess, StatusFailed, StatusCancelled} {
+	for _, status := range []JobStatus{StatusPending, StatusRunning, StatusSuccess, StatusFailed, StatusCancelled, StatusPaused} {
 		if strings.EqualFold(status.String(), name) {
 			return status, true
 		}
@@ -46,6 +51,8 @@ func ParseJobStatus(name string) (JobStatus, bool) {
 }
 
 // IsTerminal 表示任务已结束：既不会被调度，也不应被崩溃恢复重新入队。
+//
+// paused 刻意不算终态：它还要被 Resume 唤醒，也不该被存储的终态留痕淘汰策略清掉。
 func (s JobStatus) IsTerminal() bool {
 	return s == StatusSuccess || s == StatusFailed || s == StatusCancelled
 }
@@ -57,6 +64,10 @@ type Job struct {
 	Type      string    `json:"type,omitempty"` // Handler 注册键；为空时回退到 Name
 	Payload   []byte    `json:"payload"`        // 任务数据
 	TriggerAt time.Time `json:"trigger_at"`     // 下次触发时间
+
+	// Group 是分组名，空串表示未分组。它只是标签：不要求组已在 GroupStore 注册，
+	// 删除分组也不会删除任务（见 api 层的 detach 策略）。
+	Group string `json:"group,omitempty"`
 
 	// 执行配置
 	Handler Handler         `json:"-"` // 处理函数（不持久化）
@@ -115,6 +126,7 @@ func (j *Job) CloneForRetry(nextTime time.Time) *Job {
 		Type:       j.Type,
 		Payload:    j.Payload,
 		TriggerAt:  nextTime,
+		Group:      j.Group,
 		Handler:    j.Handler,
 		Timeout:    j.Timeout,
 		CronExpr:   "",
@@ -135,6 +147,7 @@ type JobSnapshot struct {
 	Type       string    `json:"type,omitempty"`
 	Payload    []byte    `json:"payload"`
 	TriggerAt  time.Time `json:"trigger_at"`
+	Group      string    `json:"group,omitempty"`
 	CronExpr   string    `json:"cron_expr"`
 	IsRepeat   bool      `json:"is_repeat"`
 	Timeout    int64     `json:"timeout"` // nanoseconds
@@ -155,6 +168,7 @@ func (j *Job) ToSnapshot() JobSnapshot {
 		Type:       j.Type,
 		Payload:    j.Payload,
 		TriggerAt:  j.TriggerAt,
+		Group:      j.Group,
 		CronExpr:   j.CronExpr,
 		IsRepeat:   j.IsRepeat,
 		Timeout:    int64(j.Timeout),
@@ -176,6 +190,7 @@ func (j *Job) FromSnapshot(s JobSnapshot) {
 	j.Type = s.Type
 	j.Payload = s.Payload
 	j.TriggerAt = s.TriggerAt
+	j.Group = s.Group
 	j.CronExpr = s.CronExpr
 	j.IsRepeat = s.IsRepeat
 	j.Timeout = time.Duration(s.Timeout)

@@ -22,6 +22,10 @@ const (
 	EventJobCancelled EventType = "job.cancelled"
 	// EventJobRetrying 表示任务进入重试流程。
 	EventJobRetrying EventType = "job.retrying"
+	// EventJobPaused 表示任务已暂停（含被强制暂停，metadata.forced 区分来源）。
+	EventJobPaused EventType = "job.paused"
+	// EventJobResumed 表示暂停的任务被恢复排期。
+	EventJobResumed EventType = "job.resumed"
 	// EventHeapUpdate 预留给堆状态变化或监控场景使用。
 	EventHeapUpdate EventType = "heap.updated"
 )

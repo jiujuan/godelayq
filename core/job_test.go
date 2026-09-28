@@ -1,7 +1,9 @@
 package core
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -17,6 +19,8 @@ func TestJobStatus_Constants(t *testing.T) {
 		{"StatusSuccess", StatusSuccess, 2},
 		{"StatusFailed", StatusFailed, 3},
 		{"StatusCancelled", StatusCancelled, 4},
+		// paused 必须是 5：快照里的 status 是裸 int，插在中间会错位历史数据
+		{"StatusPaused", StatusPaused, 5},
 	}
 
 	for _, tt := range tests {
@@ -366,5 +370,101 @@ func TestJob_ZeroValues(t *testing.T) {
 	}
 	if job.RetryCount != 0 {
 		t.Errorf("Expected RetryCount to be 0, got %d", job.RetryCount)
+	}
+}
+
+func TestJobStatus_Paused(t *testing.T) {
+	if StatusPaused.String() != "paused" {
+		t.Errorf("paused 的规范名应为 \"paused\"（与 HTTP API 的 status 取值一致），实际 %q", StatusPaused.String())
+	}
+
+	status, ok := ParseJobStatus("Paused")
+	if !ok || status != StatusPaused {
+		t.Errorf("ParseJobStatus 应大小写不敏感地解析 paused，得到 %v/%v", status, ok)
+	}
+
+	// paused 不是终态：它还要被 Resume 唤醒，也不该被终态留痕淘汰策略清掉
+	if StatusPaused.IsTerminal() {
+		t.Error("paused 不应是终态")
+	}
+	for _, terminal := range []JobStatus{StatusSuccess, StatusFailed, StatusCancelled} {
+		if !terminal.IsTerminal() {
+			t.Errorf("%s 应当是终态", terminal)
+		}
+	}
+
+	// 未知名称仍然要被判失败，否则 status=paused 的拼写错误会静默变成 pending
+	if _, ok := ParseJobStatus("pausable"); ok {
+		t.Error("未知状态名不应解析成功")
+	}
+}
+
+func TestJob_GroupSurvivesSnapshotRoundTrip(t *testing.T) {
+	job := &Job{
+		ID:        "job_group_1",
+		Name:      "payment_check",
+		Group:     "billing",
+		Payload:   []byte(`{"order_id":"ORD-1"}`),
+		TriggerAt: time.Now().Add(time.Minute),
+		Status:    StatusPending,
+	}
+
+	snapshot := job.ToSnapshot()
+	if snapshot.Group != "billing" {
+		t.Errorf("ToSnapshot 应带上分组，实际 %q", snapshot.Group)
+	}
+
+	restored := &Job{}
+	restored.FromSnapshot(snapshot)
+	if restored.Group != "billing" {
+		t.Errorf("FromSnapshot 应还原分组，实际 %q", restored.Group)
+	}
+
+	// 未分组是空串而不是某个占位名，列表过滤据此区分"未分组"与"无过滤"
+	unassigned := &Job{ID: "job_group_2", Name: "email_send"}
+	if encoded := unassigned.ToSnapshot().Group; encoded != "" {
+		t.Errorf("未分组应为空串，实际 %q", encoded)
+	}
+}
+
+func TestJob_CloneForRetry_KeepsGroup(t *testing.T) {
+	// 重试副本沿用同一 ID 与分组；丢分组会让任务在重试后从分组视图里凭空消失
+	original := &Job{ID: "job_retry_1", Name: "data_sync", Group: "nightly", MaxRetries: 3}
+	clone := original.CloneForRetry(time.Now().Add(time.Minute))
+
+	if clone.Group != "nightly" {
+		t.Errorf("CloneForRetry 应保留分组，实际 %q", clone.Group)
+	}
+	if clone.ID != original.ID {
+		t.Errorf("CloneForRetry 应保留原 ID，实际 %q", clone.ID)
+	}
+}
+
+func TestJobSnapshot_LegacyJSONStillDecodes(t *testing.T) {
+	// 真实历史数据：没有 group 字段、status 只用 0-4。升级后必须照常解码，
+	// 缺字段落到空分组，而不是报错或把已有任务判成 paused。
+	legacy := []byte(`{"id":"job_old_1","name":"payment_check","payload":"e30=",` +
+		`"trigger_at":"2024-01-02T15:30:00+08:00","cron_expr":"","is_repeat":false,` +
+		`"timeout":0,"max_retries":3,"retry_count":1,"retry_delay":60000000000,` +
+		`"status":0,"created_at":"2024-01-02T15:20:00+08:00","updated_at":"2024-01-02T15:20:00+08:00","attempts":1}`)
+
+	var snapshot JobSnapshot
+	if err := json.Unmarshal(legacy, &snapshot); err != nil {
+		t.Fatalf("旧快照解码失败: %v", err)
+	}
+	if snapshot.Group != "" {
+		t.Errorf("旧数据应落到未分组，实际 %q", snapshot.Group)
+	}
+	if JobStatus(snapshot.Status) != StatusPending {
+		t.Errorf("旧数据 status=0 应仍是 pending，实际 %s", JobStatus(snapshot.Status))
+	}
+
+	// 反向也要成立：未分组的任务落盘时不写 group 键，保持文件与旧版本一致
+	encoded, err := json.Marshal((&Job{ID: "job_new_1", Name: "email_send", Status: StatusPending}).ToSnapshot())
+	if err != nil {
+		t.Fatalf("新快照编码失败: %v", err)
+	}
+	if bytes.Contains(encoded, []byte(`"group"`)) {
+		t.Errorf("未分组不应写出 group 键，实际 %s", encoded)
 	}
 }
