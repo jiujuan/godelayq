@@ -1,6 +1,8 @@
 package core
 
 import (
+	"math/rand"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -375,6 +377,55 @@ func TestQuaternaryHeap_RemoveFromSingleItem(t *testing.T) {
 	}
 	if h.Len() != 0 {
 		t.Errorf("Expected empty heap, got length %d", h.Len())
+	}
+}
+
+func TestQuaternaryHeap_FourAryStructure(t *testing.T) {
+	h := NewQuaternaryHeap()
+	now := time.Now()
+
+	for i := 0; i < 200; i++ {
+		h.PushItem(&mockItem{
+			id:        "item-" + string(rune('A'+i%26)) + "-" + strconv.Itoa(i),
+			triggerAt: now.Add(time.Duration(rand.Intn(1000)) * time.Minute),
+		})
+	}
+
+	// 每个节点的父节点必须不大于自身：parent = (i-1)/4
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	for i := 1; i < len(h.items); i++ {
+		parent := (i - 1) / 4
+		if h.Less(i, parent) {
+			t.Fatalf("4-ary heap property violated: child %d < parent %d", i, parent)
+		}
+	}
+}
+
+func TestQuaternaryHeap_PopIfDue(t *testing.T) {
+	h := NewQuaternaryHeap()
+	now := time.Now()
+
+	// 空堆
+	if item := h.PopIfDue(now); item != nil {
+		t.Error("Expected nil from empty heap")
+	}
+
+	h.PushItem(&mockItem{id: "future", triggerAt: now.Add(1 * time.Hour)})
+	if item := h.PopIfDue(now); item != nil {
+		t.Error("Expected nil when head is not due")
+	}
+	if h.Len() != 1 {
+		t.Error("Non-due PopIfDue must not remove the item")
+	}
+
+	due := &mockItem{id: "due", triggerAt: now.Add(-1 * time.Second)}
+	h.PushItem(due)
+	if item := h.PopIfDue(now); item == nil || item.GetID() != "due" {
+		t.Errorf("Expected due item, got %v", item)
+	}
+	if h.Len() != 1 {
+		t.Errorf("Expected 1 remaining, got %d", h.Len())
 	}
 }
 

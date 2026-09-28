@@ -1,7 +1,6 @@
 package core
 
 import (
-	"container/heap"
 	"sync"
 	"time"
 )
@@ -14,10 +13,14 @@ type Item interface {
 	GetID() string
 }
 
+// branchFactor 四叉堆的分支因子：每个节点有 4 个子节点
+const branchFactor = 4
+
 // QuaternaryHeap 四叉堆 (4-ary heap)
-// 每个节点有4个子节点，索引计算：
+// 索引计算：
 // parent = (i - 1) / 4
 // children = 4*i + 1, 4*i + 2, 4*i + 3, 4*i + 4
+// 相比二叉堆层级减少约一半，父子节点在内存中更近，缓存局部性更好。
 type QuaternaryHeap struct {
 	items []Item
 	mu    sync.RWMutex
@@ -32,8 +35,12 @@ func NewQuaternaryHeap() *QuaternaryHeap {
 	}
 }
 
-// Len 实现 heap.Interface
-func (h *QuaternaryHeap) Len() int { return len(h.items) }
+// Len 返回堆中元素数量
+func (h *QuaternaryHeap) Len() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.items)
+}
 
 // Less 按触发时间升序（最小堆）
 func (h *QuaternaryHeap) Less(i, j int) bool {
@@ -47,38 +54,31 @@ func (h *QuaternaryHeap) Swap(i, j int) {
 	h.indexMap[h.items[j].GetID()] = j
 }
 
-// Push 添加元素
-func (h *QuaternaryHeap) Push(x interface{}) {
-	item := x.(Item)
-	h.indexMap[item.GetID()] = len(h.items)
-	h.items = append(h.items, item)
-}
-
-// Pop 弹出最后一个元素（非堆顶）
-func (h *QuaternaryHeap) Pop() interface{} {
-	old := h.items
-	n := len(old)
-	item := old[n-1]
-	h.items = old[:n-1]
-	delete(h.indexMap, item.GetID())
-	return item
-}
-
 // PushItem 线程安全插入
 func (h *QuaternaryHeap) PushItem(item Item) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	heap.Push(h, item)
+	h.indexMap[item.GetID()] = len(h.items)
+	h.items = append(h.items, item)
+	h.siftUp(len(h.items) - 1)
 }
 
 // PopItem 线程安全弹出堆顶
 func (h *QuaternaryHeap) PopItem() Item {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	if len(h.items) == 0 {
+	return h.popRoot()
+}
+
+// PopIfDue 原子地弹出已到期的堆顶；堆顶未到期或堆为空时返回 nil。
+// 相比 Peek 后再 Pop，避免了两次加锁之间任务被 Cancel 的竞态。
+func (h *QuaternaryHeap) PopIfDue(now time.Time) Item {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if len(h.items) == 0 || h.items[0].GetTriggerTime().After(now) {
 		return nil
 	}
-	return heap.Pop(h).(Item)
+	return h.popRoot()
 }
 
 // Peek 查看堆顶（不弹出）
@@ -91,6 +91,17 @@ func (h *QuaternaryHeap) Peek() Item {
 	return h.items[0]
 }
 
+// Get 按ID查找元素（O(1)，不弹出）
+func (h *QuaternaryHeap) Get(id string) Item {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	idx, ok := h.indexMap[id]
+	if !ok {
+		return nil
+	}
+	return h.items[idx]
+}
+
 // Remove 通过ID删除指定任务 O(log n)
 func (h *QuaternaryHeap) Remove(id string) Item {
 	h.mu.Lock()
@@ -99,47 +110,90 @@ func (h *QuaternaryHeap) Remove(id string) Item {
 	if !ok {
 		return nil
 	}
-	// 使用 heap.Remove 保持堆性质
-	return heap.Remove(h, idx).(Item)
+	return h.removeAt(idx)
 }
 
-// Update 更新时间并重新堆化
+// Update 用新元素替换同ID元素并重新堆化
 func (h *QuaternaryHeap) Update(item Item) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if idx, ok := h.indexMap[item.GetID()]; ok {
 		h.items[idx] = item
-		heap.Fix(h, idx)
+		h.siftRange(idx)
 	}
 }
 
-// HeapifyUp 上浮操作（四叉堆版本）
-func (h *QuaternaryHeap) heapifyUp(idx int) {
-	if idx == 0 {
+// popRoot 弹出堆顶，调用方须持有写锁
+func (h *QuaternaryHeap) popRoot() Item {
+	n := len(h.items)
+	if n == 0 {
+		return nil
+	}
+	return h.removeAt(0)
+}
+
+// removeAt 删除指定下标元素，调用方须持有写锁
+func (h *QuaternaryHeap) removeAt(idx int) Item {
+	last := len(h.items) - 1
+	if idx != last {
+		h.Swap(idx, last)
+	}
+	item := h.items[last]
+	h.items = h.items[:last]
+	delete(h.indexMap, item.GetID())
+	if idx != last {
+		h.siftRange(idx)
+	}
+	return item
+}
+
+// siftRange 从 idx 出发上浮或下沉，调用方须持有写锁
+func (h *QuaternaryHeap) siftRange(idx int) {
+	if idx > 0 && h.Less(idx, parentIndex(idx)) {
+		h.siftUp(idx)
 		return
 	}
-	parent := (idx - 1) / 4
-	if h.Less(idx, parent) {
+	h.siftDown(idx)
+}
+
+// siftUp 上浮（四叉堆版本），调用方须持有写锁
+func (h *QuaternaryHeap) siftUp(idx int) {
+	for idx > 0 {
+		parent := parentIndex(idx)
+		if !h.Less(idx, parent) {
+			break
+		}
 		h.Swap(idx, parent)
-		h.heapifyUp(parent)
+		idx = parent
 	}
 }
 
-// HeapifyDown 下沉操作（比较4个子节点）
-func (h *QuaternaryHeap) heapifyDown(idx int) {
+// siftDown 下沉（一次比较4个子节点），调用方须持有写锁
+func (h *QuaternaryHeap) siftDown(idx int) {
 	n := len(h.items)
-	minIdx := idx
-
-	// 检查4个子节点
-	for i := 1; i <= 4; i++ {
-		child := 4*idx + i
-		if child < n && h.Less(child, minIdx) {
-			minIdx = child
+	for {
+		minIdx := idx
+		firstChild := branchFactor*idx + 1
+		if firstChild >= n {
+			return
 		}
-	}
-
-	if minIdx != idx {
+		last := firstChild + branchFactor
+		if last > n {
+			last = n
+		}
+		for child := firstChild; child < last; child++ {
+			if h.Less(child, minIdx) {
+				minIdx = child
+			}
+		}
+		if minIdx == idx {
+			return
+		}
 		h.Swap(idx, minIdx)
-		h.heapifyDown(minIdx)
+		idx = minIdx
 	}
+}
+
+func parentIndex(i int) int {
+	return (i - 1) / branchFactor
 }
