@@ -159,6 +159,9 @@ type StoreConfig struct {
 	HistoryLimit int `mapstructure:"history_limit"`
 	// HistoryTTL 终态快照保留时长，0 表示不按时间淘汰
 	HistoryTTL time.Duration `mapstructure:"history_ttl"`
+	// GroupsPath 分组元数据文件路径，与任务快照分文件存放：
+	// 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
+	GroupsPath string `mapstructure:"groups_path"`
 }
 
 // LoggingConfig 日志输出配置，作用于调度器、存储、WebSocket 与 HTTP 访问日志
@@ -199,6 +202,7 @@ func DefaultConfig() Config {
 			FlushInterval: DefaultFlushInterval,
 			HistoryLimit:  DefaultHistoryLimit,
 			HistoryTTL:    0,
+			GroupsPath:    DefaultGroupsPath,
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
@@ -244,6 +248,7 @@ func LoadConfig(path string) (Config, error) {
 		"store.flush_interval",
 		"store.history_limit",
 		"store.history_ttl",
+		"store.groups_path",
 		"logging.level",
 		"logging.format",
 	} {
@@ -310,6 +315,9 @@ func (c Config) Validate() error {
 	if c.Store.HistoryTTL < 0 {
 		return fmt.Errorf("store.history_ttl must not be negative, got %v", c.Store.HistoryTTL)
 	}
+	if c.Store.GroupsPath == "" {
+		return fmt.Errorf("store.groups_path must not be empty")
+	}
 
 	if _, err := parseLogLevel(c.Logging.Level); err != nil {
 		return err
@@ -374,6 +382,9 @@ func (c Config) Normalized() Config {
 	}
 	if c.Store.HistoryLimit == 0 {
 		c.Store.HistoryLimit = defaults.Store.HistoryLimit
+	}
+	if c.Store.GroupsPath == "" {
+		c.Store.GroupsPath = defaults.Store.GroupsPath
 	}
 	if c.Server.Auth.JWT.AccessTTL == 0 {
 		c.Server.Auth.JWT.AccessTTL = defaults.Server.Auth.JWT.AccessTTL

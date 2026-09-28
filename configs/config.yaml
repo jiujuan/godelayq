@@ -50,6 +50,9 @@ store:
   # /api/v1/stats 的 completed/failed 计数都来自这份留痕。待执行任务不受影响。
   history_limit: 1000   # 保留条数；0=用默认值，-1=不留痕（写入即删除，文件最小）
   history_ttl: 0s       # 保留时长，如 24h；0 表示不按时间淘汰
+  # 分组元数据文件（Web 控制台的 /api/v1/groups 读写它）。与任务快照分文件：
+  # 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
+  groups_path: ./data/groups.json
 
 logging:
   level: info           # debug|info|warn|error；排障时可临时改 debug

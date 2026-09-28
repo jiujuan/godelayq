@@ -162,6 +162,7 @@ func TestLoadConfig_RejectsInvalidValues(t *testing.T) {
 		"negative queue capacity":          "scheduler:\n  queue_capacity: -5\n",
 		"empty port":                       "server:\n  port: \"\"\n",
 		"empty store path":                 "store:\n  path: \"\"\n",
+		"empty groups path":                "store:\n  groups_path: \"\"\n",
 		"non-positive shutdown":            "scheduler:\n  shutdown_timeout: 0s\n",
 		"credentials with wildcard":        "server:\n  cors:\n    allow_origins: [\"*\"]\n    allow_credentials: true\n",
 		"credentials with default origins": "server:\n  auth:\n    token: x\n  cors:\n    allow_credentials: true\n",
@@ -189,6 +190,7 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("GODELAYQ_SERVER_CORS_ALLOW_ORIGINS", "https://a.example,https://b.example")
 	t.Setenv("GODELAYQ_STORE_HISTORY_LIMIT", "7")
 	t.Setenv("GODELAYQ_STORE_HISTORY_TTL", "6h")
+	t.Setenv("GODELAYQ_STORE_GROUPS_PATH", "./data/groups-alt.json")
 	t.Setenv("GODELAYQ_LOGGING_LEVEL", "error")
 	t.Setenv("GODELAYQ_LOGGING_FORMAT", "json")
 
@@ -201,6 +203,7 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 		"list keys come from a comma-separated env value")
 	assert.Equal(t, 7, cfg.Store.HistoryLimit)
 	assert.Equal(t, 6*time.Hour, cfg.Store.HistoryTTL)
+	assert.Equal(t, "./data/groups-alt.json", cfg.Store.GroupsPath)
 	assert.Equal(t, "error", cfg.Logging.Level)
 	assert.Equal(t, "json", cfg.Logging.Format)
 }
@@ -219,6 +222,7 @@ func TestConfig_Normalized(t *testing.T) {
 	assert.Equal(t, defaults.Store.Path, cfg.Store.Path)
 	assert.Equal(t, defaults.Store.FlushInterval, cfg.Store.FlushInterval)
 	assert.Equal(t, defaults.Store.HistoryLimit, cfg.Store.HistoryLimit, "0 表示使用默认留痕条数")
+	assert.Equal(t, defaults.Store.GroupsPath, cfg.Store.GroupsPath, "分组文件路径同样有约定默认值")
 	assert.Equal(t, defaults.Logging.Level, cfg.Logging.Level, "空级别回落到 info")
 	assert.Equal(t, defaults.Logging.Format, cfg.Logging.Format)
 
