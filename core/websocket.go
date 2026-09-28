@@ -268,6 +268,9 @@ func filterMatches(event Event, f WSFilter) bool {
 	if len(f.JobTypes) > 0 && !containsString(f.JobTypes, event.JobName) {
 		return false
 	}
+	if len(f.Status) > 0 && !containsString(f.Status, event.Status.String()) {
+		return false
+	}
 	return true
 }
 

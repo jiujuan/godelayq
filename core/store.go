@@ -70,13 +70,9 @@ type JSONFileStore struct {
 	doneCh   chan struct{}
 }
 
+// NewJSONFileStore 用默认选项创建 JSON 存储。
 func NewJSONFileStore(path string) (*JSONFileStore, error) {
 	return NewJSONFileStoreWithOptions(path, StoreOptions{})
-}
-
-// NewJSONFileStoreWithInterval 自定义合并落盘周期；非正数回退到默认值。
-func NewJSONFileStoreWithInterval(path string, interval time.Duration) (*JSONFileStore, error) {
-	return NewJSONFileStoreWithOptions(path, StoreOptions{Interval: interval})
 }
 
 // NewJSONFileStoreWithOptions 按完整选项创建存储。

@@ -299,6 +299,21 @@ func TestWebSocketFilter(t *testing.T) {
 	assert.True(t, client.matchFilter(Event{Type: EventJobStarted, JobName: "email"}))
 }
 
+// status 过滤按状态名比较（pending/running/success/failed/cancelled）
+func TestWebSocketStatusFilter(t *testing.T) {
+	client := &WSClient{}
+	client.setFilter(WSFilter{Status: []string{"failed", "cancelled"}})
+
+	assert.True(t, client.matchFilter(Event{Type: EventJobFailed, Status: StatusFailed}))
+	assert.True(t, client.matchFilter(Event{Type: EventJobCancelled, Status: StatusCancelled}))
+	assert.False(t, client.matchFilter(Event{Type: EventJobCompleted, Status: StatusSuccess}))
+	assert.False(t, client.matchFilter(Event{Type: EventJobScheduled, Status: StatusPending}))
+
+	// 未设置 status 条件时不按状态过滤
+	client.setFilter(WSFilter{EventTypes: []string{"job.completed"}})
+	assert.True(t, client.matchFilter(Event{Type: EventJobCompleted, Status: StatusSuccess}))
+}
+
 func TestWebSocketPingPong(t *testing.T) {
 	eb := NewEventBus(10)
 	ws, u := newTestWSServer(t, eb)

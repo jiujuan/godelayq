@@ -63,15 +63,9 @@ func (h *QuaternaryHeap) PushItem(item Item) {
 	h.siftUp(len(h.items) - 1)
 }
 
-// PopItem 线程安全弹出堆顶
-func (h *QuaternaryHeap) PopItem() Item {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	return h.popRoot()
-}
-
 // PopIfDue 原子地弹出已到期的堆顶；堆顶未到期或堆为空时返回 nil。
-// 相比 Peek 后再 Pop，避免了两次加锁之间任务被 Cancel 的竞态。
+// 相比 Peek 后再弹出，避免了两次加锁之间任务被 Cancel 的竞态，
+// 因此不提供无条件的 Pop 出口。
 func (h *QuaternaryHeap) PopIfDue(now time.Time) Item {
 	h.mu.Lock()
 	defer h.mu.Unlock()

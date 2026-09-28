@@ -116,7 +116,7 @@ func TestScheduler_UpdatePendingRejectsDispatchedJob(t *testing.T) {
 	if err := scheduler.Schedule(&Job{ID: "fired", Name: "task", TriggerAt: time.Now().Add(time.Hour)}); err != nil {
 		t.Fatalf("Schedule failed: %v", err)
 	}
-	if scheduler.heap.PopItem() == nil {
+	if popTop(scheduler.heap) == nil {
 		t.Fatal("Expected to pop the job")
 	}
 

@@ -26,12 +26,3 @@ func (e *ExponentialBackoffRetry) NextRetry(job *Job) time.Time {
 	jitter := time.Duration(rand.Float64() * 0.2 * float64(delay))
 	return time.Now().Add(delay + jitter)
 }
-
-// FixedIntervalRetry 固定间隔重试
-type FixedIntervalRetry struct {
-	Interval time.Duration
-}
-
-func (f *FixedIntervalRetry) NextRetry(job *Job) time.Time {
-	return time.Now().Add(f.Interval)
-}

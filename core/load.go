@@ -519,37 +519,3 @@ func (l *DirectoryLoader) startWatcher() error {
 	l.logger.Info("started watching directory", "dir", l.options.Dir)
 	return nil
 }
-
-// BulkLoadFromReader 从io.Reader批量加载（支持从网络或标准输入读取）
-func (l *DirectoryLoader) BulkLoadFromReader(r io.Reader) error {
-	decoder := json.NewDecoder(r)
-
-	// 支持两种格式：
-	// 1. 单行JSON对象
-	// 2. JSON数组 [obj1, obj2, ...]
-
-	// 先尝试数组格式
-	var formats []FileJobFormat
-	if err := decoder.Decode(&formats); err == nil {
-		for _, f := range formats {
-			job, err := l.formatToJob(&f)
-			if err != nil {
-				l.logger.Warn("invalid job format", "error", err)
-				continue
-			}
-			if l.options.HandlerMap != nil {
-				if h, ok := l.options.HandlerMap[f.Name]; ok {
-					job.Handler = h
-				}
-			}
-			if err := l.scheduler.Schedule(job); err != nil {
-				l.logger.Error("failed to schedule job", "error", err)
-			}
-		}
-		return nil
-	}
-
-	// 重置decoder尝试单行JSON流
-	// 这里简化处理，实际可能需要更复杂的逻辑
-	return fmt.Errorf("bulk load format not supported")
-}

@@ -26,7 +26,7 @@ func TestJSONFileStore_DebounceCoalescesWrites(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "debounce.json")
 
 	// 周期设得足够长，确保只有显式 Flush 才会写盘
-	store, err := NewJSONFileStoreWithInterval(storePath, time.Hour)
+	store, err := NewJSONFileStoreWithOptions(storePath, StoreOptions{Interval: time.Hour})
 	require.NoError(t, err)
 
 	for i := 0; i < 400; i++ {
@@ -51,7 +51,7 @@ func TestJSONFileStore_DebounceCoalescesWrites(t *testing.T) {
 func TestJSONFileStore_PeriodicFlush(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "periodic.json")
 
-	store, err := NewJSONFileStoreWithInterval(storePath, 20*time.Millisecond)
+	store, err := NewJSONFileStoreWithOptions(storePath, StoreOptions{Interval: 20 * time.Millisecond})
 	require.NoError(t, err)
 	defer store.Close()
 
@@ -77,7 +77,7 @@ func TestJSONFileStore_PeriodicFlush(t *testing.T) {
 func TestJSONFileStore_InvalidIntervalFallsBack(t *testing.T) {
 	storePath := filepath.Join(t.TempDir(), "fallback.json")
 
-	store, err := NewJSONFileStoreWithInterval(storePath, 0)
+	store, err := NewJSONFileStoreWithOptions(storePath, StoreOptions{Interval: 0})
 	require.NoError(t, err)
 	assert.Equal(t, DefaultFlushInterval, store.interval)
 

@@ -44,11 +44,6 @@ type Event struct {
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
 }
 
-// EventHandler 定义事件处理器接口，便于外部实现统一处理逻辑。
-type EventHandler interface {
-	Handle(event Event)
-}
-
 // eventSubscription 保存单个订阅的内部元数据。
 type eventSubscription struct {
 	// ch 是当前订阅接收事件的通道。
