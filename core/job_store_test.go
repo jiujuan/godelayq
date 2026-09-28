@@ -91,6 +91,10 @@ func (s *StoreTestSuite) SetupTest() {
 }
 
 func (s *StoreTestSuite) TearDownTest() {
+	// 先停掉后台合并写入，再删临时目录，否则刷盘协程会写入已消失的路径
+	if s.store != nil {
+		s.store.Close()
+	}
 	os.RemoveAll(s.tempDir)
 }
 
@@ -104,6 +108,7 @@ func (s *StoreTestSuite) TestSaveAndLoad() {
 
 	err := s.store.Save(job)
 	assert.NoError(s.T(), err)
+	assert.NoError(s.T(), s.store.Flush())
 
 	// 验证文件存在
 	_, err = os.Stat(s.storePath)

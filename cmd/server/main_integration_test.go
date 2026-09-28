@@ -358,3 +358,11 @@ func (s *stubStore) Delete(jobID string) error {
 func (s *stubStore) LoadAll() ([]core.JobSnapshot, error) {
 	return nil, nil
 }
+
+func (s *stubStore) Flush() error {
+	return nil
+}
+
+func (s *stubStore) Close() error {
+	return nil
+}

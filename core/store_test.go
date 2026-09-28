@@ -4,12 +4,92 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+// flushSeqOf 在持锁状态下读取实际写盘次数
+func flushSeqOf(s *JSONFileStore) int {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.flushSeq
+}
+
+// TestJSONFileStore_DebounceCoalescesWrites 未到期前不落盘，
+// 大量变更由一次 Flush 合并为一次写。
+func TestJSONFileStore_DebounceCoalescesWrites(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "debounce.json")
+
+	// 周期设得足够长，确保只有显式 Flush 才会写盘
+	store, err := NewJSONFileStoreWithInterval(storePath, time.Hour)
+	require.NoError(t, err)
+
+	for i := 0; i < 400; i++ {
+		require.NoError(t, store.Save(&Job{ID: "job-" + strconv.Itoa(i), Name: "burst", Status: StatusPending}))
+	}
+	assert.Equal(t, 0, flushSeqOf(store), "debounced store must not write per mutation")
+	_, err = os.Stat(storePath)
+	assert.True(t, os.IsNotExist(err), "file must not exist before the first flush")
+
+	require.NoError(t, store.Flush())
+	assert.Equal(t, 1, flushSeqOf(store), "400 mutations must collapse into a single write")
+
+	require.NoError(t, store.Close())
+
+	reloaded, err := NewJSONFileStore(storePath)
+	require.NoError(t, err)
+	defer reloaded.Close()
+	assert.Len(t, reloaded.data, 400)
+}
+
+// TestJSONFileStore_PeriodicFlush 后台周期把突发合并成少量写入
+func TestJSONFileStore_PeriodicFlush(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "periodic.json")
+
+	store, err := NewJSONFileStoreWithInterval(storePath, 20*time.Millisecond)
+	require.NoError(t, err)
+	defer store.Close()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 300; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_ = store.Save(&Job{ID: "job-" + strconv.Itoa(i), Name: "burst", Status: StatusPending})
+		}(i)
+	}
+	wg.Wait()
+
+	time.Sleep(150 * time.Millisecond)
+
+	writes := flushSeqOf(store)
+	assert.Greater(t, writes, 0, "background flush should have written the state")
+	assert.Less(t, writes, 20, "300 mutations must be coalesced, got %d writes", writes)
+}
+
+// TestJSONFileStore_InvalidIntervalFallsBack 非正数周期回退到默认值，
+// Close 可重复调用。
+func TestJSONFileStore_InvalidIntervalFallsBack(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "fallback.json")
+
+	store, err := NewJSONFileStoreWithInterval(storePath, 0)
+	require.NoError(t, err)
+	assert.Equal(t, DefaultFlushInterval, store.interval)
+
+	require.NoError(t, store.Save(&Job{ID: "j", Name: "n", Status: StatusPending}))
+	require.NoError(t, store.Close())
+	require.NoError(t, store.Close(), "Close must be idempotent")
+
+	reloaded, err := NewJSONFileStore(storePath)
+	require.NoError(t, err)
+	defer reloaded.Close()
+	assert.Contains(t, reloaded.data, "j")
+}
 
 func TestNewJSONFileStore(t *testing.T) {
 	tempDir := t.TempDir()
@@ -115,6 +195,8 @@ func TestJSONFileStore_Save(t *testing.T) {
 	require.NoError(t, err, "Save should not return error")
 	assert.Contains(t, store.data, "test-job-1", "Job should be in memory")
 
+	require.NoError(t, store.Flush(), "Flush should succeed")
+
 	// Verify file was written
 	fileData, err := os.ReadFile(storePath)
 	require.NoError(t, err, "File should exist")
@@ -146,6 +228,8 @@ func TestJSONFileStore_Save_Multiple(t *testing.T) {
 	}
 
 	assert.Len(t, store.data, 3, "Should have 3 jobs in memory")
+
+	require.NoError(t, store.Flush())
 
 	// Verify all jobs persisted
 	fileData, err := os.ReadFile(storePath)
@@ -185,6 +269,8 @@ func TestJSONFileStore_Update(t *testing.T) {
 	assert.Equal(t, "updated-name", store.data["update-job"].Name, "Name should be updated")
 	assert.Equal(t, int(StatusSuccess), store.data["update-job"].Status, "Status should be updated")
 
+	require.NoError(t, store.Flush())
+
 	// Verify file was updated
 	fileData, err := os.ReadFile(storePath)
 	require.NoError(t, err)
@@ -214,6 +300,8 @@ func TestJSONFileStore_Delete(t *testing.T) {
 	require.NoError(t, err, "Delete should not return error")
 	assert.NotContains(t, store.data, "job1", "Deleted job should not be in memory")
 	assert.Contains(t, store.data, "job2", "Other job should remain")
+
+	require.NoError(t, store.Flush())
 
 	// Verify file was updated
 	fileData, err := os.ReadFile(storePath)
@@ -338,6 +426,8 @@ func TestJSONFileStore_AtomicWrite(t *testing.T) {
 	err = store.Save(job)
 	require.NoError(t, err)
 
+	require.NoError(t, store.Flush(), "Flush should write the pending changes")
+
 	// Verify temp file was cleaned up
 	tmpFile := storePath + ".tmp"
 	_, err = os.Stat(tmpFile)
@@ -363,10 +453,18 @@ func TestJSONFileStore_DirtyFlag(t *testing.T) {
 		Status: StatusPending,
 	}
 
-	// Save should set dirty flag and then clear it after flush
+	// Save should mark dirty and keep it dirty until a flush happens
 	err = store.Save(job)
 	require.NoError(t, err)
+	assert.True(t, store.dirty, "Store should be dirty after Save (debounced write)")
+
+	require.NoError(t, store.Flush())
 	assert.False(t, store.dirty, "Store should not be dirty after successful flush")
+
+	// A flush without changes must not rewrite the file
+	before := store.flushSeq
+	require.NoError(t, store.Flush())
+	assert.Equal(t, before, store.flushSeq, "Clean flush should not write again")
 }
 
 func TestJSONFileStore_Persistence(t *testing.T) {
@@ -385,6 +483,7 @@ func TestJSONFileStore_Persistence(t *testing.T) {
 	}
 	err = store1.Save(job)
 	require.NoError(t, err)
+	require.NoError(t, store1.Close(), "Close should flush and stop the background writer")
 
 	// Create second store (simulating restart)
 	store2, err := NewJSONFileStore(storePath)
@@ -439,6 +538,7 @@ func TestJSONFileStore_JSONFormatting(t *testing.T) {
 	}
 	err = store.Save(job)
 	require.NoError(t, err)
+	require.NoError(t, store.Flush())
 
 	// Read file and verify it's formatted (indented)
 	fileData, err := os.ReadFile(storePath)
@@ -518,6 +618,7 @@ func TestJSONFileStore_LoadFromDisk_Permissions(t *testing.T) {
 	}
 	err = store.Save(job)
 	require.NoError(t, err)
+	require.NoError(t, store.Flush())
 
 	// Verify file has correct permissions
 	info, err := os.Stat(storePath)
