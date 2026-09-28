@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
@@ -269,4 +270,36 @@ func TestWSClient_TrySendDropsWhenFull(t *testing.T) {
 		}
 	})
 	assert.Equal(t, 1, len(client.send))
+}
+
+// TestWSServerOriginPolicy 校验握手来源限制：默认放开，配置白名单后精确匹配。
+func TestWSServerOriginPolicy(t *testing.T) {
+	cases := []struct {
+		name    string
+		allowed []string
+		origin  string
+		want    bool
+	}{
+		{name: "未配置即接受任意来源", allowed: nil, origin: "https://evil.example", want: true},
+		{name: "显式通配", allowed: []string{"*"}, origin: "https://evil.example", want: true},
+		{name: "非浏览器客户端无 Origin 头", allowed: []string{"https://good.example"}, origin: "", want: true},
+		{name: "白名单命中", allowed: []string{"https://good.example"}, origin: "https://good.example", want: true},
+		{name: "白名单忽略大小写", allowed: []string{"https://Good.example"}, origin: "https://good.EXAMPLE", want: true},
+		{name: "白名单之外拒绝", allowed: []string{"https://good.example"}, origin: "https://evil.example", want: false},
+		{name: "本地打开的页面（null origin）被拒", allowed: []string{"https://good.example"}, origin: "null", want: false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ws := NewWSServer(NewEventBus(16), tc.allowed...)
+
+			req, err := http.NewRequest(http.MethodGet, "http://localhost/ws", nil)
+			require.NoError(t, err)
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+
+			assert.Equal(t, tc.want, ws.upgrader.CheckOrigin(req))
+		})
+	}
 }

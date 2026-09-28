@@ -4,20 +4,13 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
 )
-
-var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // 生产环境应限制来源
-	},
-	ReadBufferSize:  1024,
-	WriteBufferSize: 1024,
-}
 
 // WSMessage WebSocket消息格式
 type WSMessage struct {
@@ -44,6 +37,9 @@ type WSServer struct {
 	quit     chan struct{}
 	stopOnce sync.Once
 	wg       sync.WaitGroup
+
+	// upgrader 按来源白名单决定是否放行握手，创建后不再变更
+	upgrader websocket.Upgrader
 }
 
 // WSClient WebSocket客户端连接
@@ -67,11 +63,44 @@ type WSClient struct {
 	closeOnce sync.Once
 }
 
-func NewWSServer(eventBus *EventBus) *WSServer {
+// NewWSServer 创建 WebSocket 服务。allowedOrigins 限制浏览器跨域握手来源：
+// 为空或含 "*" 表示接受任意来源（沿用历史行为），否则要求 Origin 精确匹配；
+// 非浏览器客户端不发 Origin 头，始终允许。
+func NewWSServer(eventBus *EventBus, allowedOrigins ...string) *WSServer {
 	return &WSServer{
 		eventBus: eventBus,
 		clients:  make(map[*WSClient]bool),
 		quit:     make(chan struct{}),
+		upgrader: websocket.Upgrader{
+			CheckOrigin:     originChecker(allowedOrigins),
+			ReadBufferSize:  1024,
+			WriteBufferSize: 1024,
+		},
+	}
+}
+
+// originChecker 生成 websocket.Upgrader 的 CheckOrigin 实现
+func originChecker(allowed []string) func(*http.Request) bool {
+	wildcard := len(allowed) == 0
+	set := make(map[string]bool, len(allowed))
+	for _, o := range allowed {
+		if o == "*" {
+			wildcard = true
+			continue
+		}
+		set[strings.ToLower(o)] = true
+	}
+
+	return func(r *http.Request) bool {
+		origin := r.Header.Get("Origin")
+		if origin == "" {
+			// 浏览器以外的客户端（Go/curl）不发 Origin
+			return true
+		}
+		if wildcard {
+			return true
+		}
+		return set[strings.ToLower(origin)]
 	}
 }
 
@@ -80,7 +109,7 @@ func NewWSServer(eventBus *EventBus) *WSServer {
 func (ws *WSServer) Handle(c *gin.Context) {
 	subID, eventCh := ws.eventBus.SubscribeAll()
 
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
+	conn, err := ws.upgrader.Upgrade(c.Writer, c.Request, nil)
 	if err != nil {
 		ws.eventBus.Unsubscribe(subID)
 		log.Printf("WebSocket upgrade failed: %v", err)
