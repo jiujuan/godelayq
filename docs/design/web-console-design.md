@@ -161,12 +161,15 @@ web/
 │  └─ styles/tokens.css      # 颜色/圆角/间距 CSS 变量
 ```
 
-M3 交付的是这张表的骨架层：`api/` 只有 types/client/auth/keys/stats（jobs、groups、
-events、admin 的调用随各自页面在 M4 落地），composables 只有 `usePermission`，
-`ui/` 只凑齐 layout 用得到的 Button/Input/Badge/EmptyState/Toast。
-新增 `api/keys.ts`（Query 键集中一处，失效管线与页面共用）与 `plugins/`
+M3 交的是这张表的骨架层，M4 把页面层补齐：`api/` 现在有 types/client/auth/keys/stats
+与 jobs、groups、events、admin 四个调用模块，composables 有 usePermission、useCountdown、
+useJobEvents、useEventFeed，`ui/` 补上 Select/Drawer/Confirm，
+并按页面长出 `jobs/`（状态徽标、筛选条、表格、表单、Cron、Payload、时间线）与 `groups/`（列表、表单）。
+另有 `api/keys.ts`（Query 键集中一处，失效管线与页面共用）、`display.ts`（短 ID 与时间格式化）与 `plugins/`
 （`query.ts` 装 QueryClient、`realtime-effects.ts` 把事件翻译成失效请求），
 目的是让 realtime store 不认识 QueryClient。
+Select 之外的 Table/Modal/Drawer 类通用组件没有预先抽出来：表格与抽屉的形状由各页自己长，
+在没有第三个使用者之前抽出来只会变成一层需要维护的间接。
 
 ### 4.3 布局与视觉规范
 
@@ -249,6 +252,12 @@ events、admin 的调用随各自页面在 M4 落地），composables 只有 `us
   2. 按 `job_id` 使相关 Query 失效：`jobs` 列表、`job/:id`、`stats`（debounce 500ms，
      避免高频事件把请求打爆）。
 - Monitor 页沿用旧 dashboard 的订阅过滤（`job_types`/`event_types` 复选）。
+  过滤是**服务端**的：store 发 `{"action":"subscribe","filter":{...}}`（`core.WSFilter`），
+  不匹配的事件根本不会被推过来。由此带出两条必须一起做的规则，实测都踩过：
+  1. 视图还要对"已回填的历史 + 已到达的缓冲"再判一次同一个谓词，否则一次筛选会出现两套结果；
+  2. 过滤条件一变就要作废 `['events']` 的回填重取一次——过滤期间服务端没推的事件
+     浏览器从来没拿到过，不清掉这份缓存，"清除筛选"会显示成一段凭空消失的时间。
+  离开 Monitor 页时恢复全量订阅：这条连接是全应用共用的，不能让一个页面把别的页面饿着。
 
 ### 4.6 页面详设
 
@@ -260,12 +269,20 @@ events、admin 的调用随各自页面在 M4 落地），composables 只有 `us
 #### DashboardView（概览）
 - 顶部 6 张 `StatCard`：pending / running / paused / completed / failed / heap_size+uptime。
   数据源 `GET /api/v1/stats`（新增 paused 后见 §5.4），Query `refetchInterval: 5s` + WS 事件即时失效。
-- 下方两栏：左为分组健康度（每组 pending/failed 计数，来自 `GET /groups` 聚合字段）；
-  右为实时事件流（前端缓冲，非持久）。
+- 下方两栏：左为分组健康度（每组的 `job_count` 与 `paused_count`，来自 `GET /groups`），
+  右为实时事件流（最近几条，完整流与筛选在 Monitor 页）。
+  两栏与统计卡共用同一套 Query 键，所以概览上的数字与列表页必然同源。
+  `/stats` 的 5s 轮询挂在 **Topbar**（每个页面都渲染它）而不是本页：
+  两处都声明 `refetchInterval` 会让同一把钥匙被两个观察者各敲一遍，请求量翻倍却买不到新鲜度。
 
 #### JobsView（任务列表，核心页）
-- 筛选条：状态下拉（含 paused）、分组下拉、名称（=job type）下拉、关键字。
-  前三个映射为 `?status=&group=&name=`（group 为新增参数）。
+- 筛选条：状态下拉（含 paused）、分组下拉、名称（=job type）下拉，映射为 `?status=&group=&name=`
+  （group 为新增参数）。**原稿里的"关键字"输入框不做**：列表端点只认这三个参数，
+  硬加一个"只过滤当前这一页"的输入框会让翻页与总数自相矛盾，比没有更糟。
+  想按 ID 定位就复制链接——筛选条件同时写进 URL（用 replace，不压历史记录），
+  于是 `/jobs?group=nightly` 既是从分组页跳过来的入口，也是可以贴给别人的地址。
+  `group=`（空串）与不带 `group` 在后端分别是"只看未分组"与"不过滤"，这一区分在筛选条
+  用两个独立选项（全部分组 / 未分组）表达，不能合并。
 - 表格列：ID 短码、名称、分组、状态徽标、trigger_at + 本地倒数（`useCountdown` 显示
   `next_run_in`）、重试 `retry_count/max_retries`、cron、操作。
 - 行操作（按状态 + 角色启用/禁用，与后端能力一致）：
@@ -275,8 +292,14 @@ events、admin 的调用随各自页面在 M4 落地），composables 只有 `us
     低角色看到的是置灰 + "需要 admin 角色"提示）
   - failed：重试（POST retry）、查看
   - success/cancelled：查看
-- 行点击 → JobDetailView。多选列 + 批量条（批量取消/批量暂停/移入分组），
-  依赖新端点 `POST /api/v1/jobs/batch-ops`（§5.5）。批量**创建**已有可用端点
+- 行点击 → JobDetailView。多选列 + 批量条（批量取消/暂停/恢复/移入分组），
+  依赖端点 `POST /api/v1/jobs/batch-ops`（§5.5）。批量按钮与行内按钮**同一档位判断**：
+  只置灰行内而放过批量，等于给低角色留一条"点了才知道 403"的旁路。
+  batch-ops 的 207 混合结果要逐条给原因（最常见的是"这条不在待执行队列"），
+  并把失败条目留在选中状态里以便重试；回报中的 ID 用**尾段**而不是前 8 位——
+  任务 ID 是 UUIDv7，高 48 位是毫秒时间戳，一起提交的任务前缀完全相同
+  （实测同一秒内创建的 6 条任务前 8 位一模一样）。
+  批量**创建**已有可用端点
   `POST /jobs/batch`（逐条独立、207 混合结果、单请求 ≤100，`api/handlers.go 的 BatchCreateJobs`），
   前端的"从模板批量导入"可直接复用。
 - 新建任务 = 右侧 Drawer 中 `JobForm`：
@@ -291,11 +314,27 @@ events、admin 的调用随各自页面在 M4 落地），composables 只有 `us
 - **运行时间线**：`GET /api/v1/jobs/:id/events`（新增端点，§5.6）返回最近历史事件；
   同时把该 job 的 WS 实时事件 append 到同一时间线（按 timestamp 归并）。
   每条节点：图标 + 类型 + 时间 + metadata（duration_ms、attempt、error、timeout 标记）。
+  实时部分读的是 realtime store 那 200 条全局环形缓冲，而不是给它再开一个监听位：
+  监听位只有一个且已被"事件 → Query 失效"管线占用，多处注册会互相覆盖。
+  代价是高频任务的旧事件可能被缓冲挤出，但首屏那 100 条已在手上，不会因此丢历史。
+  时间线的说明文案直接引用响应里的 `note`（"in-memory buffer, cleared on restart"），
+  两处各写一句迟早不同步。
+  另一个实现约束：`/jobs/:id → /jobs/:id` 复用同一个组件实例，
+  所以 job id 必须是响应式的——捕获一次就会永远停在第一条任务上（实测踩过）。
 - 操作区：与列表行操作同一套规则。
 
 #### GroupsView（分组管理）
 - 左侧组列表（名称、颜色点、job 计数），右侧编辑区：名称、描述、颜色（从固定 8 色板选）、
   删除按钮（**仅 admin/ops 可见**，operator/viewer 置灰并提示所需角色）。
+  计数用 `GET /groups` 实际给出的 `job_count`/`paused_count`（原稿写的"每组 pending/failed
+  计数"后端并不提供：分组维度只统计挂了多少条任务、其中多少条处于暂停）。
+- 颜色是 8 色板而不是自由取色器：后端只校验 `#rgb`/`#rrggbb`，放开选择器只会产出
+  成百上千种"近似蓝"，分组色就失去了"一眼认出"的意义。没配色渲染成描边空圈，
+  不挑一个默认色假装它有身份。
+- `registered=false` 的组（只挂在任务标签上、注册表里没有条目）是一等公民：
+  列表要显示"未注册"，编辑区退化为只读 + **注册这个组**（走 POST），
+  不给改名与删除（那两个端点对它返回 404）。改名改到一半失败留下的"半个旧组"
+  全靠这一格看得见，否则无处下手。
 - 删除组时弹窗说明后果：**组内 job 不会被删除，只解除分组归入"未分组"**（决策 D5，§5.5）。
   admin/ops 请求不带 `strategy` 参数，后端默认按 detach 处理；弹窗只需勾选确认，
   无需输入 `?strategy=detach`。
@@ -303,11 +342,18 @@ events、admin 的调用随各自页面在 M4 落地），composables 只有 `us
 
 #### MonitorView（实时事件流）
 即旧 dashboard 能力：WS 状态、事件类型复选过滤、事件卡片流（限 100 条 DOM）。
+过滤是服务端订阅级的，机制与两条配套规则（视图二次判定、筛选变化作废回填）见 §4.5。
+首屏由 `GET /events` 回灌一次：刷新页面不该让刚发生的事凭空消失——
+M3 那一版只渲染前端缓冲，重载后是空的，页头却写着"由后端缓冲重新供给"，
+属于文案承诺了代码没做的事，本轮把代码补上而不是把话删掉。
 
 #### AdminView（运维，仅 ops 角色）
 - **调度总开关**：suspend / resume 整个调度循环（维护窗口内不再弹出到期任务，
   执行中的任务不受影响），需要二次确认；状态在 Topbar 显示醒目横幅"scheduling suspended"。
   对应 §5.4 新端点与 §5.2 的 `Scheduler.Suspend/Resume`。
+  横幅的数据源是 `/stats` 的 `scheduling_suspended` 而不是 `/admin/runtime`：
+  后者只有 ops 能读，那样"任务为什么不出"这句话就说给了改得动它的人，
+  而真正需要被告知的是在维护窗口里等结果的所有人。
 - **运行时诊断**（只读）：`GET /api/v1/admin/runtime` → worker 数、队列容量与占用、
   堆长度、in-flight、事件缓冲占用、启动时长。
 - **清空事件缓冲**：`DELETE /api/v1/admin/events`（会让各详情页时间线从当前时刻重新开始）。
@@ -527,7 +573,7 @@ Job 不强制属于已注册组：允许 `group=foo` 建任务而 foo 未建组�
 | `GET /jobs` | 增加 `group` 查询参数（忽略大小写匹配）；`status` 接受 `paused`（`ParseJobStatus` 自动支持）；空值参数：`group=`（精确取未分组）与省略（不过滤）要区分 |
 | `PUT /jobs/:id` | `UpdateJobRequest` 增加 `group`（**指针**，区分"没传"与"传空串=取消分组"）。只对 pending 生效：暂停/已结束的任务移组走 `batch-ops` 的 `move` |
 | `JobResponse` | 增加 `group`；`status` 枚举说明加 paused |
-| `GET /stats` | `StatsResponse` 增加 `paused` 计数（扫描循环加一个 case，`api/handlers.go 的 GetStats`） |
+| `GET /stats` | `StatsResponse` 增加 `paused` 计数（扫描循环加一个 case，`api/handlers.go 的 GetStats`）；M4 再加 `scheduling_suspended`（布尔、不带 omitempty，取 `Scheduler.RuntimeStats().Suspended`），给 Topbar 的挂起横幅做全角色可读的数据源。顺手把 `running`/`heap_size` 改成同一次 `RuntimeStats()` 里取，免得三个字段来自三个瞬间而自相矛盾 |
 
 **新增**（"角色"列为最低可满足角色，服务端 RBAC 与前端 UI 同一张表，见 §5.7.3）：
 
@@ -844,7 +890,7 @@ var dist embed.FS
 | M1 | core：paused + group **已交付** | 状态枚举/Job/Snapshot/事件常量；`Scheduler.Pause/ForcePause/Resume`、`Suspend/Unsuspend`；`handleInterrupted`/`handleSuccess`/`handleFailure` 的强制暂停守卫；Restore/Cancel 修正；`GroupStore`（路径由构造传入，`store.groups_path` 配置键随 M2 消费者一起加）；SSE 类型白名单补 paused/resumed；单测（旧数据兼容、重启不解除暂停、暂停后可取消、Handler 忽略取消仍停在 paused、并发落盘完整性） | `core/*.go`、`api/sse.go` |
 | M2 | api：REST **已交付** | pause/force-pause/resume/groups/batch-ops/events/admin 端点 + DTO 扩展 + stats.paused；EventHistory 记录器；`store.groups_path` 配置键与生产装配；403 越权尝试进访问日志 | `api/*.go`、`core/scheduler.go`（RuntimeStats/SetGroup/RetagGroup）、`core/config.go`、`cmd/server/main.go` |
 | M3 | web 骨架 **已交付** | Vite 7+TS 5+Tailwind 4+lucide 工程、token 样式层、`api/`（types/client 401→refresh→重放/auth/keys/stats）、auth store（sessionStorage + 单飞刷新）与 `usePermission` 能力表、路由守卫与角色过滤菜单、两栏 layout + 基础 UI 组件、登录流（含"未启用鉴权 直接进入"）、realtime store（ticket 建连/退避重连/200 条缓冲）与事件→Query 失效管线。**为把整条链路跑通验证，Dashboard/Monitor/Settings 三页按真页面实现**；Jobs/Groups/Admin/JobDetail 为 M4 占位 | `web/` |
-| M4 | web 页面 | Jobs 列表+表单+详情（时间线）、Groups、Admin 面板、Topbar 的 scheduling suspended 横幅、Monitor 的订阅过滤与后端缓冲回填 | `web/src/views/*`、`web/src/components/{jobs,groups}/*` |
+| M4 | web 页面 **已交付** | Jobs 列表（筛选/分页/URL 驱动）、JobForm（新建与编辑两种字段集）、批量条（batch-ops 207 逐条回报）、JobDetail（信息卡 + payload + 运行时间线）、Groups（左列表右编辑、8 色板、未注册组的注册路径、删除 detach 确认）、Admin（占用/缓冲诊断 + 挂起与清缓冲二次确认）、Topbar 挂起横幅、Monitor 服务端订阅过滤 + `/events` 回灌、Dashboard 两面板。附带一处后端契约追加：`/stats.scheduling_suspended`（含 Go 测试与 api.md 同步） | `web/src/views/*`、`web/src/components/{jobs,groups}/*`、`web/src/composables/*`、`api/{dto,handlers}.go` |
 | M5 | 集成与发布 | vite proxy 联调、embed 单二进制、`docs/api.md` 与 README/deployment 更新（鉴权章节重写）、（可选）旧 dashboard/index.html 改为跳转页 | `docs/`、`api/server.go` |
 
 后端 M0+M1+M2 约 6-8 天（M0 的 JWT/RBAC 比原 token 方案多约 2 天），
@@ -854,18 +900,27 @@ var dist embed.FS
 ## 7. 验收清单
 
 后端三项里程碑（M0/M1/M2）能自证的部分已勾选，括号里是覆盖它的测试；
-依赖浏览器的条目留空，等 M3/M4 的前端落地再验。
+依赖浏览器的条目在 M3/M4 两轮真浏览器冒烟中逐条复核，实测证据写在条目后面，
+观测不到的（例如被隐藏标签页节流掉的定时动画）明确标"未观测"而不是勾掉。
 
 - [x] 未认证访问任意业务端点 → 401；`viewer` 调写端点 → 403；`operator` 调强制暂停/删组 → 403
       （`api/auth_test.go`、`api/handlers_lifecycle_test.go`、`api/handlers_groups_test.go`、`api/handlers_admin_test.go`）
+- [x] 前端把同一张档位表用在 UI 上：`viewer` 下**行内与批量**的写按钮一律置灰并写出
+      "需要 operator 及以上角色"，运维菜单入口不出现、直连 `/admin` 被守卫弹回首页
+      （浏览器实测：以 viewer 登录后逐项读 disabled 与 title；两处曾不一致——
+      批量按钮漏了判档、以及冷启动时应用外壳先挂载引发的一次 401，均已修）
+- [x] 挂起调度时所有角色都能在 Topbar 看到"调度已挂起"横幅（数据源 `/stats.scheduling_suspended`，
+      `TestStatsReportsSchedulingSuspended`；浏览器实测挂起→横幅出现、
+      恢复→横幅消失，且挂起期间到点的任务停在 pending 不出堆，恢复后立即补跑）
 - [x] 错误密码与不存在的账号返回同一状态码与文案（不可枚举账号）；连续失败触发限流（`TestLoginFailureIsIndistinguishable`、`TestLoginRateLimitedAfterFailures`）
 - [x] access token 过期后前端静默刷新并重放成功；logout 后旧 access token 立即 401（jti 拒绝表）、
       refresh token 立即失效（后端轮转/吊销已覆盖：`TestRefreshRotatesRefreshToken`、
       `TestLogoutRevokesAccessTokenAndRefreshToken`；前端侧在浏览器实测：把 `access_ttl` 调到 20s
       后不刷新页面跑完一轮任务，服务端访问日志出现 4 次 `/auth/refresh` 且其间无 401 冒泡；
       退出后 sessionStorage 清空并回到 `/login`（按钮是显式跳转，凭据彻底失效时由
-      sessionLost 带 `?redirect=` 送回）；"登录已过期"那条 toast 文案在未显示的标签页里
-      被定时器节流挡住，本轮没观测到，不做已验证的声明）
+      sessionLost 带 `?redirect=` 送回）。M3 时因标签页隐藏、定时器被节流而没观测到的
+      toast，M4 在浏览器里读到了实际文案（"批量暂停：3 条成功、1 条未执行。…"、
+      "已保存"、"已注册"），这条保留意见撤销）
 - [x] WS/SSE 通过一次性 ticket 建连；ticket 复用第二次被拒；URL 与访问日志中不出现长期凭据
       （`TestWSTicketIsSingleUseAndScopedToRealtimeChannels`、`TestAccessTokenIsRejectedInQueryString`；
       浏览器复核：启用鉴权与未启用鉴权两种部署下 Topbar 徽标均进入"实时连接"，
@@ -883,11 +938,13 @@ var dist embed.FS
       （`core/suspend_test.go`、`TestAdminRuntimeReportsOccupancy`）
 - [x] 分组改名连带改写任务标签，且不会被下一次执行写回旧值（`TestGroupRenameRetagsJobs`、
       `TestScheduler_SetGroup_KeepsNewGroupAfterTheJobRuns`）
-- [ ] 详情页时间线展示最近事件（含 paused/force-paused/resumed/retrying/failed 与 timeout 标记）
-      （端点已就绪：`GET /jobs/:id/events`，见 `TestJobEventsEndpointServesTimeline`；UI 属 M4）
-- [ ] WS 事件触发列表/统计自动刷新；断线显示黄色徽标并自动重连。**统计侧已实测**：
-      不刷新页面用 `POST /jobs` 建一个任务，概览的"已完成"从 0 变 1（事件→debounce→失效→重取）；
-      列表侧与"断线重连徽标"待 M4（JobsView 尚无列表，重连退避也未在浏览器里触发过）
+- [x] 详情页时间线展示最近事件（含 paused/force-paused/resumed/retrying/failed 与 timeout 标记）
+      （端点：`TestJobEventsEndpointServesTimeline`；浏览器实测：一条完成任务渲染出
+      scheduled/started/completed 三节点并显示"第 1 次尝试"，一条暂停任务显示
+      scheduled/paused；`/jobs/a → /jobs/b` 切换后正文与时间线都跟着换）
+- [ ] WS 事件触发列表/统计自动刷新；断线显示黄色徽标并自动重连。**统计与列表都已实测**：
+      不刷新页面建任务、暂停任务，概览计数与列表行状态同步变化（事件→debounce→失效→重取）；
+      断线重连的黄色徽标仍未验证（重连退避没在浏览器里触发过，M5 联调时补）
 - [x] 旧 `data/jobs.json`（无 group、状态 0-4）直接升级运行无报错；配置中写非法 role 或
       缺 jwt.secret 时启动即报错（`core/job_status_test.go`、`core/config_test.go`、
       `TestStartFailsWhenAuthMisconfigured`）

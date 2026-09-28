@@ -633,7 +633,8 @@ GET /stats
   "completed": 1542,
   "failed": 8,
   "heap_size": 15,
-  "uptime": "72h15m30s"
+  "uptime": "72h15m30s",
+  "scheduling_suspended": false
 }
 ```
 
@@ -645,6 +646,11 @@ GET /stats
 | running | 进程内实时执行数 | 已进入 Handler、尚未返回的任务数 |
 | heap_size | 调度堆长度 | 仍在堆里等待的任务数 |
 | uptime | 进程启动至今 | 计数器不跨重启，completed/failed 随存储恢复而继续累计 |
+| scheduling_suspended | 调度总开关的当前值 | 与 `GET /admin/runtime` 的 `scheduler.suspended` 同源 |
+
+`scheduling_suspended` 放在 `/stats` 而不是只留在 ops 专属的 `/admin/runtime`：
+调度被挂起时，"任务为什么不出"是每一个看列表的人的疑问，不是只有改得动它的人才需要知道。
+该字段不带 `omitempty`——缺席会让前端只能猜，而猜错的方向是"以为调度器卡死了"。
 
 `pending` 与 `heap_size` 通常相等，差值来自"已出堆、还在执行队列里排队"的那一小段：
 它的快照仍是 `pending`，但已不在堆里，也未进入 Handler。`running` 只统计已进入 Handler 的任务。

@@ -167,13 +167,14 @@ godelayq/
 │   ├── vite.config.ts        # dev 代理 /api、/sse、/ws → :8080
 │   ├── package.json          # 版本钉在设计文档 §4.1：Vite 7 / TS 5 / Pinia 3 / Router 4
 │   └── src/
-│       ├── api/              # types、client（401→刷新→重放一次）、auth、keys、stats
-│       ├── stores/           # auth（sessionStorage + 单飞刷新）、realtime（WS + 200 条事件缓冲）、toast
+│       ├── api/              # types、client（401→刷新→重放一次）、auth、jobs、groups、events、admin、keys、stats
+│       ├── stores/           # auth（sessionStorage + 单飞刷新）、realtime（WS + 200 条事件缓冲 + 订阅过滤）、toast
 │       ├── plugins/          # query 装配、realtime-effects（事件 → Query 失效，debounce 500ms）
 │       ├── router/           # 路由表派生菜单，守卫按 meta.minimumRole 拦截
-│       ├── composables/      # usePermission 能力表
-│       ├── components/       # layout（侧栏/顶栏/页头）与 ui（按钮/输入/徽标/空态/提示）
-│       ├── views/            # 登录、概览、实时、设置已实现；任务/分组/运维页属 M4
+│       ├── composables/      # usePermission 能力表、useCountdown、useJobEvents、useEventFeed
+│       ├── components/       # layout（侧栏/顶栏/页头）、ui、jobs（表格/表单/筛选/时间线）、groups、dashboard
+│       ├── views/            # 登录、概览、任务、任务详情、分组、实时、运维、设置（八页均已实现）
+│       ├── display.ts        # 短 ID（取 UUIDv7 尾段）与时间格式化
 │       └── styles/           # tokens.css：蓝白灰主题变量
 │
 ├── configs/
