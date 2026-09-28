@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -44,6 +45,9 @@ type Server struct {
 	groups core.GroupStore
 	// history 是事件总线的内存订阅者，为详情页时间线与 Dashboard 提供最近事件
 	history *EventHistory
+	// console 是嵌入的前端产物根；nil 表示这次部署只提供 API（开发形态）。
+	// 它同时决定鉴权中间件是否豁免静态资源——登录页本身也是产物的一部分。
+	console fs.FS
 
 	// baseCtx 传给每个请求；Stop 取消它即可让 SSE 等长连接立即收尾
 	baseCtx    context.Context
@@ -110,6 +114,12 @@ func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Sec
 	// 事件历史跟着服务器起：订阅在构造时建立，服务器活着期间的第一个事件就不会漏。
 	// 上限是常量（api/history.go），运维要看的只是"缓冲占用多少"，不配 knob。
 	s.history = NewEventHistory(scheduler.GetEventBus())
+
+	// 是否带控制台只在这一处可见：没有这个日志，"我是不是编了个不带前端的二进制"
+	// 只能靠访问 / 看是 404 还是页面来猜。
+	if s.console != nil {
+		logger.Info("embedded console enabled", "mount", "/")
+	}
 
 	// 持有唯一的 http.Server 实例，Stop 才能真正关闭监听
 	s.httpSrv = &http.Server{
@@ -220,10 +230,15 @@ func (s *Server) setupRoutes() {
 		api.GET("/job-types", reader, s.ListJobTypes)
 	}
 
-	// 404处理
+	// 404 处理。嵌入了前端产物时先给 SPA 一次兜底的机会（SPA 深链与静态资源
+	// 都没有注册路由，全部落在这里），判定条件与鉴权豁免共用 consoleRequest。
 	s.engine.NoRoute(func(c *gin.Context) {
-		c.JSON(404, ErrorResponse{
-			Code:    404,
+		if s.consoleRequest(c) {
+			s.serveConsole(c)
+			return
+		}
+		c.JSON(http.StatusNotFound, ErrorResponse{
+			Code:    http.StatusNotFound,
 			Message: "resource not found",
 		})
 	})

@@ -144,6 +144,15 @@ func (s *Server) authMiddleware() gin.HandlerFunc {
 			return
 		}
 
+		if s.consoleRequest(c) {
+			// 嵌入的前端产物不要求凭据：登录页本身就是产物的一部分，这里拦下来
+			// 等于启用鉴权的部署连登录框都打不开。豁免范围由 consoleRequest 收紧在
+			// "GET/HEAD + 不在 /api、/ws、/sse 名字空间里"，任何写方法都不通过。
+			// 不设置 Principal：这些路径上没有业务处理器，也就没有可判定的档位。
+			c.Next()
+			return
+		}
+
 		principal, info, ok := s.authenticate(c.Request, want)
 		if !ok {
 			c.AbortWithStatusJSON(http.StatusUnauthorized, ErrorResponse{
