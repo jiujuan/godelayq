@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,10 +47,13 @@ type Scheduler struct {
 	inFlight atomic.Int32
 
 	eventBus *EventBus // 新增
+
+	// logger 结构化日志器，构造后不再变更；未注入时为 slog.Default()
+	logger *slog.Logger
 }
 
-// NewScheduler 创建调度器
-func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus) *Scheduler {
+// NewScheduler 创建调度器。可通过 WithLogger 注入日志器。
+func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts ...Option) *Scheduler {
 	if retryPolicy == nil {
 		retryPolicy = &ExponentialBackoffRetry{}
 	}
@@ -58,6 +61,8 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus) *Sch
 	if eventBus == nil {
 		eventBus = NewEventBus(100) // 默认事件总线
 	}
+
+	settings := newComponentOptions(opts...)
 
 	return &Scheduler{
 		heap:        NewQuaternaryHeap(),
@@ -70,6 +75,7 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus) *Sch
 		handlers:    make(map[string]Handler),
 		cancelMap:   make(map[string]context.CancelFunc),
 		eventBus:    eventBus,
+		logger:      resolveLogger(settings.logger),
 	}
 }
 
@@ -83,7 +89,7 @@ func (s *Scheduler) SetConcurrency(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.running {
-		log.Printf("SetConcurrency(%d) ignored: scheduler already running", n)
+		s.logger.Warn("SetConcurrency ignored: scheduler already running", "workers", n)
 		return
 	}
 	s.concurrency = n
@@ -99,7 +105,7 @@ func (s *Scheduler) SetQueueCapacity(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.running {
-		log.Printf("SetQueueCapacity(%d) ignored: scheduler already running", n)
+		s.logger.Warn("SetQueueCapacity ignored: scheduler already running", "queue_capacity", n)
 		return
 	}
 	s.queueCapacity = n
@@ -146,7 +152,7 @@ func (s *Scheduler) Schedule(job *Job) error {
 	// 持久化
 	if s.store != nil {
 		if err := s.store.Save(job); err != nil {
-			log.Printf("Failed to persist job %s: %v", job.ID, err)
+			s.logger.Error("failed to persist job", "job_id", job.ID, "error", err)
 		}
 	}
 
@@ -204,7 +210,7 @@ func (s *Scheduler) Cancel(jobID string) error {
 
 	if s.store != nil {
 		if err := s.store.Delete(jobID); err != nil {
-			log.Printf("Failed to delete cancelled job %s: %v", jobID, err)
+			s.logger.Error("failed to delete cancelled job", "job_id", jobID, "error", err)
 		}
 	}
 
@@ -256,7 +262,7 @@ func (s *Scheduler) UpdatePending(jobID string, apply func(*Job) error) (*Job, e
 
 	if s.store != nil {
 		if err := s.store.Update(updated.ToSnapshot()); err != nil {
-			log.Printf("Failed to persist updated job %s: %v", updated.ID, err)
+			s.logger.Error("failed to persist updated job", "job_id", updated.ID, "error", err)
 		}
 	}
 
@@ -277,7 +283,7 @@ func (s *Scheduler) hasStoredJob(jobID string) bool {
 
 	snapshots, err := s.store.LoadAll()
 	if err != nil {
-		log.Printf("Failed to load jobs while checking %s: %v", jobID, err)
+		s.logger.Error("failed to load jobs while checking job", "job_id", jobID, "error", err)
 		return false
 	}
 	for _, snap := range snapshots {
@@ -319,7 +325,7 @@ func (s *Scheduler) Restore() error {
 		restored++
 	}
 	if restored > 0 {
-		log.Printf("Restored %d job(s) from store", restored)
+		s.logger.Info("restored jobs from store", "count", restored)
 	}
 	return nil
 }
@@ -348,7 +354,7 @@ func (s *Scheduler) Start() {
 	s.mu.Unlock()
 
 	if err := s.Restore(); err != nil {
-		log.Printf("Failed to restore jobs on start: %v", err)
+		s.logger.Error("failed to restore jobs on start", "error", err)
 	}
 
 	s.wg.Add(1 + workers)
@@ -483,7 +489,7 @@ func (s *Scheduler) executeJob(job *Job) {
 			job.Handler = h
 		}
 		if job.Handler == nil {
-			log.Printf("No handler registered for job %s (key=%s)", job.ID, key)
+			s.logger.Error("no handler registered for job", "job_id", job.ID, "handler_key", key)
 			job.Status = StatusFailed
 			job.UpdatedAt = time.Now()
 			if s.store != nil {
@@ -543,7 +549,7 @@ func (s *Scheduler) executeJob(job *Job) {
 	// 统计接口也不再依赖进程内状态。写入会被合并落盘吸收，不增加每次一写。
 	if s.store != nil {
 		if err := s.store.Update(job.ToSnapshot()); err != nil {
-			log.Printf("Failed to persist running job %s: %v", job.ID, err)
+			s.logger.Error("failed to persist running job", "job_id", job.ID, "error", err)
 		}
 	}
 
@@ -591,9 +597,9 @@ func (s *Scheduler) executeJob(job *Job) {
 	})
 
 	if timedOut {
-		log.Printf("Job %s timed out after %v: %v", job.ID, job.Timeout, err)
+		s.logger.Error("job timed out", "job_id", job.ID, "timeout", job.Timeout, "error", err)
 	} else {
-		log.Printf("Job %s failed: %v", job.ID, err)
+		s.logger.Error("job failed", "job_id", job.ID, "error", err)
 	}
 	s.handleFailure(job)
 }
@@ -608,7 +614,7 @@ func (s *Scheduler) handleInterrupted(job *Job) {
 	s.mu.RUnlock()
 
 	if running {
-		log.Printf("Job %s execution cancelled", job.ID)
+		s.logger.Info("job execution cancelled", "job_id", job.ID)
 		return
 	}
 
@@ -616,7 +622,7 @@ func (s *Scheduler) handleInterrupted(job *Job) {
 	job.UpdatedAt = time.Now()
 	if s.store != nil {
 		if err := s.store.Update(job.ToSnapshot()); err != nil {
-			log.Printf("Failed to persist interrupted job %s: %v", job.ID, err)
+			s.logger.Error("failed to persist interrupted job", "job_id", job.ID, "error", err)
 		}
 	}
 
@@ -628,7 +634,7 @@ func (s *Scheduler) handleInterrupted(job *Job) {
 		Timestamp: time.Now(),
 		Metadata:  map[string]interface{}{"reason": "shutdown"},
 	})
-	log.Printf("Job %s interrupted by shutdown, kept pending for recovery", job.ID)
+	s.logger.Info("job interrupted by shutdown, kept pending for recovery", "job_id", job.ID)
 }
 
 // 处理成功
@@ -658,13 +664,13 @@ func (s *Scheduler) handleSuccess(job *Job) {
 			s.Schedule(newJob)
 			return
 		}
-		log.Printf("Failed to compute next run for cron job %s (expr=%s): %v", job.ID, job.CronExpr, err)
+		s.logger.Error("failed to compute next run for cron job", "job_id", job.ID, "cron_expr", job.CronExpr, "error", err)
 	}
 
 	// 终态留痕：写入成功快照，是否长期保留由存储的保留策略决定
 	if s.store != nil {
 		if err := s.store.Update(job.ToSnapshot()); err != nil {
-			log.Printf("Failed to persist completed job %s: %v", job.ID, err)
+			s.logger.Error("failed to persist completed job", "job_id", job.ID, "error", err)
 		}
 	}
 }
@@ -690,14 +696,14 @@ func (s *Scheduler) handleFailure(job *Job) {
 
 		retryJob := job.CloneForRetry(nextTime)
 
-		log.Printf("Scheduling retry for job %s at %v", job.ID, nextTime)
+		s.logger.Warn("scheduling retry", "job_id", job.ID, "next_time", nextTime)
 		s.Schedule(retryJob)
 	} else {
 		job.Status = StatusFailed
 		job.UpdatedAt = time.Now()
 		if s.store != nil {
 			if err := s.store.Update(job.ToSnapshot()); err != nil {
-				log.Printf("Failed to persist failed job %s: %v", job.ID, err)
+				s.logger.Error("failed to persist failed job", "job_id", job.ID, "error", err)
 			}
 		}
 	}

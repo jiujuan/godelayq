@@ -175,7 +175,7 @@ func (u *fakeUpgrader) latest() *fakeConn {
 func newTestWSServer(t *testing.T, eb *EventBus, allowedOrigins ...string) (*WSServer, *fakeUpgrader) {
 	t.Helper()
 	u := &fakeUpgrader{}
-	return NewWSServer(eb, u, allowedOrigins...), u
+	return NewWSServer(eb, u, WithAllowedOrigins(allowedOrigins...)), u
 }
 
 // connect 走完整 Handle 流程建立一条 fake 连接

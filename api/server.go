@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"sync"
@@ -24,6 +25,8 @@ type Server struct {
 	port      string
 	sec       Security
 	startTime time.Time
+	// logger 访问日志与服务器生命周期日志
+	logger *slog.Logger
 
 	// baseCtx 传给每个请求；Stop 取消它即可让 SSE 等长连接立即收尾
 	baseCtx    context.Context
@@ -68,23 +71,30 @@ func (r *JobRegistry) List() []string {
 	return names
 }
 
-// NewServer 创建API服务器。sec 为零值时不鉴权、接受任意跨域来源。
-func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Security) *Server {
+// NewServer 创建API服务器。sec 为零值时不鉴权、接受任意跨域来源；
+// logger 为 nil 时使用 slog.Default()。
+func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Security, logger *slog.Logger) *Server {
 	if port == "" {
 		port = "8080"
+	}
+	if logger == nil {
+		logger = slog.Default()
 	}
 
 	baseCtx, baseCancel := context.WithCancel(context.Background())
 
 	s := &Server{
-		scheduler:  scheduler,
-		store:      store,
-		registry:   NewJobRegistry(),
-		engine:     gin.New(),
-		wsServer:   core.NewWSServer(scheduler.GetEventBus(), newWSUpgrader(), sec.AllowOrigins...),
+		scheduler: scheduler,
+		store:     store,
+		registry:  NewJobRegistry(),
+		engine:    gin.New(),
+		wsServer: core.NewWSServer(scheduler.GetEventBus(), newWSUpgrader(),
+			core.WithAllowedOrigins(sec.AllowOrigins...),
+			core.WithLogger(logger)),
 		port:       port,
 		sec:        sec,
 		startTime:  time.Now(),
+		logger:     logger,
 		baseCtx:    baseCtx,
 		baseCancel: baseCancel,
 	}
@@ -113,23 +123,11 @@ func (s *Server) RegisterJobHandler(name string, handler core.Handler) {
 }
 
 func (s *Server) setupMiddleware() {
-	// 恢复中间件
-	s.engine.Use(gin.Recovery())
+	// 恢复中间件（panic 连同堆栈写入 slog）
+	s.engine.Use(recovery(s.logger))
 
-	// 日志中间件（自定义格式）
-	s.engine.Use(gin.LoggerWithFormatter(func(param gin.LogFormatterParams) string {
-		return fmt.Sprintf("%s - [%s] \"%s %s %s %d %s \"%s\" %s\"\n",
-			param.ClientIP,
-			param.TimeStamp.Format(time.RFC1123),
-			param.Method,
-			param.Path,
-			param.Request.Proto,
-			param.StatusCode,
-			param.Latency,
-			param.Request.UserAgent(),
-			param.ErrorMessage,
-		)
-	}))
+	// 访问日志（同进程日志共用级别与格式）
+	s.engine.Use(requestLogger(s.logger))
 
 	// CORS（同时负责预检，故必须早于鉴权中间件）
 	s.engine.Use(corsMiddleware(s.sec))
@@ -193,11 +191,11 @@ func (s *Server) Start() error {
 
 	go func() {
 		if err := s.httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			fmt.Printf("HTTP server error: %v\n", err)
+			s.logger.Error("http server error", "error", err)
 		}
 	}()
 
-	fmt.Printf("HTTP API server listening on http://%s\n", s.ListenAddr())
+	s.logger.Info("http api server listening", "addr", s.ListenAddr())
 	return nil
 }
 

@@ -285,7 +285,7 @@ func TestSSEUsesConfiguredCORS(t *testing.T) {
 	require.NoError(t, err)
 
 	scheduler := core.NewScheduler(store, nil, nil)
-	srv := NewServer(scheduler, store, "0", Security{AllowOrigins: []string{"https://app.example"}})
+	srv := NewServer(scheduler, store, "0", Security{AllowOrigins: []string{"https://app.example"}}, newTestLogger())
 	require.NoError(t, srv.Start())
 	defer srv.Stop(context.Background())
 

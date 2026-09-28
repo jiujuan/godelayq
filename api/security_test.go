@@ -27,7 +27,7 @@ func newSecurityServer(t *testing.T, sec Security) *Server {
 	store, err := core.NewJSONFileStore(filepath.Join(t.TempDir(), "jobs.json"))
 	require.NoError(t, err)
 
-	return NewServer(core.NewScheduler(store, nil, nil), store, "0", sec)
+	return NewServer(core.NewScheduler(store, nil, nil), store, "0", sec, newTestLogger())
 }
 
 func doGet(t *testing.T, srv *Server, target string, header http.Header) *httptest.ResponseRecorder {

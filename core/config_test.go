@@ -101,6 +101,22 @@ func TestLoadConfig_StoreHistory(t *testing.T) {
 	assert.Equal(t, -1, offCfg.Normalized().Store.HistoryLimit, "0 才表示默认值，-1 不能被改写")
 }
 
+func TestLoadConfig_Logging(t *testing.T) {
+	path := writeConfigFile(t, "logging:\n  level: warn\n  format: json\n")
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	assert.Equal(t, "warn", cfg.Logging.Level)
+	assert.Equal(t, "json", cfg.Logging.Format)
+
+	// 留空即回到默认级别与格式
+	empty := writeConfigFile(t, "logging:\n  level: \"\"\n  format: \"\"\n")
+	emptyCfg, err := LoadConfig(empty)
+	require.NoError(t, err)
+	assert.Equal(t, "info", emptyCfg.Normalized().Logging.Level)
+	assert.Equal(t, "text", emptyCfg.Normalized().Logging.Format)
+}
+
 func TestLoadConfig_PartialFileKeepsDefaults(t *testing.T) {
 	path := writeConfigFile(t, "scheduler:\n  workers: 5\n")
 
@@ -151,6 +167,8 @@ func TestLoadConfig_RejectsInvalidValues(t *testing.T) {
 		"empty origin entry":               "server:\n  cors:\n    allow_origins: [\"https://a.example\", \"\"]\n",
 		"history limit below sentinel":     "store:\n  history_limit: -2\n",
 		"negative history ttl":             "store:\n  history_ttl: -1s\n",
+		"unknown logging level":            "logging:\n  level: verbose\n",
+		"unknown logging format":           "logging:\n  format: yaml\n",
 	}
 
 	for name, content := range cases {
@@ -170,6 +188,8 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("GODELAYQ_SERVER_CORS_ALLOW_ORIGINS", "https://a.example,https://b.example")
 	t.Setenv("GODELAYQ_STORE_HISTORY_LIMIT", "7")
 	t.Setenv("GODELAYQ_STORE_HISTORY_TTL", "6h")
+	t.Setenv("GODELAYQ_LOGGING_LEVEL", "error")
+	t.Setenv("GODELAYQ_LOGGING_FORMAT", "json")
 
 	cfg, err := LoadConfig(path)
 	require.NoError(t, err)
@@ -180,6 +200,8 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 		"list keys come from a comma-separated env value")
 	assert.Equal(t, 7, cfg.Store.HistoryLimit)
 	assert.Equal(t, 6*time.Hour, cfg.Store.HistoryTTL)
+	assert.Equal(t, "error", cfg.Logging.Level)
+	assert.Equal(t, "json", cfg.Logging.Format)
 }
 
 func TestConfig_Normalized(t *testing.T) {
@@ -196,6 +218,8 @@ func TestConfig_Normalized(t *testing.T) {
 	assert.Equal(t, defaults.Store.Path, cfg.Store.Path)
 	assert.Equal(t, defaults.Store.FlushInterval, cfg.Store.FlushInterval)
 	assert.Equal(t, defaults.Store.HistoryLimit, cfg.Store.HistoryLimit, "0 表示使用默认留痕条数")
+	assert.Equal(t, defaults.Logging.Level, cfg.Logging.Level, "空级别回落到 info")
+	assert.Equal(t, defaults.Logging.Format, cfg.Logging.Format)
 
 	// 显式设置的值不被覆盖
 	kept := Config{}

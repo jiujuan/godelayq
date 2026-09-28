@@ -2,7 +2,7 @@ package core
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
@@ -67,6 +67,8 @@ type WSServer struct {
 	// allowAll 为真时不检查来源；否则要求 Origin 命中 originSet（小写比较）
 	allowAll  bool
 	originSet map[string]bool
+	// logger 结构化日志器，创建后不再变更
+	logger *slog.Logger
 }
 
 // WSClient WebSocket客户端连接
@@ -90,10 +92,14 @@ type WSClient struct {
 	closeOnce sync.Once
 }
 
-// NewWSServer 创建 WebSocket 服务。allowedOrigins 限制浏览器跨域握手来源：
-// 为空或含 "*" 表示接受任意来源（沿用历史行为），否则要求 Origin 精确匹配；
-// 非浏览器客户端不发 Origin 头，始终允许。
-func NewWSServer(eventBus *EventBus, upgrader WSUpgrader, allowedOrigins ...string) *WSServer {
+// NewWSServer 创建 WebSocket 服务。
+// WithAllowedOrigins 限制浏览器跨域握手来源：未设置或含 "*" 表示接受任意来源
+// （沿用历史行为），否则要求 Origin 精确匹配；非浏览器客户端不发 Origin 头，始终允许。
+// WithLogger 注入日志器。
+func NewWSServer(eventBus *EventBus, upgrader WSUpgrader, opts ...Option) *WSServer {
+	settings := newComponentOptions(opts...)
+
+	allowedOrigins := settings.allowedOrigins
 	allowAll := len(allowedOrigins) == 0
 	originSet := make(map[string]bool, len(allowedOrigins))
 	for _, o := range allowedOrigins {
@@ -111,6 +117,7 @@ func NewWSServer(eventBus *EventBus, upgrader WSUpgrader, allowedOrigins ...stri
 		upgrader:  upgrader,
 		allowAll:  allowAll,
 		originSet: originSet,
+		logger:    resolveLogger(settings.logger),
 	}
 }
 
@@ -140,7 +147,7 @@ func (ws *WSServer) Handle(w http.ResponseWriter, r *http.Request) {
 	conn, err := ws.upgrader.Upgrade(w, r)
 	if err != nil {
 		ws.eventBus.Unsubscribe(subID)
-		log.Printf("WebSocket upgrade failed: %v", err)
+		ws.logger.Warn("websocket upgrade failed", "error", err)
 		return
 	}
 
@@ -177,7 +184,7 @@ func (ws *WSServer) register(client *WSClient) bool {
 	go client.writePump()
 	go client.readPump()
 
-	log.Printf("WebSocket client connected: %s (total: %d)", client.ID, total)
+	ws.logger.Info("websocket client connected", "client_id", client.ID, "clients", total)
 	return true
 }
 
@@ -190,7 +197,7 @@ func (ws *WSServer) unregister(client *WSClient) {
 	ws.mu.Unlock()
 
 	if ok {
-		log.Printf("WebSocket client disconnected: %s (total: %d)", client.ID, total)
+		ws.logger.Info("websocket client disconnected", "client_id", client.ID, "clients", total)
 	}
 }
 
@@ -230,7 +237,7 @@ func (c *WSClient) trySend(data []byte) {
 	select {
 	case c.send <- data:
 	default:
-		log.Printf("WebSocket client %s send buffer full, dropping message", c.ID)
+		c.server.logger.Warn("websocket send buffer full, dropping message", "client_id", c.ID)
 	}
 }
 
@@ -288,7 +295,7 @@ func (c *WSClient) readPump() {
 		_, message, err := c.Conn.ReadMessage()
 		if err != nil {
 			if c.Conn.UnexpectedClose(err) {
-				log.Printf("WebSocket error: %v", err)
+				c.server.logger.Warn("websocket read error", "client_id", c.ID, "error", err)
 			}
 			return
 		}
@@ -365,7 +372,7 @@ func (c *WSClient) writePump() {
 func (c *WSClient) write(message []byte) error {
 	c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if err := c.Conn.WriteMessage(WSTextMessage, message); err != nil {
-		log.Printf("WebSocket write failed for %s: %v", c.ID, err)
+		c.server.logger.Error("websocket write failed", "client_id", c.ID, "error", err)
 		return err
 	}
 	return nil

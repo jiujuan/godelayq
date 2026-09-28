@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -72,7 +72,7 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 			}()
 		},
 		timeout: 40 * time.Millisecond,
-		logger:  log.New(&logs, "", 0),
+		logger:  newCaptureLogger(&logs),
 	}
 
 	if err := run(deps); err != nil {
@@ -108,10 +108,10 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 	}
 
 	logText := logs.String()
-	if !strings.Contains(logText, "Shutting down server...") {
+	if !strings.Contains(logText, `msg="shutting down server"`) {
 		t.Fatalf("expected shutdown log, got %q", logText)
 	}
-	if !strings.Contains(logText, "Server exited") {
+	if !strings.Contains(logText, `msg="server exited"`) {
 		t.Fatalf("expected exit log, got %q", logText)
 	}
 	if server.stopCtx == nil {
@@ -138,7 +138,7 @@ func TestRun_ServerStartFailureStopsScheduler(t *testing.T) {
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {},
 		timeout:       5 * time.Second,
-		logger:        log.New(io.Discard, "", 0),
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 
 	if !errors.Is(err, server.startErr) {
@@ -169,7 +169,7 @@ func TestRun_StoreCreationFailure(t *testing.T) {
 			return nil, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {},
-		logger:        log.New(io.Discard, "", 0),
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 
 	if !errors.Is(err, wantErr) {
@@ -205,13 +205,14 @@ func TestRun_ServerStopErrorIsLoggedAndIgnored(t *testing.T) {
 			}()
 		},
 		timeout: 20 * time.Millisecond,
-		logger:  log.New(&logs, "", 0),
+		logger:  newCaptureLogger(&logs),
 	})
 
 	if err != nil {
 		t.Fatalf("expected run to ignore stop error, got %v", err)
 	}
-	if !strings.Contains(logs.String(), "Server forced to shutdown: shutdown failed") {
+	if !strings.Contains(logs.String(), `msg="server forced to shutdown"`) ||
+		!strings.Contains(logs.String(), "shutdown failed") {
 		t.Fatalf("expected stop error log, got %q", logs.String())
 	}
 }
@@ -265,7 +266,7 @@ func TestRun_ServerFactoryError(t *testing.T) {
 			return nil, wantErr
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {},
-		logger:        log.New(io.Discard, "", 0),
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 
 	if !errors.Is(err, wantErr) {
@@ -390,4 +391,9 @@ func (s *stubStore) Flush() error {
 
 func (s *stubStore) Close() error {
 	return nil
+}
+
+// newCaptureLogger 返回把文本日志写进 sb 的日志器，供断言运行期日志内容
+func newCaptureLogger(sb *strings.Builder) *slog.Logger {
+	return slog.New(slog.NewTextHandler(sb, nil))
 }

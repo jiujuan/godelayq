@@ -4,7 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -65,6 +65,9 @@ type LoaderOptions struct {
 
 	// 任务名到Handler的映射（用于自动绑定）
 	HandlerMap map[string]Handler
+
+	// Logger 加载过程的日志器，nil 表示 slog.Default()
+	Logger *slog.Logger
 }
 
 // PostLoadAction 加载后动作
@@ -83,8 +86,10 @@ const (
 type DirectoryLoader struct {
 	scheduler *Scheduler
 	options   LoaderOptions
-	watcher   *fsnotify.Watcher
-	mu        sync.RWMutex
+	// logger 构造后不再变更
+	logger  *slog.Logger
+	watcher *fsnotify.Watcher
+	mu      sync.RWMutex
 	// 记录已处理的文件（避免重复加载，当使用KeepAfterLoad时）
 	processedFiles map[string]time.Time
 	stopCh         chan struct{}
@@ -108,6 +113,7 @@ func NewDirectoryLoader(scheduler *Scheduler, options LoaderOptions) (*Directory
 	loader := &DirectoryLoader{
 		scheduler:      scheduler,
 		options:        options,
+		logger:         resolveLogger(options.Logger),
 		processedFiles: make(map[string]time.Time),
 		stopCh:         make(chan struct{}),
 	}
@@ -182,7 +188,7 @@ func (l *DirectoryLoader) ScanAndLoad() error {
 	// 加载每个文件
 	for _, f := range files {
 		if err := l.LoadFile(f); err != nil {
-			log.Printf("Failed to load job file %s: %v", f, err)
+			l.logger.Error("failed to load job file", "path", f, "error", err)
 			l.handleErrorFile(f, err)
 		}
 	}
@@ -232,8 +238,8 @@ func (l *DirectoryLoader) LoadFile(filePath string) error {
 		return fmt.Errorf("schedule job failed: %w", err)
 	}
 
-	log.Printf("Loaded job from %s: ID=%s, Name=%s, TriggerAt=%v",
-		filePath, job.ID, job.Name, job.TriggerAt)
+	l.logger.Debug("loaded job from file",
+		"path", filePath, "job_id", job.ID, "job_name", job.Name, "trigger_at", job.TriggerAt)
 
 	// 后处理
 	return l.postProcess(filePath)
@@ -308,7 +314,7 @@ func (l *DirectoryLoader) postProcess(filePath string) error {
 		if err := os.Remove(filePath); err != nil {
 			return fmt.Errorf("delete file failed: %w", err)
 		}
-		log.Printf("Deleted processed file: %s", filePath)
+		l.logger.Debug("deleted processed file", "path", filePath)
 
 	case ArchiveAfterLoad:
 		if l.options.ArchiveDir == "" {
@@ -322,7 +328,7 @@ func (l *DirectoryLoader) postProcess(filePath string) error {
 		if err := os.Rename(filePath, dest); err != nil {
 			return fmt.Errorf("archive file failed: %w", err)
 		}
-		log.Printf("Archived file to: %s", dest)
+		l.logger.Debug("archived processed file", "path", dest)
 
 	case KeepAfterLoad:
 		l.mu.Lock()
@@ -409,7 +415,7 @@ func (l *DirectoryLoader) startWatcher() error {
 						// 延迟一点加载，避免文件写入不完整
 						time.Sleep(100 * time.Millisecond)
 						if err := l.LoadFile(event.Name); err != nil {
-							log.Printf("Failed to load new file %s: %v", event.Name, err)
+							l.logger.Error("failed to load new file", "path", event.Name, "error", err)
 						}
 					}
 					// 如果是新目录且递归模式，添加监控
@@ -423,12 +429,12 @@ func (l *DirectoryLoader) startWatcher() error {
 				if !ok {
 					return
 				}
-				log.Printf("Watcher error: %v", err)
+				l.logger.Error("watcher error", "error", err)
 			}
 		}
 	}()
 
-	log.Printf("Started watching directory: %s", l.options.Dir)
+	l.logger.Info("started watching directory", "dir", l.options.Dir)
 	return nil
 }
 
@@ -446,7 +452,7 @@ func (l *DirectoryLoader) BulkLoadFromReader(r io.Reader) error {
 		for _, f := range formats {
 			job, err := l.formatToJob(&f)
 			if err != nil {
-				log.Printf("Invalid job format: %v", err)
+				l.logger.Warn("invalid job format", "error", err)
 				continue
 			}
 			if l.options.HandlerMap != nil {
@@ -455,7 +461,7 @@ func (l *DirectoryLoader) BulkLoadFromReader(r io.Reader) error {
 				}
 			}
 			if err := l.scheduler.Schedule(job); err != nil {
-				log.Printf("Failed to schedule job: %v", err)
+				l.logger.Error("failed to schedule job", "error", err)
 			}
 		}
 		return nil

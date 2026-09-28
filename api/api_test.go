@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -19,6 +21,11 @@ import (
 	"github.com/stretchr/testify/suite"
 )
 
+// newTestLogger 丢弃日志输出，只保留 error，避免访问日志刷屏
+func newTestLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
+}
+
 // APITestSuite 使用真实的 core.Scheduler 与临时 JSON 存储，
 // 覆盖 HTTP 处理器的请求/响应契约。
 type APITestSuite struct {
@@ -26,6 +33,7 @@ type APITestSuite struct {
 	router    *gin.Engine
 	scheduler *core.Scheduler
 	server    *Server
+	store     core.Store
 }
 
 func (s *APITestSuite) SetupTest() {
@@ -34,9 +42,15 @@ func (s *APITestSuite) SetupTest() {
 	store, err := core.NewJSONFileStore(filepath.Join(s.T().TempDir(), "jobs.json"))
 	require.NoError(s.T(), err)
 
+	s.store = store
 	s.scheduler = core.NewScheduler(store, nil, nil)
-	s.server = NewServer(s.scheduler, store, "8080", Security{})
+	s.server = NewServer(s.scheduler, store, "8080", Security{}, newTestLogger())
 	s.router = s.server.engine
+}
+
+// TearDownTest 关闭存储：否则后台合并协程会在临时目录删除后持续报错
+func (s *APITestSuite) TearDownTest() {
+	require.NoError(s.T(), s.store.Close())
 }
 
 func (s *APITestSuite) TestCreateJob() {

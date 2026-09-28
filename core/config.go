@@ -19,6 +19,7 @@ type Config struct {
 	Server    ServerConfig    `mapstructure:"server"`
 	Scheduler SchedulerConfig `mapstructure:"scheduler"`
 	Store     StoreConfig     `mapstructure:"store"`
+	Logging   LoggingConfig   `mapstructure:"logging"`
 }
 
 // ServerConfig HTTP 接入层配置
@@ -72,6 +73,14 @@ type StoreConfig struct {
 	HistoryTTL time.Duration `mapstructure:"history_ttl"`
 }
 
+// LoggingConfig 日志输出配置，作用于调度器、存储、WebSocket 与 HTTP 访问日志
+type LoggingConfig struct {
+	// Level 最低输出级别：debug|info|warn|error
+	Level string `mapstructure:"level"`
+	// Format 输出格式：text|json
+	Format string `mapstructure:"format"`
+}
+
 // DefaultConfig 返回与代码内置默认值一致的配置
 func DefaultConfig() Config {
 	return Config{
@@ -97,6 +106,10 @@ func DefaultConfig() Config {
 			FlushInterval: DefaultFlushInterval,
 			HistoryLimit:  DefaultHistoryLimit,
 			HistoryTTL:    0,
+		},
+		Logging: LoggingConfig{
+			Level:  "info",
+			Format: "text",
 		},
 	}
 }
@@ -133,6 +146,8 @@ func LoadConfig(path string) (Config, error) {
 		"store.flush_interval",
 		"store.history_limit",
 		"store.history_ttl",
+		"logging.level",
+		"logging.format",
 	} {
 		if err := v.BindEnv(key, "GODELAYQ_"+strings.ToUpper(strings.ReplaceAll(key, ".", "_"))); err != nil {
 			return cfg, fmt.Errorf("bind env for %q failed: %w", key, err)
@@ -198,6 +213,15 @@ func (c Config) Validate() error {
 		return fmt.Errorf("store.history_ttl must not be negative, got %v", c.Store.HistoryTTL)
 	}
 
+	if _, err := parseLogLevel(c.Logging.Level); err != nil {
+		return err
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Logging.Format)) {
+	case "", "text", "json":
+	default:
+		return fmt.Errorf("invalid logging.format %q, use text or json", c.Logging.Format)
+	}
+
 	for _, origin := range c.Server.CORS.AllowOrigins {
 		if strings.TrimSpace(origin) == "" {
 			return fmt.Errorf("server.cors.allow_origins must not contain an empty entry")
@@ -248,6 +272,12 @@ func (c Config) Normalized() Config {
 	}
 	if c.Store.HistoryLimit == 0 {
 		c.Store.HistoryLimit = defaults.Store.HistoryLimit
+	}
+	if c.Logging.Level == "" {
+		c.Logging.Level = defaults.Logging.Level
+	}
+	if c.Logging.Format == "" {
+		c.Logging.Format = defaults.Logging.Format
 	}
 	return c
 }

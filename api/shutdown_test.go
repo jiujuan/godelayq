@@ -28,7 +28,7 @@ func newStartedServer(t *testing.T) (*Server, string) {
 	require.NoError(t, err)
 
 	scheduler := core.NewScheduler(store, nil, nil)
-	srv := NewServer(scheduler, store, "0", Security{})
+	srv := NewServer(scheduler, store, "0", Security{}, newTestLogger())
 	require.NoError(t, srv.Start())
 
 	return srv, "http://" + srv.ListenAddr()
@@ -175,7 +175,7 @@ func TestServerStartReturnsListenError(t *testing.T) {
 	_, port, err := net.SplitHostPort(first.ListenAddr())
 	require.NoError(t, err)
 
-	second := NewServer(core.NewScheduler(store, nil, nil), store, port, Security{})
+	second := NewServer(core.NewScheduler(store, nil, nil), store, port, Security{}, newTestLogger())
 
 	err = second.Start()
 	require.Error(t, err)

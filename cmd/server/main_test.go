@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -141,38 +141,47 @@ func TestHandleReportGenerate(t *testing.T) {
 	})
 }
 
-func TestHandlers_WritePayloadToStdout(t *testing.T) {
+// TestHandlers_LogPayloadWithJobID 示例 handler 走结构化日志，
+// payload 作为字段而不是拼接进消息文本。
+func TestHandlers_LogPayload(t *testing.T) {
 	testCases := []struct {
 		name       string
 		handler    func(context.Context, *core.Job) error
 		payload    string
 		wantOutput string
 	}{
-		{name: "payment", handler: handlePaymentCheck, payload: `{"id":1}`, wantOutput: "processing payment check"},
-		{name: "email", handler: handleEmailSend, payload: `{"to":"a@example.com"}`, wantOutput: "sending email"},
-		{name: "sync", handler: handleDataSync, payload: `{"source":"crm"}`, wantOutput: "syncing data"},
+		{name: "payment", handler: handlePaymentCheck, payload: "order-42", wantOutput: "processing payment check"},
+		{name: "email", handler: handleEmailSend, payload: "alice@example.com", wantOutput: "sending email"},
+		{name: "sync", handler: handleDataSync, payload: "crm-backup", wantOutput: "syncing data"},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			output := captureStdout(t, func() {
-				if err := tc.handler(context.Background(), &core.Job{Payload: []byte(tc.payload)}); err != nil {
-					t.Fatalf("expected no error, got %v", err)
-				}
-			})
+			var logs strings.Builder
+			restore := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(restore) })
 
-			if !strings.Contains(output, tc.wantOutput) {
-				t.Fatalf("expected output %q to contain %q", output, tc.wantOutput)
+			if err := tc.handler(context.Background(), &core.Job{ID: "job-1", Payload: []byte(tc.payload)}); err != nil {
+				t.Fatalf("expected no error, got %v", err)
+			}
+
+			output := logs.String()
+			if !strings.Contains(output, `msg="`+tc.wantOutput+`"`) {
+				t.Fatalf("expected log %q to contain %q", output, tc.wantOutput)
+			}
+			if !strings.Contains(output, "job_id=job-1") {
+				t.Fatalf("expected log %q to carry the job id", output)
 			}
 			if !strings.Contains(output, tc.payload) {
-				t.Fatalf("expected output %q to contain payload %q", output, tc.payload)
+				t.Fatalf("expected log %q to contain payload %q", output, tc.payload)
 			}
 		})
 	}
 }
 
 func TestDefaultRuntimeDeps(t *testing.T) {
-	deps := defaultRuntimeDeps(core.DefaultConfig())
+	deps := defaultRuntimeDeps(core.DefaultConfig(), slog.Default())
 
 	if deps.newStore == nil || deps.newScheduler == nil || deps.newServer == nil || deps.notifySignals == nil {
 		t.Fatal("expected all runtime dependencies to be set")
@@ -190,7 +199,7 @@ func TestDefaultNewStore_CreatesUsableStore(t *testing.T) {
 	cfg.Store.Path = filepath.Join(t.TempDir(), "jobs.json")
 	cfg.Store.FlushInterval = 10 * time.Millisecond
 
-	store, err := defaultRuntimeDeps(cfg).newStore()
+	store, err := defaultRuntimeDeps(cfg, slog.Default()).newStore()
 	if err != nil {
 		t.Fatalf("expected store creation to succeed, got %v", err)
 	}
@@ -243,26 +252,3 @@ func assertPanics(t *testing.T, fn func()) {
 	fn()
 }
 
-func captureStdout(t *testing.T, fn func()) string {
-	t.Helper()
-
-	oldStdout := os.Stdout
-	reader, writer, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("pipe failed: %v", err)
-	}
-	os.Stdout = writer
-
-	outputCh := make(chan string, 1)
-	go func() {
-		data, _ := io.ReadAll(reader)
-		outputCh <- string(data)
-	}()
-
-	fn()
-
-	_ = writer.Close()
-	os.Stdout = oldStdout
-
-	return <-outputCh
-}

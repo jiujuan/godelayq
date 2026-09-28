@@ -3,7 +3,7 @@ package core
 import (
 	"encoding/json"
 	"errors"
-	"log"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sort"
@@ -44,6 +44,8 @@ type StoreOptions struct {
 	HistoryLimit int
 	// HistoryTTL 终态快照保留时长，<=0 表示不按时间淘汰
 	HistoryTTL time.Duration
+	// Logger 后台合并落盘失败时的日志器，nil 表示 slog.Default()
+	Logger *slog.Logger
 }
 
 // JSONFileStore 基于JSON文件的存储，写入按 Interval 合并
@@ -54,6 +56,9 @@ type JSONFileStore struct {
 	// 终态留痕策略
 	historyLimit int
 	historyTTL   time.Duration
+
+	// logger 后台协程使用的日志器，构造后不再变更
+	logger *slog.Logger
 
 	mu       sync.RWMutex
 	data     map[string]JobSnapshot // 内存缓存
@@ -90,6 +95,7 @@ func NewJSONFileStoreWithOptions(path string, opts StoreOptions) (*JSONFileStore
 		interval:     interval,
 		historyLimit: historyLimit,
 		historyTTL:   opts.HistoryTTL,
+		logger:       resolveLogger(opts.Logger),
 		data:         make(map[string]JobSnapshot),
 		stopCh:       make(chan struct{}),
 		doneCh:       make(chan struct{}),
@@ -212,7 +218,7 @@ func (s *JSONFileStore) flushLoop() {
 			return
 		case <-ticker.C:
 			if err := s.Flush(); err != nil {
-				log.Printf("JSON store flush failed: %v", err)
+				s.logger.Error("json store flush failed", "error", err)
 			}
 		}
 	}

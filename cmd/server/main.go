@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"log"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -37,11 +38,11 @@ type runtimeDeps struct {
 	newServer     func(scheduler schedulerAPI, store core.Store, port string) (serverAPI, error)
 	notifySignals signalNotifier
 	timeout       time.Duration
-	logger        *log.Logger
+	logger        *slog.Logger
 }
 
 // defaultRuntimeDeps 把配置注入各构造闭包，run() 本身不再关心具体取值来源
-func defaultRuntimeDeps(cfg core.Config) runtimeDeps {
+func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 	return runtimeDeps{
 		config: cfg,
 		newStore: func() (core.Store, error) {
@@ -49,10 +50,11 @@ func defaultRuntimeDeps(cfg core.Config) runtimeDeps {
 				Interval:     cfg.Store.FlushInterval,
 				HistoryLimit: cfg.Store.HistoryLimit,
 				HistoryTTL:   cfg.Store.HistoryTTL,
+				Logger:       logger,
 			})
 		},
 		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
-			return core.NewScheduler(store, retryPolicy, eventBus)
+			return core.NewScheduler(store, retryPolicy, eventBus, core.WithLogger(logger))
 		},
 		newServer: func(scheduler schedulerAPI, store core.Store, port string) (serverAPI, error) {
 			coreScheduler, ok := scheduler.(*core.Scheduler)
@@ -64,11 +66,11 @@ func defaultRuntimeDeps(cfg core.Config) runtimeDeps {
 				AllowOrigins:     cfg.Server.CORS.AllowOrigins,
 				AllowCredentials: cfg.Server.CORS.AllowCredentials,
 			}
-			return api.NewServer(coreScheduler, store, port, security), nil
+			return api.NewServer(coreScheduler, store, port, security, logger), nil
 		},
 		notifySignals: signal.Notify,
 		timeout:       cfg.Scheduler.ShutdownTimeout,
-		logger:        log.Default(),
+		logger:        logger,
 	}
 }
 
@@ -79,10 +81,18 @@ func main() {
 
 	cfg, err := core.LoadConfig(*configPath)
 	if err != nil {
+		// 日志器还没建起来，只能用标准库直接失败退出
 		log.Fatalf("load config failed: %v", err)
 	}
 
-	if err := run(defaultRuntimeDeps(cfg)); err != nil {
+	logger, err := core.NewLogger(cfg.Logging.Level, cfg.Logging.Format, os.Stdout)
+	if err != nil {
+		log.Fatalf("init logging failed: %v", err)
+	}
+	// 让第三方库与示例 handler 的包级 slog 调用走同一份配置
+	slog.SetDefault(logger)
+
+	if err := run(defaultRuntimeDeps(cfg, logger)); err != nil {
 		log.Fatal(err)
 	}
 }
@@ -97,7 +107,7 @@ func run(deps runtimeDeps) error {
 		deps.timeout = cfg.Scheduler.ShutdownTimeout
 	}
 	if deps.logger == nil {
-		deps.logger = log.Default()
+		deps.logger = slog.Default()
 	}
 
 	store, err := deps.newStore()
@@ -107,7 +117,7 @@ func run(deps runtimeDeps) error {
 	// 存储按周期合并落盘，退出前必须收尾（早退路径同样覆盖）
 	defer func() {
 		if err := store.Close(); err != nil {
-			deps.logger.Printf("Failed to close store: %v", err)
+			deps.logger.Error("failed to close store", "error", err)
 		}
 	}()
 
@@ -134,17 +144,17 @@ func run(deps runtimeDeps) error {
 	deps.notifySignals(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	deps.logger.Println("Shutting down server...")
+	deps.logger.Info("shutting down server")
 
 	ctx, cancel := context.WithTimeout(context.Background(), deps.timeout)
 	defer cancel()
 
 	if err := server.Stop(ctx); err != nil {
-		deps.logger.Printf("Server forced to shutdown: %v", err)
+		deps.logger.Error("server forced to shutdown", "error", err)
 	}
 
 	scheduler.Stop()
-	deps.logger.Println("Server exited")
+	deps.logger.Info("server exited")
 	return nil
 }
 
@@ -156,7 +166,7 @@ func registerHandlers(server serverAPI) {
 }
 
 func handlePaymentCheck(ctx context.Context, job *core.Job) error {
-	fmt.Printf("processing payment check: %s\n", string(job.Payload))
+	slog.Info("processing payment check", "job_id", job.ID, "payload", string(job.Payload))
 	select {
 	case <-time.After(2 * time.Second):
 		return nil
@@ -166,7 +176,7 @@ func handlePaymentCheck(ctx context.Context, job *core.Job) error {
 }
 
 func handleEmailSend(ctx context.Context, job *core.Job) error {
-	fmt.Printf("sending email: %s\n", string(job.Payload))
+	slog.Info("sending email", "job_id", job.ID, "payload", string(job.Payload))
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -174,7 +184,7 @@ func handleEmailSend(ctx context.Context, job *core.Job) error {
 }
 
 func handleDataSync(ctx context.Context, job *core.Job) error {
-	fmt.Printf("syncing data: %s\n", string(job.Payload))
+	slog.Info("syncing data", "job_id", job.ID, "payload", string(job.Payload))
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -182,7 +192,7 @@ func handleDataSync(ctx context.Context, job *core.Job) error {
 }
 
 func handleReportGenerate(ctx context.Context, job *core.Job) error {
-	fmt.Printf("generating report: %s\n", string(job.Payload))
+	slog.Info("generating report", "job_id", job.ID, "payload", string(job.Payload))
 	select {
 	case <-time.After(10 * time.Second):
 		return nil
