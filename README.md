@@ -180,12 +180,14 @@ godelayq/
 - **四叉堆数据结构**：比二叉堆减少约 50% 的层级，提升缓存命中率
 - **O(log n) 操作复杂度**：插入、删除、更新均为对数时间
 - **无锁设计**：读多写少场景使用 RWMutex，高并发优化
+- **有界并发执行**：默认 100 个执行 worker + 等容量队列；到期风暴时调度循环阻塞入队形成背压，不会无限起协程，未执行任务保留在堆与存储中
 
 ### 2. 可靠性保障
 
-- **持久化存储**：JSON 文件原子写入，崩溃后自动恢复
-- **至少一次执行**：失败自动重试，支持指数退避和最大重试限制
-- **优雅关闭**：SIGTERM 信号处理，等待正在执行的任务完成
+- **持久化存储**：JSON 文件原子写入，崩溃后自动恢复；写入按 200ms 周期合并，崩溃时最多丢失一个周期的状态变更
+- **至少一次执行**：失败自动重试，支持指数退避和最大重试限制；被关停打断的执行不计入失败与重试，会保持待处理状态等下次启动恢复
+- **执行超时**：任务可配置 `timeout`，到期后 Handler 收到 `DeadlineExceeded`（需自行检查 ctx）
+- **优雅关闭**：SIGTERM 信号处理，停止投递新任务、取消在途任务上下文并等待执行协程退出
 
 ### 3. 灵活的任务定义
 
@@ -229,7 +231,31 @@ go build -o godelayq-server ./cmd/server
 
 # 运行
 ./godelayq-server
+
+# 使用配置文件（留空则自动查找 configs/config.yaml，找不到就用代码默认值）
+./godelayq-server -config=configs/config.yaml
 ```
+
+### 配置项
+
+配置解析在 `core/config.go`，只收录当前真正生效的字段，写入未知键会直接报错。
+每项都可被环境变量覆盖，前缀 `GODELAYQ_`、层级用下划线连接（如 `GODELAYQ_SERVER_PORT=9090`）。
+
+```yaml
+server:
+  port: "8080"                # HTTP 监听端口
+scheduler:
+  workers: 100                # 并发执行协程数；0 表示 core.DefaultConcurrency
+  queue_capacity: 0           # 执行队列容量；0 表示与 workers 相等
+  max_retry_delay: 30m        # 指数退避的单次重试延迟上限
+  shutdown_timeout: 5s        # 优雅关闭等待时长
+store:
+  type: json                  # 目前仅支持 json
+  path: ./data/jobs.json
+  flush_interval: 200ms       # 合并落盘周期
+```
+
+完整说明与取舍见 [部署文档](./docs/deployment.md)。
 
 ### Docker 部署
 

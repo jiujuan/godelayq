@@ -1,39 +1,43 @@
 ## 生产环境配置
 
+可配置项定义在 `core/config.go`，通过 `-config` 指定文件路径；留空时按 `configs/config.yaml`
+自动查找，文件不存在则使用代码默认值。任何键都可以用环境变量覆盖，前缀 `GODELAYQ_`、
+层级用下划线连接（如 `GODELAYQ_SERVER_PORT=9090`、`GODELAYQ_SCHEDULER_WORKERS=32`）。
+
+```bash
+./godelayq-server -config=/etc/godelayq/config.yaml
+```
+
 ```yaml
 # config.yaml
 server:
-  port: 8080
-  read_timeout: 10s
-  write_timeout: 30s
-  
+  port: "8080"                # HTTP 监听端口
+
 scheduler:
-  workers: 100              # 并发执行协程数
-  max_retries: 5
-  default_retry_delay: 1m
-  
+  workers: 100                # 并发执行协程数；0 表示 core.DefaultConcurrency
+  queue_capacity: 0           # 执行队列容量；0 表示与 workers 相等
+  max_retry_delay: 30m        # 指数退避的单次重试延迟上限
+  shutdown_timeout: 5s        # 优雅关闭等待时长
+
 store:
-  type: json               # json/redis/mysql
+  type: json                  # 目前仅支持 json
   path: /var/lib/godelayq/jobs.json
-  # redis:
-  #   addr: localhost:6379
-  #   db: 0
-  
-loader:
-  enabled: true
-  dir: /var/spool/godelayq
-  pattern: "*.json"
-  action: archive          # delete/archive/keep
-  archive_dir: /var/spool/godelayq/archive
-  
-websocket:
-  max_connections: 10000
-  buffer_size: 256
-  
-logging:
-  level: info              # debug/info/warn/error
-  format: json             # json/text
-  output: /var/log/godelayq/app.log
+  flush_interval: 200ms       # 合并落盘周期；崩溃时最多丢失一个周期的状态
+```
+
+两点设计取舍，配置校验会直接拒绝未知键，因此不要照抄旧文档里的其它字段：
+
+- **没有 `read_timeout` / `write_timeout`**：`http.Server` 的这两个超时是按连接生效的，
+  而 `/ws`（hijack 后长连接）与 `/sse/events`（持续写）会被它们掐断。
+  服务器只固定设置 `ReadHeaderTimeout: 10s`。
+- **`loader` / `websocket.max_connections` / `logging` 尚未实现为配置项**：
+  目录加载器需在代码中显式创建（见 `core/load.go`），WebSocket 缓冲区固定 256 条，
+  日志仍是标准库 `log` 输出到 stderr。
+
+数据目录需提前创建并保证进程可写：
+
+```bash
+mkdir -p /var/lib/godelayq && chown godelayq:godelayq /var/lib/godelayq
 ```
 
 ## Systemd 服务配置
@@ -64,6 +68,10 @@ KillSignal=SIGTERM
 [Install]
 WantedBy=multi-user.target
 ```
+
+收到 `SIGTERM` 后进程按序关停：停止接受新连接 → 取消所有请求上下文（SSE 长连接随即返回）→
+关闭全部 WebSocket 客户端并等待读写协程退出。整个流程由 `cmd/server` 的 5 秒超时兜底，
+超时后强制关闭残留连接，因此 `TimeoutStopSec` 无需大于该值。
 
 启用服务：
 

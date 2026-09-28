@@ -23,7 +23,8 @@ Content-Type: application/json
     "user_id": "U123456"
   },
   "max_retries": 3,
-  "retry_delay": "5m"
+  "retry_delay": "5m",
+  "timeout": "30s"
 }
 ```
 
@@ -37,8 +38,11 @@ Content-Type: application/json
 | cron\_expr   | string | 条件 | Cron 表达式，如 "0 \*/5 \* \* \* \*"                     |
 | payload      | object | ❌  | 任务数据，JSON 对象，会透传给 Handler                           |
 | is\_repeat   | bool   | ❌  | 是否重复执行（Cron 任务需设为 true）                             |
+| timeout      | string | ❌  | 单次执行超时，如 "30s"；为空不限制。Handler 需检查 ctx 才能被按时中止      |
 | max\_retries | int    | ❌  | 最大重试次数，默认 3                                         |
 | retry\_delay | string | ❌  | 基础重试间隔，默认 "1m"                                      |
+
+`timeout` 格式非法会直接返回 400（`invalid timeout format`），不会被静默忽略。
 
 
 **响应**：
@@ -237,7 +241,24 @@ GET /job-types
 {
   "action": "get_stats"
 }
+
+// 取消全部过滤条件（恢复接收所有事件）
+{
+  "action": "unsubscribe"
+}
 ```
+
+服务端除事件外还会回送**控制帧**，它们没有 `type` / `job_id` 字段，客户端需先判断再解析：
+
+```json
+{"action": "subscribed",   "timestamp": "..."}
+{"action": "unsubscribed", "timestamp": "..."}
+{"action": "pong",         "timestamp": "..."}
+{"action": "stats",        "data": {"clients": 2, "timestamp": "..."}}
+```
+
+事件推送缓冲区为 256 条；写队列满时该条消息被丢弃（不阻塞调度主循环）。
+连接空闲 60 秒未收到客户端 pong 即被关闭，服务端每 30 秒发一次 ping。
 
 服务端推送事件
 
@@ -292,7 +313,8 @@ GET /job-types
   },
   "metadata": {
     "retry_count": 1,
-    "max_retries": 3
+    "max_retries": 3,
+    "timeout": false
   }
 }
 
@@ -310,3 +332,28 @@ GET /job-types
 }
 
 ```
+
+`job.failed` 的 `metadata.timeout` 为 `true` 表示本次失败由执行超时引起（Handler 收到的 ctx 已
+`DeadlineExceeded`），它仍按普通失败计入重试次数。任务被**关停打断**时不会发出 `job.failed`：
+调度器会把它保持为 `pending` 落盘，等下次启动恢复，并广播一条
+`{"type":"job.cancelled","metadata":{"reason":"shutdown"}}`。
+
+## Server-Sent Events（WebSocket 备选）
+
+```
+GET /sse/events
+```
+
+响应头为 `text/event-stream`。建连后服务端**先下发一个注释帧** `: connected`，
+用于立刻把响应头交给客户端（否则订阅方要等到第一个事件才能拿到 header），
+标准 `EventSource` 会自动忽略以 `:` 开头的行。之后的每一帧是 `data: <Event JSON>`：
+
+```
+: connected
+
+data: {"type":"job.scheduled","job_id":"...","job_name":"...","status":0,"timestamp":"..."}
+
+```
+
+查询参数 `job_types`、`event_types` 可重复传入用于过滤（当前服务端尚未实现过滤，
+客户端需自行按 `type` 判断）。

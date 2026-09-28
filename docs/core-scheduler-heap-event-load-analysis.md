@@ -9,8 +9,10 @@
 四叉堆比二叉堆更适合这里，因为每层分支更多，调整树高更低，插入/删除/下沉/上浮的实际路径更短。代码里还维护了 `indexMap`，可以通过 `job.ID` 直接定位堆内位置，从而支持：
 
 - `Remove(id)`：按 ID 删除任务
+- `Get(id)`：按 ID 取出任务（不弹出）
 - `Update(item)`：按 ID 更新并重排
 - `Peek()`：快速查看最近任务
+- `PopIfDue(now)`：仅当堆顶已到期时原子弹出，避免"先看再取"之间任务被取消
 
 这让调度器不需要全量扫描，就能知道下一个该谁执行。
 
@@ -19,10 +21,18 @@
 `scheduler.go` 的 `Scheduler.scheduleLoop()` 是系统的心脏。它不停看堆顶：
 
 - 如果堆空，就等 `newJobCh` 或超时唤醒
-- 如果堆顶任务已经到期，就 `PopItem()` 并执行
+- 如果堆顶任务已经到期，`PopIfDue(now)` 原子弹出并投递给执行队列
 - 如果还没到期，就 `time.NewTimer(waitTime)` 精确等待
 
 这个设计把“定时器”从任务级别抽象成了“堆顶级别”。也就是说，系统只需要盯住最早的任务，而不是给每个任务单独开定时器。
+`PopIfDue` 而不是 `Peek()` + `PopItem()`，是为了消除“看一眼再取走”之间任务被 `Cancel()` 摘掉的竞态。
+
+投递方向是一条有界队列 `workCh` 加上固定数量的 worker 协程：
+
+- 默认 `core.DefaultConcurrency = 100` 个 worker，队列容量与之相同；启动前用 `SetConcurrency(n)` 调整
+- 队列满时 `scheduleLoop()` 阻塞在投递上，形成背压——到期风暴不会无限起协程，未投递的任务仍留在堆里，且已落盘可被下次 `Restore()` 找回
+- 因此**Handler 必须自行做超时或尽快返回**：worker 被一个慢任务占住，就等于少一个并发额度
+- `Stop()` 关闭 `stopCh` 后，会取消所有在途任务的上下文，避免不检查上下文的 Handler 把关停挂死
 
 ## 3. 事件总线负责“发生了什么”
 
@@ -90,13 +100,15 @@ sequenceDiagram
     Scheduler->>EventBus: Publish(job.scheduled)
 
     loop scheduleLoop
-        Scheduler->>Heap: Peek()
+        Scheduler->>Heap: PopIfDue(now)
+        alt 无到期任务
+            Scheduler->>Heap: Peek()
+        end
         alt 堆为空
             Scheduler->>Scheduler: 等待 newJobCh / timeout
         else 任务未到期
             Scheduler->>Scheduler: 等待 waitTime 或 newJobCh
         else 任务到期
-            Scheduler->>Heap: PopItem()
             Scheduler->>EventBus: Publish(job.started)
             Scheduler->>Handler: 异步执行 Handler(ctx, job)
             alt 执行成功
@@ -158,11 +170,30 @@ graph TD
     E --> E3["Update failed snapshot"]
 ```
 
-## 6. 这个设计的关键点
+## 6. 持久化写入与执行超时
+
+`store.go` 的 `JSONFileStore` 是"内存 map + 定期合并落盘"：`Save/Update/Delete` 只标脏，
+后台协程每 `DefaultFlushInterval`（200ms）写一次文件，临时文件 + rename 保证原子性。
+因此：
+
+- 到期风暴或批量导入时，几百次变更合并成个位数次写入
+- 崩溃时最多丢失一个周期的状态；需要立即落盘的调用方可以显式 `Flush()`
+- 进程退出路径必须 `Close()`（`cmd/server` 用 defer 保证），它会停掉后台协程并做最后一次写盘
+
+恢复侧由 `Scheduler.Restore()` 负责：只捞 `pending/running` 的快照，过期任务入堆后立即补跑，
+Handler 在执行前按 `HandlerKey`（`Type`，回退 `Name`）绑定。
+
+执行侧还有两个容易忽略的语义：
+
+- `Job.Timeout` 会给 Handler 的 ctx 套一层 `WithTimeout`；不检查 ctx 的处理器依然会占住 worker 名额
+- 父 ctx 被取消（用户 `Cancel` 或关停）不算任务失败：不记失败事件、不消耗重试次数，
+  任务保持 `pending` 落盘等下次恢复——这是"至少一次"语义，Handler 需自行保证幂等
+
+## 7. 这个设计的关键点
 
 它不是“简单的定时器队列”，而是一个带持久化、恢复、事件广播和重试能力的调度系统。四叉堆解决顺序问题，调度循环解决时间问题，事件总线解决可观测性问题，加载器解决任务来源问题。
 
-## 7. 未完善的边界
+## 8. 未完善的边界
 
 当前实现已经能跑通完整闭环，但还有几个明显边界：
 

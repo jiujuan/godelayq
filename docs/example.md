@@ -97,6 +97,7 @@ curl -X POST http://localhost:8080/api/v1/jobs \
   "id": "bulk_cancel_001",
   "name": "order_timeout_cancel",
   "delay": "15m",
+  "timeout": "30s",
   "payload": {
     "order_id": "ORD-20240115-002",
     "amount": 199.99,
@@ -107,6 +108,9 @@ curl -X POST http://localhost:8080/api/v1/jobs \
   "description": "批量导入的订单超时任务"
 }
 ```
+
+`timeout` 可选，是单次执行超时（`time.ParseDuration` 格式）；省略则不限制。
+Handler 必须检查传入的 `ctx`，否则超时只能被记录为失败、无法真正中止执行。
 
 配置目录加载器自动监控：
 
