@@ -199,8 +199,8 @@ godelayq/
 ### 4. 实时可观测性
 
 - **WebSocket 推送**：任务状态变更实时推送到前端
-- **SSE 备选方案**：兼容不支持 WebSocket 的客户端
-- **REST API 查询**：完整的任务生命周期管理接口
+- **SSE 备选方案**：兼容不支持 WebSocket 的客户端，`event_types` 走服务端类型订阅、`job_types` 按任务名过滤
+- **REST API 查询**：完整的任务生命周期管理接口，支持 `POST /jobs/batch` 单请求最多 100 条的批量提交（逐条独立，混合结果以 207 返回）
 - **监控面板**：内置 Web Dashboard
 
 ### 5. 扩展能力

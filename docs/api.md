@@ -6,6 +6,11 @@ Base URL: http://localhost:8080/api/v1
 Content-Type: application/json
 字符编码: UTF-8
 
+任务 ID 是 UUIDv7 的 36 位小写文本（如 `0198a2e3-7d4f-7abc-9def-0123456789ab`）：
+前 48 位是毫秒时间戳，因此字符串序即创建序；随机位来自 `crypto/rand`。
+创建任务时可以不带 `id`（由服务端生成）；历史遗留的 `20260928173933-XXXXXXXX` 形式 ID
+仍能被读取与取消，只是新任务不再使用该格式。
+
 ## 鉴权与跨域
 
 服务端默认**不启用鉴权**（`server.auth.token` 为空）。配置 token 后，全部端点都要求凭据，
@@ -82,7 +87,7 @@ Content-Type: application/json
 
 ```json
 {
-  "id": "job_1704182400_a1b2c3d4",
+  "id": "0198a2e3-7d4f-7abc-9def-0123456789ab",
   "name": "payment_check",
   "status": "pending",
   "trigger_at": "2024-01-02T15:30:00+08:00",
@@ -160,7 +165,7 @@ GET /jobs?status=pending&name=payment_check&limit=20&offset=0
   "total": 156,
   "items": [
     {
-      "id": "job_1704182400_a1b2c3d4",
+      "id": "0198a2e3-7d4f-7abc-9def-0123456789ab",
       "name": "payment_check",
       "status": "pending",
       "trigger_at": "2024-01-02T15:30:00+08:00",
@@ -222,6 +227,41 @@ POST /jobs/:id/retry
 在存储中查找该 ID 且状态为 `failed` 的记录，重置 `retry_count` 并在 1 秒后重新入队，
 返回新的任务视图（状态 `pending`）。这条路径依赖终态留痕：若已关闭留痕
 （`store.history_limit: -1`）或该记录已被保留策略淘汰，则返回 404。
+
+### 8. 批量创建任务
+
+```json
+POST /jobs/batch
+Content-Type: application/json
+
+[
+  { "name": "payment_check", "delay": "5m", "payload": {"order_id": "A-1"} },
+  { "name": "email_send", "delay": "1h", "timeout": "30s" },
+  { "name": "not_registered", "delay": "5m" }
+]
+```
+
+请求体是任务数组（不是对象），单请求最多 100 条，空数组或超限返回 400。
+
+响应固定 `207 Multi-Status`，条目**逐条独立处理**：某条失败不会回退其他条，也不会中断后续解析。
+
+```json
+{
+  "succeeded": 2,
+  "failed": 1,
+  "items": [
+    { "id": "0198a2e3-7d4f-7abc-9def-0123456789ab", "name": "payment_check", "status": "pending", "next_run_in": "5m0s" }
+  ],
+  "errors": [
+    { "index": 2, "code": 400, "message": "unknown job type", "details": "job type 'not_registered' not registered" }
+  ]
+}
+```
+
+`errors[].index` 指回请求数组的下标；全部成功时 `errors` 为空数组，全部失败时 `items` 为空数组
+（此时仍是 207，调用方按 `failed` 判断结果，而不是靠 HTTP 状态码）。
+校验规则与单条 `POST /jobs` 完全一致（同一套解析逻辑），包括 `delay`/`trigger_at`/`cron_expr`
+优先级、`timeout` 格式非法即拒绝、以及未注册的 `name` 视为错误。
 
 ## 统计与监控 API
 
@@ -335,7 +375,7 @@ GET /job-types
 // 任务已调度
 {
   "type": "job.scheduled",
-  "job_id": "job_1704182400_a1b2c3d4",
+  "job_id": "0198a2e3-7d4f-7abc-9def-0123456789ab",
   "job_name": "payment_check",
   "status": 0,
   "timestamp": "2024-01-02T15:20:00+08:00",
@@ -348,7 +388,7 @@ GET /job-types
 // 任务开始执行
 {
   "type": "job.started",
-  "job_id": "job_1704182400_a1b2c3d4",
+  "job_id": "0198a2e3-7d4f-7abc-9def-0123456789ab",
   "job_name": "payment_check",
   "status": 1,
   "timestamp": "2024-01-02T15:30:00+08:00",
@@ -360,7 +400,7 @@ GET /job-types
 // 任务执行成功
 {
   "type": "job.completed",
-  "job_id": "job_1704182400_a1b2c3d4",
+  "job_id": "0198a2e3-7d4f-7abc-9def-0123456789ab",
   "job_name": "payment_check",
   "status": 2,
   "timestamp": "2024-01-02T15:30:02+08:00",
@@ -372,7 +412,7 @@ GET /job-types
 // 任务执行失败
 {
   "type": "job.failed",
-  "job_id": "job_1704182400_a1b2c3d4",
+  "job_id": "0198a2e3-7d4f-7abc-9def-0123456789ab",
   "job_name": "payment_check",
   "status": 3,
   "timestamp": "2024-01-02T15:30:01+08:00",
@@ -389,7 +429,7 @@ GET /job-types
 // 任务重试中
 {
   "type": "job.retrying",
-  "job_id": "job_1704182400_a1b2c3d4",
+  "job_id": "0198a2e3-7d4f-7abc-9def-0123456789ab",
   "job_name": "payment_check",
   "status": 0,
   "timestamp": "2024-01-02T15:30:01+08:00",
@@ -424,5 +464,11 @@ data: {"type":"job.scheduled","job_id":"...","job_name":"...","status":0,"timest
 
 ```
 
-查询参数 `job_types`、`event_types` 可重复传入用于过滤（当前服务端尚未实现过滤，
-客户端需自行按 `type` 判断）。
+查询参数用于服务端过滤，两者都省略时等价于订阅全部事件：
+
+| 参数 | 写法 | 语义 |
+| --- | --- | --- |
+| `event_types` | 可重复，也可逗号分隔（`?event_types=job.failed,job.completed`） | 按事件类型做**服务端订阅**（`EventBus.Subscribe(types...)`），不是收全量再丢弃；取值必须是已发布的类型：`job.scheduled`、`job.started`、`job.completed`、`job.failed`、`job.cancelled`、`job.retrying`，未知取值在建流前返回 400 |
+| `job_types` | 可重复 | 按事件的 `job_name` 过滤（事件总线不感知任务属性，这一层在 SSE 处理器内完成） |
+
+同一类型重复出现只注册一次，事件不会重复投递。过滤参数只在建连时生效，变更需重连。
