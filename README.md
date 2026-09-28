@@ -97,7 +97,7 @@
 | `heap.go` | 四叉堆实现 | 索引映射实现 O(1) 查找，支持并发安全操作 |
 | `scheduler.go` | 调度器引擎 | 时间轮询优化，避免忙等待，支持优雅关闭 |
 | `event.go` | 事件驱动架构 | 发布-订阅模式，支持多路复用和背压处理 |
-| `websocket.go` | 实时通信 | 心跳保活、过滤订阅、自动重连支持 |
+| `websocket.go` | 实时通信 | 心跳保活、过滤订阅、自动重连支持；仅依赖 `WSConn`/`WSUpgrader` 接口，协议库由上层注入 |
 | `load.go` | 文件任务加载 | fsnotify 实时监控，支持原子移动和错误隔离 |
 
 
@@ -136,14 +136,15 @@ godelayq/
 │   ├── event_test.go         # 事件总线测试
 │   ├── load.go             # 目录任务加载器
 │   ├── load_test.go        # 加载器测试
-│   └── websocket.go          # WebSocket服务器
+│   └── websocket.go          # WebSocket服务器（只依赖连接/升级接口，不绑定具体协议库）
 │
 ├── api/                      # HTTP API 层
 │   ├── server.go             # Gin服务器与路由
 │   ├── handlers.go           # HTTP处理器实现
 │   ├── dto.go                # 请求/响应数据结构
 │   ├── middleware.go         # 中间件（日志、恢复、CORS）
-│   ├── websocket.go          # WebSocket升级处理
+│   ├── security.go           # Token 鉴权与跨域来源策略
+│   ├── websocket.go          # WebSocket升级处理（gorilla 适配器）
 │   ├── sse.go                # Server-Sent Events
 │   └── api_test.go           # API集成测试
 │

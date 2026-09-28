@@ -7,10 +7,34 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/gin-gonic/gin"
-	"github.com/gorilla/websocket"
 )
+
+// WebSocket 帧类型，取值与 RFC 6455 操作码一致，便于实现方原样透传给底层协议库。
+const (
+	WSTextMessage = 1
+	WSPingMessage = 9
+)
+
+// WSConn 是读写泵所需的最小连接能力。core 只依赖该接口，
+// 具体协议实现（如 gorilla/websocket）由上层适配。
+type WSConn interface {
+	// ReadMessage 读取一帧，返回帧类型（WSTextMessage 等）与负载。
+	ReadMessage() (int, []byte, error)
+	WriteMessage(messageType int, data []byte) error
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+	SetPongHandler(h func(appData string) error)
+	// UnexpectedClose 判断读错误是否属于非正常关闭，用于决定是否记日志。
+	UnexpectedClose(err error) bool
+	Close() error
+}
+
+// WSUpgrader 完成 HTTP 到 WebSocket 的协议握手。
+// 来源白名单由 WSServer 在调用前判定，实现只负责升级本身；
+// 升级失败时实现应已写好 HTTP 响应并关闭连接。
+type WSUpgrader interface {
+	Upgrade(w http.ResponseWriter, r *http.Request) (WSConn, error)
+}
 
 // WSMessage WebSocket消息格式
 type WSMessage struct {
@@ -38,14 +62,17 @@ type WSServer struct {
 	stopOnce sync.Once
 	wg       sync.WaitGroup
 
-	// upgrader 按来源白名单决定是否放行握手，创建后不再变更
-	upgrader websocket.Upgrader
+	// upgrader 负责协议握手，创建后不再变更
+	upgrader WSUpgrader
+	// allowAll 为真时不检查来源；否则要求 Origin 命中 originSet（小写比较）
+	allowAll  bool
+	originSet map[string]bool
 }
 
 // WSClient WebSocket客户端连接
 type WSClient struct {
 	ID     string
-	Conn   *websocket.Conn
+	Conn   WSConn
 	server *WSServer
 
 	// send 承载请求-响应类消息；只有 writePump 读取，且从不关闭
@@ -66,50 +93,51 @@ type WSClient struct {
 // NewWSServer 创建 WebSocket 服务。allowedOrigins 限制浏览器跨域握手来源：
 // 为空或含 "*" 表示接受任意来源（沿用历史行为），否则要求 Origin 精确匹配；
 // 非浏览器客户端不发 Origin 头，始终允许。
-func NewWSServer(eventBus *EventBus, allowedOrigins ...string) *WSServer {
+func NewWSServer(eventBus *EventBus, upgrader WSUpgrader, allowedOrigins ...string) *WSServer {
+	allowAll := len(allowedOrigins) == 0
+	originSet := make(map[string]bool, len(allowedOrigins))
+	for _, o := range allowedOrigins {
+		if o == "*" {
+			allowAll = true
+			continue
+		}
+		originSet[strings.ToLower(o)] = true
+	}
+
 	return &WSServer{
-		eventBus: eventBus,
-		clients:  make(map[*WSClient]bool),
-		quit:     make(chan struct{}),
-		upgrader: websocket.Upgrader{
-			CheckOrigin:     originChecker(allowedOrigins),
-			ReadBufferSize:  1024,
-			WriteBufferSize: 1024,
-		},
+		eventBus:  eventBus,
+		clients:   make(map[*WSClient]bool),
+		quit:      make(chan struct{}),
+		upgrader:  upgrader,
+		allowAll:  allowAll,
+		originSet: originSet,
 	}
 }
 
-// originChecker 生成 websocket.Upgrader 的 CheckOrigin 实现
-func originChecker(allowed []string) func(*http.Request) bool {
-	wildcard := len(allowed) == 0
-	set := make(map[string]bool, len(allowed))
-	for _, o := range allowed {
-		if o == "*" {
-			wildcard = true
-			continue
-		}
-		set[strings.ToLower(o)] = true
+// allowOrigin 判定握手来源是否放行
+func (ws *WSServer) allowOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		// 浏览器以外的客户端（Go/curl）不发 Origin
+		return true
 	}
-
-	return func(r *http.Request) bool {
-		origin := r.Header.Get("Origin")
-		if origin == "" {
-			// 浏览器以外的客户端（Go/curl）不发 Origin
-			return true
-		}
-		if wildcard {
-			return true
-		}
-		return set[strings.ToLower(origin)]
+	if ws.allowAll {
+		return true
 	}
+	return ws.originSet[strings.ToLower(origin)]
 }
 
 // Handle 处理 HTTP 升级请求。
-// 先订阅事件总线再升级，避免客户端拿到 101 后立即发布时落在订阅窗口之前。
-func (ws *WSServer) Handle(c *gin.Context) {
+// 先校验来源，再订阅事件总线，最后升级：避免客户端拿到 101 后立即发布时落在订阅窗口之前。
+func (ws *WSServer) Handle(w http.ResponseWriter, r *http.Request) {
+	if !ws.allowOrigin(r) {
+		http.Error(w, "websocket origin not allowed", http.StatusForbidden)
+		return
+	}
+
 	subID, eventCh := ws.eventBus.SubscribeAll()
 
-	conn, err := ws.upgrader.Upgrade(c.Writer, c.Request, nil)
+	conn, err := ws.upgrader.Upgrade(w, r)
 	if err != nil {
 		ws.eventBus.Unsubscribe(subID)
 		log.Printf("WebSocket upgrade failed: %v", err)
@@ -259,7 +287,7 @@ func (c *WSClient) readPump() {
 	for {
 		_, message, err := c.Conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseNormalClosure, websocket.CloseAbnormalClosure) {
+			if c.Conn.UnexpectedClose(err) {
 				log.Printf("WebSocket error: %v", err)
 			}
 			return
@@ -327,7 +355,7 @@ func (c *WSClient) writePump() {
 
 		case <-ticker.C:
 			c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if err := c.Conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+			if err := c.Conn.WriteMessage(WSPingMessage, nil); err != nil {
 				return
 			}
 		}
@@ -336,7 +364,7 @@ func (c *WSClient) writePump() {
 
 func (c *WSClient) write(message []byte) error {
 	c.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-	if err := c.Conn.WriteMessage(websocket.TextMessage, message); err != nil {
+	if err := c.Conn.WriteMessage(WSTextMessage, message); err != nil {
 		log.Printf("WebSocket write failed for %s: %v", c.ID, err)
 		return err
 	}

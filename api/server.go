@@ -81,7 +81,7 @@ func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Sec
 		store:      store,
 		registry:   NewJobRegistry(),
 		engine:     gin.New(),
-		wsServer:   core.NewWSServer(scheduler.GetEventBus(), sec.AllowOrigins...),
+		wsServer:   core.NewWSServer(scheduler.GetEventBus(), newWSUpgrader(), sec.AllowOrigins...),
 		port:       port,
 		sec:        sec,
 		startTime:  time.Now(),
@@ -171,8 +171,10 @@ func (s *Server) setupRoutes() {
 		})
 	})
 
-	// WebSocket 端点
-	s.engine.GET("/ws", s.wsServer.Handle)
+	// WebSocket 端点：core.WSServer 只认 http，升级请求由 gin 转发
+	s.engine.GET("/ws", func(c *gin.Context) {
+		s.wsServer.Handle(c.Writer, c.Request)
+	})
 
 	// SSE 备选方案（对于不支持WebSocket的客户端）
 	s.engine.GET("/sse/events", s.handleSSE)
