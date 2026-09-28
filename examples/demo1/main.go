@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"core"
+	"godelayq/core"
 )
 
 func main() {
@@ -19,7 +19,7 @@ func main() {
 	// 创建调度器
 	scheduler := core.NewScheduler(store, &core.ExponentialBackoffRetry{
 		MaxDelay: 30 * time.Minute,
-	})
+	}, nil)
 
 	// 注册处理器
 	scheduler.RegisterHandler("payment_check", handlePaymentCheck)
@@ -47,7 +47,7 @@ func main() {
 		ID:         "heartbeat_001", // 固定ID确保只有一个实例
 		Name:       "heartbeat",
 		Payload:    []byte(`{"type": "ping"}`),
-		CronExpr:   "*/5 * * * * *", // 每5秒（需robfig/cron支持秒级）
+		CronExpr:   "*/5 * * * *", // 每5分钟（当前解析器为分钟级精度）
 		IsRepeat:   true,
 		MaxRetries: 2,
 	}
@@ -56,7 +56,7 @@ func main() {
 	}
 
 	// 示例3: 带取消的任务
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	timeoutJob := &core.Job{
@@ -69,12 +69,9 @@ func main() {
 	time.Sleep(3 * time.Second)
 	scheduler.Cancel(timeoutJob.ID)
 
-	// 恢复持久化的任务（程序重启后）
-	snapshots, _ := store.LoadAll()
-	for _, s := range snapshots {
-		job := &core.Job{}
-		job.FromSnapshot(s)
-		scheduler.Schedule(job)
+	// 恢复持久化的任务（程序重启后；Start() 会自动执行相同的恢复逻辑）
+	if err := scheduler.Restore(); err != nil {
+		log.Printf("restore jobs failed: %v", err)
 	}
 
 	select {} // 保持运行

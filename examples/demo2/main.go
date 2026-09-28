@@ -4,30 +4,29 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"os"
 	"time"
 
-	"core"
+	"godelayq/core"
 )
 
 func main() {
 	// 初始化组件
-	store, _ := goschedjob.NewJSONFileStore("./jobs.json")
-	scheduler := goschedjob.NewScheduler(store, &goschedjob.ExponentialBackoffRetry{
+	store, _ := core.NewJSONFileStore("./jobs.json")
+	scheduler := core.NewScheduler(store, &core.ExponentialBackoffRetry{
 		MaxDelay: 30 * time.Minute,
-	})
+	}, nil)
 
 	// 注册处理器
-	handlers := map[string]goschedjob.Handler{
-		"payment_check": func(ctx context.Context, job *goschedjob.Job) error {
+	handlers := map[string]core.Handler{
+		"payment_check": func(ctx context.Context, job *core.Job) error {
 			fmt.Printf("检查支付: %s\n", string(job.Payload))
 			return nil
 		},
-		"email_notify": func(ctx context.Context, job *goschedjob.Job) error {
+		"email_notify": func(ctx context.Context, job *core.Job) error {
 			fmt.Printf("发送邮件: %s\n", string(job.Payload))
 			return nil
 		},
-		"data_backup": func(ctx context.Context, job *goschedjob.Job) error {
+		"data_backup": func(ctx context.Context, job *core.Job) error {
 			fmt.Printf("数据备份: %s\n", string(job.Payload))
 			return nil
 		},
@@ -43,15 +42,15 @@ func main() {
 	defer scheduler.Stop()
 
 	// 配置并启动目录加载器
-	loader, err := goschedjob.NewDirectoryLoader(scheduler, goschedjob.LoaderOptions{
-		Dir:            "./job_queue",               // 任务文件存放目录
-		Pattern:        "*.json",                    // 匹配所有json文件
-		PostLoadAction: goschedjob.ArchiveAfterLoad, // 加载后归档
-		ArchiveDir:     "./job_archive",             // 归档目录
-		ErrorDir:       "./job_errors",              // 错误文件目录
-		Recursive:      true,                        // 递归子目录
-		EnableWatcher:  true,                        // 实时监控新文件
-		HandlerMap:     handlers,                    // 自动绑定handler
+	loader, err := core.NewDirectoryLoader(scheduler, core.LoaderOptions{
+		Dir:            "./job_queue",         // 任务文件存放目录
+		Pattern:        "*.json",              // 匹配所有json文件
+		PostLoadAction: core.ArchiveAfterLoad, // 加载后归档
+		ArchiveDir:     "./job_archive",       // 归档目录
+		ErrorDir:       "./job_errors",        // 错误文件目录
+		Recursive:      true,                  // 递归子目录
+		EnableWatcher:  true,                  // 实时监控新文件
+		HandlerMap:     handlers,              // 自动绑定handler
 	})
 	if err != nil {
 		log.Fatal(err)
