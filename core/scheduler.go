@@ -32,6 +32,14 @@ type Scheduler struct {
 
 	// 信号通知有新任务加入（用于提前唤醒定时器）
 	newJobCh chan struct{}
+	// resumeCh 只用于唤醒挂起中的调度循环，与"有新任务"分开：
+	// 复用 newJobCh 会让 suspend 期间的 Schedule 调用把它占满，
+	// 恢复信号就可能在下次循环之前被当成普通唤醒消费掉。
+	resumeCh chan struct{}
+
+	// suspended 是调度总开关：true 时不弹出任何到期任务。
+	// 进程内状态，Start 会清零——重启即解除，维护窗口不该跨重启生效。
+	suspended atomic.Bool
 
 	// 执行侧：有界队列 + 固定 worker 池，避免到期风暴时无限起协程
 	concurrency   int
@@ -76,6 +84,7 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 		cronParser:  NewCronParser(),
 		stopCh:      make(chan struct{}),
 		newJobCh:    make(chan struct{}, 1),
+		resumeCh:    make(chan struct{}, 1),
 		concurrency: DefaultConcurrency,
 		handlers:    make(map[string]Handler),
 		cancelMap:   make(map[string]context.CancelFunc),
@@ -512,6 +521,34 @@ func (s *Scheduler) notifyNewJob() {
 	}
 }
 
+// Suspend 挂起调度：不再弹出任何到期任务，用于发布或维护窗口。
+//
+// 与 Stop 是两件事，不要混用：Stop 是优雅关停（worker 退出、被打断的任务以 pending
+// 落盘等下次 Restore），Suspend 只让调度循环停止取任务——已在执行的任务照常跑完，
+// 堆与存储都不改动。挂起期间 Schedule 仍然可用（任务照进堆，只是暂不触发），
+// 恢复后一并生效。
+//
+// 状态是进程内的，重启后自动解除（见 Start）。
+func (s *Scheduler) Suspend() {
+	if s.suspended.CompareAndSwap(false, true) {
+		s.logger.Warn("scheduling suspended; due jobs will not be dispatched")
+	}
+}
+
+// Unsuspend 恢复调度，并唤醒正在等待的调度循环。
+func (s *Scheduler) Unsuspend() {
+	if s.suspended.CompareAndSwap(true, false) {
+		s.logger.Info("scheduling resumed")
+	}
+	// 无论之前是否挂起都发一次唤醒：循环可能正卡在其它等待分支上，
+	// 多一次空转只是重算堆顶等待时长。
+	select {
+	case s.resumeCh <- struct{}{}:
+	default:
+	}
+	s.notifyNewJob()
+}
+
 // ErrJobNotPending 表示任务已不在待执行队列中（已被弹出执行、已结束或不存在），
 // 因此无法原地更新。
 var ErrJobNotPending = errors.New("job is not pending")
@@ -627,6 +664,9 @@ func (s *Scheduler) Start() {
 	s.running = true
 	// 复位停止信号，否则 Start→Stop→Start 的新协程会立刻撞上已关闭的通道
 	s.stopCh = make(chan struct{})
+	// 调度总开关不跨重启：suspend 是给"这次发版/维护窗口"用的进程内意图，
+	// 进程都换了，留着它只会让人对着一个不出任务的调度器猜原因。
+	s.suspended.Store(false)
 	workers := s.concurrency
 	queueCap := s.queueCapacity
 	if queueCap <= 0 {
@@ -696,6 +736,17 @@ func (s *Scheduler) scheduleLoop() {
 		}
 
 		now := time.Now()
+
+		// 挂起期间不弹出任何到期任务：堆、存储、执行中的任务都不动，
+		// 到点的任务攒着，恢复后按原时间一并补跑。
+		if s.suspended.Load() {
+			select {
+			case <-s.stopCh:
+				return
+			case <-s.resumeCh:
+				continue
+			}
+		}
 
 		// 原子地取出所有已到期任务（避免 Peek 与 Pop 之间被 Cancel 的竞态）
 		if job := s.heap.PopIfDue(now); job != nil {
