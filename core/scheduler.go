@@ -1078,3 +1078,47 @@ func generateID() string {
 func (s *Scheduler) HeapLen() int {
 	return s.heap.Len()
 }
+
+// RuntimeStats 是调度与执行侧的实时占用，供运维端点读取。
+// 只有计数与开关状态，不含任务内容与凭据，因此 viewer 以外的角色才需要看到它。
+type RuntimeStats struct {
+	// Started 表示调度循环与 worker 池是否在跑（Stop 之后为 false）
+	Started bool `json:"started"`
+	// Workers 配置的 worker 数量
+	Workers int `json:"workers"`
+	// QueueCapacity 执行队列容量；未显式配置时与 Workers 相等
+	QueueCapacity int `json:"queue_capacity"`
+	// QueueLength 已入队但尚未被 worker 取走的任务数
+	QueueLength int `json:"queue_length"`
+	// Running 已进入 Handler、尚未返回的任务数
+	Running int `json:"running"`
+	// HeapSize 堆中待执行任务数
+	HeapSize int `json:"heap_size"`
+	// Suspended 调度总开关是否处于挂起
+	Suspended bool `json:"suspended"`
+	// ForcePausePending 已请求强制暂停、尚待执行收尾认领的任务数
+	ForcePausePending int `json:"force_pause_pending"`
+}
+
+// RuntimeStats 返回当前占用快照。队列长度与在跑数量是瞬时值，
+// 读到的只是调用那一刻的状态，用于观察趋势而不是审计。
+func (s *Scheduler) RuntimeStats() RuntimeStats {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	capacity := s.queueCapacity
+	if capacity <= 0 {
+		capacity = s.concurrency
+	}
+
+	return RuntimeStats{
+		Started:           s.running,
+		Workers:           s.concurrency,
+		QueueCapacity:     capacity,
+		QueueLength:       len(s.workCh),
+		Running:           int(s.inFlight.Load()),
+		HeapSize:          s.heap.Len(),
+		Suspended:         s.suspended.Load(),
+		ForcePausePending: len(s.forcedPause),
+	}
+}
