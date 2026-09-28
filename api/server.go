@@ -164,18 +164,26 @@ func (s *Server) setupRoutes() {
 
 		// 只读端点：任何已认证身份都够用（machine 凭据也在内）
 		reader := s.RequireRole(core.RoleViewer)
+		// 任务写操作：operator 档及以上；machine 静态凭据的档位等同 operator
+		operator := s.RequireRole(core.RoleOperator)
 
 		// 任务管理：读放行宽，写要求 operator 档
 		jobs := api.Group("/jobs")
 		{
 			jobs.GET("", reader, s.ListJobs)
 			jobs.GET("/:id", reader, s.GetJob)
-			jobs.POST("", s.RequireRole(core.RoleOperator), s.CreateJob)
-			jobs.PUT("/:id", s.RequireRole(core.RoleOperator), s.UpdateJob)
-			jobs.DELETE("/:id", s.RequireRole(core.RoleOperator), s.CancelJob)
-			jobs.POST("/:id/cancel", s.RequireRole(core.RoleOperator), s.CancelJob)
-			jobs.POST("/:id/retry", s.RequireRole(core.RoleOperator), s.RetryJob)
-			jobs.POST("/batch", s.RequireRole(core.RoleOperator), s.BatchCreateJobs)
+			jobs.POST("", operator, s.CreateJob)
+			jobs.PUT("/:id", operator, s.UpdateJob)
+			jobs.DELETE("/:id", operator, s.CancelJob)
+			jobs.POST("/:id/cancel", operator, s.CancelJob)
+			jobs.POST("/:id/retry", operator, s.RetryJob)
+			jobs.POST("/batch", operator, s.BatchCreateJobs)
+
+			// 生命周期：暂停/恢复归 operator，强制暂停会中止执行，只有 admin 以上
+			jobs.POST("/:id/pause", operator, s.PauseJob)
+			jobs.POST("/:id/resume", operator, s.ResumeJob)
+			jobs.POST("/:id/force-pause", s.RequireRole(core.RoleAdmin), s.ForcePauseJob)
+			jobs.POST("/batch-ops", operator, s.BatchJobOps)
 		}
 
 		// 统计与监控。/health 继续保持"启用鉴权则需凭据"的历史契约
