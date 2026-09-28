@@ -40,10 +40,13 @@ registerAuthBridge({
   sessionLost: () => {
     auth.clear()
     realtime.stop()
-    if (router.currentRoute.value.name !== 'login') {
-      toasts.warning('登录已过期，请重新登录')
-      void router.replace({ name: 'login', query: { redirect: router.currentRoute.value.fullPath } })
-    }
+    const current = router.currentRoute.value
+    // matched 为空 = 初始导航还没落地（currentRoute 仍是 START_LOCATION '/'）。
+    // 这时跳登录会把守卫正在写的 ?redirect=<目标> 覆盖成 ?redirect=/，
+    // 用户登录回来就落回首页
+    if (current.name === 'login' || current.matched.length === 0) return
+    toasts.warning('登录已过期，请重新登录')
+    void router.replace({ name: 'login', query: { redirect: current.fullPath } })
   },
 })
 
