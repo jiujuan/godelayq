@@ -30,11 +30,16 @@ store:
   flush_interval: 200ms       # 合并落盘周期；崩溃时最多丢失一个周期的状态
   history_limit: 1000         # 终态快照留痕条数；0 用默认值，-1 不留痕
   history_ttl: 0s             # 终态快照保留时长，如 24h；0 不按时间淘汰
+  groups_path: /var/lib/godelayq/groups.json  # 分组注册表（改动即同步落盘）
 
 logging:
   level: info                 # debug|info|warn|error
   format: text                # text|json
 ```
+
+任务状态与分组是**两个文件**：前者按 `flush_interval` 合并写盘（崩溃最多丢一个周期），
+后者每次改动同步原子重写。备份或迁移时两个都要带走——只带 `jobs.json` 的话，
+任务的 `group` 标签还在，但分组的描述与颜色没了。
 
 两点设计取舍，配置校验会直接拒绝未知键，因此不要照抄旧文档里的其它字段：
 

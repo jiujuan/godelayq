@@ -37,7 +37,7 @@
 
 ## 2. 现状盘点（改动前的基线，已核实）
 
-下表记录规划时的代码事实。**M0/M1 已把其中若干条改掉**，被改动的行以 ⚠️ 标注并写明去向，避免读者把基线当成现状。
+下表记录规划时的代码事实。**M0/M1/M2 已把其中若干条改掉**，被改动的行以 ⚠️ 标注并写明去向，避免读者把基线当成现状。
 
 | 事实 | 位置 |
 | --- | --- |
@@ -61,11 +61,16 @@
 | EventBus：`SubscribeAll` 返回 `<-chan Event` | `core/event.go 的 EventBus` |
 | WS 订阅过滤已支持 `job_types`/`event_types`/`job_ids`/**`status`**；发送缓冲 256 条 | `core/websocket.go` 的 `WSFilter` 与发送缓冲 |
 | `POST /jobs/batch` 已实现：逐条独立、207 混合结果、单请求上限 100 | `api/handlers.go` 的 `BatchCreateJobs` 与 `maxBatchCreateSize` |
-| ListJobs 仍只支持 `status/name/limit/offset`（`group` 过滤属 M2） | `api/handlers.go` 的 `ListJobs` |
+| ⚠️ ListJobs 基线只支持 `status/name/limit/offset` → **M2 已加 `group` 过滤**（省略=不筛，`group=`=只看未分组） | `api/handlers.go` 的 `ListJobs`、`parseGroupFilter` |
 | GET/重试/统计按 ID 或全量走 `store.LoadAll` 线性扫描 | `api/handlers.go 里多处 store.LoadAll` |
 | 老 dashboard 是纯静态 HTML，靠 `?token=` 连 WS | `dashboard/index.html` |
 
-M0/M1 之后新增的事实（不属于基线）：`core/auth.go` 的角色阶梯与 `machine` 例外档、`core/group_store.go` 的 `GroupStore`、`api/authenticator.go`/`api/authstore.go`/`api/ratelimit.go` 三件套、`core/scheduler.go` 的 `Pause`/`ForcePause`/`Resume`/`Suspend`。
+M0/M1/M2 之后新增的事实（不属于基线）：`core/auth.go` 的角色阶梯与 `machine` 例外档、
+`core/group_store.go` 的 `GroupStore`、`api/authenticator.go`/`api/authstore.go`/`api/ratelimit.go` 三件套、
+`core/scheduler.go` 的 `Pause`/`ForcePause`/`Resume`/`Suspend`/`Unsuspend`/`RuntimeStats`/`SetGroup`/`RetagGroup`、
+`api/history.go` 的事件内存缓冲、`api/server.go` 的 `Option`/`WithGroupStore`，
+以及 §5.4 列出的全部 M2 端点（生命周期、分组、事件、运维）。
+下表 §2 的"基线"仍是规划时的事实，读它时注意 ⚠️ 行已被改掉。
 
 ---
 
@@ -478,10 +483,11 @@ type GroupStore interface {
 1. **接口不含 Close/Flush**。分组是低频实体，每次改动同步全量原子重写
    （临时文件 + rename，与 jobs 同源）即可；照搬 `core/store.go` 的 `flushLoop` 那套合并写盘协程
    只会多出一个"崩溃丢掉最后一次改动"的窗口，也没有后台协程需要收尾。
-2. **配置键 `store.groups_path` 推迟到 M2**。本仓库的惯例是配置只收录真正生效的字段
-   （`core/config.go 顶部的"只收录生效字段"注释` 的注释明写未实现的选项故意不出现），而目前还没有任何
-   生产代码消费它——M2 的分组端点接线时再加键，并与 schema、`configs/config.yaml`
-   同批提交（`UnmarshalExact` 对未知键直接报错）。当前由构造函数显式传路径。
+2. **配置键 `store.groups_path` 随 M2 的消费者一起加**（已落地：`core/config.go 的 StoreConfig`
+   与 `configs/config.yaml`，默认 `./data/groups.json`，可用 `GODELAYQ_STORE_GROUPS_PATH` 覆盖）。
+   本仓库的惯例是配置只收录真正生效的字段，所以 M1 只让构造函数显式收路径；
+   M2 分组端点接线时才加键，与 schema、配置文件同批提交
+   （`UnmarshalExact` 对未知键直接报错）。
 3. **损坏的分组文件报错而不是当成空集合**。静默视为空意味着下一次 Save
    就把用户已有的分组全部覆盖掉，这类数据丢失不可逆。
 
@@ -492,15 +498,18 @@ Job 不强制属于已注册组：允许 `group=foo` 建任务而 foo 未建组�
 列表过滤仍可用）；GroupsView 提供"一键收编"（列出被 job 引用但未注册的组名）。
 `List()` 返回按名称字典序的稳定顺序，UI 不必再排一次，也不会每次刷新就换位置。
 
-### 5.4 DTO 与 REST API（api 层）
+### 5.4 DTO 与 REST API（api 层）**已实现**
+
+> 落地后的口径以 `docs/api.md` 为准（含每个端点的角色与状态码）；本节保留的是设计意图，
+> 与实现的差异都在下面标注出来。
 
 **修改既有**：
 
 | 端点 | 变化 |
 | --- | --- |
-| `POST /jobs` | `CreateJobRequest` 增加 `group` 字段（可选）；handler 赋给 `job.Group` |
-| `GET /jobs` | 增加 `group` 查询参数；`status` 接受 `paused`（`ParseJobStatus` 自动支持）；空值参数：`group=`（精确取未分组）与省略（不过滤）要区分 |
-| `PUT /jobs/:id` | `UpdateJobRequest` 增加 `group`（可把 job 移组） |
+| `POST /jobs` | `CreateJobRequest` 增加 `group` 字段（可选）；handler 赋给 `job.Group`，非法组名 400 |
+| `GET /jobs` | 增加 `group` 查询参数（忽略大小写匹配）；`status` 接受 `paused`（`ParseJobStatus` 自动支持）；空值参数：`group=`（精确取未分组）与省略（不过滤）要区分 |
+| `PUT /jobs/:id` | `UpdateJobRequest` 增加 `group`（**指针**，区分"没传"与"传空串=取消分组"）。只对 pending 生效：暂停/已结束的任务移组走 `batch-ops` 的 `move` |
 | `JobResponse` | 增加 `group`；`status` 枚举说明加 paused |
 | `GET /stats` | `StatsResponse` 增加 `paused` 计数（扫描循环加一个 case，`api/handlers.go 的 GetStats`） |
 
@@ -517,8 +526,9 @@ POST   /api/v1/jobs/:id/pause      operator     200 | 404 | 409(仅 pending 可�
 POST   /api/v1/jobs/:id/force-pause admin       200 | 404 | 409(不在执行中)  §5.2
 POST   /api/v1/jobs/:id/resume     operator     200 | 404 | 409
 GET    /api/v1/jobs/:id/events     viewer       {items:[Event]}              §5.6
+GET    /api/v1/events              viewer       跨任务全局最近事件（Dashboard 首屏回灌）
 
-GET    /api/v1/groups              viewer       [{name,description,color,job_count,paused_count}]
+GET    /api/v1/groups              viewer       [{name,description,color,job_count,paused_count,registered}]
 POST   /api/v1/groups              operator     201；重名 409
 PUT    /api/v1/groups/:name        operator     重命名同步改写 job.Group
 DELETE /api/v1/groups/:name        admin        204；组内有 job 时**默认 detach**（D5）；
@@ -531,9 +541,13 @@ POST   /api/v1/jobs/batch-ops      operator     {action: cancel|pause|resume|mov
 GET    /api/v1/admin/runtime       ops          worker/队列/堆/in-flight/缓冲占用
 POST   /api/v1/admin/scheduler/suspend   ops    调度总开关（§5.2 Suspend）
 POST   /api/v1/admin/scheduler/unsuspend ops
-DELETE /api/v1/admin/events        ops          清空事件环形缓冲
+DELETE /api/v1/admin/events        ops          清空事件环形缓冲，返回 {cleared:n}
 # 写操作审计本期只输出结构化日志（§5.7.6）；/admin/audit 查询端点留二期
 ```
+
+实现落点：生命周期与批量在 `api/handlers_lifecycle.go`，分组在 `api/handlers_groups.go`，
+事件在 `api/handlers_events.go`，运维在 `api/handlers_admin.go`；
+调度器侧新增 `RuntimeStats`（诊断）与 `SetGroup`/`RetagGroup`（改组名单原语）。
 
 WS 侧无需协议改动：`job.paused`/`job.resumed` 会按类型透传，`filterMatches` 的状态过滤
 按 `JobStatus.String()` 比对，paused 自动可用（`core/websocket.go 的 filterMatches`）。
@@ -552,17 +566,25 @@ CORS 预检必须早于认证（`api/server.go 的 setupMiddleware（顺序不�
 
 - **删除组**（决策 D5）：任何角色都**不会**级联删除或取消 job。
   `DELETE /groups/:name` 由 admin/ops 调用时**默认 detach**——组内 job 的 `Group` 置空后
-  删除组记录，前端不需要传 `strategy`。要更保守可显式 `?strategy=block`，此时组非空返回 409。
+  删除组记录，前端不需要传 `strategy`。要更保守可显式 `?strategy=block`，此时组非空返回 409；
+  其它策略名一律 400，绝不静默降级成 detach。
   operator/viewer 调该端点直接 403（§5.4 角色列）。
-- **重命名组**：`store.LoadAll()` 找出 `Group==old` 的快照逐个 `Update`。非原子，
-  中途失败会在下次操作时呈现"部分 job 还挂在旧组"——UI 的"未注册临时组"入口能兜住，
+- **重命名组**：走 `core.Scheduler.RetagGroup(from, to)`，**不是**只改存储快照。
+  原因是执行收尾会用内存里的那份 `Job` 写回快照：只改 `store` 的话，任务跑完一轮
+  组名就被旧值覆盖回去（`core/scheduler.go 的 applyGroupToSnapshot`）。
+  堆里的条目与快照一起改，暂停中与终态留痕的走快照路径。
+  非原子，中途失败会在下次操作时呈现"部分 job 还挂在旧组"——UI 的"未注册临时组"入口
+  （`GET /groups` 里 `registered:false` 的条目）能兜住，重发一次 PUT 即可（幂等），
   可接受（本仓库整体就是尽力落盘 + 崩溃靠 Restore 的哲学）。
-- **batch-ops**：循环调用单个 Scheduler 方法即可，不做事务。含 `force-pause` 时逐条判角色
-  （整批要求 admin 以上，简单一致）。批量**创建**已由 `POST /jobs/batch` 实现
-  （逐条独立、207、≤100 条，`api/handlers.go 的 BatchCreateJobs`），本端点只做"对已有 job 的动作"，
-  两者语义不要混用。
+- **batch-ops**：循环调用单个 Scheduler 方法即可，不做事务。含 `force-pause` 时整批要求 admin 以上
+  （档位要看请求体，中间件做不到，落在处理器里判，见 `api/security.go 的 allowRole`）。批量**创建**
+  已由 `POST /jobs/batch` 实现（逐条独立、207、≤100 条，`api/handlers.go 的 BatchCreateJobs`），
+  本端点只做"对已有 job 的动作"，两者语义不要混用。
 
-### 5.6 运行事件历史（api/history.go，新文件）
+### 5.6 运行事件历史（api/history.go）**已实现**
+
+实现即下面的形状（常量名 `historyPerJobLimit`/`historyMaxJobs`/`historyGlobalLimit`），
+外加 `Stats()`（占用观测，`/admin/runtime` 用它）与 `Clear()`（`DELETE /admin/events` 用它）。
 
 ```go
 // EventHistory 是 EventBus 的内存订阅者，按 job_id 保留最近 N 条事件。
@@ -577,16 +599,20 @@ func (h *EventHistory) Events(jobID string, limit int) []Event
 func (h *EventHistory) Recent(limit int) []Event
 ```
 
-- 挂载点：`api.NewServer` 里创建（`api/server.go 的 NewServer`），随 Server 一起 Stop。
+- 挂载点：`api.NewServer` 里创建（`api/server.go 的 NewServer`），随 Server 一起 Stop
+  （`Stop` 走 `bus.Unsubscribe`，drain 协程随通道关闭退出，重复调用安全）。
   不新增配置项，上限先用常量，需要再开 knob（本仓库惯例是"未生效的选项不进配置"，
   见 `core/config.go 顶部的"只收录生效字段"注释` 注释）。
 - 端点：`GET /api/v1/jobs/:id/events?limit=`；`GET /api/v1/events?limit=`（全局 recent，
-  Dashboard 刷新后补历史用，可选实现）。
+  Dashboard 刷新后补历史用）。两者**按时间升序**返回，空结果是空列表而不是 404——
+  详情页时间线本来就可能还没事件。响应带 `note` 字段说明"内存缓冲，重启即清空"。
 - **明确语义并写进前端 UI**：进程重启即清空；详情页时间线标题旁标注"内存缓冲，最近 100 条"。
   持久化审计不在本期范围。
-- EventBus 的 `SubscribeAll` 通道容量/丢弃策略需在实现时核实（`core/event.go 的 SubscribeAll`）：
-  若缓冲满丢消息，历史记录器丢的是"记录"而非调度事实，可接受，但要在 code review 时确认
-  drain goroutine 不被阻塞反压整个总线。
+- 反压问题已在实现里核实（`core/event.go 的 Publish`）：总线的发送是
+  `select { case ch <- event: default: }`，缓冲区满就丢，所以 drain 协程不可能阻塞总线；
+  丢掉的是记录而不是调度事实。`api/history_test.go` 的窗口裁剪用例因此直接调 `record`，
+  而不是靠总线发上千条（那种断言会退化成竞态掷硬币）。
+- 不带 `JobID` 的事件（如 `heap.updated`）被忽略：它没有归属，塞进任何任务的时间线都是噪音。
 
 ### 5.7 认证与角色权限（决策 D1/D5 的后端部分）
 
@@ -752,9 +778,14 @@ var dist embed.FS
   `NewServer` 内部构造认证器与凭据存储（`api/server.go 的 NewServer`）。
   认证器构造失败（坏哈希、缺密钥）存进 `Server.authErr`，由 `Start()` 返回——
   既守住"配置坏掉就别上线"，又不用把 `error` 塞进已被十几处测试使用的构造函数。
-- **groupStore 仍然要改签名**（M1）：`api.NewServer` 再加一个依赖时，
-  按本仓库既有风格走可选参数 `opts ...Option`（对齐 `core.NewScheduler(..., opts ...Option)`，
-  `core/scheduler.go 的 NewScheduler`），用 `WithGroupStore` 承接，避免位置参数列表继续变长。
+- **groupStore 走可选参数**（M1/M2 已实现）：`api.NewServer(..., opts ...Option)`，
+  由 `api.WithGroupStore(core.GroupStore)` 承接（`api/server.go 的 Option`），
+  形态对齐 `core.NewScheduler(..., opts ...Option)`（`core/scheduler.go 的 NewScheduler`），
+  位置参数列表不再变长、既有测试的构造调用一行都不用改。
+  没注入注册表的部署里 `/api/v1/groups` 统一返回 503（`api/handlers_groups.go 的 requireGroupStore`），
+  任务的 `group` 标签照常读写——那是两份数据。
+  生产装配点在 `cmd/server/main.go 的 defaultRuntimeDeps`：分组文件读不出来就挡住启动，
+  而不是让每个分组请求都 500。
 - **`Restore` 在 `Start()` 内部执行**（`core/scheduler.go 的 Start（内部调用 Restore）`），不在 main 里；
   因此 §5.2 的 paused 跳过必须在 `Restore` 本体改，别指望调用方过滤。
 - **`Start→Stop→Start` 是被支持的**（`core/scheduler.go 的 Start（stopCh 复位）` 显式复位 `stopCh`），
@@ -771,7 +802,11 @@ var dist embed.FS
   `api/handlers_auth.go`（五个 `/auth/*` 端点）、`cmd/hashpassword/main.go`（生成哈希）。
   未单独建 `api/rbac.go`/`api/ticket.go`：角色中间件与 ticket 分别归入
   `api/security.go` 与 `api/authstore.go`，避免为一个函数开一个文件。
-- **待新增（M1/M2）**：`core/group_store.go`（分组存储）、`api/history.go`（事件环形缓冲）。
+- **M1/M2 新增文件**：`core/group_store.go`（分组存储）、`api/history.go`（事件环形缓冲）、
+  `api/handlers_lifecycle.go`（暂停/强制暂停/恢复/批量操作）、`api/handlers_groups.go`（分组 CRUD）、
+  `api/handlers_events.go`（时间线与全局事件流）、`api/handlers_admin.go`（ops 端点）。
+  没有为单个函数再拆文件：`allowRole` 归 `api/security.go`；
+  任务与认证相关的 DTO 仍在 `api/dto.go`，分组/事件/运维的响应体与它的端点同文件（只有一处用它们）。
 
 ### 5.10 兼容性与性能注记
 
@@ -791,7 +826,7 @@ var dist embed.FS
 | --- | --- | --- | --- |
 | M0 | 认证与角色 **已交付** | JWT 签发/校验、bcrypt 账号配置、`RequireRole`（machine 由阶梯天然排除）、RT 表 + jti 拒绝表 + ticket、`/auth/*` 五个端点、登录限流、写操作进访问日志（who/role）；httptest 覆盖三档角色越权、轮转、登出即失效、ticket 一次一用 | `core/auth.go`、`core/config.go`、`api/auth*.go`、`api/ratelimit.go`、`api/security.go`、`cmd/hashpassword` |
 | M1 | core：paused + group **已交付** | 状态枚举/Job/Snapshot/事件常量；`Scheduler.Pause/ForcePause/Resume`、`Suspend/Unsuspend`；`handleInterrupted`/`handleSuccess`/`handleFailure` 的强制暂停守卫；Restore/Cancel 修正；`GroupStore`（路径由构造传入，`store.groups_path` 配置键随 M2 消费者一起加）；SSE 类型白名单补 paused/resumed；单测（旧数据兼容、重启不解除暂停、暂停后可取消、Handler 忽略取消仍停在 paused、并发落盘完整性） | `core/*.go`、`api/sse.go` |
-| M2 | api：REST | pause/force-pause/resume/groups/batch-ops/events/admin 端点 + DTO 扩展 + stats.paused；EventHistory 记录器 | `api/*.go` |
+| M2 | api：REST **已交付** | pause/force-pause/resume/groups/batch-ops/events/admin 端点 + DTO 扩展 + stats.paused；EventHistory 记录器；`store.groups_path` 配置键与生产装配；403 越权尝试进访问日志 | `api/*.go`、`core/scheduler.go`（RuntimeStats/SetGroup/RetagGroup）、`core/config.go`、`cmd/server/main.go` |
 | M3 | web 骨架 | Vite+TS+Tailwind+lucide 初始化、client(含刷新链路)/auth/permission/router/layout、登录流、WS store + Query 失效管线 | `web/` |
 | M4 | web 页面 | Jobs 列表+表单+详情（时间线）、Groups、Dashboard、Monitor、Admin、Settings | `web/src/views/*` |
 | M5 | 集成与发布 | vite proxy 联调、embed 单二进制、`docs/api.md` 与 README/deployment 更新（鉴权章节重写）、（可选）旧 dashboard/index.html 改为跳转页 | `docs/`、`api/server.go` |
@@ -802,23 +837,38 @@ var dist embed.FS
 
 ## 7. 验收清单
 
-- [ ] 未认证访问任意业务端点 → 401；`viewer` 调写端点 → 403；`operator` 调强制暂停/删组 → 403
-- [ ] 错误密码与不存在的账号返回同一状态码与文案（不可枚举账号）；连续失败触发限流
+后端三项里程碑（M0/M1/M2）能自证的部分已勾选，括号里是覆盖它的测试；
+依赖浏览器的条目留空，等 M3/M4 的前端落地再验。
+
+- [x] 未认证访问任意业务端点 → 401；`viewer` 调写端点 → 403；`operator` 调强制暂停/删组 → 403
+      （`api/auth_test.go`、`api/handlers_lifecycle_test.go`、`api/handlers_groups_test.go`、`api/handlers_admin_test.go`）
+- [x] 错误密码与不存在的账号返回同一状态码与文案（不可枚举账号）；连续失败触发限流（`TestLoginFailureIsIndistinguishable`、`TestLoginRateLimitedAfterFailures`）
 - [ ] access token 过期后前端静默刷新并重放成功；logout 后旧 access token 立即 401（jti 拒绝表）、
-      refresh token 立即失效
-- [ ] WS/SSE 通过一次性 ticket 建连；ticket 复用第二次被拒；URL 与访问日志中不出现长期凭据
-- [ ] pending job 暂停 → 列表显示 paused、不再触发、重启后仍 paused；恢复后 cron 任务按新周期排期，一次性过期任务立即补跑
-- [ ] running job 强制暂停 → 当前 attempt 被中止、不计入 `retry_count`、状态停在 paused、
+      refresh token 立即失效（后端轮转/吊销已覆盖：`TestRefreshRotatesRefreshToken`、
+      `TestLogoutRevokesAccessTokenAndRefreshToken`；前端重放链路属 M3）
+- [x] WS/SSE 通过一次性 ticket 建连；ticket 复用第二次被拒；URL 与访问日志中不出现长期凭据
+      （`TestWSTicketIsSingleUseAndScopedToRealtimeChannels`、`TestAccessTokenIsRejectedInQueryString`；
+      浏览器实际建连在 M3 联调时复核）
+- [x] pending job 暂停 → 列表显示 paused、不再触发、重启后仍 paused；恢复后 cron 任务按新周期排期，
+      一次性过期任务立即补跑（`core/pause_test.go`、`TestPauseAndResumeOverHTTP`）
+- [x] running job 强制暂停 → 当前 attempt 被中止、不计入 `retry_count`、状态停在 paused、
       不产生 `job.failed`；**Handler 不检查 ctx 时仍在成功/失败收尾后停在 paused**（§5.2 第 3 点）
-- [ ] paused job 可取消（Cancel 修正生效）
-- [ ] admin/ops `DELETE /groups/:name` 不带参数即删除，组内 job 归入未分组、无一被删除；
-      `?strategy=block` 时组非空返回 409
-- [ ] ops 可 suspend 调度：暂停期间到期任务不弹出，堆与存储不变；unsuspend 后按原时间补跑
+      （`core/pause_test.go` 的忽略取消用例、`TestPauseRunningJobPointsAtForcePause`）
+- [x] paused job 可取消（Cancel 修正生效，`core/pause_test.go`）
+- [x] admin/ops `DELETE /groups/:name` 不带参数即删除，组内 job 归入未分组、无一被删除；
+      `?strategy=block` 时组非空返回 409（`TestGroupDeleteDefaultsToDetach`、
+      `TestGroupDeleteBlockStrategyRefusesNonEmptyGroup`）
+- [x] ops 可 suspend 调度：暂停期间到期任务不弹出，堆与存储不变；unsuspend 后按原时间补跑
+      （`core/suspend_test.go`、`TestAdminRuntimeReportsOccupancy`）
+- [x] 分组改名连带改写任务标签，且不会被下一次执行写回旧值（`TestGroupRenameRetagsJobs`、
+      `TestScheduler_SetGroup_KeepsNewGroupAfterTheJobRuns`）
 - [ ] 详情页时间线展示最近事件（含 paused/force-paused/resumed/retrying/failed 与 timeout 标记）
-- [ ] WS 事件触发列表/统计自动刷新；断线显示黄色徽标并自动重连
-- [ ] 旧 `data/jobs.json`（无 group、状态 0-4）直接升级运行无报错；配置中写非法 role 或
-      缺 jwt.secret 时启动即报错
-- [ ] `go build ./... && go vet ./... && go test ./...` 全绿（含 -race）
+      （端点已就绪：`GET /jobs/:id/events`，见 `TestJobEventsEndpointServesTimeline`；UI 属 M4）
+- [ ] WS 事件触发列表/统计自动刷新；断线显示黄色徽标并自动重连（属 M3/M4）
+- [x] 旧 `data/jobs.json`（无 group、状态 0-4）直接升级运行无报错；配置中写非法 role 或
+      缺 jwt.secret 时启动即报错（`core/job_status_test.go`、`core/config_test.go`、
+      `TestStartFailsWhenAuthMisconfigured`）
+- [x] `go build ./... && go vet ./... && go test ./...` 全绿（含 -race）
 
 ## 8. 风险与后续演进
 

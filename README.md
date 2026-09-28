@@ -96,7 +96,7 @@
 |------|------|----------|
 | `heap.go` | 四叉堆实现 | 索引映射实现按 ID 的 O(1) 定位，四叉 sift 与 `Update`/`PopIfDue` |
 | `job.go` | 任务模型 | 状态含 `paused`（追加在枚举末尾，兼容已落盘的 int）；`group` 只是标签，落盘省略空值；快照与重试副本四处搬运同一字段 |
-| `scheduler.go` | 调度器引擎 | 堆顶定时器唤醒（非忙等待），有界 worker 池 + 队列背压，优雅关闭与崩溃恢复；`Pause`/`ForcePause`/`Resume` 暂停语义（收尾守卫保证不复活），`Suspend` 调度总开关 |
+| `scheduler.go` | 调度器引擎 | 堆顶定时器唤醒（非忙等待），有界 worker 池 + 队列背压，优雅关闭与崩溃恢复；`Pause`/`ForcePause`/`Resume` 暂停语义（收尾守卫保证不复活），`Suspend` 调度总开关，`SetGroup`/`RetagGroup` 连堆内条目一起改分组，`RuntimeStats` 供运维端点读占用 |
 | `group_store.go` | 分组元数据 | 单 JSON 文件同步原子重写（低频实体不复制 jobs 的合并落盘协程）；组名规则、损坏文件报错而非当空集 |
 | `auth.go` | 角色模型 | `viewer < operator < admin < ops` 单阶梯比较；`machine` 等同 operator 档，因而天然拿不到 admin 能力 |
 | `event.go` | 事件驱动架构 | 发布-订阅；订阅缓冲满时丢弃事件而非阻塞调度主流程 |
@@ -138,9 +138,14 @@ godelayq/
 │   └── *_test.go             # 与上述文件一一对应的单元测试
 │
 ├── api/                      # HTTP API 层（gin）
-│   ├── server.go             # 路由、中间件、优雅关闭
-│   ├── handlers.go           # REST 处理器实现
+│   ├── server.go             # 路由、中间件、优雅关闭（可选依赖走 Option/WithGroupStore）
+│   ├── handlers.go           # 任务 CRUD、列表过滤（含 group）、统计
 │   ├── handlers_auth.go      # 登录、刷新、登出、身份、实时票据
+│   ├── handlers_lifecycle.go # 暂停/强制暂停/恢复 + batch-ops 批量操作
+│   ├── handlers_groups.go    # 分组注册表 CRUD（改名连带改写任务标签）
+│   ├── handlers_events.go    # 任务时间线与全局最近事件
+│   ├── handlers_admin.go     # ops 档：运行时诊断、调度总开关、清缓冲
+│   ├── history.go            # 事件内存环形缓冲（订阅事件总线，重启即清空）
 │   ├── authenticator.go      # 账号校验与 JWT 签发/验签
 │   ├── authstore.go          # refresh 表、登出拒绝表、一次性 ticket
 │   ├── ratelimit.go          # 登录失败限流（IP+账号 与 IP 双维度）
@@ -205,6 +210,12 @@ godelayq/
 - **WebSocket 推送**：任务状态变更实时推送到前端，客户端可用 `subscribe` 设置过滤条件
 - **SSE 备选方案**：兼容不支持 WebSocket 的客户端，`event_types` 走服务端类型订阅、`job_types` 按任务名过滤
 - **REST API 查询**：完整的任务生命周期管理接口，支持 `POST /jobs/batch` 单请求最多 100 条的批量提交（逐条独立，混合结果以 207 返回）
+- **暂停与分组**：`POST /jobs/:id/pause|resume|force-pause` 三个动作，`GET /jobs?group=` 按分组过滤（空值=未分组），
+  分组注册表走 `/api/v1/groups` 增删改查；改名/detach 由调度器连堆内条目一起改写，任务跑完不会把旧组名写回去
+- **事件时间线**：`GET /jobs/:id/events` 与 `GET /events` 读进程内的环形缓冲（每任务 100 条、全局 500 条），
+  补"打开页面之前"的历史；重启即清空，长期留痕请接外部日志
+- **运维端点**：`GET /admin/runtime` 读 worker/队列/堆/缓冲占用，`POST /admin/scheduler/suspend|unsuspend`
+  是维护窗口的调度总开关（进程内状态，重启自动解除）
 - **监控页**：`dashboard/index.html` 是单文件页面，用浏览器直接打开即可连 `/ws` 与统计接口（不由服务端托管，需自行处理跨域或同源部署）
 - **结构化日志**：全进程 `log/slog`，级别与格式可配，HTTP 访问日志与 panic 堆栈同流
 
@@ -216,6 +227,8 @@ godelayq/
 - **静态 token**：`server.auth.token` 保留给脚本与 CI，身份是 `machine`——
   能读写任务，但不能强制暂停、不能删组、不能用运维端点。
 - **角色**：`viewer < operator < admin < ops`，路由级中间件把关；
+  只有 `batch-ops` 的 `action=force-pause` 需要在处理器里判档（档位取决于请求体）。
+  被权限层拒掉的请求额外记一条 warn，比翻 403 状态码好定位。
   前端的按钮隐藏只是体验，服务端 403 才是边界。
 - **实时通道凭据**：浏览器 WebSocket/EventSource 无法带请求头，改用一次一用、5 秒过期的
   `?ticket=`；JWT 不允许出现在 URL 里（访问日志会记下 query）。
@@ -287,6 +300,7 @@ store:
   flush_interval: 200ms       # 合并落盘周期
   history_limit: 1000         # 终态快照留痕条数；-1 表示不留痕
   history_ttl: 0s             # 终态快照保留时长，如 24h；0 不按时间淘汰
+  groups_path: ./data/groups.json  # 分组注册表文件（/api/v1/groups 读写它）
 logging:
   level: info                 # debug|info|warn|error
   format: text                # text|json（输出固定为标准输出）
