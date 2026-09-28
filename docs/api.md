@@ -318,6 +318,19 @@ GET /health
 GET /job-types
 ```
 
+响应：
+
+```json
+{
+  "types": ["data_sync", "email_send", "payment_check", "report_generate"]
+}
+```
+
+`types` 来自调度器里唯一的一份 Handler 注册表（`core.Scheduler.LookupHandler`），
+按字典序返回；`POST /jobs` 与 `POST /jobs/batch` 只接受其中出现过的 `name`，
+否则返回 400 `unknown job type`。注册表由进程启动时代码注册（见 `cmd/server`），
+不能通过 HTTP 动态增删。
+
 ## WebSocket 实时通信
 
 连接地址: ws://localhost:8080/ws
