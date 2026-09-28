@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -605,6 +607,105 @@ func (s *Scheduler) UpdatePending(jobID string, apply func(*Job) error) (*Job, e
 func (s *Scheduler) hasStoredJob(jobID string) bool {
 	_, ok := s.findSnapshot(jobID)
 	return ok
+}
+
+// SetGroup 改挂一个任务的分组；group 为空串表示取消分组。
+//
+// 堆里的任务必须连堆内条目一起改：只写快照的话，内存里仍带着旧分组，
+// 任务执行完收尾会把它写回去，分组改动跑一轮就失效。
+// 暂停中的任务与终态留痕不在堆里，直接改快照；正在执行的任务由 worker 持有，
+// 改法同上会被收尾覆盖，因此返回 ErrJobNotPending。
+func (s *Scheduler) SetGroup(jobID string, group string) error {
+	snap, ok := s.findSnapshot(jobID)
+	if !ok {
+		// 纯内存部署（store 为 nil）没有快照可读，但堆里确实可能有这个任务
+		item := s.heap.Get(jobID)
+		if item == nil {
+			return ErrJobNotFound
+		}
+		snap = item.(*Job).ToSnapshot()
+	}
+
+	changed, err := s.applyGroupToSnapshot(snap, group)
+	switch {
+	case err != nil:
+		return err
+	case !changed && snap.Group != group:
+		// 没改动也没报错：任务正在执行，或刚好在这次读取后被弹出
+		return ErrJobNotPending
+	default:
+		return nil
+	}
+}
+
+// RetagGroup 把所有挂在 fromGroup 上的任务改挂到 toGroup（空串表示取消分组），
+// 返回改动的任务数。名称匹配忽略大小写，与 GroupStore 的主键口径一致。
+//
+// 非原子：中途出错时前面的已改、后面的未改，调用方重试即可（幂等）。
+// 这与本仓库"尽力落盘 + 崩溃靠 Restore"的整体口径一致。
+func (s *Scheduler) RetagGroup(fromGroup string, toGroup string) (int, error) {
+	if s.store == nil || fromGroup == "" {
+		return 0, nil
+	}
+	snapshots, err := s.store.LoadAll()
+	if err != nil {
+		return 0, fmt.Errorf("load jobs for retag failed: %w", err)
+	}
+
+	changed := 0
+	for _, snap := range snapshots {
+		if !strings.EqualFold(snap.Group, fromGroup) {
+			continue
+		}
+		ok, err := s.applyGroupToSnapshot(snap, toGroup)
+		if err != nil {
+			s.logger.Error("failed to retag job", "job_id", snap.ID, "group", toGroup, "error", err)
+			continue
+		}
+		if ok {
+			changed++
+		}
+	}
+	return changed, nil
+}
+
+// applyGroupToSnapshot 把一个任务的分组改成 toGroup，返回是否真的写动了。
+// 调用方已经持有该任务的快照，因此不再回查存储。
+func (s *Scheduler) applyGroupToSnapshot(snap JobSnapshot, toGroup string) (bool, error) {
+	if item := s.heap.Get(snap.ID); item != nil {
+		job := *(item.(*Job))
+		if job.Group == toGroup {
+			return false, nil
+		}
+		job.Group = toGroup
+		job.UpdatedAt = time.Now()
+		if !s.heap.Update(&job) {
+			// 取到条目之后被调度循环弹出了，交给执行侧
+			return false, nil
+		}
+		if s.store == nil {
+			return true, nil
+		}
+		if err := s.store.Update(job.ToSnapshot()); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+
+	// 正在执行的任务由 worker 持有内存副本，改快照会被它的收尾写回覆盖
+	if JobStatus(snap.Status) == StatusRunning {
+		return false, nil
+	}
+	if s.store == nil || snap.Group == toGroup {
+		return false, nil
+	}
+
+	snap.Group = toGroup
+	snap.UpdatedAt = time.Now()
+	if err := s.store.Update(snap); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // Restore 从持久化存储重建调度队列（崩溃/重启恢复）。
