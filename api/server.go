@@ -183,8 +183,12 @@ func (s *Server) setupRoutes() {
 			jobs.POST("/:id/pause", operator, s.PauseJob)
 			jobs.POST("/:id/resume", operator, s.ResumeJob)
 			jobs.POST("/:id/force-pause", s.RequireRole(core.RoleAdmin), s.ForcePauseJob)
+			jobs.GET("/:id/events", reader, s.GetJobEvents)
 			jobs.POST("/batch-ops", operator, s.BatchJobOps)
 		}
+
+		// 全局最近事件：Dashboard 刷新后补历史用
+		api.GET("/events", reader, s.ListRecentEvents)
 
 		// 统计与监控。/health 继续保持"启用鉴权则需凭据"的历史契约
 		// （docs/api.md 现有描述），控制台的登录页正是靠它的 401/200 判断鉴权是否开启。
