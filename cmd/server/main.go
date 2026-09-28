@@ -13,6 +13,7 @@ import (
 
 	"godelayq/api"
 	"godelayq/core"
+	"godelayq/web"
 )
 
 type schedulerAPI interface {
@@ -73,7 +74,10 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				return nil, err
 			}
 			return api.NewServer(coreScheduler, store, port, security, logger,
-				api.WithGroupStore(groups)), nil
+				api.WithGroupStore(groups),
+				// 不带 -tags dashboard 时 web.Dist 恒为 nil，这一行等价于"不提供控制台"。
+				// 写成无条件调用而不是两份装配，是为了让单二进制的差异只留在 web 包那一处。
+				api.WithConsole(web.Dist)), nil
 		},
 		notifySignals: signal.Notify,
 		timeout:       cfg.Scheduler.ShutdownTimeout,
