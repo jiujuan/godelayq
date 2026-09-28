@@ -201,6 +201,16 @@ func (s *Server) setupRoutes() {
 			groups.DELETE("/:name", s.RequireRole(core.RoleAdmin), s.DeleteGroup)
 		}
 
+		// 运维端点：改的是整个进程的行为（调度总开关、缓冲清理）或暴露内部占用，
+		// 只给 ops 档
+		admin := api.Group("/admin", s.RequireRole(core.RoleOps))
+		{
+			admin.GET("/runtime", s.GetRuntime)
+			admin.POST("/scheduler/suspend", s.SuspendScheduler)
+			admin.POST("/scheduler/unsuspend", s.UnsuspendScheduler)
+			admin.DELETE("/events", s.ClearEventHistory)
+		}
+
 		// 统计与监控。/health 继续保持"启用鉴权则需凭据"的历史契约
 		// （docs/api.md 现有描述），控制台的登录页正是靠它的 401/200 判断鉴权是否开启。
 		api.GET("/stats", reader, s.GetStats)
