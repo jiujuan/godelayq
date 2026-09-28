@@ -300,3 +300,42 @@ func TestSSEUsesConfiguredCORS(t *testing.T) {
 	assert.Equal(t, "https://app.example", resp.Header.Get("Access-Control-Allow-Origin"))
 	assert.NotEqual(t, "*", resp.Header.Get("Access-Control-Allow-Origin"))
 }
+
+func pausedEvent(jobName string) core.Event {
+	return core.Event{
+		Type:      core.EventJobPaused,
+		JobID:     "job-" + jobName,
+		JobName:   jobName,
+		Status:    core.StatusPaused,
+		Timestamp: time.Now(),
+	}
+}
+
+// 新增的 core 事件类型必须同时进 SSE 的类型白名单：SSE 走类型级订阅，
+// 漏掉的表现是"客户端请求 job.paused 直接 400"或"事件永远不推"，
+// 而不是任何显式错误，很容易一路带到生产。
+func TestSSEAcceptsPauseEventTypes(t *testing.T) {
+	srv, baseURL := newStartedServer(t)
+	defer srv.Stop(context.Background())
+
+	for _, name := range []string{"job.paused", "job.resumed"} {
+		resp, err := http.Get(baseURL + "/sse/events?event_types=" + name)
+		require.NoError(t, err)
+		// 未知类型会在建流前被拒成 400；能进入流式响应即说明该类型受支持
+		assert.Equal(t, http.StatusOK, resp.StatusCode, "%s 应被 event_types 接受", name)
+		assert.Equal(t, "text/event-stream", resp.Header.Get("Content-Type"))
+		_ = resp.Body.Close()
+	}
+
+	stream := openSSE(t, baseURL+"/sse/events?event_types=job.paused")
+	stop := publishUntil(t, srv.scheduler.GetEventBus(), 10*time.Millisecond,
+		scheduledEvent("noise"), pausedEvent("quiet"))
+	defer stop()
+
+	got := collect(t, stream, 3, 2*time.Second)
+	require.NotEmpty(t, got, "job.paused 事件应能推给 SSE 客户端")
+	for _, event := range got {
+		assert.Equal(t, core.EventJobPaused, event.Type, "只要 job.paused，别的类型不该出现")
+		assert.Equal(t, core.StatusPaused, event.Status)
+	}
+}

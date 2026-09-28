@@ -11,6 +11,10 @@ import (
 
 // publishedEventTypes 是实际会被广播的事件类型，用于校验过滤参数。
 // heap.updated 虽然在 core 里定义了类型，但目前没有任何代码发布它，故不列入。
+//
+// 新增 core 事件类型必须同步这里：SSE 走类型级订阅（见下方 eventBus.Subscribe），
+// 漏掉的表现是事件不推给客户端，且 ?event_types=job.paused 直接 400——
+// 一种"看起来服务坏了"的静默失败。WebSocket 不受影响，它订阅全量。
 var publishedEventTypes = []core.EventType{
 	core.EventJobScheduled,
 	core.EventJobStarted,
@@ -18,6 +22,8 @@ var publishedEventTypes = []core.EventType{
 	core.EventJobFailed,
 	core.EventJobCancelled,
 	core.EventJobRetrying,
+	core.EventJobPaused,
+	core.EventJobResumed,
 }
 
 // handleSSE 以 Server-Sent Events 推送事件。
