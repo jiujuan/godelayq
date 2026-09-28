@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -17,7 +18,7 @@ import (
 type FileJobFormat struct {
 	// 基础字段
 	ID      string          `json:"id"`
-	Name    string          `json:"name"`
+	Name    string          `json:"name"`    // 必填，同时作为 Handler 查找键
 	Payload json.RawMessage `json:"payload"` // 使用RawMessage保持原始JSON
 
 	// 时间设置（二选一）
@@ -31,14 +32,14 @@ type FileJobFormat struct {
 	// 单次执行超时，如 "30s"；为空表示不限制
 	Timeout string `json:"timeout,omitempty"`
 
-	// 重试配置
-	MaxRetries int    `json:"max_retries"`
+	// 重试配置。MaxRetries 用指针区分"未写"与"写 0"：
+	// 未写取 DefaultLoaderMaxRetries，写 0 表示不重试（与 POST /jobs 口径一致）。
+	MaxRetries *int   `json:"max_retries,omitempty"`
 	RetryDelay string `json:"retry_delay"` // 如 "30s", "5m"
-
-	// 元数据
-	Tags []string `json:"tags"`
-	Desc string   `json:"description"`
 }
+
+// DefaultLoaderMaxRetries 是任务文件未声明 max_retries 时的重试次数。
+const DefaultLoaderMaxRetries = 3
 
 // LoaderOptions 加载器配置选项
 type LoaderOptions struct {
@@ -157,7 +158,9 @@ func (l *DirectoryLoader) Start() error {
 func (l *DirectoryLoader) Stop() {
 	close(l.stopCh)
 	if l.watcher != nil {
-		l.watcher.Close()
+		if err := l.watcher.Close(); err != nil {
+			l.logger.Error("failed to close fs watcher", "error", err)
+		}
 	}
 
 	l.mu.Lock()
@@ -237,7 +240,9 @@ func (l *DirectoryLoader) ScanAndLoad() error {
 	for _, f := range files {
 		if err := l.LoadFile(f); err != nil {
 			l.logger.Error("failed to load job file", "path", f, "error", err)
-			l.handleErrorFile(f, err)
+			if herr := l.handleErrorFile(f, err); herr != nil {
+				l.logger.Error("failed to stash invalid job file", "path", f, "error", herr)
+			}
 		}
 	}
 
@@ -295,16 +300,30 @@ func (l *DirectoryLoader) LoadFile(filePath string) error {
 
 // formatToJob 将文件格式转换为Job对象
 func (l *DirectoryLoader) formatToJob(f *FileJobFormat) (*Job, error) {
-	job := &Job{
-		ID:         f.ID,
-		Name:       f.Name,
-		Payload:    []byte(f.Payload),
-		CronExpr:   f.CronExpr,
-		IsRepeat:   f.IsRepeat,
-		MaxRetries: f.MaxRetries,
-		CreatedAt:  time.Now(),
-		Status:     StatusPending,
+	// name 既是任务标识也是 Handler 查找键：留空的任务注定无 handler，直接在入口拒掉
+	if strings.TrimSpace(f.Name) == "" {
+		return nil, fmt.Errorf("name is required")
 	}
+
+	job := &Job{
+		ID:        f.ID,
+		Name:      f.Name,
+		Payload:   []byte(f.Payload),
+		CronExpr:  f.CronExpr,
+		IsRepeat:  f.IsRepeat,
+		CreatedAt: time.Now(),
+		Status:    StatusPending,
+	}
+
+	// 重试次数：未写用默认，显式 0 表示不重试
+	maxRetries := DefaultLoaderMaxRetries
+	if f.MaxRetries != nil {
+		if *f.MaxRetries < 0 {
+			return nil, fmt.Errorf("max_retries must not be negative, got %d", *f.MaxRetries)
+		}
+		maxRetries = *f.MaxRetries
+	}
+	job.MaxRetries = maxRetries
 
 	// 生成ID（如果未指定）。不能用 UnixNano 直接拼：时钟粒度会让同批文件得到相同 ID，
 	// 后一个任务会覆盖前一个。
@@ -347,11 +366,6 @@ func (l *DirectoryLoader) formatToJob(f *FileJobFormat) (*Job, error) {
 		job.Timeout = td
 	}
 
-	// 默认重试次数
-	if job.MaxRetries == 0 {
-		job.MaxRetries = 3
-	}
-
 	return job, nil
 }
 
@@ -387,38 +401,50 @@ func (l *DirectoryLoader) postProcess(filePath string) error {
 	return nil
 }
 
-// handleErrorFile 处理解析失败的文件
-func (l *DirectoryLoader) handleErrorFile(filePath string, loadErr error) {
+// handleErrorFile 把解析失败的文件复制到 ErrorDir 并附错误说明。
+// 未配置 ErrorDir 时什么都不做（原始错误已由调用方记录），其余失败一律返回错误。
+func (l *DirectoryLoader) handleErrorFile(filePath string, loadErr error) error {
 	if l.options.ErrorDir == "" {
-		return
+		return nil
 	}
 
-	// 确保错误目录存在
-	os.MkdirAll(l.options.ErrorDir, 0755)
+	if err := os.MkdirAll(l.options.ErrorDir, 0755); err != nil {
+		return fmt.Errorf("create error dir %s failed: %w", l.options.ErrorDir, err)
+	}
 
 	filename := filepath.Base(filePath)
 	errorFile := filepath.Join(l.options.ErrorDir, filename+".error")
 
-	// 复制原文件并附加错误信息
 	src, err := os.Open(filePath)
 	if err != nil {
-		return
+		return fmt.Errorf("open failed file %s: %w", filePath, err)
 	}
 	defer src.Close()
 
 	dst, err := os.Create(errorFile)
 	if err != nil {
-		return
+		return fmt.Errorf("create error file %s failed: %w", errorFile, err)
 	}
 	defer dst.Close()
 
-	io.Copy(dst, src)
-	dst.WriteString(fmt.Sprintf("\n\n// ERROR: %s\n", loadErr.Error()))
-
-	// 可选：删除原文件或保留，根据配置
-	if l.options.PostLoadAction == DeleteAfterLoad {
-		os.Remove(filePath)
+	if _, err := io.Copy(dst, src); err != nil {
+		return fmt.Errorf("copy failed file to %s: %w", errorFile, err)
 	}
+	if _, err := fmt.Fprintf(dst, "\n\n// ERROR: %s\n", loadErr.Error()); err != nil {
+		return fmt.Errorf("append error note to %s: %w", errorFile, err)
+	}
+	if err := dst.Close(); err != nil {
+		return fmt.Errorf("close error file %s: %w", errorFile, err)
+	}
+
+	// 失败文件已归档，按后处理策略决定原文件去留
+	if l.options.PostLoadAction == DeleteAfterLoad {
+		if err := os.Remove(filePath); err != nil {
+			return fmt.Errorf("delete failed file %s: %w", filePath, err)
+		}
+	}
+
+	return nil
 }
 
 // startWatcher 启动文件系统监控
@@ -434,14 +460,23 @@ func (l *DirectoryLoader) startWatcher() error {
 		return err
 	}
 
-	// 递归添加子目录（如果启用）
+	// 递归添加子目录（如果启用）：单个目录加不上就记日志跳过，
+	// 不能因为一次遍历失败而丢掉整个监控
 	if l.options.Recursive {
-		filepath.Walk(l.options.Dir, func(path string, info os.FileInfo, err error) error {
-			if info != nil && info.IsDir() {
-				watcher.Add(path)
+		if err := filepath.Walk(l.options.Dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				l.logger.Warn("failed to scan directory for watcher", "path", path, "error", err)
+				return nil
+			}
+			if info != nil && info.IsDir() && path != l.options.Dir {
+				if err := watcher.Add(path); err != nil {
+					l.logger.Error("failed to watch subdirectory", "path", path, "error", err)
+				}
 			}
 			return nil
-		})
+		}); err != nil {
+			l.logger.Error("failed to walk jobs dir", "dir", l.options.Dir, "error", err)
+		}
 	}
 
 	l.wg.Add(1)
@@ -463,10 +498,12 @@ func (l *DirectoryLoader) startWatcher() error {
 						// 等静默窗口过去再读，既不阻塞事件循环也避免读到半截文件
 						l.scheduleLoad(event.Name)
 					}
-					// 如果是新目录且递归模式，添加监控
+					// 如果是新目录且递归模式，添加监控。stat 失败多为目标已被删除，跳过即可
 					if l.options.Recursive {
 						if info, err := os.Stat(event.Name); err == nil && info.IsDir() {
-							watcher.Add(event.Name)
+							if err := watcher.Add(event.Name); err != nil {
+								l.logger.Error("failed to watch new directory", "path", event.Name, "error", err)
+							}
 						}
 					}
 				}

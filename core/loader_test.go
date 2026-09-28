@@ -64,7 +64,7 @@ func TestDirectoryLoaderFormatToJob(t *testing.T) {
 		format := &FileJobFormat{
 			Name:       "test",
 			Delay:      "10m",
-			MaxRetries: 3,
+			MaxRetries: retryPtr(3),
 		}
 		job, err := loader.formatToJob(format)
 		require.NoError(t, err)
