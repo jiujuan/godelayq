@@ -64,6 +64,8 @@
         
         ws.onmessage = (event) => {
             const data = JSON.parse(event.data);
+            // 服务端控制帧（subscribed / pong / stats）没有事件字段，直接忽略
+            if (!data || !data.type) return;
             console.log('Received:', data);
             
             // 创建事件卡片

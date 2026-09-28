@@ -1,8 +1,10 @@
 package core
 
 import (
+	"encoding/json"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -12,29 +14,32 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestWebSocketServer(t *testing.T) {
+// newWSTestServer 启动一个仅暴露 /ws 的测试服务，返回 ws 地址与关闭函数
+func newWSTestServer(t *testing.T, eb *EventBus) (string, *WSServer, func()) {
+	t.Helper()
+
 	gin.SetMode(gin.TestMode)
+	ws := NewWSServer(eb)
 
-	eb := NewEventBus(100)
-	wsServer := NewWSServer(eb)
-	wsServer.Start()
-	defer wsServer.Stop()
-
-	// 创建Gin路由
 	r := gin.New()
-	r.GET("/ws", wsServer.Handle)
-
-	// 创建测试服务器
+	r.GET("/ws", ws.Handle)
 	ts := httptest.NewServer(r)
-	defer ts.Close()
 
-	// 转换 http:// -> ws://
-	wsURL := strings.Replace(ts.URL, "http", "ws", 1) + "/ws"
+	url := strings.Replace(ts.URL, "http", "ws", 1) + "/ws"
+	return url, ws, func() {
+		ts.Close()
+		ws.Stop()
+	}
+}
 
-	// 连接WebSocket
-	ws, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+func TestWebSocketServer(t *testing.T) {
+	eb := NewEventBus(100)
+	wsURL, wsServer, cleanup := newWSTestServer(t, eb)
+	defer cleanup()
+
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
 	require.NoError(t, err)
-	defer ws.Close()
+	defer conn.Close()
 
 	// 发送订阅消息
 	subMsg := WSMessage{
@@ -43,84 +48,225 @@ func TestWebSocketServer(t *testing.T) {
 			EventTypes: []string{string(EventJobScheduled)},
 		},
 	}
-	err = ws.WriteJSON(subMsg)
-	require.NoError(t, err)
+	require.NoError(t, conn.WriteJSON(subMsg))
 
 	// 等待订阅确认
-	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, data, err := ws.ReadMessage()
-	assert.NoError(t, err)
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, data, err := conn.ReadMessage()
+	require.NoError(t, err)
 	assert.Contains(t, string(data), "subscribed")
 
-	// 发布事件
-	eb.Publish(Event{
-		Type:    EventJobScheduled,
-		JobID:   "test-1",
-		JobName: "test-job",
-	})
+	// 发布匹配事件
+	eb.Publish(Event{Type: EventJobScheduled, JobID: "test-1", JobName: "test-job"})
 
-	// 验证收到推送
-	ws.SetReadDeadline(time.Now().Add(2 * time.Second))
-	_, data, err = ws.ReadMessage()
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, data, err = conn.ReadMessage()
 	require.NoError(t, err)
 	assert.Contains(t, string(data), "test-1")
 	assert.Contains(t, string(data), "job.scheduled")
+
+	// 发布不匹配事件：不应推送给该客户端
+	eb.Publish(Event{Type: EventJobCompleted, JobID: "test-2", JobName: "test-job"})
+	conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+	_, skipped, err := conn.ReadMessage()
+	assert.Error(t, err, "filtered event should not be delivered")
+	assert.NotContains(t, string(skipped), "test-2")
+
+	// 连接仍在使用中
+	assert.Equal(t, 1, wsServer.GetStats()["clients"])
 }
 
 func TestWebSocketFilter(t *testing.T) {
-	client := &WSClient{
-		Filter: WSFilter{
-			JobTypes:   []string{"payment"},
-			EventTypes: []string{"job.completed"},
-		},
-	}
+	client := &WSClient{}
+	client.setFilter(WSFilter{
+		JobTypes:   []string{"payment"},
+		EventTypes: []string{"job.completed"},
+	})
 
 	// 匹配的事件
-	matching := Event{
-		Type:    EventJobCompleted,
-		JobName: "payment",
-	}
-	assert.True(t, client.matchFilter(matching))
+	assert.True(t, client.matchFilter(Event{Type: EventJobCompleted, JobName: "payment"}))
 
 	// 类型不匹配
-	wrongType := Event{
-		Type:    EventJobStarted,
-		JobName: "payment",
-	}
-	assert.False(t, client.matchFilter(wrongType))
+	assert.False(t, client.matchFilter(Event{Type: EventJobStarted, JobName: "payment"}))
 
 	// 名称不匹配
-	wrongName := Event{
-		Type:    EventJobCompleted,
-		JobName: "email",
-	}
-	assert.False(t, client.matchFilter(wrongName))
+	assert.False(t, client.matchFilter(Event{Type: EventJobCompleted, JobName: "email"}))
+
+	// 清空后不再过滤
+	client.setFilter(WSFilter{})
+	assert.True(t, client.matchFilter(Event{Type: EventJobStarted, JobName: "email"}))
 }
 
 func TestWebSocketPingPong(t *testing.T) {
-	gin.SetMode(gin.TestMode)
 	eb := NewEventBus(10)
-	ws := NewWSServer(eb)
-	ws.Start()
+	wsURL, _, cleanup := newWSTestServer(t, eb)
+	defer cleanup()
 
+	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.NoError(t, conn.WriteJSON(WSMessage{Action: "ping"}))
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, data, err := conn.ReadMessage()
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "pong")
+
+	require.NoError(t, conn.WriteJSON(WSMessage{Action: "get_stats"}))
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, data, err = conn.ReadMessage()
+	require.NoError(t, err)
+	assert.Contains(t, string(data), "stats")
+}
+
+// TestWebSocket_StopUnsubscribesAndIsIdempotent 关停必须退订事件总线（否则
+// 订阅表随连接数无界增长），且重复 Stop 不得 panic。
+func TestWebSocket_StopUnsubscribesAndIsIdempotent(t *testing.T) {
+	eb := NewEventBus(50)
+	wsURL, wsServer, shutdown := newWSTestServer(t, eb)
+
+	conns := make([]*websocket.Conn, 0, 5)
+	for i := 0; i < 5; i++ {
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+		require.NoError(t, err)
+		conns = append(conns, conn)
+	}
+
+	waitFor := func(pred func() bool) {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if pred() {
+				return
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		t.Fatal("condition not met in time")
+	}
+
+	waitFor(func() bool { return wsServer.GetStats()["clients"] == 5 })
+
+	eb.mu.RLock()
+	subsWhileConnected := len(eb.subscriptions)
+	eb.mu.RUnlock()
+	assert.Equal(t, 5, subsWhileConnected, "each client should hold exactly one subscription")
+
+	shutdown() // ws.Stop()
+
+	waitFor(func() bool { return wsServer.GetStats()["clients"] == 0 })
+
+	eb.mu.RLock()
+	remaining := len(eb.subscriptions)
+	eb.mu.RUnlock()
+	assert.Equal(t, 0, remaining, "Stop must unsubscribe every client")
+
+	assert.NotPanics(t, func() { wsServer.Stop() })
+
+	for _, conn := range conns {
+		assert.NoError(t, conn.Close())
+	}
+}
+
+// TestWebSocket_ConcurrentChurn 并发建连/发布/关停，需在 -race 下通过：
+// 覆盖 clients 集合、filter 读写、done/closeOnce 与心跳协程的交互。
+func TestWebSocket_ConcurrentChurn(t *testing.T) {
+	eb := NewEventBus(20)
+	wsURL, wsServer, shutdown := newWSTestServer(t, eb)
+	defer shutdown()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+
+			// 反复更新过滤器，与写协程的匹配读取并发
+			for j := 0; j < 5; j++ {
+				_ = conn.WriteJSON(WSMessage{Action: "subscribe", Filter: WSFilter{
+					EventTypes: []string{string(EventJobScheduled)},
+					JobIDs:     []string{"job-x"},
+				}})
+				conn.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+				_, _, _ = conn.ReadMessage()
+			}
+		}(i)
+	}
+
+	stop := make(chan struct{})
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			eb.Publish(Event{Type: EventJobScheduled, JobID: "job-x", JobName: "burst"})
+		}
+	}()
+
+	time.Sleep(150 * time.Millisecond)
+	assert.NotPanics(t, func() { wsServer.Stop() })
+	close(stop)
+	wg.Wait()
+
+	assert.Equal(t, 0, wsServer.GetStats()["clients"])
+}
+
+// TestWebSocket_HandleAfterStop 关停后到达的连接不应进入客户端集合。
+func TestWebSocket_HandleAfterStop(t *testing.T) {
+	eb := NewEventBus(10)
+	gin.SetMode(gin.TestMode)
+	ws := NewWSServer(eb)
 	r := gin.New()
 	r.GET("/ws", ws.Handle)
 	ts := httptest.NewServer(r)
 	defer ts.Close()
 
+	ws.Stop()
+
 	wsURL := strings.Replace(ts.URL, "http", "ws", 1) + "/ws"
 	conn, _, err := websocket.DefaultDialer.Dial(wsURL, nil)
-	require.NoError(t, err)
-	defer conn.Close()
+	if err == nil {
+		defer conn.Close()
+		// 升级成功后立即被服务端关闭
+		conn.SetReadDeadline(time.Now().Add(time.Second))
+		_, _, err = conn.ReadMessage()
+		assert.Error(t, err)
+	}
 
-	// 发送ping
-	ping := WSMessage{Action: "ping"}
-	err = conn.WriteJSON(ping)
+	assert.Equal(t, 0, ws.GetStats()["clients"])
+	eb.mu.RLock()
+	defer eb.mu.RUnlock()
+	assert.Equal(t, 0, len(eb.subscriptions))
+}
+
+// TestWSClient_TrySendDropsWhenFull 发送缓冲满时丢弃而非阻塞/关闭通道，
+// 这是原实现自死锁的根因。
+func TestWSClient_TrySendDropsWhenFull(t *testing.T) {
+	eb := NewEventBus(1)
+	client := &WSClient{
+		ID:     "c1",
+		Conn:   &websocket.Conn{},
+		server: NewWSServer(eb),
+		send:   make(chan []byte, 1),
+		done:   make(chan struct{}),
+	}
+
+	payload, err := json.Marshal(map[string]string{"a": "b"})
 	require.NoError(t, err)
 
-	// 接收pong
-	conn.SetReadDeadline(time.Now().Add(time.Second))
-	_, data, err := conn.ReadMessage()
-	assert.NoError(t, err)
-	assert.Contains(t, string(data), "pong")
+	assert.NotPanics(t, func() {
+		for i := 0; i < 10; i++ {
+			client.trySend(payload)
+		}
+	})
+	assert.Equal(t, 1, len(client.send))
 }

@@ -2,53 +2,43 @@ package api
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"testing"
 	"time"
 
-	"core"
+	"godelayq/core"
 
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/mock"
+	"github.com/stretchr/testify/require"
+	"github.com/stretchr/testify/suite"
 )
 
-// MockScheduler 模拟调度器
-type MockScheduler struct {
-	mock.Mock
-}
-
-func (m *MockScheduler) Schedule(job *core.Job) error {
-	args := m.Called(job)
-	return args.Error(0)
-}
-
-func (m *MockScheduler) Cancel(id string) error {
-	args := m.Called(id)
-	return args.Error(0)
-}
-
-func (m *MockScheduler) HeapLen() int {
-	return m.Called().Int(0)
-}
-
+// APITestSuite 使用真实的 core.Scheduler 与临时 JSON 存储，
+// 覆盖 HTTP 处理器的请求/响应契约。
 type APITestSuite struct {
+	suite.Suite
 	router    *gin.Engine
-	mockSched *MockScheduler
+	scheduler *core.Scheduler
 	server    *Server
 }
 
 func (s *APITestSuite) SetupTest() {
 	gin.SetMode(gin.TestMode)
-	s.mockSched = new(MockScheduler)
-	s.server = NewServer(s.mockSched, nil, "8080")
+
+	store, err := core.NewJSONFileStore(filepath.Join(s.T().TempDir(), "jobs.json"))
+	require.NoError(s.T(), err)
+
+	s.scheduler = core.NewScheduler(store, nil, nil)
+	s.server = NewServer(s.scheduler, store, "8080")
 	s.router = s.server.engine
 }
 
 func (s *APITestSuite) TestCreateJob() {
-	s.mockSched.On("Schedule", mock.AnythingOfType("*core.Job")).Return(nil)
 	s.server.RegisterJobHandler("payment_check", func(ctx context.Context, job *core.Job) error {
 		return nil
 	})
@@ -73,8 +63,7 @@ func (s *APITestSuite) TestCreateJob() {
 	assert.NoError(s.T(), err)
 	assert.Equal(s.T(), "payment_check", resp.Name)
 	assert.NotEmpty(s.T(), resp.ID)
-
-	s.mockSched.AssertExpectations(s.T())
+	assert.Equal(s.T(), 1, s.scheduler.HeapLen())
 }
 
 func (s *APITestSuite) TestCreateJobUnknownType() {
@@ -92,19 +81,22 @@ func (s *APITestSuite) TestCreateJobUnknownType() {
 }
 
 func (s *APITestSuite) TestCancelJob() {
-	s.mockSched.On("Cancel", "job-123").Return(nil)
+	job := &core.Job{
+		ID:        "job-123",
+		Name:      "payment_check",
+		TriggerAt: time.Now().Add(1 * time.Hour),
+	}
+	require.NoError(s.T(), s.scheduler.Schedule(job))
 
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("DELETE", "/api/v1/jobs/job-123", nil)
 	s.router.ServeHTTP(w, req)
 
 	assert.Equal(s.T(), 204, w.Code)
-	s.mockSched.AssertCalled(s.T(), "Cancel", "job-123")
+	assert.Equal(s.T(), 0, s.scheduler.HeapLen())
 }
 
 func (s *APITestSuite) TestCancelJobNotFound() {
-	s.mockSched.On("Cancel", "missing").Return(core.ErrJobNotFound)
-
 	w := httptest.NewRecorder()
 	req, _ := http.NewRequest("DELETE", "/api/v1/jobs/missing", nil)
 	s.router.ServeHTTP(w, req)

@@ -14,6 +14,14 @@ func (s *Server) handleSSE(c *gin.Context) {
 	c.Writer.Header().Set("Connection", "keep-alive")
 	c.Writer.Header().Set("Access-Control-Allow-Origin", "*")
 
+	// 立即下发响应头：否则客户端要等到第一个事件才能拿到 header，
+	// 期间 EventSource / http.Client.Do 都会一直阻塞。
+	// 用 SSE 注释帧做首包，客户端解析时会自动忽略 ":"开头的行。
+	if _, err := fmt.Fprint(c.Writer, ": connected\n\n"); err != nil {
+		return
+	}
+	c.Writer.Flush()
+
 	// 获取客户端过滤参数
 	jobTypes := c.QueryArray("job_types")
 	eventTypes := c.QueryArray("event_types")

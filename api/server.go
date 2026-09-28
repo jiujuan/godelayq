@@ -2,13 +2,15 @@ package api
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 	"time"
 
-	"godelayq/core"
 	"github.com/gin-gonic/gin"
+	"godelayq/core"
 )
 
 // Server HTTP API 服务器
@@ -17,10 +19,17 @@ type Server struct {
 	store     core.Store
 	registry  *JobRegistry
 	engine    *gin.Engine
+	wsServer  *core.WSServer
+	httpSrv   *http.Server
 	port      string
 	startTime time.Time
 
-	// wsServer *core.WSServer // Commented out for now
+	// baseCtx 传给每个请求；Stop 取消它即可让 SSE 等长连接立即收尾
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+	mu         sync.Mutex   // 保护 ln 与 shutdown
+	ln         net.Listener // Start 成功后有效，ListenAddr 返回真实监听地址
+	shutdown   bool
 }
 
 // JobRegistry 任务处理器注册表（用于API创建的任务自动绑定Handler）
@@ -64,15 +73,28 @@ func NewServer(scheduler *core.Scheduler, store core.Store, port string) *Server
 		port = "8080"
 	}
 
-	s := &Server{
-		scheduler: scheduler,
-		store:     store,
-		registry:  NewJobRegistry(),
-		engine:    gin.New(),
-		port:      port,
-		startTime: time.Now(),
+	baseCtx, baseCancel := context.WithCancel(context.Background())
 
-		// wsServer: core.NewWSServer(scheduler.GetEventBus()),
+	s := &Server{
+		scheduler:  scheduler,
+		store:      store,
+		registry:   NewJobRegistry(),
+		engine:     gin.New(),
+		wsServer:   core.NewWSServer(scheduler.GetEventBus()),
+		port:       port,
+		startTime:  time.Now(),
+		baseCtx:    baseCtx,
+		baseCancel: baseCancel,
+	}
+
+	// 持有唯一的 http.Server 实例，Stop 才能真正关闭监听
+	s.httpSrv = &http.Server{
+		Addr:              fmt.Sprintf(":%s", s.port),
+		Handler:           s.engine,
+		ReadHeaderTimeout: 10 * time.Second,
+		BaseContext: func(net.Listener) context.Context {
+			return s.baseCtx
+		},
 	}
 
 	s.setupMiddleware()
@@ -154,39 +176,65 @@ func (s *Server) setupRoutes() {
 	})
 
 	// WebSocket 端点
-	// s.engine.GET("/ws", s.wsServer.Handle)
+	s.engine.GET("/ws", s.wsServer.Handle)
 
 	// SSE 备选方案（对于不支持WebSocket的客户端）
 	s.engine.GET("/sse/events", s.handleSSE)
 }
 
-// Start 启动HTTP服务（非阻塞）
+// Start 启动HTTP服务（非阻塞）。监听失败直接返回错误，便于上层回滚。
 func (s *Server) Start() error {
-	addr := fmt.Sprintf(":%s", s.port)
-
-	// s.wsServer.Start() // 启动WebSocket管理
-
-	// 使用http.Server支持优雅关闭
-	srv := &http.Server{
-		Addr:    addr,
-		Handler: s.engine,
+	ln, err := net.Listen("tcp", s.httpSrv.Addr)
+	if err != nil {
+		return fmt.Errorf("listen on %s failed: %w", s.httpSrv.Addr, err)
 	}
 
-	// 在后台启动
+	s.mu.Lock()
+	s.ln = ln
+	s.mu.Unlock()
+
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := s.httpSrv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			fmt.Printf("HTTP server error: %v\n", err)
 		}
 	}()
 
-	fmt.Printf("HTTP API server listening on http://localhost%s\n", addr)
+	fmt.Printf("HTTP API server listening on http://%s\n", s.ListenAddr())
 	return nil
 }
 
-// Stop 优雅关闭
+// ListenAddr 返回实际监听地址（端口为 0 时由系统分配），未启动时返回空串
+func (s *Server) ListenAddr() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.ln == nil {
+		return ""
+	}
+	return s.ln.Addr().String()
+}
+
+// Stop 优雅关闭：通知长连接退出、停止监听，最后关闭全部 WebSocket 客户端。
+// 重复调用安全。
 func (s *Server) Stop(ctx context.Context) error {
-	srv := &http.Server{Addr: fmt.Sprintf(":%s", s.port)}
-	return srv.Shutdown(ctx)
+	s.mu.Lock()
+	if s.shutdown {
+		s.mu.Unlock()
+		return nil
+	}
+	s.shutdown = true
+	s.mu.Unlock()
+
+	// 请求上下文随即结束，SSE 等长连接处理器可立即返回
+	s.baseCancel()
+
+	err := s.httpSrv.Shutdown(ctx)
+	s.wsServer.Stop()
+
+	if err != nil {
+		// 超时后强制关闭残留连接
+		s.httpSrv.Close()
+	}
+	return err
 }
 
 // 获取端口
