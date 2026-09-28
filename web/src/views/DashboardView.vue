@@ -1,20 +1,34 @@
 <script setup lang="ts">
-/* 概览页：先把"统计卡"这一条链路打通（登录 → REST 查询 → WS 事件触发失效 → 数字变动），
-   它是 M3 骨架能否端到端验证的探针。分组健康度与事件流两个面板随 M4 落地。 */
+/* 概览页：统计卡（REST + 事件驱动失效）、分组健康度、最近事件三块。
+   三块共用同一套 Query 键，所以在这一页看到的数字与列表页必然同源。 */
+import { computed } from 'vue'
 import { useQuery } from '@tanstack/vue-query'
 import { AlertTriangle, CircleCheck, Clock, HardDrive, PauseCircle, Play } from 'lucide-vue-next'
 import PageHeader from '../components/layout/PageHeader.vue'
 import StatCard from '../components/dashboard/StatCard.vue'
+import UiBadge from '../components/ui/UiBadge.vue'
 import UiEmptyState from '../components/ui/UiEmptyState.vue'
+import { listGroups } from '../api/groups'
 import { queryKeys } from '../api/keys'
 import { fetchStats } from '../api/stats'
+import { useEventFeed } from '../composables/useEventFeed'
+import { formatClockTime, shortJobId } from '../display'
 
 const { data, isPending, error } = useQuery({
   queryKey: queryKeys.stats,
   queryFn: fetchStats,
-  // 5s 轮询是 WS 断线期间的兜底（§4.6），实时性主要靠事件驱动的失效
-  refetchInterval: 5_000,
+  // 轮询兜底交给 Topbar（它每个页面都挂着，同一个 key 只需一份定时器）：
+  // 这里再声明一次 refetchInterval 会让同一把钥匙被两个观察者各敲一遍，
+  // 请求量凭空翻倍却拿不到更多新鲜度。实时性本来就靠事件驱动的失效。
 })
+
+const groupsQuery = useQuery({ queryKey: queryKeys.groups, queryFn: listGroups })
+const groups = computed(() => groupsQuery.data.value ?? [])
+const groupsPending = computed(() => groupsQuery.isPending.value)
+const groupError = computed(() => groupsQuery.error.value)
+
+// 事件流面板只要最近几条可读，完整流与筛选在实时页
+const { events: feed, isPending: feedPending } = useEventFeed(20)
 </script>
 
 <template>
@@ -61,10 +75,76 @@ const { data, isPending, error } = useQuery({
 
     <div class="mt-8 grid gap-4 lg:grid-cols-2">
       <section class="rounded-[var(--radius-card)] border border-[var(--color-border)] bg-white">
-        <UiEmptyState title="分组健康度" description="每组 pending/failed 计数，随 M4 的分组视图一起落地" />
+        <header class="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-2.5">
+          <h2 class="text-sm font-semibold">分组健康度</h2>
+          <router-link
+            to="/groups"
+            class="text-xs text-[var(--color-primary)] hover:underline"
+          >
+            管理分组
+          </router-link>
+        </header>
+
+        <UiEmptyState
+          v-if="groupError"
+          :title="`分组读取失败：${groupError.message}`"
+          description="这一栏只影响概览，任务列表与分组页各自还会再取一次"
+        />
+        <UiEmptyState
+          v-else-if="groups.length === 0 && !groupsPending"
+          title="还没有分组"
+          description="分组的 job_count 按实际任务标签统计，只在有任务挂着时出现"
+        />
+
+        <ul v-else class="divide-y divide-[var(--color-border)]">
+          <li v-for="group in groups" :key="group.name">
+            <router-link
+              :to="{ name: 'jobs', query: { group: group.name } }"
+              class="flex items-center gap-3 px-4 py-2.5 text-sm transition-colors hover:bg-[var(--color-surface)]"
+            >
+              <span
+                class="h-2.5 w-2.5 shrink-0 rounded-full"
+                :style="group.color ? { backgroundColor: group.color } : { border: '1px solid var(--color-border)' }"
+              ></span>
+              <span class="min-w-0 flex-1 truncate">{{ group.name }}</span>
+              <span class="text-xs tabular-nums text-[var(--color-text-muted)]">{{ group.job_count }} 条</span>
+              <UiBadge v-if="group.paused_count > 0" tone="primary">{{ group.paused_count }} 已暂停</UiBadge>
+              <UiBadge v-if="!group.registered" tone="warning">未注册</UiBadge>
+            </router-link>
+          </li>
+        </ul>
       </section>
+
       <section class="rounded-[var(--radius-card)] border border-[var(--color-border)] bg-white">
-        <UiEmptyState title="实时事件流" description="前端缓冲的最近事件，随 M4 的 Monitor 面板落地" />
+        <header class="flex items-center justify-between border-b border-[var(--color-border)] px-4 py-2.5">
+          <h2 class="text-sm font-semibold">实时事件流</h2>
+          <router-link to="/monitor" class="text-xs text-[var(--color-primary)] hover:underline">
+            查看全部
+          </router-link>
+        </header>
+
+        <UiEmptyState
+          v-if="feed.length === 0"
+          :title="feedPending ? '正在读取事件缓冲' : '还没有事件'"
+          description="最近几条在这里，完整流与筛选在实时页"
+        />
+
+        <ul v-else class="divide-y divide-[var(--color-border)]">
+          <li
+            v-for="event in feed.slice(0, 6)"
+            :key="`${event.timestamp}-${event.job_id}-${event.type}`"
+            class="flex items-center gap-2 px-4 py-2.5 text-sm"
+          >
+            <UiBadge :tone="event.type === 'job.failed' ? 'danger' : event.type === 'job.completed' ? 'success' : 'neutral'">
+              {{ event.type }}
+            </UiBadge>
+            <span class="min-w-0 flex-1 truncate">{{ event.job_name }}</span>
+            <code class="text-xs text-[var(--color-text-muted)]">{{ shortJobId(event.job_id) }}</code>
+            <span class="text-xs tabular-nums text-[var(--color-text-muted)]">
+              {{ formatClockTime(event.timestamp) }}
+            </span>
+          </li>
+        </ul>
       </section>
     </div>
   </div>
