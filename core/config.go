@@ -25,6 +25,24 @@ type Config struct {
 type ServerConfig struct {
 	// Port 监听端口，如 "8080"
 	Port string `mapstructure:"port"`
+	// Auth 静态 token 鉴权
+	Auth AuthConfig `mapstructure:"auth"`
+	// CORS 跨域来源白名单
+	CORS CORSConfig `mapstructure:"cors"`
+}
+
+// AuthConfig 鉴权配置。Token 为空表示不启用鉴权。
+type AuthConfig struct {
+	// Token 访问受保护端点所需的静态 token，通过 GODELAYQ_SERVER_AUTH_TOKEN 注入更安全
+	Token string `mapstructure:"token"`
+}
+
+// CORSConfig 跨域配置。AllowOrigins 为空等价于 ["*"]（历史行为）。
+type CORSConfig struct {
+	// AllowOrigins 允许的来源列表，元素为完整 origin（如 https://app.example.com）或 "*"
+	AllowOrigins []string `mapstructure:"allow_origins"`
+	// AllowCredentials 是否允许携带凭据；开启时不允许使用 "*" 来源
+	AllowCredentials bool `mapstructure:"allow_credentials"`
 }
 
 // SchedulerConfig 调度与执行侧配置
@@ -54,6 +72,13 @@ func DefaultConfig() Config {
 	return Config{
 		Server: ServerConfig{
 			Port: "8080",
+			Auth: AuthConfig{
+				Token: "", // 空即不启用鉴权
+			},
+			CORS: CORSConfig{
+				AllowOrigins:     []string{"*"},
+				AllowCredentials: false,
+			},
 		},
 		Scheduler: SchedulerConfig{
 			Workers:         DefaultConcurrency,
@@ -86,8 +111,12 @@ func LoadConfig(path string) (Config, error) {
 	}
 
 	// 环境变量覆盖：GODELAYQ_SERVER_PORT / GODELAYQ_SCHEDULER_WORKERS ...
+	// 列表型（allow_origins）由 viper 默认的逗号分隔 hook 解析。
 	for _, key := range []string{
 		"server.port",
+		"server.auth.token",
+		"server.cors.allow_origins",
+		"server.cors.allow_credentials",
 		"scheduler.workers",
 		"scheduler.queue_capacity",
 		"scheduler.max_retry_delay",
@@ -153,7 +182,27 @@ func (c Config) Validate() error {
 		return fmt.Errorf("store.flush_interval must not be negative, got %v", c.Store.FlushInterval)
 	}
 
+	for _, origin := range c.Server.CORS.AllowOrigins {
+		if strings.TrimSpace(origin) == "" {
+			return fmt.Errorf("server.cors.allow_origins must not contain an empty entry")
+		}
+	}
+	if c.Server.CORS.AllowCredentials && containsOrigin(c.Server.CORS.AllowOrigins, "*") {
+		// 浏览器会拒绝 "*"+凭据 的组合，配置层面直接否掉而不是运行时静默降级
+		return fmt.Errorf("server.cors.allow_credentials cannot be combined with the \"*\" origin")
+	}
+
 	return nil
+}
+
+// containsOrigin 判断列表里是否有指定来源（忽略首尾空白）
+func containsOrigin(origins []string, want string) bool {
+	for _, o := range origins {
+		if strings.TrimSpace(o) == want {
+			return true
+		}
+	}
+	return false
 }
 
 // Normalized 把 0 值替换成代码默认值，便于直接传给各构造函数
@@ -162,6 +211,9 @@ func (c Config) Normalized() Config {
 
 	if c.Server.Port == "" {
 		c.Server.Port = defaults.Server.Port
+	}
+	if len(c.Server.CORS.AllowOrigins) == 0 {
+		c.Server.CORS.AllowOrigins = defaults.Server.CORS.AllowOrigins
 	}
 	if c.Scheduler.Workers == 0 {
 		c.Scheduler.Workers = defaults.Scheduler.Workers

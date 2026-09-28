@@ -29,6 +29,9 @@ func TestDefaultConfig(t *testing.T) {
 	assert.Equal(t, "json", cfg.Store.Type)
 	assert.Equal(t, "./data/jobs.json", cfg.Store.Path)
 	assert.Equal(t, DefaultFlushInterval, cfg.Store.FlushInterval)
+	assert.Empty(t, cfg.Server.Auth.Token, "auth must stay off until a token is configured")
+	assert.Equal(t, []string{"*"}, cfg.Server.CORS.AllowOrigins)
+	assert.False(t, cfg.Server.CORS.AllowCredentials)
 
 	assert.NoError(t, cfg.Validate())
 }
@@ -58,6 +61,27 @@ store:
 	assert.Equal(t, 12*time.Second, cfg.Scheduler.ShutdownTimeout)
 	assert.Equal(t, "/var/lib/godelayq/jobs.json", cfg.Store.Path)
 	assert.Equal(t, time.Second, cfg.Store.FlushInterval)
+}
+
+func TestLoadConfig_AuthAndCORS(t *testing.T) {
+	path := writeConfigFile(t, `
+server:
+  port: "9090"
+  auth:
+    token: "s3cret"
+  cors:
+    allow_origins:
+      - https://app.example.com
+      - http://localhost:5173
+    allow_credentials: true
+`)
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+
+	assert.Equal(t, "s3cret", cfg.Server.Auth.Token)
+	assert.Equal(t, []string{"https://app.example.com", "http://localhost:5173"}, cfg.Server.CORS.AllowOrigins)
+	assert.True(t, cfg.Server.CORS.AllowCredentials)
 }
 
 func TestLoadConfig_PartialFileKeepsDefaults(t *testing.T) {
@@ -99,12 +123,15 @@ func TestLoadConfig_RejectsUnknownKeys(t *testing.T) {
 
 func TestLoadConfig_RejectsInvalidValues(t *testing.T) {
 	cases := map[string]string{
-		"unsupported store type":  "store:\n  type: redis\n",
-		"negative workers":        "scheduler:\n  workers: -1\n",
-		"negative queue capacity": "scheduler:\n  queue_capacity: -5\n",
-		"empty port":              "server:\n  port: \"\"\n",
-		"empty store path":        "store:\n  path: \"\"\n",
-		"non-positive shutdown":   "scheduler:\n  shutdown_timeout: 0s\n",
+		"unsupported store type":           "store:\n  type: redis\n",
+		"negative workers":                 "scheduler:\n  workers: -1\n",
+		"negative queue capacity":          "scheduler:\n  queue_capacity: -5\n",
+		"empty port":                       "server:\n  port: \"\"\n",
+		"empty store path":                 "store:\n  path: \"\"\n",
+		"non-positive shutdown":            "scheduler:\n  shutdown_timeout: 0s\n",
+		"credentials with wildcard":        "server:\n  cors:\n    allow_origins: [\"*\"]\n    allow_credentials: true\n",
+		"credentials with default origins": "server:\n  auth:\n    token: x\n  cors:\n    allow_credentials: true\n",
+		"empty origin entry":               "server:\n  cors:\n    allow_origins: [\"https://a.example\", \"\"]\n",
 	}
 
 	for name, content := range cases {
@@ -120,11 +147,16 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 
 	t.Setenv("GODELAYQ_SERVER_PORT", "7777")
 	t.Setenv("GODELAYQ_SCHEDULER_WORKERS", "13")
+	t.Setenv("GODELAYQ_SERVER_AUTH_TOKEN", "env-token")
+	t.Setenv("GODELAYQ_SERVER_CORS_ALLOW_ORIGINS", "https://a.example,https://b.example")
 
 	cfg, err := LoadConfig(path)
 	require.NoError(t, err)
 	assert.Equal(t, "7777", cfg.Server.Port)
 	assert.Equal(t, 13, cfg.Scheduler.Workers)
+	assert.Equal(t, "env-token", cfg.Server.Auth.Token)
+	assert.Equal(t, []string{"https://a.example", "https://b.example"}, cfg.Server.CORS.AllowOrigins,
+		"list keys come from a comma-separated env value")
 }
 
 func TestConfig_Normalized(t *testing.T) {
@@ -133,6 +165,8 @@ func TestConfig_Normalized(t *testing.T) {
 	defaults := DefaultConfig()
 
 	assert.Equal(t, defaults.Server.Port, cfg.Server.Port)
+	assert.Equal(t, defaults.Server.CORS.AllowOrigins, cfg.Server.CORS.AllowOrigins,
+		"an omitted origin list means wildcard, not \"block everything\"")
 	assert.Equal(t, defaults.Scheduler.Workers, cfg.Scheduler.Workers)
 	assert.Equal(t, defaults.Scheduler.ShutdownTimeout, cfg.Scheduler.ShutdownTimeout)
 	assert.Equal(t, defaults.Store.Type, cfg.Store.Type)

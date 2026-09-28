@@ -9,6 +9,17 @@
 
 server:
   port: "8080"          # HTTP 监听端口
+  auth:
+    # 静态访问 token：留空即不启用鉴权（当前默认，便于本地开发）。
+    # 生产环境用环境变量注入：GODELAYQ_SERVER_AUTH_TOKEN=...
+    # 启用后 REST 用 Authorization: Bearer <token> 或 X-Auth-Token；
+    # 浏览器 WebSocket / EventSource 只能用 ?token=<token>
+    token: ""
+  cors:
+    # 跨域来源白名单，元素为完整 origin；["*"] 或留空表示任意来源
+    allow_origins: ["*"]
+    # 允许携带 Cookie 等凭据；开启时不允许使用 "*"（启动即报错）
+    allow_credentials: false
 
 scheduler:
   workers: 100          # 并发执行协程数；0 表示使用 core.DefaultConcurrency
