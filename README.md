@@ -95,7 +95,10 @@
 | 文件 | 作用 | 关键设计 |
 |------|------|----------|
 | `heap.go` | 四叉堆实现 | 索引映射实现按 ID 的 O(1) 定位，四叉 sift 与 `Update`/`PopIfDue` |
-| `scheduler.go` | 调度器引擎 | 堆顶定时器唤醒（非忙等待），有界 worker 池 + 队列背压，优雅关闭与崩溃恢复 |
+| `job.go` | 任务模型 | 状态含 `paused`（追加在枚举末尾，兼容已落盘的 int）；`group` 只是标签，落盘省略空值；快照与重试副本四处搬运同一字段 |
+| `scheduler.go` | 调度器引擎 | 堆顶定时器唤醒（非忙等待），有界 worker 池 + 队列背压，优雅关闭与崩溃恢复；`Pause`/`ForcePause`/`Resume` 暂停语义（收尾守卫保证不复活），`Suspend` 调度总开关 |
+| `group_store.go` | 分组元数据 | 单 JSON 文件同步原子重写（低频实体不复制 jobs 的合并落盘协程）；组名规则、损坏文件报错而非当空集 |
+| `auth.go` | 角色模型 | `viewer < operator < admin < ops` 单阶梯比较；`machine` 等同 operator 档，因而天然拿不到 admin 能力 |
 | `event.go` | 事件驱动架构 | 发布-订阅；订阅缓冲满时丢弃事件而非阻塞调度主流程 |
 | `websocket.go` | 实时通信 | 心跳保活、按事件类型/任务名过滤订阅；只依赖 `WSConn`/`WSUpgrader` 接口，协议库由上层注入（重连属客户端能力） |
 | `load.go` | 文件任务加载 | fsnotify 监控 + 100ms 静默窗口合并写入事件，加载后删除/归档，非法文件可隔离到 `error_dir` |
@@ -120,8 +123,10 @@ godelayq/
 │
 ├── core/                     # 核心库（不依赖任何 web 框架）
 │   ├── heap.go               # 四叉堆（索引映射、Update、PopIfDue）
-│   ├── job.go                # 任务定义、状态、快照与 CloneForRetry
-│   ├── scheduler.go          # 调度器：堆 + worker 池 + 取消表 + 事件总线
+│   ├── job.go                # 任务定义、状态（含 paused）、分组标签、快照与 CloneForRetry
+│   ├── scheduler.go          # 调度器：堆 + worker 池 + 取消表 + 暂停/强制暂停 + 调度总开关 + 事件总线
+│   ├── group_store.go        # 分组元数据存储（单 JSON 文件，同步原子落盘）
+│   ├── auth.go               # 控制台角色档位与权限比较
 │   ├── store.go              # 存储接口与 JSON 实现（合并落盘、终态留痕）
 │   ├── retry.go              # 指数退避重试策略（抖动 + 延迟上限）
 │   ├── cron.go               # Cron 表达式解析（5/6 段，可选秒级）

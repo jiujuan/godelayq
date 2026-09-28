@@ -1,6 +1,9 @@
 # Web 控制台：前端界面设计与后端实现方案
 
-> 状态：设计稿（尚未实施）。
+> 状态：设计定稿。**M0（认证与角色）、M1（core 的暂停/分组模型与调度器改动）已实施**，
+> 实现与本文件的偏离已在对应小节就地标注；M2 起（HTTP 端点、运维端点、前端）尚未开工。
+> 引用约定：本文件按**符号**锚定代码（如 `core/scheduler.go` 的 `Restore`），不写行号——
+> 行号每加一个里程碑就会漂移，符号不会。
 > 技术栈约定：Vue 3 + Vite + TypeScript + Pinia + TanStack Query + lucide 图标。
 > 说明：用户要求中的 "typescript7" 按当前生态理解为 Vite 7 / TypeScript 5.x；
 > "tank query" 按 TanStack Query（`@tanstack/vue-query` v5）理解。若需偏离请在评审时指出。
@@ -26,39 +29,43 @@
 
 - 用户账号的在线增删改（账号在 `configs/config.yaml` 声明，改动需重启）
 - 运行时调整 worker 数 / 队列容量（现有 `SetConcurrency`/`SetQueueCapacity`
-  在 Start 后被忽略并告警，`core/scheduler.go:83-113`；需要 worker 池 resize 能力，列为二期）
+  在 Start 后被忽略并告警，`core/scheduler.go 的 SetConcurrency/SetQueueCapacity`；需要 worker 池 resize 能力，列为二期）
 - 运行历史的持久化审计（重启即清空，终态快照留痕仍由 `store.history_limit` 负责）
 - 集群 / 多实例管理
 
 ---
 
-## 2. 现状盘点（已核实的代码事实）
+## 2. 现状盘点（改动前的基线，已核实）
+
+下表记录规划时的代码事实。**M0/M1 已把其中若干条改掉**，被改动的行以 ⚠️ 标注并写明去向，避免读者把基线当成现状。
 
 | 事实 | 位置 |
 | --- | --- |
-| REST 路由：jobs CRUD/cancel/retry/batch、stats、health、job-types | `api/server.go:102-124` |
-| WS `/ws`、SSE `/sse/events` | `api/server.go:134-140`、`api/sse.go` |
-| 鉴权：单一静态 token，`Authorization: Bearer` / `X-Auth-Token` / `?token=` 三通道 | `api/security.go:69-110` |
-| 访问日志同时记录 `path` **与 `query`**（凭据写进 URL 会落日志的直接原因） | `api/logging.go:20-30` |
-| SSE 已按 `event_types` 做**服务端类型级订阅**，未知类型返回 400 | `api/sse.go:13-33` |
-| CORS：`server.cors.allow_origins`，预检在鉴权前短路（顺序：recovery→logger→CORS→auth） | `api/server.go:87-100`、`api/security.go:31-66` |
-| 中间件顺序不可调换（预检必须先于鉴权答复） | `api/server.go:95-99` |
-| Job 状态枚举 `pending(0)/running(1)/success(2)/failed(3)/cancelled(4)` | `core/job.go:12-18` |
-| Job / JobSnapshot 字段（无 group、无 paused） | `core/job.go:54-86`、`core/job.go:132-149` |
-| Store 接口（Save/Update/Delete/LoadAll/Flush/Close），仅 JSON 文件实现 | `core/store.go:25-37` |
-| 调度循环：`PopIfDue` 到期即弹出投递 | `core/scheduler.go:426-475` |
-| Cancel：堆内移除 + 取消执行中 + **删除存储记录** | `core/scheduler.go:216-244` |
-| UpdatePending：原地更新，堆外返回 409 | `core/scheduler.go:253-296` |
-| Restore：非终态快照全部重新入队并置为 pending | `core/scheduler.go:320-351` |
-| Handler 注册表已收敛到 Scheduler（api 层 JobRegistry 已删除）：`LookupHandler`/`HandlerNames` | `core/scheduler.go:124-140`、`api/handlers.go:412-416` |
-| Cron 重复任务执行成功后由 `handleSuccess` 重新排期 | `core/scheduler.go:661` 起 |
-| 执行取消走 `handleInterrupted`，当前只记日志（存储清理由 Cancel 负责） | `core/scheduler.go:596-599`、`:631-639` |
-| EventBus：`SubscribeAll` 返回 `<-chan Event` | `core/event.go:56-128` |
-| WS 订阅过滤已支持 `job_types`/`event_types`/`job_ids`/**`status`**；发送缓冲 256 条 | `core/websocket.go:42-51`、`:158` |
-| `POST /jobs/batch` 已实现：逐条独立、207 混合结果、单请求上限 100 | `api/handlers.go:419-474`、`:20-21` |
-| ListJobs 只支持 `status/name/limit/offset` 过滤 | `api/handlers.go:108-175` |
-| GET/重试/统计按 ID 或全量走 `store.LoadAll` 线性扫描 | `api/handlers.go:130,215,335,378` |
+| REST 路由：jobs CRUD/cancel/retry/batch、stats、health、job-types | `api/server.go 的 setupRoutes` |
+| WS `/ws`、SSE `/sse/events` | `api/server.go 的 setupRoutes（ws/sse 注册）`、`api/sse.go` |
+| ⚠️ 鉴权原本只有单一静态 token → **M0 已改为账号 + JWT + 四档角色**，token 降级为 `machine` 机器凭据；query 通道新增一次一用的 `?ticket=` | `api/security.go` 的 `authMiddleware`，见 §5.7 |
+| 访问日志同时记录 `path` **与 `query`**（凭据写进 URL 会落日志的直接原因） | `api/logging.go 的 requestLogger` |
+| SSE 按 `event_types` 做**服务端类型级订阅**，未知类型返回 400（因此新事件类型必须同步白名单，**M1 已补 paused/resumed**） | `api/sse.go` 的 `publishedEventTypes`，见 §5.1 |
+| CORS：`server.cors.allow_origins`，预检在鉴权前短路（顺序：recovery→logger→CORS→auth） | `api/server.go 的 setupMiddleware`、`api/security.go 的 corsMiddleware` |
+| 中间件顺序不可调换（预检必须先于鉴权答复） | `api/server.go 的 setupMiddleware（顺序不可调换）` |
+| ⚠️ Job 状态枚举原为 `pending(0)…cancelled(4)` → **M1 追加 `paused(5)`**（追加在末尾，避免与已落盘的 int 错位） | `core/job.go` 的 `JobStatus` 常量块，见 §5.1 |
+| ⚠️ Job / JobSnapshot 原本无分组 → **M1 各加 `Group`**，并在 `ToSnapshot`/`FromSnapshot`/`CloneForRetry`/Cron 重排四处搬运 | `core/job.go` 的 `Job`、`JobSnapshot`，见 §5.1 |
+| Store 接口（Save/Update/Delete/LoadAll/Flush/Close），仅 JSON 文件实现 | `core/store.go 的 Store 接口` |
+| 调度循环：`PopIfDue` 到期即弹出投递 | `core/scheduler.go 的 scheduleLoop` |
+| Cancel：堆内移除 + 取消执行中 + **删除存储记录** | `core/scheduler.go 的 Cancel` |
+| UpdatePending：原地更新，堆外返回 409 | `core/scheduler.go 的 UpdatePending` |
+| ⚠️ Restore 原本把非终态快照全部入队 → **M1 起跳过 paused**（重启不解除暂停） | `core/scheduler.go` 的 `Restore`，见 §5.2 |
+| Handler 注册表已收敛到 Scheduler（api 层 JobRegistry 已删除）：`LookupHandler`/`HandlerNames` | `core/scheduler.go 的 LookupHandler/HandlerNames`、`api/handlers.go 的 ListJobTypes` |
+| Cron 重复任务执行成功后由 `handleSuccess` 重新排期 | `core/scheduler.go 的 handleSuccess` 起 |
+| ⚠️ 执行取消走 `handleInterrupted`，基线只记日志（存储清理由 Cancel 负责）→ **M1 起三条收尾路径都先认领强制暂停标记**，把任务钉在 paused | `core/scheduler.go` 的 `executeJob`（取消分支）与 `handleInterrupted`，见 §5.2 |
+| EventBus：`SubscribeAll` 返回 `<-chan Event` | `core/event.go 的 EventBus` |
+| WS 订阅过滤已支持 `job_types`/`event_types`/`job_ids`/**`status`**；发送缓冲 256 条 | `core/websocket.go` 的 `WSFilter` 与发送缓冲 |
+| `POST /jobs/batch` 已实现：逐条独立、207 混合结果、单请求上限 100 | `api/handlers.go` 的 `BatchCreateJobs` 与 `maxBatchCreateSize` |
+| ListJobs 仍只支持 `status/name/limit/offset`（`group` 过滤属 M2） | `api/handlers.go` 的 `ListJobs` |
+| GET/重试/统计按 ID 或全量走 `store.LoadAll` 线性扫描 | `api/handlers.go 里多处 store.LoadAll` |
 | 老 dashboard 是纯静态 HTML，靠 `?token=` 连 WS | `dashboard/index.html` |
+
+M0/M1 之后新增的事实（不属于基线）：`core/auth.go` 的角色阶梯与 `machine` 例外档、`core/group_store.go` 的 `GroupStore`、`api/authenticator.go`/`api/authstore.go`/`api/ratelimit.go` 三件套、`core/scheduler.go` 的 `Pause`/`ForcePause`/`Resume`/`Suspend`。
 
 ---
 
@@ -253,7 +260,7 @@ web/
   - success/cancelled：查看
 - 行点击 → JobDetailView。多选列 + 批量条（批量取消/批量暂停/移入分组），
   依赖新端点 `POST /api/v1/jobs/batch-ops`（§5.5）。批量**创建**已有可用端点
-  `POST /jobs/batch`（逐条独立、207 混合结果、单请求 ≤100，`api/handlers.go:419-474`），
+  `POST /jobs/batch`（逐条独立、207 混合结果、单请求 ≤100，`api/handlers.go 的 BatchCreateJobs`），
   前端的"从模板批量导入"可直接复用。
 - 新建任务 = 右侧 Drawer 中 `JobForm`：
   - name：下拉，数据来自 `GET /api/v1/job-types`；
@@ -319,7 +326,7 @@ web/
 - **D5 删组策略**：operator 不可删组；admin/ops **删除组无需显式 `?strategy=detach`
   即默认解绑**，组内 job 归入未分组，**任何角色都不会级联删除 job**（§5.5）。
 
-### 5.1 数据模型（core/job.go）
+### 5.1 数据模型（core/job.go）**已实现**
 
 ```go
 const (
@@ -333,23 +340,23 @@ const (
 ```
 
 - **必须追加在末尾**：`JobSnapshot.Status` 以 int 持久化在既有 `data/jobs.json`
-  （`core/job.go:132-149`），插入中间会错位历史数据。
-- `String()`/`ParseJobStatus` 增加 `"paused"`（`core/job.go:21-46`）；`IsTerminal()` 不含 paused
-  （`core/job.go:49-51`，paused 仍需可恢复，也不是终态留痕淘汰对象——见下方 trim 注意点）。
+  （`core/job.go 的 JobSnapshot`），插入中间会错位历史数据。
+- `String()`/`ParseJobStatus` 增加 `"paused"`（`core/job.go 的 String/ParseJobStatus`）；`IsTerminal()` 不含 paused
+  （`core/job.go 的 IsTerminal`，paused 仍需可恢复，也不是终态留痕淘汰对象——见下方 trim 注意点）。
 - `Job` 与 `JobSnapshot` 各加 `Group string`（json tag `group,omitempty`）；
   `ToSnapshot/FromSnapshot` 同步搬运。旧 jobs.json 无该字段，反序列化为空串 = 未分组，
   天然兼容。
 - 事件类型补充：`EventJobPaused = "job.paused"`、`EventJobResumed = "job.resumed"`
-  （常量表在 `core/event.go:13-24`）。
+  （常量表在 `core/event.go 的 EventType 常量`）。
 - **两个必须同步的白名单**（否则新事件在链路里被静默吞掉）：
-  1. `api/sse.go:13-20` 的 `publishedEventTypes`——SSE 走类型级订阅，未列入的类型既不会被推送，
+  1. `api/sse.go 的 publishedEventTypes` 的 `publishedEventTypes`——SSE 走类型级订阅，未列入的类型既不会被推送，
      `?event_types=job.paused` 还会被判 400。
   2. WS 侧无需改动：`filterMatches` 按 `event.Status.String()` 比对状态
-     （`core/websocket.go:261-275`），`paused` 随 `JobStatus.String()` 自动可用；
+     （`core/websocket.go 的 filterMatches`），`paused` 随 `JobStatus.String()` 自动可用；
      客户端因此可以直接用 `{"filter":{"status":["paused","failed"]}}` 订阅，前端 Monitor 页
      应暴露这个 status 过滤（旧 dashboard 只有事件类型过滤）。
 
-### 5.2 调度器（core/scheduler.go）
+### 5.2 调度器（core/scheduler.go）**已实现**
 
 新增四个方法。Pause/Resume 完全复用既有积木（堆移除 + 存储写回 + Schedule 重排），
 但 ForcePause 必须动执行收尾路径（见下），Suspend 要动 `scheduleLoop` 顶部：
@@ -371,104 +378,119 @@ func (s *Scheduler) Unsuspend()
 
 1. `heap.Remove(jobID)`；拿不到 → 若在 `cancelMap`（执行中）返回 `ErrJobNotPending`（→409），
    否则 `ErrJobNotFound`（→404）。**运行中的 job 不允许暂停**——执行已被 worker 拿走，
-   暂停它语义不明；v1 保持与 PUT 更新同样的边界（`core/scheduler.go:253-296` 先例）；
+   暂停它语义不明；v1 保持与 PUT 更新同样的边界（`core/scheduler.go 的 UpdatePending` 先例）；
    `admin`/`ops` 走下面的 ForcePause。
 2. 置 `Status=StatusPaused`、`UpdatedAt=now`，`store.Update(snapshot)`（不删除！
-   这是与 `Cancel` 的本质差别，`core/scheduler.go:230-234` 是 Delete）。
+   这是与 `Cancel` 的本质差别，`core/scheduler.go 的 Cancel（store.Delete 分支）` 是 Delete）。
 3. 广播 `job.paused` 事件。
-4. cron 重复任务：暂停即离开堆，`handleSuccess` 的重排路径（`core/scheduler.go:661` 起）
+4. cron 重复任务：暂停即离开堆，`handleSuccess` 的重排路径（`core/scheduler.go 的 handleSuccess` 起）
    不会碰到它——因为弹出发生在暂停前，此路径无需改动。
 
 **Resume 语义**：
 
-1. `store.LoadAll()` 找 ID（与 `hasStoredJob` 同款扫描，`core/scheduler.go:299-315`；
+1. `store.LoadAll()` 找 ID（与 `hasStoredJob` 同款扫描，`core/scheduler.go 的 findSnapshot`；
    当前规模可接受，见 §5.10 性能注记），非 paused 状态返回 409。
 2. `FromSnapshot` 还原，绑定 Handler（`s.scheduler.LookupHandler(job.HandlerKey())`，同 RetryJob 做法，
-   `api/handlers.go:359-361`；api 层已无 JobRegistry）。
+   `api/handlers.go 的 RetryJob（按 HandlerKey 绑定）`；api 层已无 JobRegistry）。
 3. 触发时间重算：cron 任务用 `cronParser.Next` 取未来时点；一次性任务若
    `TriggerAt` 已过期则"到期立即补跑"（与 Restore 的过期语义一致，`scheduler.go:
    313-315` 注释所述行为）。
-4. `Schedule(job)`——ID 非空不会被重新生成（`core/scheduler.go:151-153`），堆、存储、
+4. `Schedule(job)`——ID 非空不会被重新生成（`core/scheduler.go 的 Schedule（ID 非空不会被重新生成）`），堆、存储、
    事件广播全部复用现路径。
+5. **实现补充**：强制暂停的快照落盘发生在取消上下文之前，因此"已暂停但 Handler 还在收尾"
+   是一个真实存在的中间态。`Resume` 此时拒绝（任务仍在 `cancelMap` 里 → `ErrJobNotPending`），
+   否则会与"即将把状态钉回 paused"的收尾守卫打架，表现为恢复了却又自己停住。
+   另外 `Suspend` 标志在 `Start()` 里清零：`Start→Stop→Start` 与重启都不继承挂起状态，
+   一个遗留的挂起会让调度器"看起来在跑却永不出任务"，是最难排查的故障形状。
 
 **ForcePause（强制暂停，限 admin/ops）**：
 
 作用于**已出堆、正在执行**的任务，语义定为"中止当前 attempt，不计失败、不消耗重试，
 停在 paused"：
 
-1. `Scheduler.ForcePause(jobID)`：在 `s.mu` 下查 `cancelMap`（`core/scheduler.go:203-212`
-   的 `CancelRunning` 已能拿到取消函数），命中则记录"该 ID 待强制暂停"到
-   `forcedPause map[string]struct{}`（同 mutex 保护）并 `cancel()`；随后把快照以
-   `StatusPaused` 写回存储并广播 `job.paused`（metadata `forced: true`）。
-   堆里也有（不该发生，但竞态可能）→ 一并 `heap.Remove`。
-2. Handler 收到 `ctx.Canceled` 后返回错误 → 走 `executeJob` 的取消分支
-   （`core/scheduler.go:596-599`）→ `handleInterrupted`（`:631`）。
-   **`handleInterrupted` 必须改为三分支**：当前实现是"running 时只记日志、交给 Cancel 清存储"
-   （`:636-639`），那是取消语义；强制暂停要在此处识别 `forcedPause` 标记，
-   把状态保持为 `StatusPaused` 落盘且不进 `handleFailure`。
-3. **Handler 不检查 ctx 的情况**（`core/scheduler.go:555-556` 注释已承认这类处理器存在）：
-   ctx 已取消但 Handler 返回 nil → 会走 `handleSuccess`（`:634` 起）并重排 cron 下一轮。
-   因此 `handleSuccess`/`handleFailure` 开头都要先查 `forcedPause` 标记：命中则
-   清标记、按 paused 落盘、跳过成功/失败/重试/重排逻辑，并额外广播一条
-   `job.paused`（metadata `note: handler_ignored_cancellation`）。
-   这条是强制暂停正确性的关键，必须有单测。
-4. 副作用：被中止的 attempt 可能已产生部分副作用（本仓库整体是至少一次语义，
-   `core/scheduler.go:628-630` 注释所述），文档与 UI 二次确认弹窗都要写明
+1. `Scheduler.ForcePause(jobID)`：在 `s.mu` 下查 `cancelMap`（`core/scheduler.go` 的
+   `CancelRunning` 已能拿到取消函数），命中则记录"该 ID 待强制暂停"到
+   `forcedPause map[string]struct{}`（同 mutex 保护）并 `cancel()`；快照以 `StatusPaused`
+   写回存储。任务若还在堆里（竞态可能）→ 一并 `heap.Remove`，退化成一次更强的普通暂停。
+   **实现偏离原方案的一点**：`job.paused` 事件不在这里发出，而是由认领标记的那条收尾路径
+   发出（见第 2、3 点）。这样"一条 job.paused = 确实停住了"，前端就能诚实区分
+   "暂停中"（已请求、Handler 还没返回）与"已暂停"；否则事件先于事实到达，
+   UI 会在 Handler 仍在跑的时候显示已暂停，用户以为按钮坏了。
+2. Handler 收到 `ctx.Canceled` 后返回错误 → 走 `executeJob` 的取消分支 →
+   `handleInterrupted`。**该函数现在先认领强制暂停标记**：命中就保持 `StatusPaused`
+   落盘并返回，绝不落到"关停打断→复位 pending"那条分支，否则暂停请求会当场失效。
+   未命中时行为不变（running 时只记日志，存储清理由 Cancel 负责）。
+3. **Handler 不检查 ctx 的情况**（`executeJob` 的超时注释一直承认这类处理器存在）：
+   ctx 已取消但 Handler 返回 nil → 会走 `handleSuccess` 并重排 Cron 的下一轮；
+   返回 error → 会走 `handleFailure` 消耗重试。因此这两个函数开头都先试
+   `parkForcedPause`：命中则清标记、按 paused 落盘、跳过成功/失败/重试/重排，
+   并广播 `job.paused`，metadata 用 `note` 区分是哪条收尾路径兜住的：
+   `interrupted`（守规矩）、`handler_completed_despite_cancel`、
+   `handler_failed_despite_cancel`。后两个是强制暂停正确性的关键，都有单测。
+4. 副作用：被中止的 attempt 可能已产生部分副作用（`handleInterrupted` 的注释所述，
+   本仓库整体是至少一次语义），文档与 UI 二次确认弹窗都要写明
    "当前执行会被中止，Handler 需保证幂等"。
 5. UI：列表点强制暂停 → running 徽标变"暂停中"（本地态，等待 WS `job.paused`）；
    若 10s 内没收到 `job.paused`，提示"Handler 未响应取消，将在本轮执行结束后停在 paused"
    ——这正是第 3 点的可观测化。
 
 **Restore 修正（关键正确性点）**：现有 Restore 把"所有非终态"快照重新入队并置为
-pending（`core/scheduler.go:329-346`）。paused 也非终态，照旧逻辑会被**静默恢复**。必须加一行
+pending（`core/scheduler.go 的 Restore`）。paused 也非终态，照旧逻辑会被**静默恢复**。必须加一行
 `if status == StatusPaused { continue }`——重启不解除暂停。
 
 **Cancel 修正**：paused 任务不在堆里也不在执行中，`Cancel` 会返回 `ErrJobNotFound`
-（`core/scheduler.go:226-228`），导致暂停后的任务**删不掉**。需在 Cancel 中补一路：堆和执行
+（`core/scheduler.go 的 Cancel（未命中即 ErrJobNotFound）`），导致暂停后的任务**删不掉**。需在 Cancel 中补一路：堆和执行
 中都没有时，检查存储快照，若为 paused 则 `store.Delete` + 广播 `job.cancelled`。
 
 **UpdatePending 修正**：语义保持"仅 pending 可改"；paused 走 409。前端表单以禁用态呈现，
 不再发请求。
 
 **调度总开关（ops 专用，供维护窗口）**：新增 `Scheduler.Suspend()` / `Scheduler.Unsuspend()`
-+ `suspended atomic.Bool`。`scheduleLoop` 顶部（`core/scheduler.go:429-435` 的 select 之后）
++ `suspended atomic.Bool`。`scheduleLoop` 顶部（`core/scheduler.go 的 scheduleLoop 顶部` 的 select 之后）
 判断 suspended 则等待唤醒信号，不弹出任何到期任务；已在 worker 里的任务照常跑完，
 堆与存储都不动。注意这与 `Stop()` 完全不同（Stop 是优雅关停并落盘 pending），
 不能复用；恢复时只需重新计算堆顶等待时长。suspend 期间 `POST /jobs` 仍可入队（
 `Schedule` 不走 scheduleLoop），恢复后一并生效——文档需明示这一点，避免误以为
 suspend 会屏蔽创建。
 
-### 5.3 分组存储（core/group_store.go，新文件）
+### 5.3 分组存储（core/group_store.go）**已实现**
 
-组是一等实体（可挂描述与颜色），不能从 job 列表反推，需要独立存储：
+组是一等实体（可挂描述与颜色），不能从 job 列表反推，需要独立存储。
+实现与原方案有三处刻意的偏离，都记录在这里以免后来者以为文档写错了：
 
 ```go
 type Group struct {
-    Name        string    `json:"name"`        // 唯一键，同时就是 Job.Group 的取值
-    Description string    `json:"description,omitempty"`
-    Color       string    `json:"color,omitempty"` // "#2563EB" 等，前端色板八选一
-    CreatedAt   time.Time `json:"created_at"`
-    UpdatedAt   time.Time `json:"updated_at"`
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	Color       string    `json:"color,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type GroupStore interface {
-    List() ([]Group, error)
-    Get(name string) (Group, bool, error)
-    Save(g Group) error
-    Delete(name string) error
-    Close() error
+	List() ([]Group, error)
+	Get(name string) (Group, bool, error)   // 忽略大小写
+	Save(group Group) error                // 已存在时保留 CreatedAt
+	Delete(name string) error              // 不存在返回 ErrGroupNotFound
 }
 ```
 
-- 实现 `JSONFileGroupStore`：单文件 `data/groups.json`，复用 JSONFileStore 的
-  合并写盘模式（`core/store.go:205-248` 的 flushLoop 可直接借用/抽取）。
-- 配置：`StoreConfig` 增加 `GroupsPath string`（mapstructure `groups_path`，默认
-  `./data/groups.json`），同步加入 `LoadConfig` 的环境变量绑定清单
-  （`core/config.go:135-153`）与 `configs/config.yaml` 注释。**注意**：该仓库用
-  `UnmarshalExact`，schema 不加键而 yaml 里写了会启动报错，需一起提交。
-- 校验：组名 `[a-zA-Z0-9_-]{1,64}`（避免 URL/查询参数歧义），大小写不敏感唯一。
-- Job 不强制属于已注册组：允许 `group=foo` 建任务而 foo 未建组（自动视同"未注册的
-  临时组"，列表过滤仍可用）； GroupsView 提供"一键收编"（列出被 job 引用但未注册的组名）。
+1. **接口不含 Close/Flush**。分组是低频实体，每次改动同步全量原子重写
+   （临时文件 + rename，与 jobs 同源）即可；照搬 `core/store.go` 的 `flushLoop` 那套合并写盘协程
+   只会多出一个"崩溃丢掉最后一次改动"的窗口，也没有后台协程需要收尾。
+2. **配置键 `store.groups_path` 推迟到 M2**。本仓库的惯例是配置只收录真正生效的字段
+   （`core/config.go 顶部的"只收录生效字段"注释` 的注释明写未实现的选项故意不出现），而目前还没有任何
+   生产代码消费它——M2 的分组端点接线时再加键，并与 schema、`configs/config.yaml`
+   同批提交（`UnmarshalExact` 对未知键直接报错）。当前由构造函数显式传路径。
+3. **损坏的分组文件报错而不是当成空集合**。静默视为空意味着下一次 Save
+   就把用户已有的分组全部覆盖掉，这类数据丢失不可逆。
+
+其余按原方案：组名 `[A-Za-z0-9_-]{1,64}`（要当 URL 段与查询参数用），
+大小写不敏感唯一但保留用户书写的原名；颜色接受 `#rgb` 与 `#rrggbb` 并在写入时校验。
+
+Job 不强制属于已注册组：允许 `group=foo` 建任务而 foo 未建组（视同"未注册的临时组"，
+列表过滤仍可用）；GroupsView 提供"一键收编"（列出被 job 引用但未注册的组名）。
+`List()` 返回按名称字典序的稳定顺序，UI 不必再排一次，也不会每次刷新就换位置。
 
 ### 5.4 DTO 与 REST API（api 层）
 
@@ -480,7 +502,7 @@ type GroupStore interface {
 | `GET /jobs` | 增加 `group` 查询参数；`status` 接受 `paused`（`ParseJobStatus` 自动支持）；空值参数：`group=`（精确取未分组）与省略（不过滤）要区分 |
 | `PUT /jobs/:id` | `UpdateJobRequest` 增加 `group`（可把 job 移组） |
 | `JobResponse` | 增加 `group`；`status` 枚举说明加 paused |
-| `GET /stats` | `StatsResponse` 增加 `paused` 计数（扫描循环加一个 case，`api/handlers.go:386-394`） |
+| `GET /stats` | `StatsResponse` 增加 `paused` 计数（扫描循环加一个 case，`api/handlers.go 的 GetStats`） |
 
 **新增**（"角色"列为最低可满足角色，服务端 RBAC 与前端 UI 同一张表，见 §5.7.3）：
 
@@ -514,15 +536,15 @@ DELETE /api/v1/admin/events        ops          清空事件环形缓冲
 ```
 
 WS 侧无需协议改动：`job.paused`/`job.resumed` 会按类型透传，`filterMatches` 的状态过滤
-按 `JobStatus.String()` 比对，paused 自动可用（`core/websocket.go:261-275`）。
-**但 SSE 的 `publishedEventTypes` 白名单必须同步加这两类**（`api/sse.go:13-20`），
+按 `JobStatus.String()` 比对，paused 自动可用（`core/websocket.go 的 filterMatches`）。
+**但 SSE 的 `publishedEventTypes` 白名单必须同步加这两类**（`api/sse.go 的 publishedEventTypes`），
 否则 SSE 客户端收不到暂停事件，见 §5.1。
 
 **鉴权覆盖**：新端点全部挂在既有 `/api/v1` 组内。认证中间件本期由"静态 token 校验"升级为
 "JWT 校验 + 角色注入"（§5.7.2-§5.7.3），两条顺序约束不能动：
-CORS 预检必须早于认证（`api/server.go:95-99`）；
+CORS 预检必须早于认证（`api/server.go 的 setupMiddleware（顺序不可调换）`）；
 而 `POST /auth/login`、`POST /auth/refresh` 是**公开端点**，现有认证是 `engine.Use` 全局挂载
-（`api/server.go:99`），因此要改成"公开路由组先注册 / 其余路由再挂认证"，
+（`api/server.go 的 setupMiddleware`），因此要改成"公开路由组先注册 / 其余路由再挂认证"，
 或在中间件里维护一份显式放行路径表——**不能用"路径前缀不是 /api 就放行"这类松散判断**，
 否则漏保护一个写端点就是越权。验收项里包含"未认证调写端点 401"的逐端点用例（§7）。
 
@@ -537,7 +559,7 @@ CORS 预检必须早于认证（`api/server.go:95-99`）；
   可接受（本仓库整体就是尽力落盘 + 崩溃靠 Restore 的哲学）。
 - **batch-ops**：循环调用单个 Scheduler 方法即可，不做事务。含 `force-pause` 时逐条判角色
   （整批要求 admin 以上，简单一致）。批量**创建**已由 `POST /jobs/batch` 实现
-  （逐条独立、207、≤100 条，`api/handlers.go:419-474`），本端点只做"对已有 job 的动作"，
+  （逐条独立、207、≤100 条，`api/handlers.go 的 BatchCreateJobs`），本端点只做"对已有 job 的动作"，
   两者语义不要混用。
 
 ### 5.6 运行事件历史（api/history.go，新文件）
@@ -555,20 +577,20 @@ func (h *EventHistory) Events(jobID string, limit int) []Event
 func (h *EventHistory) Recent(limit int) []Event
 ```
 
-- 挂载点：`api.NewServer` 里创建（`api/server.go:40-78`），随 Server 一起 Stop。
+- 挂载点：`api.NewServer` 里创建（`api/server.go 的 NewServer`），随 Server 一起 Stop。
   不新增配置项，上限先用常量，需要再开 knob（本仓库惯例是"未生效的选项不进配置"，
-  见 `core/config.go:16-17` 注释）。
+  见 `core/config.go 顶部的"只收录生效字段"注释` 注释）。
 - 端点：`GET /api/v1/jobs/:id/events?limit=`；`GET /api/v1/events?limit=`（全局 recent，
   Dashboard 刷新后补历史用，可选实现）。
 - **明确语义并写进前端 UI**：进程重启即清空；详情页时间线标题旁标注"内存缓冲，最近 100 条"。
   持久化审计不在本期范围。
-- EventBus 的 `SubscribeAll` 通道容量/丢弃策略需在实现时核实（`core/event.go:105-122`）：
+- EventBus 的 `SubscribeAll` 通道容量/丢弃策略需在实现时核实（`core/event.go 的 SubscribeAll`）：
   若缓冲满丢消息，历史记录器丢的是"记录"而非调度事实，可接受，但要在 code review 时确认
   drain goroutine 不被阻塞反压整个总线。
 
 ### 5.7 认证与角色权限（决策 D1/D5 的后端部分）
 
-现状：后端只有一个全局静态 token（`api/security.go:69-88`，恒定时间比较），
+现状：后端只有一个全局静态 token（`api/security.go 的 authMiddleware`，恒定时间比较），
 无身份概念。本期把它替换为"账号 + 密码 + JWT + 角色"的最小可用体系。
 
 #### 5.7.1 凭据形态
@@ -608,10 +630,10 @@ server:
 - 密码只存 **bcrypt** 哈希（cost 10；`golang.org/x/crypto/bcrypt` 已在 indirect 依赖中，
   会转为直接依赖）。提供 `cmd/hashpassword` 小工具生成哈希，避免用户手抄。
 - `role` 取值 `viewer|operator|admin|ops`，`core.Config.Validate` 校验非法值启动即报错
-  （延续"未生效/非法配置早失败"的既有惯例，`core/config.go:176-235`）。
+  （延续"未生效/非法配置早失败"的既有惯例，`core/config.go 的 Validate`）。
 - `users` 非空但 `jwt.secret` 为空 → 启动报错；`users` 为空且 `token` 为空 → 不启用鉴权
   （等价现状，登录页显示"未启用鉴权"）。
-- 新键必须同步加入 `LoadConfig` 的环境变量绑定清单（`core/config.go:135-153`），
+- 新键必须同步加入 `LoadConfig` 的环境变量绑定清单（`core/config.go 的 LoadConfig 环境变量清单`），
   但 **`users` 列表不绑定环境变量**（viper 的逗号分隔 hook 处理不了嵌套结构，
   明确写进注释避免踩坑）；secret 单独绑 `GODELAYQ_SERVER_AUTH_JWT_SECRET`。
 
@@ -624,7 +646,7 @@ server:
   不回退到 query（与历史行为一致，`api/security_test.go` 有对应用例）。
 - JWT 与静态 token 在同一条头通道上共存：先按 JWT 验签（配了账号才有认证器），
   失败再对静态 token 做恒定时间比较，命中即 `RoleMachine`。
-- **JWT 不接受走 query**：访问日志会把 `path` 与 `query` 原样记下（`api/logging.go:20-30`），
+- **JWT 不接受走 query**：访问日志会把 `path` 与 `query` 原样记下（`api/logging.go 的 requestLogger`），
   长令牌进日志等于泄露；实时通道改用 §5.7.5 的 ticket。
 - 认证器每次验签都会用**当前配置**复核 `sub` 与 `role`：账号被删除或降权后，
   旧令牌立即失效，不必等 TTL。
@@ -668,7 +690,7 @@ server:
 #### 5.7.5 WS / SSE 一次性 ticket
 
 浏览器 `WebSocket`/`EventSource` 无法加请求头，把 JWT 塞 query 会进访问日志
-（`api/logging.go:20-30` 会把 `path` 与 `query` 一起写进日志）。改法：
+（`api/logging.go 的 requestLogger` 会把 `path` 与 `query` 一起写进日志）。改法：
 
 1. `POST /api/v1/auth/ws-ticket`（带 AT）→ 返回 16B 随机 ticket，内存登记 `{principal, exp=5s}`。
 2. `GET /ws?ticket=...` / `GET /sse/events?ticket=...`：握手时校验并**立即消费**（一次性），
@@ -718,7 +740,7 @@ var dist embed.FS
 ```
 
 `api` 层注册静态路由：`engine.NoRoute` 兜底——GET 且 Accept 含 text/html 时返回
-`dist/index.html`（SPA history fallback），其余路径保持现有 JSON 404（`api/server.go:126-131`）。
+`dist/index.html`（SPA history fallback），其余路径保持现有 JSON 404（`api/server.go 的 NoRoute`）。
 资源走 `http.FS` + `/assets` 前缀。用构建 tag（`//go:build dashboard`）区分是否嵌入，
 避免没跑前端构建时 dist 为空目录导致 `go build` 失败。
 
@@ -727,21 +749,21 @@ var dist embed.FS
 ### 5.9 装配点与依赖清单
 
 - **认证不需要改构造签名**（M0 已实现）：`Security` 直接携带 `core.AuthConfig`，
-  `NewServer` 内部构造认证器与凭据存储（`api/server.go:40-90`）。
+  `NewServer` 内部构造认证器与凭据存储（`api/server.go 的 NewServer`）。
   认证器构造失败（坏哈希、缺密钥）存进 `Server.authErr`，由 `Start()` 返回——
   既守住"配置坏掉就别上线"，又不用把 `error` 塞进已被十几处测试使用的构造函数。
 - **groupStore 仍然要改签名**（M1）：`api.NewServer` 再加一个依赖时，
   按本仓库既有风格走可选参数 `opts ...Option`（对齐 `core.NewScheduler(..., opts ...Option)`，
-  `core/scheduler.go:52`），用 `WithGroupStore` 承接，避免位置参数列表继续变长。
-- **`Restore` 在 `Start()` 内部执行**（`core/scheduler.go:376`），不在 main 里；
+  `core/scheduler.go 的 NewScheduler`），用 `WithGroupStore` 承接，避免位置参数列表继续变长。
+- **`Restore` 在 `Start()` 内部执行**（`core/scheduler.go 的 Start（内部调用 Restore）`），不在 main 里；
   因此 §5.2 的 paused 跳过必须在 `Restore` 本体改，别指望调用方过滤。
-- **`Start→Stop→Start` 是被支持的**（`core/scheduler.go:361-366` 显式复位 `stopCh`），
+- **`Start→Stop→Start` 是被支持的**（`core/scheduler.go 的 Start（stopCh 复位）` 显式复位 `stopCh`），
   所以 `Suspend` 标志要定义为"进程内、重启即解除"，并在 `Start()` 里清零；
   ops 的 suspend 不跨重启生效，UI 需说明。
 - **Handler 注册只有一个入口**：`Server.RegisterJobHandler` 直接转发到
-  `scheduler.RegisterHandler`（`api/server.go:81-85`、`cmd/server/main.go:161-166`），
+  `scheduler.RegisterHandler`（`api/server.go 的 RegisterJobHandler`、`cmd/server/main.go 的 registerHandlers`），
   api 层已无 JobRegistry；控制台展示 job 类型走 `scheduler.HandlerNames()`
-  （`api/handlers.go:412-416`，已按字典序）。
+  （`api/handlers.go 的 ListJobTypes`，已按字典序）。
 - **Go 依赖**（M0 已加）：`github.com/golang-jwt/jwt/v5 v5.3.1`（JWT）、
   `golang.org/x/crypto v0.41.0`（bcrypt，由 indirect 转为直接依赖）。
 - **已落地文件（M0）**：`core/auth.go`（角色阶梯与档位比较）、`api/authenticator.go`（账号校验 + JWT 签发/验签）、
@@ -755,9 +777,9 @@ var dist embed.FS
 
 - **旧数据**：无 `group` 字段的 jobs.json、状态 int 0-4 的快照全部兼容（新状态取 5）。
 - **LoadAll 线性扫描**：ListJobs/GetJob/RetryJob/分组重命名都在扫全量快照
-  （`api/handlers.go:130,215,335,378`）。当前 history_limit=1000 量级无碍；Store 增加
+  （`api/handlers.go 里多处 store.LoadAll`）。当前 history_limit=1000 量级无碍；Store 增加
   `Get(jobID)` 是合理的后续重构，**不阻塞本期**。
-- **paused 与 trim**：`trimTerminalLocked` 只淘汰终态（`core/store.go:161-189`），
+- **paused 与 trim**：`trimTerminalLocked` 只淘汰终态（`core/store.go 的 trimTerminalLocked`），
   paused 非终态，不会被历史淘汰策略误删。✅（实现时加回归测试）
 - **前端轮询兜底**：WS 断线期间 stats 仍有 5s refetchInterval，页面不至于假死。
 
@@ -768,14 +790,14 @@ var dist embed.FS
 | # | 里程碑 | 内容 | 涉及 |
 | --- | --- | --- | --- |
 | M0 | 认证与角色 **已交付** | JWT 签发/校验、bcrypt 账号配置、`RequireRole`（machine 由阶梯天然排除）、RT 表 + jti 拒绝表 + ticket、`/auth/*` 五个端点、登录限流、写操作进访问日志（who/role）；httptest 覆盖三档角色越权、轮转、登出即失效、ticket 一次一用 | `core/auth.go`、`core/config.go`、`api/auth*.go`、`api/ratelimit.go`、`api/security.go`、`cmd/hashpassword` |
-| M1 | core：paused + group | 状态枚举/Job/Snapshot/事件常量；`Scheduler.Pause/ForcePause/Resume`、`Suspend/Unsuspend`；`handleInterrupted`/`handleSuccess`/`handleFailure` 的强制暂停分支；Restore/Cancel 修正；GroupStore 与配置键；单测（旧数据兼容、重启不解除暂停、暂停后可取消、Handler 忽略取消仍停在 paused） | `core/*.go`、`configs/config.yaml` |
+| M1 | core：paused + group **已交付** | 状态枚举/Job/Snapshot/事件常量；`Scheduler.Pause/ForcePause/Resume`、`Suspend/Unsuspend`；`handleInterrupted`/`handleSuccess`/`handleFailure` 的强制暂停守卫；Restore/Cancel 修正；`GroupStore`（路径由构造传入，`store.groups_path` 配置键随 M2 消费者一起加）；SSE 类型白名单补 paused/resumed；单测（旧数据兼容、重启不解除暂停、暂停后可取消、Handler 忽略取消仍停在 paused、并发落盘完整性） | `core/*.go`、`api/sse.go` |
 | M2 | api：REST | pause/force-pause/resume/groups/batch-ops/events/admin 端点 + DTO 扩展 + stats.paused；EventHistory 记录器 | `api/*.go` |
 | M3 | web 骨架 | Vite+TS+Tailwind+lucide 初始化、client(含刷新链路)/auth/permission/router/layout、登录流、WS store + Query 失效管线 | `web/` |
 | M4 | web 页面 | Jobs 列表+表单+详情（时间线）、Groups、Dashboard、Monitor、Admin、Settings | `web/src/views/*` |
 | M5 | 集成与发布 | vite proxy 联调、embed 单二进制、`docs/api.md` 与 README/deployment 更新（鉴权章节重写）、（可选）旧 dashboard/index.html 改为跳转页 | `docs/`、`api/server.go` |
 
 后端 M0+M1+M2 约 6-8 天（M0 的 JWT/RBAC 比原 token 方案多约 2 天），
-前端 M3+M4 约 1.5-2 周。M0 与 M1 **都要改 `core/config.go` 的环境变量键清单**（`core/config.go:135-153`），并行开发时在合并阶段协调这一处即可；M3 可在 M0 端点契约
+前端 M3+M4 约 1.5-2 周。M0 与 M1 **都要改 `core/config.go` 的环境变量键清单**（`core/config.go 的 LoadConfig 环境变量清单`），并行开发时在合并阶段协调这一处即可；M3 可在 M0 端点契约
 （§5.4 + §5.7）冻结后启动。
 
 ## 7. 验收清单
@@ -806,7 +828,7 @@ var dist embed.FS
 2. ~~删除组的解绑策略~~（**已确认**：admin/ops 不带参数即默认 detach，任何角色都不级联删 job；
    更保守可显式 `?strategy=block`，见 §5.5）。
 3. **强制暂停依赖 Handler 检查 ctx**：本仓库一贯承认"不检查 ctx 的 Handler 无法被中断"
-   （`core/scheduler.go:555-556`）。方案用"执行收尾处兜底停在 paused"覆盖这一情形
+   （`core/scheduler.go 的 executeJob（超时注释）`）。方案用"执行收尾处兜底停在 paused"覆盖这一情形
    （§5.2 第 3 点），代价是中止要等到 Handler 自己返回——UI 必须把这段时间显示为
    "暂停中"而不是"已暂停"，否则用户会重复点击。
 4. **JWT 的即时吊销是近似的**：access token 有效期内 logout 靠 jti 内存拒绝表兜住

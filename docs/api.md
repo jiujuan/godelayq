@@ -234,7 +234,7 @@ GET /jobs?status=pending&name=payment_check&limit=20&offset=0
 
 | 参数     | 类型     | 说明                                            |
 | ------ | ------ | --------------------------------------------- |
-| status | string | 过滤状态：pending/running/success/failed/cancelled（大小写不敏感） |
+| status | string | 过滤状态：pending/running/success/failed/cancelled/paused（大小写不敏感） |
 | name   | string | 按任务类型过滤                                       |
 | limit  | int    | 分页大小，默认 50，最大 100（超过按 100 截断）  |
 | offset | int    | 分页偏移，默认 0；非数字或负数按 0 处理            |
@@ -330,6 +330,26 @@ POST /jobs/:id/retry
 ```json
 { "code": 404, "message": "failed job not found" }
 ```
+
+### 8. 暂停状态（`paused`）目前只能观测
+
+任务模型已支持 `paused`：调度器提供 `Pause` / `ForcePause` / `Resume`，
+暂停中的任务离开待触发堆但**保留快照**（与 `Cancel` 连记录一起删不同），
+重启后仍是暂停态——`Restore` 不会替用户解除这个决定。
+
+本仓库当前只在库层暴露这些能力（`core.Scheduler`，用法见 `examples/`），
+**HTTP 侧还没有 pause / resume / force-pause 端点**，它们随 Web 控制台的
+后端里程碑一起提供（见 `docs/design/web-console-design.md` §5.4）。
+
+因此这个状态现在"看得到、改不了"：
+
+- `GET /jobs?status=paused` 可正常过滤，`JobResponse.status` 会返回 `"paused"`；
+- WS 的 `status` 过滤与 SSE 的 `event_types=job.paused|job.resumed` 均已支持；
+- 暂停中的任务既不在堆里也不在执行中，`PUT /jobs/:id` 返回 409（仅 pending 可改），
+  但 `DELETE /jobs/:id` 能删掉它。
+
+`group` 字段同理：任务模型与分组存储（`core.GroupStore` → `data/groups.json`）已就位，
+但按分组过滤、分组增删改查的端点尚未开放。
 
 这条路径依赖终态留痕：若已关闭留痕（`store.history_limit: -1`）或该记录已被保留策略淘汰，则 404。
 
@@ -488,7 +508,7 @@ GET /job-types
 
 过滤条件之间的关系：同一列表内是“命中任一即可”，不同列表之间是“同时满足”；
 某一项留空（或省略）表示该项不参与过滤。`status` 比较的是状态名
-（`pending`/`running`/`success`/`failed`/`cancelled`），`job_types` 比较事件里的任务名。
+（`pending`/`running`/`success`/`failed`/`cancelled`/`paused`），`job_types` 比较事件里的任务名。
 
 服务端除事件外还会回送**控制帧**，它们没有 `type` / `job_id` 字段，客户端需先判断再解析：
 
@@ -513,6 +533,7 @@ GET /job-types
 | 2 | `success` | 执行成功 |
 | 3 | `failed` | 执行失败 |
 | 4 | `cancelled` | 已取消 |
+| 5 | `paused` | 已暂停（见下方"暂停状态"） |
 
 注意两套写法不要混用：REST 响应里的 `status` 是状态**名**（`"pending"`），
 WS/SSE 推送事件里的 `status` 是**数字**；而 WS 订阅过滤的 `status` 列表按状态**名**匹配
@@ -617,7 +638,7 @@ data: {"type":"job.scheduled","job_id":"...","job_name":"...","status":0,"timest
 
 | 参数 | 写法 | 语义 |
 | --- | --- | --- |
-| `event_types` | 可重复，也可逗号分隔（`?event_types=job.failed,job.completed`） | 按事件类型做**服务端订阅**（`EventBus.Subscribe(types...)`），不是收全量再丢弃；取值必须是已发布的类型：`job.scheduled`、`job.started`、`job.completed`、`job.failed`、`job.cancelled`、`job.retrying`，未知取值在建流前返回 400 |
+| `event_types` | 可重复，也可逗号分隔（`?event_types=job.failed,job.completed`） | 按事件类型做**服务端订阅**（`EventBus.Subscribe(types...)`），不是收全量再丢弃；取值必须是已发布的类型：`job.scheduled`、`job.started`、`job.completed`、`job.failed`、`job.cancelled`、`job.retrying`、`job.paused`、`job.resumed`，未知取值在建流前返回 400 |
 | `job_types` | 可重复 | 按事件的 `job_name` 过滤（事件总线不感知任务属性，这一层在 SSE 处理器内完成） |
 
 同一类型重复出现只注册一次，事件不会重复投递。过滤参数只在建连时生效，变更需重连。
