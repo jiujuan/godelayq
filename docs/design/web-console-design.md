@@ -63,7 +63,7 @@
 | `POST /jobs/batch` 已实现：逐条独立、207 混合结果、单请求上限 100 | `api/handlers.go` 的 `BatchCreateJobs` 与 `maxBatchCreateSize` |
 | ⚠️ ListJobs 基线只支持 `status/name/limit/offset` → **M2 已加 `group` 过滤**（省略=不筛，`group=`=只看未分组） | `api/handlers.go` 的 `ListJobs`、`parseGroupFilter` |
 | GET/重试/统计按 ID 或全量走 `store.LoadAll` 线性扫描 | `api/handlers.go 里多处 store.LoadAll` |
-| 老 dashboard 是纯静态 HTML，靠 `?token=` 连 WS | `dashboard/index.html` |
+| 老 dashboard 是纯静态 HTML，靠 `?token=` 连 WS | `dashboard/index.html`（M5 已改为跳转页，能力落在控制台实时页） |
 
 M0/M1/M2 之后新增的事实（不属于基线）：`core/auth.go` 的角色阶梯与 `machine` 例外档、
 `core/group_store.go` 的 `GroupStore`、`api/authenticator.go`/`api/authstore.go`/`api/ratelimit.go` 三件套、
@@ -834,6 +834,22 @@ var dist embed.FS
 
 前端产物目录 `web/dist` 提交与否二选一，倾向 `.gitignore` 排除、CI/发布时构建。
 
+**落地实况（M5）**：按方案 B 实现，与上面的草图有三处不同，都是当时没预见到的耦合：
+
+1. **不给 `/assets` 单独注册路由**，静态资源、`/` 与 SPA 深链全部走 `NoRoute` 一个分派点。
+   理由是这个进程里还有一个全局鉴权中间件：豁免判断与分派判断必须是同一个函数
+   （`api/console.go` 的 `consoleRequest`），分成两处就会出现"中间件放行了却没有处理器
+   接管"（未认证请求拿到 JSON 404，前端当成页面不存在）或反向的"页面能取到但先被 401"。
+2. **豁免范围**：`GET`/`HEAD`，路径为 `/` 或 `/assets/*`，或（不在 `/api/`、`/ws`、`/sse/`
+   名字空间里且）`Accept` 含 `text/html`。写方法一律不免；未注入产物时这条豁免根本不存在
+   （`TestNoConsoleKeepsPlainAPIBehaviour` 钉住）。
+3. **缓存分档**：`index.html` 是 `no-cache`，`/assets/*` 是 `max-age=31536000, immutable`。
+   原稿没提这一点，但它是升级事故的直接来源——缓存住 index.html 就会去取已被替换的哈希文件。
+
+`web/dist` 取"不提交"这一支（`web/.gitignore` 已排除），构建顺序写进 README 与
+`docs/deployment.md`。构建 tag 就叫 `dashboard`，与草图一致：不带它时 `web.Dist` 为 nil，
+`go build ./...` 与全部测试因此完全不依赖 Node。
+
 ### 5.9 装配点与依赖清单
 
 - **认证不需要改构造签名**（M0 已实现）：`Security` 直接携带 `core.AuthConfig`，
@@ -891,7 +907,7 @@ var dist embed.FS
 | M2 | api：REST **已交付** | pause/force-pause/resume/groups/batch-ops/events/admin 端点 + DTO 扩展 + stats.paused；EventHistory 记录器；`store.groups_path` 配置键与生产装配；403 越权尝试进访问日志 | `api/*.go`、`core/scheduler.go`（RuntimeStats/SetGroup/RetagGroup）、`core/config.go`、`cmd/server/main.go` |
 | M3 | web 骨架 **已交付** | Vite 7+TS 5+Tailwind 4+lucide 工程、token 样式层、`api/`（types/client 401→refresh→重放/auth/keys/stats）、auth store（sessionStorage + 单飞刷新）与 `usePermission` 能力表、路由守卫与角色过滤菜单、两栏 layout + 基础 UI 组件、登录流（含"未启用鉴权 直接进入"）、realtime store（ticket 建连/退避重连/200 条缓冲）与事件→Query 失效管线。**为把整条链路跑通验证，Dashboard/Monitor/Settings 三页按真页面实现**；Jobs/Groups/Admin/JobDetail 为 M4 占位 | `web/` |
 | M4 | web 页面 **已交付** | Jobs 列表（筛选/分页/URL 驱动）、JobForm（新建与编辑两种字段集）、批量条（batch-ops 207 逐条回报）、JobDetail（信息卡 + payload + 运行时间线）、Groups（左列表右编辑、8 色板、未注册组的注册路径、删除 detach 确认）、Admin（占用/缓冲诊断 + 挂起与清缓冲二次确认）、Topbar 挂起横幅、Monitor 服务端订阅过滤 + `/events` 回灌、Dashboard 两面板。附带一处后端契约追加：`/stats.scheduling_suspended`（含 Go 测试与 api.md 同步） | `web/src/views/*`、`web/src/components/{jobs,groups}/*`、`web/src/composables/*`、`api/{dto,handlers}.go` |
-| M5 | 集成与发布 | vite proxy 联调、embed 单二进制、`docs/api.md` 与 README/deployment 更新（鉴权章节重写）、（可选）旧 dashboard/index.html 改为跳转页 | `docs/`、`api/server.go` |
+| M5 | 集成与发布 **已交付** | 单二进制形态落地：`web/embed_dashboard.go`（`//go:build dashboard` + `//go:embed all:dist`）与 `web/embed_stub.go`（无 tag 时 `Dist` 恒为 nil），`api.WithConsole(fs.FS)` 可选依赖，`/`、`/assets/*` 与 SPA 深链由 NoRoute 统一分派（鉴权豁免与分派共用 `consoleRequest`），`index.html` no-cache / `/assets` immutable；不带 tag 的构建与全部测试不依赖 Node。vite 联调按开发形态复验。旧 `dashboard/index.html` 改为跳转页（http 下自动跳同源根路径，`file://` 下只给指引）。文档：api.md 免鉴权路径与静态托管两节、deployment.md 控制台与产物一节 + 已知边界、README 两种形态与构建顺序、example.md 旧页描述更正 | `web/embed_*.go`、`api/console.go`、`cmd/server/main.go`、`docs/`、`dashboard/` |
 
 后端 M0+M1+M2 约 6-8 天（M0 的 JWT/RBAC 比原 token 方案多约 2 天），
 前端 M3+M4 约 1.5-2 周。M0 与 M1 **都要改 `core/config.go` 的环境变量键清单**（`core/config.go 的 LoadConfig 环境变量清单`），并行开发时在合并阶段协调这一处即可；M3 可在 M0 端点契约
@@ -942,9 +958,12 @@ var dist embed.FS
       （端点：`TestJobEventsEndpointServesTimeline`；浏览器实测：一条完成任务渲染出
       scheduled/started/completed 三节点并显示"第 1 次尝试"，一条暂停任务显示
       scheduled/paused；`/jobs/a → /jobs/b` 切换后正文与时间线都跟着换）
-- [ ] WS 事件触发列表/统计自动刷新；断线显示黄色徽标并自动重连。**统计与列表都已实测**：
-      不刷新页面建任务、暂停任务，概览计数与列表行状态同步变化（事件→debounce→失效→重取）；
-      断线重连的黄色徽标仍未验证（重连退避没在浏览器里触发过，M5 联调时补）
+- [x] WS 事件触发列表/统计自动刷新；断线显示黄色徽标并自动重连。**统计与列表都已实测**：
+      不刷新页面建任务、暂停任务，概览计数与列表行状态同步变化（事件→debounce→失效→重取）。
+      断线重连在 M5 的单二进制联调里补齐：杀掉服务端进程后顶栏徽标变为"重连中"，
+      实测计算样式 `color`/`dot` 均为 `rgb(217, 119, 6)`（warning 档），tooltip 显示
+      "实时票据申领失败"；重启进程后徽标回到"实时连接"，无需刷新页面
+      （`web/src/components/layout/AppTopbar.vue` 的 tone 映射 + 浏览器 computed style 取样）
 - [x] 旧 `data/jobs.json`（无 group、状态 0-4）直接升级运行无报错；配置中写非法 role 或
       缺 jwt.secret 时启动即报错（`core/job_status_test.go`、`core/config_test.go`、
       `TestStartFailsWhenAuthMisconfigured`）
