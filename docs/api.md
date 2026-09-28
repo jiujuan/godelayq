@@ -6,6 +6,39 @@ Base URL: http://localhost:8080/api/v1
 Content-Type: application/json
 字符编码: UTF-8
 
+## 鉴权与跨域
+
+服务端默认**不启用鉴权**（`server.auth.token` 为空）。配置 token 后，全部端点都要求凭据，
+包括 `/ws`、`/sse/events` 与 `/api/v1/health`；缺少或错误凭据返回 401。
+
+```json
+{ "code": 401, "message": "invalid or missing token" }
+```
+
+三种等价的传法，按此优先级取其一：
+
+| 通道 | 示例 | 适用场景 |
+| --- | --- | --- |
+| `Authorization` 请求头 | `Authorization: Bearer <token>` | 推荐，REST 客户端默认用法 |
+| `X-Auth-Token` 请求头 | `X-Auth-Token: <token>` | 不便设置标准授权头时 |
+| `token` 查询参数 | `GET /ws?token=<token>` | 浏览器 WebSocket / EventSource 无法自定义请求头 |
+
+注意两点：
+
+- 出现 `Authorization` 头时只认它（非 `Bearer` scheme 直接判失败），不会再回退到查询参数。
+- 查询参数会进入访问日志与浏览器历史，除 WS/SSE 外建议一律用请求头。
+
+跨域由 `server.cors.allow_origins` 控制，默认 `["*"]`（任意来源）。配置为具体白名单后，
+只回显命中的 `Origin` 并附 `Vary: Origin`，未命中的响应不带 `Access-Control-Allow-Origin`，
+由浏览器拦截。`allow_credentials: true` 与 `*` 互斥（启动即报错）。预检 `OPTIONS` 请求
+不校验 token，由 CORS 中间件直接返回 204。
+
+```bash
+# 启用鉴权后的调用示例
+curl -H "Authorization: Bearer $GODELAYQ_TOKEN" http://localhost:8080/api/v1/jobs
+curl -H "X-Auth-Token: $GODELAYQ_TOKEN"      http://localhost:8080/api/v1/stats
+```
+
 ## 任务管理 API
 
 ### 1. 创建延迟任务
@@ -217,6 +250,9 @@ GET /job-types
 
 连接地址: ws://localhost:8080/ws
 
+启用鉴权后浏览器只能写 `ws://localhost:8080/ws?token=<token>`（握手前由 HTTP 中间件校验，
+凭据不对直接返回 401，不进入升级流程）；`server.cors.allow_origins` 白名单同时约束握手的 `Origin`。
+
 **协议说明**
 
 客户端发送 JSON 消息进行订阅控制：
@@ -342,6 +378,7 @@ GET /job-types
 
 ```
 GET /sse/events
+GET /sse/events?token=<token>   # 启用鉴权后：EventSource 无法带请求头，只能走查询参数
 ```
 
 响应头为 `text/event-stream`。建连后服务端**先下发一个注释帧** `: connected`，

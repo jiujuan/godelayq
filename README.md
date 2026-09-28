@@ -244,6 +244,11 @@ go build -o godelayq-server ./cmd/server
 ```yaml
 server:
   port: "8080"                # HTTP 监听端口
+  auth:
+    token: ""                 # 留空即不启用鉴权（默认，便于本地开发）
+  cors:
+    allow_origins: ["*"]      # 跨域来源白名单，可写具体 origin 列表
+    allow_credentials: false  # 与 "*" 互斥
 scheduler:
   workers: 100                # 并发执行协程数；0 表示 core.DefaultConcurrency
   queue_capacity: 0           # 执行队列容量；0 表示与 workers 相等
@@ -254,6 +259,11 @@ store:
   path: ./data/jobs.json
   flush_interval: 200ms       # 合并落盘周期
 ```
+
+设置 `server.auth.token` 后，全部端点（含 `/ws`、`/sse/events`、`/api/v1/health`）都要凭据，
+支持 `Authorization: Bearer <token>`、`X-Auth-Token` 与浏览器专用的 `?token=`；
+`server.cors.allow_origins` 控制跨域来源，同时约束 WebSocket 握手 `Origin`。
+默认不启用鉴权，公网或多团队环境必须显式配置，详见 [部署文档](./docs/deployment.md)。
 
 完整说明与取舍见 [部署文档](./docs/deployment.md)。
 
