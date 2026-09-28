@@ -177,10 +177,7 @@ func (s *Scheduler) Schedule(job *Job) error {
 	}
 
 	// 通知调度循环可能有更早的任务
-	select {
-	case s.newJobCh <- struct{}{}:
-	default:
-	}
+	s.notifyNewJob()
 
 	// 发布事件
 	s.eventBus.Publish(Event{
@@ -225,6 +222,24 @@ func (s *Scheduler) Cancel(jobID string) error {
 	}
 
 	if !cancelled {
+		// 暂停中的任务既不在堆里也不在执行中，但它确实存在且必须还能被删掉——
+		// 否则一旦暂停就再也清理不掉，存储里只会长出删不掉的僵尸快照。
+		if snap, ok := s.findSnapshot(jobID); ok && JobStatus(snap.Status) == StatusPaused {
+			if s.store != nil {
+				if err := s.store.Delete(jobID); err != nil {
+					s.logger.Error("failed to delete paused job", "job_id", jobID, "error", err)
+				}
+			}
+			s.eventBus.Publish(Event{
+				Type:      EventJobCancelled,
+				JobID:     jobID,
+				JobName:   snap.Name,
+				Status:    StatusCancelled,
+				Timestamp: time.Now(),
+				Metadata:  map[string]interface{}{"was_paused": true},
+			})
+			return nil
+		}
 		return ErrJobNotFound
 	}
 
@@ -243,9 +258,145 @@ func (s *Scheduler) Cancel(jobID string) error {
 	return nil
 }
 
+// Pause 暂停一个待执行任务：把它从堆里取出，并以 paused 状态写回存储。
+//
+// 与 Cancel 的关键差别就在这里——Cancel 连存储一起删除（任务从此不存在），
+// Pause 保留快照（任务只是不排期），因此 Resume 能按原 ID 把它唤回。
+//
+// 只对堆里的任务生效：正在执行的任务由 worker 持有，暂停它语义不明，
+// 需要中止执行请走 ForcePause（admin 档）。对已暂停的任务重复调用是幂等的，
+// 返回当前状态而不报错，让控制器的双击/重试不至于变成 409。
+func (s *Scheduler) Pause(jobID string) (*Job, error) {
+	item := s.heap.Remove(jobID)
+	if item == nil {
+		if s.isRunning(jobID) {
+			return nil, ErrJobNotPending
+		}
+		if snap, ok := s.findSnapshot(jobID); ok && JobStatus(snap.Status) == StatusPaused {
+			job := &Job{}
+			job.FromSnapshot(snap)
+			return job, nil
+		}
+		return nil, ErrJobNotFound
+	}
+
+	job := item.(*Job)
+	job.Status = StatusPaused
+	job.UpdatedAt = time.Now()
+
+	if s.store != nil {
+		if err := s.store.Update(job.ToSnapshot()); err != nil {
+			// 堆里已经取走了，落盘失败只可能让重启后的恢复口径不一致：
+			// 记日志并继续，任务此刻确实处于暂停中。
+			s.logger.Error("failed to persist paused job", "job_id", jobID, "error", err)
+		}
+	}
+
+	// 堆顶可能变了，唤醒调度循环重算等待时长
+	s.notifyNewJob()
+
+	s.eventBus.Publish(Event{
+		Type:      EventJobPaused,
+		JobID:     job.ID,
+		JobName:   job.Name,
+		Status:    StatusPaused,
+		Timestamp: time.Now(),
+		Metadata: map[string]interface{}{
+			"trigger_at": job.TriggerAt,
+			"forced":     false,
+		},
+	})
+
+	return job, nil
+}
+
+// Resume 恢复一个暂停的任务：从存储取回快照，重新排期并保留原 ID。
+//
+// 触发时间由 Schedule 统一处理：Cron 重复任务按表达式取下一个未来时点，
+// 一次性任务的 TriggerAt 若已过期则立刻补跑——与崩溃恢复 Restore 的口径一致，
+// 不额外制造"暂停期间到期的任务被吞掉"这种差异。
+func (s *Scheduler) Resume(jobID string) (*Job, error) {
+	snap, ok := s.findSnapshot(jobID)
+	if !ok {
+		return nil, ErrJobNotFound
+	}
+	if JobStatus(snap.Status) != StatusPaused {
+		return nil, ErrJobNotPaused
+	}
+
+	job := &Job{}
+	job.FromSnapshot(snap)
+	// Handler 不落盘，恢复时必须按 HandlerKey 重新绑定
+	if handler, exists := s.lookupHandler(job.HandlerKey()); exists {
+		job.Handler = handler
+	}
+	job.Status = StatusPending
+	job.UpdatedAt = time.Now()
+
+	if err := s.Schedule(job); err != nil {
+		return nil, err
+	}
+
+	// Schedule 已广播 job.scheduled（它确实被重新排期了）；再补一条 resumed，
+	// 让时间线能把"恢复"这个人为动作与自动重排区分开。
+	s.eventBus.Publish(Event{
+		Type:      EventJobResumed,
+		JobID:     job.ID,
+		JobName:   job.Name,
+		Status:    StatusPending,
+		Timestamp: time.Now(),
+		Metadata: map[string]interface{}{
+			"trigger_at": job.TriggerAt,
+		},
+	})
+
+	return job, nil
+}
+
+// isRunning 判断任务是否已被 worker 取出、尚未返回。
+func (s *Scheduler) isRunning(jobID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.cancelMap[jobID]
+	return ok
+}
+
+// findSnapshot 按 ID 取存储中的快照。
+//
+// 线性扫描 LoadAll：与 hasStoredJob 同一代价，当前 history_limit 量级可接受。
+// 等 Store 有 Get(jobID) 之后这两处一起收敛。
+func (s *Scheduler) findSnapshot(jobID string) (JobSnapshot, bool) {
+	if s.store == nil {
+		return JobSnapshot{}, false
+	}
+
+	snapshots, err := s.store.LoadAll()
+	if err != nil {
+		s.logger.Error("failed to load jobs while looking up a job", "job_id", jobID, "error", err)
+		return JobSnapshot{}, false
+	}
+	for _, snap := range snapshots {
+		if snap.ID == jobID {
+			return snap, true
+		}
+	}
+	return JobSnapshot{}, false
+}
+
+// notifyNewJob 唤醒调度循环重算等待时长；信号通道满时丢弃即可（已有待处理唤醒）。
+func (s *Scheduler) notifyNewJob() {
+	select {
+	case s.newJobCh <- struct{}{}:
+	default:
+	}
+}
+
 // ErrJobNotPending 表示任务已不在待执行队列中（已被弹出执行、已结束或不存在），
 // 因此无法原地更新。
 var ErrJobNotPending = errors.New("job is not pending")
+
+// ErrJobNotPaused 表示任务当前不处于暂停状态，无法恢复。
+var ErrJobNotPaused = errors.New("job is not paused")
 
 // UpdatePending 原地修改一个待执行任务：apply 在任务的副本上生效，
 // 只有堆内条目被成功替换后才落盘，避免"取消成功但重排失败"丢任务。
@@ -287,35 +438,20 @@ func (s *Scheduler) UpdatePending(jobID string, apply func(*Job) error) (*Job, e
 	}
 
 	// 触发时间可能提前，唤醒调度循环重算等待时长
-	select {
-	case s.newJobCh <- struct{}{}:
-	default:
-	}
+	s.notifyNewJob()
 
 	return &updated, nil
 }
 
 // hasStoredJob 判断存储中是否仍有该任务的记录，用于区分"从未存在"与"已不可修改"。
 func (s *Scheduler) hasStoredJob(jobID string) bool {
-	if s.store == nil {
-		return false
-	}
-
-	snapshots, err := s.store.LoadAll()
-	if err != nil {
-		s.logger.Error("failed to load jobs while checking job", "job_id", jobID, "error", err)
-		return false
-	}
-	for _, snap := range snapshots {
-		if snap.ID == jobID {
-			return true
-		}
-	}
-	return false
+	_, ok := s.findSnapshot(jobID)
+	return ok
 }
 
 // Restore 从持久化存储重建调度队列（崩溃/重启恢复）。
 // 快照中仅 Pending/Running 状态的任务会被重新入队，状态重置为 Pending；
+// 终态留痕与 paused 任务都不入队——暂停是人为决定，重启不该替用户取消它。
 // Handler 在执行前按 HandlerKey 从注册表绑定。
 func (s *Scheduler) Restore() error {
 	if s.store == nil {
@@ -331,6 +467,11 @@ func (s *Scheduler) Restore() error {
 		// 存储现在同时保存终态留痕，恢复时只关心未完成的任务
 		status := JobStatus(snap.Status)
 		if status.IsTerminal() {
+			continue
+		}
+		// paused 不是终态，但也不能被复活：重启不解除暂停，
+		// 否则"暂停"在最常见的一次部署重启之后就悄悄失效了。
+		if status == StatusPaused {
 			continue
 		}
 		if s.heap.Get(snap.ID) != nil {
