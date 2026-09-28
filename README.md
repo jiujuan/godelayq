@@ -94,11 +94,13 @@
 
 | 文件 | 作用 | 关键设计 |
 |------|------|----------|
-| `heap.go` | 四叉堆实现 | 索引映射实现 O(1) 查找，支持并发安全操作 |
-| `scheduler.go` | 调度器引擎 | 时间轮询优化，避免忙等待，支持优雅关闭 |
-| `event.go` | 事件驱动架构 | 发布-订阅模式，支持多路复用和背压处理 |
-| `websocket.go` | 实时通信 | 心跳保活、过滤订阅、自动重连支持；仅依赖 `WSConn`/`WSUpgrader` 接口，协议库由上层注入 |
-| `load.go` | 文件任务加载 | fsnotify 实时监控，支持原子移动和错误隔离 |
+| `heap.go` | 四叉堆实现 | 索引映射实现按 ID 的 O(1) 定位，四叉 sift 与 `Update`/`PopIfDue` |
+| `scheduler.go` | 调度器引擎 | 堆顶定时器唤醒（非忙等待），有界 worker 池 + 队列背压，优雅关闭与崩溃恢复 |
+| `event.go` | 事件驱动架构 | 发布-订阅；订阅缓冲满时丢弃事件而非阻塞调度主流程 |
+| `websocket.go` | 实时通信 | 心跳保活、按事件类型/任务名过滤订阅；只依赖 `WSConn`/`WSUpgrader` 接口，协议库由上层注入（重连属客户端能力） |
+| `load.go` | 文件任务加载 | fsnotify 监控 + 100ms 静默窗口合并写入事件，加载后删除/归档，非法文件可隔离到 `error_dir` |
+| `config.go` | 运行配置 | viper 读 yaml + `GODELAYQ_*` 环境变量，未知键与非法取值启动即报错 |
+| `logging.go` | 日志装配 | 标准库 `log/slog`，`NewLogger` 按级别/格式构造，组件经 `WithLogger` 注入 |
 
 
 ## 目录结构
@@ -106,72 +108,61 @@
 ```shell
 godelayq/
 ├── README.md                 # 项目文档（本文件）
-├── LICENSE                   # MIT 许可证
-├── go.mod                    # Go 模块定义
-├── go.sum                    # 依赖校验
-├── Makefile                  # 构建脚本
-├── Dockerfile                # 容器镜像
-├── docker-compose.yml        # 快速部署配置
+├── go.mod / go.sum           # 模块定义与依赖校验
+├── .gitignore
 │
 ├── cmd/                      # 可执行程序入口
-│   ├── server/               # HTTP API 服务器
-│   │   └── main.go           # 主程序入口
-│   └── cli/                  # 命令行工具（可选）
-│       └── main.go
+│   └── server/
+│       ├── main.go           # 服务器主程序（配置 → 存储 → 调度器 → API → 信号）
+│       ├── main_test.go
+│       └── main_integration_test.go
 │
-├── core/                      # 核心库代码
-│   ├── heap.go               # 四叉堆实现（核心数据结构）
-│   ├── heap_test.go          # 堆单元测试
-│   ├── job.go                # 任务定义与状态管理
-│   ├── job_test.go           # 任务单元测试
-│   ├── scheduler.go          # 调度器主逻辑
-│   ├── scheduler_test.go     # 调度器单元测试
-│   ├── store.go              # 持久化接口与JSON实现
-│   ├── store_test.go         # 存储单元测试
-│   ├── retry.go              # 重试策略
-│   ├── retry_test.go         # 重试策略测试
-│   ├── cron.go               # Cron表达式解析
-│   ├── cron_test.go          # Cron测试
+├── core/                     # 核心库（不依赖任何 web 框架）
+│   ├── heap.go               # 四叉堆（索引映射、Update、PopIfDue）
+│   ├── job.go                # 任务定义、状态、快照与 CloneForRetry
+│   ├── scheduler.go          # 调度器：堆 + worker 池 + 取消表 + 事件总线
+│   ├── store.go              # 存储接口与 JSON 实现（合并落盘、终态留痕）
+│   ├── retry.go              # 指数退避 / 固定间隔重试策略
+│   ├── cron.go               # Cron 表达式解析（5/6 段，可选秒级）
 │   ├── event.go              # 事件总线
-│   ├── event_test.go         # 事件总线测试
+│   ├── config.go             # 运行配置（viper + GODELAYQ_* 环境变量）
 │   ├── logging.go            # slog 日志器构造与组件可选项
-│   ├── load.go             # 目录任务加载器
-│   ├── load_test.go        # 加载器测试
-│   └── websocket.go          # WebSocket服务器（只依赖连接/升级接口，不绑定具体协议库）
+│   ├── load.go               # 目录任务加载器（fsnotify）
+│   ├── websocket.go          # WebSocket 服务（只依赖连接/升级接口）
+│   └── *_test.go             # 与上述文件一一对应的单元测试
 │
-├── api/                      # HTTP API 层
-│   ├── server.go             # Gin服务器与路由
-│   ├── handlers.go           # HTTP处理器实现
+├── api/                      # HTTP API 层（gin）
+│   ├── server.go             # 路由、中间件、优雅关闭
+│   ├── handlers.go           # REST 处理器实现
 │   ├── dto.go                # 请求/响应数据结构
-│   ├── logging.go          # 访问日志与 panic 恢复中间件（slog）
 │   ├── security.go           # Token 鉴权与跨域来源策略
-│   ├── websocket.go          # WebSocket升级处理（gorilla 适配器）
+│   ├── logging.go            # 访问日志与 panic 恢复中间件（slog）
+│   ├── websocket.go          # gorilla/websocket 适配器
 │   ├── sse.go                # Server-Sent Events
-│   └── api_test.go           # API集成测试
+│   └── *_test.go             # 契约、鉴权、关闭与流式测试
 │
+├── examples/                 # 独立可运行示例
+│   ├── demo1/                # 编程式提交与崩溃恢复
+│   └── demo2/                # 目录加载器
 │
-├── web/                      # 前端监控面板
-│   └── dashboard/
-│       ├── index.html        # 实时监控页面
-│       ├── app.js            # 前端逻辑
-│       └── style.css         # 样式表
+├── dashboard/
+│   └── index.html            # 单文件监控页（浏览器直接打开，可填 token）
 │
-├── configs/                  # 配置文件
-│   ├── config.yaml           # 主配置
-│   └── jobs/                 # 示例任务文件
-│       ├── payment_check.json
-│       └── daily_report.json
+├── configs/
+│   └── config.yaml           # 运行配置样例
 │
-├── scripts/                  # 运维脚本
-│   ├── init.sh               # 初始化脚本
-│   └── backup.sh             # 备份脚本
+├── job_queue/                # 目录加载器的示例任务文件（demo2 监控此目录）
+├── data/                     # 默认 store.path 的数据文件（仓库内是空占位）
 │
-└── docs/                     # 详细文档
-    ├── architecture.md       # 架构设计文档
-    ├── api.md                # API详细文档
-    ├── deployment.md         # 部署指南
-└── benchmark.md          # 性能测试报告
+└── docs/
+    ├── api.md                # API 详细文档
+    ├── deployment.md         # 部署与安全配置指南
+    ├── example.md            # 用法示例
+    └── core-scheduler-heap-event-load-analysis.md  # 核心模块设计分析
 ```
+
+仓库不提供 Makefile、Dockerfile、docker-compose.yml 与运维脚本；构建直接用
+`go build -o godelayq-server ./cmd/server`，部署方式见 [部署文档](./docs/deployment.md)。
 
 ---
 
@@ -181,7 +172,7 @@ godelayq/
 
 - **四叉堆数据结构**：比二叉堆减少约 50% 的层级，提升缓存命中率
 - **O(log n) 操作复杂度**：插入、删除、更新均为对数时间
-- **无锁设计**：读多写少场景使用 RWMutex，高并发优化
+- **并发控制**：堆、调度器与注册表各由 RWMutex 保护，读路径（列表/统计/查找）不互斥
 - **有界并发执行**：默认 100 个执行 worker + 等容量队列；到期风暴时调度循环阻塞入队形成背压，不会无限起协程，未执行任务保留在堆与存储中
 
 ### 2. 可靠性保障
@@ -194,20 +185,28 @@ godelayq/
 
 ### 3. 灵活的任务定义
 
-- **多种触发方式**：延迟执行（Duration）、定时执行（Time）、周期执行（Cron）
-- **动态注册**：运行时注册任务处理器，支持热更新
-- **上下文传递**：支持 cancellation 和 timeout
+- **多种触发方式**：延迟执行（Duration）、定时执行（Time）、周期执行（Cron，5 或 6 段）
+- **三种提交入口**：REST API、任务文件目录、代码内直接 `Schedule`
+- **上下文传递**：Handler 收到带 cancellation 与 timeout 的 `context.Context`
+- **标识**：任务 ID 为 UUIDv7（毫秒时间戳前缀 + 随机后缀，可按字典序粗略排序）
 
 ### 4. 实时可观测性
 
-- **WebSocket 推送**：任务状态变更实时推送到前端
+- **WebSocket 推送**：任务状态变更实时推送到前端，客户端可用 `subscribe` 设置过滤条件
 - **SSE 备选方案**：兼容不支持 WebSocket 的客户端，`event_types` 走服务端类型订阅、`job_types` 按任务名过滤
 - **REST API 查询**：完整的任务生命周期管理接口，支持 `POST /jobs/batch` 单请求最多 100 条的批量提交（逐条独立，混合结果以 207 返回）
-- **监控面板**：内置 Web Dashboard
+- **监控页**：`dashboard/index.html` 是单文件页面，用浏览器直接打开即可连 `/ws` 与统计接口（不由服务端托管，需自行处理跨域或同源部署）
+- **结构化日志**：全进程 `log/slog`，级别与格式可配，HTTP 访问日志与 panic 堆栈同流
 
-### 5. 扩展能力
+### 5. 接入层安全
 
-- **存储插件化**：接口设计支持 Redis、MySQL 等扩展
+- **静态 token**：`server.auth.token` 覆盖全部端点（含 `/ws`、`/sse/events`、`/health`），支持 Bearer / `X-Auth-Token` / `?token=`
+- **跨域与握手来源**：`server.cors.allow_origins` 同时约束 HTTP 与 WebSocket 握手来源
+- **边界**：只有一个全局口令，无角色、无过期；不内置 HTTPS 与限流，需前置反代
+
+### 6. 扩展能力
+
+- **存储插件化**：`Store` 接口化，Redis/MySQL 等后端可自行实现（仓库内目前只有 JSON）
 - **任务文件化**：支持通过文件系统提交任务，便于 CI/CD 集成
 
 ---
@@ -216,7 +215,7 @@ godelayq/
 
 ### 环境要求
 
-- Go 1.21+
+- Go 1.24+（与 `go.mod` 的 `go 1.24.13` 一致）
 - Linux/macOS/Windows
 
 ### 安装
@@ -278,24 +277,16 @@ logging:
 
 完整说明与取舍见 [部署文档](./docs/deployment.md)。
 
-### Docker 部署
+### 容器化
 
-```bash
-# 构建镜像
-docker build -t godelayq:latest .
-
-# 运行容器
-docker run -d \
-  -p 8080:8080 \
-  -v /data/godelayq:/app/data \
-  -e TZ=Asia/Shanghai \
-  --name godelayq \
-  godelayq:latest
-```
+仓库不再提供 Dockerfile 与 docker-compose.yml。需要容器部署时，用
+`go build -o godelayq-server ./cmd/server` 产出二进制自行打镜像，
+把数据目录挂到 `-config` 里 `store.path` 指向的路径即可；
+裸机/虚机的 systemd 部署、反向代理与安全加固见 [部署文档](./docs/deployment.md)。
 
 ## 其它文档
 
 - [API文档](./docs/api.md)
-- [架构文档](./docs/architecture.md)
-- [例子](./docs/example.md)
+- [用法示例](./docs/example.md)
 - [部署文档](./docs/deployment.md)
+- [核心模块设计分析](./docs/core-scheduler-heap-event-load-analysis.md)
