@@ -190,6 +190,17 @@ func (s *Server) setupRoutes() {
 		// 全局最近事件：Dashboard 刷新后补历史用
 		api.GET("/events", reader, s.ListRecentEvents)
 
+		// 分组注册表。未 WithGroupStore 的部署直接 503，任务上的 group 标签不受影响。
+		groups := api.Group("/groups", s.requireGroupStore())
+		{
+			groups.GET("", reader, s.ListGroups)
+			groups.POST("", operator, s.CreateGroup)
+			groups.PUT("/:name", operator, s.UpdateGroup)
+			// 删除是唯一会牵动一批任务的操作（默认 detach 解除分组），
+			// 因此档位比创建/改名更高（决策 D5）
+			groups.DELETE("/:name", s.RequireRole(core.RoleAdmin), s.DeleteGroup)
+		}
+
 		// 统计与监控。/health 继续保持"启用鉴权则需凭据"的历史契约
 		// （docs/api.md 现有描述），控制台的登录页正是靠它的 401/200 判断鉴权是否开启。
 		api.GET("/stats", reader, s.GetStats)
