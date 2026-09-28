@@ -251,4 +251,3 @@ func assertPanics(t *testing.T, fn func()) {
 
 	fn()
 }
-
