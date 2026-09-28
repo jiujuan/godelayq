@@ -79,22 +79,37 @@ HTTP 访问日志与 panic 恢复由 `api/logging.go` 的中间件产出，替�
 注意两点边界：Cron 重复任务沿用同一 ID，每轮成功都会被下一轮的 `pending` 覆盖，
 所以看不到逐轮历史；进程重启后 `uptime` 归零，但 completed/failed 会随留痕记录一并恢复。
 
-### 接入层安全（token 与跨域）
+### 接入层安全（账号、token 与跨域）
 
-**默认是敞开的**：不配 token 时任何能连上端口的主机都能创建/取消任务并订阅全部事件，
-`allow_origins` 默认 `*`，任意网页也能跨域调用。公网或多人环境至少做三件事：
+**默认是敞开的**：不配任何凭据时，任何能连上端口的主机都能创建/取消任务并订阅全部事件，
+`allow_origins` 默认 `*`，任意网页也能跨域调用。公网或多人环境至少做四件事：
 
-1. 设置 token。写进配置文件会把凭据落盘，优先用环境变量注入，
-   systemd 下用 `EnvironmentFile=/etc/godelayq/token.env`（`GODELAYQ_SERVER_AUTH_TOKEN=...`，
-   文件权限 0600）。token 是全局共享口令，无角色区分、无过期，轮换需重启进程。
-2. 收紧跨域。把 `allow_origins` 写成实际前端地址列表；需要 Cookie 时配
+1. 启用鉴权。两种凭据可以并存：
+   - **控制台账号** `server.auth.users`：只存 bcrypt 哈希（`go run ./cmd/hashpassword` 生成，
+     cost 至少 10），配 `server.auth.jwt.secret` 签发 JWT。哈希写进配置文件是可以的（它不可逆），
+     **签名密钥不要落盘**：用 `GODELAYQ_SERVER_AUTH_JWT_SECRET` 注入，systemd 下放进
+     `EnvironmentFile=/etc/godelayq/auth.env`（权限 0600）。轮换密钥会让全部已发令牌立即失效，
+     所有人都要重新登录。账号本身不支持环境变量覆盖，增删账号需重启进程。
+   - **静态 token** `server.auth.token`：给脚本与 CI 用的全局口令，身份是 `machine`
+     （能读写任务，没有 admin/ops 能力）。同样优先用 `GODELAYQ_SERVER_AUTH_TOKEN` 注入。
+2. 按人分配角色（`viewer`/`operator`/`admin`/`ops`）。最小可用的一组通常是：一个 `ops` 给值班、
+   若干 `operator` 给业务、`viewer` 给只看监控的人。机器凭据不给 admin 能力，
+   需要自动化做强制暂停/删组时，请为脚本单建一个 `admin` 账号并单独保管其口令。
+3. 收紧跨域。把 `allow_origins` 写成实际前端地址列表；需要 Cookie 时配
    `allow_credentials: true`（此时不允许 `*`，否则启动报错）。
-3. 前置 TLS。本服务不内置 HTTPS，用 Nginx/负载均衡终结证书后回环转发（见下文反向代理）。
+4. 前置 TLS。本服务不内置 HTTPS，用 Nginx/负载均衡终结证书后回环转发（见下文反向代理）。
+   登录限流按 `c.ClientIP()` 计数，反代必须正确传 `X-Forwarded-For`，
+   否则所有请求会被算成同一个来源 IP（详见 gin 的代理信任配置）。
 
-已知边界：只有一个静态 token，因此**浏览器页面里的 WS/SSE 必须用 `?token=`**
-（`EventSource`/`WebSocket` 无法自定义请求头），token 会出现在访问日志与浏览器历史里；
-把该服务暴露给不可信网络前，请在反向代理层关掉 `/ws`、`/sse/events` 的 query 日志，
-或只在内网开放。健康检查 `/api/v1/health` 也在保护范围内，探针需要带 token。
+已知边界：
+
+- 令牌与登录态都在内存里。**进程重启 = 所有人重新登录**，登出拒绝表也随之清空
+  （重启后旧 access token 依然过不了验签，因为 refresh 表没了、且部署本身已被认为可信边界内）。
+- 浏览器页面的 WS/SSE 无法自定义请求头。控制台走一次一用、5 秒过期的 `?ticket=`；
+  机器凭据仍可用 `?token=`。后者会出现在访问日志与浏览器历史里，
+  暴露给不可信网络前请在反向代理层关掉 `/ws`、`/sse/events` 的 query 日志，或只在内网开放。
+- 健康检查 `/api/v1/health` 在保护范围内，探针需要带凭据。
+- 写操作只有结构化日志，没有可查询的审计存储；要留证据链请收集 stdout 日志（见下文日志与观测）。
 
 数据目录需提前创建并保证进程可写：
 

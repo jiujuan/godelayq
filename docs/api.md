@@ -13,35 +13,107 @@ Content-Type: application/json
 
 ## 鉴权与跨域
 
-服务端默认**不启用鉴权**（`server.auth.token` 为空）。配置 token 后，全部端点都要求凭据，
-包括 `/ws`、`/sse/events` 与 `/api/v1/health`；缺少或错误凭据返回 401。
+服务端支持两类凭据，都不配置时**不启用鉴权**（全部端点匿名放行，等价单机自托管）：
+
+| 凭据 | 来源 | 身份 | 适用 |
+| --- | --- | --- | --- |
+| 用户名 + 密码 → JWT | `server.auth.users`（bcrypt 哈希）+ `server.auth.jwt.secret` | 账号自身角色 | Web 控制台 |
+| 静态 token | `server.auth.token` | `machine` | 脚本、CI、旧集成 |
+
+配置了任一凭据后，除 `POST /api/v1/auth/login`、`POST /api/v1/auth/refresh` 两个登录入口外，
+全部端点（含 `/ws`、`/sse/events`、`/api/v1/health`）都要求有效凭据，缺失或无效返回 401：
 
 ```json
-{ "code": 401, "message": "invalid or missing token" }
+{ "code": 401, "message": "invalid or missing credentials" }
 ```
 
-三种等价的传法，按此优先级取其一：
+角色不足返回 403（`{"code":403,"message":"insufficient role"}`），登录失败过于频繁返回 429
+并附 `Retry-After` 秒数。
+
+### 认证端点
+
+```json
+POST /api/v1/auth/login
+{ "username": "admin01", "password": "..." }
+```
+
+响应：
+
+```json
+{
+  "access_token": "eyJhbGciOiJIUzI1NiIs...",
+  "refresh_token": "6f1c...32字节随机串",
+  "token_type": "Bearer",
+  "expires_at": "2024-01-02T15:35:00+08:00",
+  "user": { "name": "admin01", "role": "admin" }
+}
+```
+
+- `POST /api/v1/auth/refresh`：`{"refresh_token":"..."}` → 同一形状的响应。
+  refresh token **一次一用**，每次刷新都轮转，旧的立即作废。
+- `POST /api/v1/auth/logout`：`{"refresh_token":"..."}`（可省略）→ 204。
+  同时吊销 refresh token，并把当前 access token 记入拒绝表，
+  因此退出后旧 access token 立刻失效，不必等它自然过期。
+- `GET /api/v1/auth/me` → `{"name":"admin01","role":"admin","expires_at":"..."}`。
+  前端以这里为权威身份，不去解析 JWT 的 claims。
+- `POST /api/v1/auth/ws-ticket` → `{"ticket":"...","expires_in_seconds":5}`。
+  见下文实时通道。
+
+未配置 `server.auth.users` 时登录端点返回 400（`console accounts are not configured`），
+静态 token 照常可用。
+
+### 角色
+
+四档有序角色，低档不能做高档的事：
+
+| 角色 | 能做什么 |
+| --- | --- |
+| `viewer` | 只读：任务列表/详情、`/stats`、`/job-types`、实时事件流 |
+| `operator` | + 创建、编辑、取消、重试任务，建组与改名 |
+| `admin` | + 强制暂停执行中的任务、删除分组 |
+| `ops` | + 调度总开关、清空事件缓冲、运行时诊断 |
+| `machine` | 静态 token 的身份：等同于 `operator` 的读写，但**没有** admin/ops 的任何能力 |
+
+完整矩阵见 `docs/design/web-console-design.md` §5.7.3。
+
+### 凭据通道
+
+四种等价传法，**按此优先级取其一**：
 
 | 通道 | 示例 | 适用场景 |
 | --- | --- | --- |
-| `Authorization` 请求头 | `Authorization: Bearer <token>` | 推荐，REST 客户端默认用法 |
-| `X-Auth-Token` 请求头 | `X-Auth-Token: <token>` | 不便设置标准授权头时 |
-| `token` 查询参数 | `GET /ws?token=<token>` | 浏览器 WebSocket / EventSource 无法自定义请求头 |
+| `Authorization` 请求头 | `Authorization: Bearer <jwt>` | 推荐，REST 客户端默认用法 |
+| `X-Auth-Token` 请求头 | `X-Auth-Token: <jwt>` | 不便设置标准授权头时 |
+| `ticket` 查询参数 | `GET /ws?ticket=<ticket>` | **仅限 `/ws` 与 `/sse/events`**，一次性、5 秒过期 |
+| `token` 查询参数 | `GET /api/v1/jobs?token=<静态token>` | 仅接受静态机器凭据，且同样会进访问日志 |
 
-注意两点：
+注意三点：
 
-- 出现 `Authorization` 头时只认它（非 `Bearer` scheme 直接判失败），不会再回退到查询参数。
-- 查询参数会进入访问日志与浏览器历史，除 WS/SSE 外建议一律用请求头。
+- 出现 `Authorization` 头时只认它（非 `Bearer` scheme 直接判失败），不会再回退到其他通道。
+- 查询参数会进入访问日志与浏览器历史。JWT 是长期凭据，**不接受**它走 `?token=`；
+  浏览器 WebSocket / EventSource 无法自定义请求头，请改用 `ticket`：
+  先带 access token 调 `POST /api/v1/auth/ws-ticket`，再用返回的票据建连，票据用一次即废。
+- 静态 token 走 `?token=` 是历史兼容行为，仅供脚本使用；生产环境建议注入到
+  `GODELAYQ_SERVER_AUTH_TOKEN` 并收紧 CORS 白名单。
+
+令牌与账号的一致性：access token 里写着角色，但服务端每次都会用**当前配置**复核——
+账号被删除或降权后，旧令牌立即不再可用。
+
+### 跨域
 
 跨域由 `server.cors.allow_origins` 控制，默认 `["*"]`（任意来源）。配置为具体白名单后，
 只回显命中的 `Origin` 并附 `Vary: Origin`，未命中的响应不带 `Access-Control-Allow-Origin`，
 由浏览器拦截。`allow_credentials: true` 与 `*` 互斥（启动即报错）。预检 `OPTIONS` 请求
-不校验 token，由 CORS 中间件直接返回 204。
+不校验凭据，由 CORS 中间件直接返回 204。
 
 ```bash
-# 启用鉴权后的调用示例
+# 启用静态 token 后的调用示例
 curl -H "Authorization: Bearer $GODELAYQ_TOKEN" http://localhost:8080/api/v1/jobs
-curl -H "X-Auth-Token: $GODELAYQ_TOKEN"      http://localhost:8080/api/v1/stats
+curl -H "X-Auth-Token: $GODELAYQ_TOKEN"         http://localhost:8080/api/v1/stats
+
+# 控制台账号：先登录，再用 access token
+curl -X POST -d '{"username":"admin01","password":"..."}' http://localhost:8080/api/v1/auth/login
+curl -H "Authorization: Bearer <access_token>" http://localhost:8080/api/v1/jobs
 ```
 
 ## 任务管理 API
@@ -369,10 +441,18 @@ GET /job-types
 
 连接地址: ws://localhost:8080/ws
 
-启用鉴权后浏览器只能写 `ws://localhost:8080/ws?token=<token>`（握手前由 HTTP 中间件校验，
-凭据不对直接返回 401，不进入升级流程）；`server.cors.allow_origins` 白名单同时约束握手的 `Origin`，
+启用鉴权后浏览器只能把凭据写在 URL 上，两种写法：
+
+- `ws://localhost:8080/ws?ticket=<ticket>`（**推荐**）：先带 access token 调
+  `POST /api/v1/auth/ws-ticket` 申领，票据 5 秒过期、一次一用，重放直接 401。
+- `ws://localhost:8080/ws?token=<静态token>`：只接受 `server.auth.token`（机器凭据）。
+  JWT **不能**走这条通道——访问日志会原样记下 query，长令牌进日志等于泄露。
+
+握手前由 HTTP 中间件校验凭据，凭据不对直接返回 401，不进入升级流程；
+`server.cors.allow_origins` 白名单同时约束握手的 `Origin`，
 来源不在白名单内返回 `403 Forbidden`（响应体是纯文本 `websocket origin not allowed`）；
 不带 `Origin` 头的客户端（Go/curl）不受白名单限制。
+实时通道要求 `viewer` 档及以上：ticket 由已登录账号申领，身份随票据一起带过来。
 
 **协议说明**
 
@@ -518,7 +598,8 @@ WS/SSE 推送事件里的 `status` 是**数字**；而 WS 订阅过滤的 `statu
 
 ```
 GET /sse/events
-GET /sse/events?token=<token>   # 启用鉴权后：EventSource 无法带请求头，只能走查询参数
+GET /sse/events?ticket=<ticket>   # 推荐：先调 POST /api/v1/auth/ws-ticket 申领，一次一用
+GET /sse/events?token=<静态token>  # 仅机器凭据可用；JWT 不接受走 query
 ```
 
 响应头为 `text/event-stream`。建连后服务端**先下发一个注释帧** `: connected`，

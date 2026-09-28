@@ -112,10 +112,11 @@ godelayq/
 ├── .gitignore
 │
 ├── cmd/                      # 可执行程序入口
-│   └── server/
-│       ├── main.go           # 服务器主程序（配置 → 存储 → 调度器 → API → 信号）
-│       ├── main_test.go
-│       └── main_integration_test.go
+│   ├── server/
+│   │   ├── main.go           # 服务器主程序（配置 → 存储 → 调度器 → API → 信号）
+│   │   ├── main_test.go
+│   │   └── main_integration_test.go
+│   └── hashpassword/         # 生成 server.auth.users 里要的 bcrypt 密码哈希
 │
 ├── core/                     # 核心库（不依赖任何 web 框架）
 │   ├── heap.go               # 四叉堆（索引映射、Update、PopIfDue）
@@ -134,8 +135,12 @@ godelayq/
 ├── api/                      # HTTP API 层（gin）
 │   ├── server.go             # 路由、中间件、优雅关闭
 │   ├── handlers.go           # REST 处理器实现
+│   ├── handlers_auth.go      # 登录、刷新、登出、身份、实时票据
+│   ├── authenticator.go      # 账号校验与 JWT 签发/验签
+│   ├── authstore.go          # refresh 表、登出拒绝表、一次性 ticket
+│   ├── ratelimit.go          # 登录失败限流（IP+账号 与 IP 双维度）
 │   ├── dto.go                # 请求/响应数据结构
-│   ├── security.go           # Token 鉴权与跨域来源策略
+│   ├── security.go           # 认证与角色中间件、跨域来源策略
 │   ├── logging.go            # 访问日志与 panic 恢复中间件（slog）
 │   ├── websocket.go          # gorilla/websocket 适配器
 │   ├── sse.go                # Server-Sent Events
@@ -200,9 +205,19 @@ godelayq/
 
 ### 5. 接入层安全
 
-- **静态 token**：`server.auth.token` 覆盖全部端点（含 `/ws`、`/sse/events`、`/health`），支持 Bearer / `X-Auth-Token` / `?token=`
+- **控制台账号**：`server.auth.users` 声明账号（只存 bcrypt 哈希，用 `go run ./cmd/hashpassword` 生成），
+  登录换 JWT：access token 默认 15 分钟、refresh token 默认 12 小时且一次一用；
+  登出会把当前 access token 立即拉黑，不等它自然过期。账号增删需重启进程。
+- **静态 token**：`server.auth.token` 保留给脚本与 CI，身份是 `machine`——
+  能读写任务，但不能强制暂停、不能删组、不能用运维端点。
+- **角色**：`viewer < operator < admin < ops`，路由级中间件把关；
+  前端的按钮隐藏只是体验，服务端 403 才是边界。
+- **实时通道凭据**：浏览器 WebSocket/EventSource 无法带请求头，改用一次一用、5 秒过期的
+  `?ticket=`；JWT 不允许出现在 URL 里（访问日志会记下 query）。
 - **跨域与握手来源**：`server.cors.allow_origins` 同时约束 HTTP 与 WebSocket 握手来源
-- **边界**：只有一个全局口令，无角色、无过期；不内置 HTTPS 与限流，需前置反代
+- **登录限流**：同一来源对同一账号 1 分钟内失败 5 次、对任意账号失败 20 次即 429
+  （bcrypt 单次约 60-100ms，不限流的登录端点是免费的 DoS 开关）
+- **边界**：无 HTTPS、无在线账号管理、无审计落盘（写操作只进结构化日志），需前置反代
 
 ### 6. 扩展能力
 
@@ -247,7 +262,12 @@ go build -o godelayq-server ./cmd/server
 server:
   port: "8080"                # HTTP 监听端口
   auth:
-    token: ""                 # 留空即不启用鉴权（默认，便于本地开发）
+    token: ""                 # 静态机器凭据；留空即不启用
+    jwt:
+      secret: ""              # HS256 密钥，≥32 字节；用 GODELAYQ_SERVER_AUTH_JWT_SECRET 注入
+      access_ttl: 15m         # 访问令牌有效期；0 用默认值
+      refresh_ttl: 12h        # 刷新令牌有效期；0 用默认值
+    users: []                 # 控制台账号：name + password_bcrypt + role（viewer|operator|admin|ops）
   cors:
     allow_origins: ["*"]      # 跨域来源白名单，可写具体 origin 列表
     allow_credentials: false  # 与 "*" 互斥
@@ -267,8 +287,10 @@ logging:
   format: text                # text|json（输出固定为标准输出）
 ```
 
-设置 `server.auth.token` 后，全部端点（含 `/ws`、`/sse/events`、`/api/v1/health`）都要凭据，
-支持 `Authorization: Bearer <token>`、`X-Auth-Token` 与浏览器专用的 `?token=`；
+配置 `server.auth.token` 或 `server.auth.users` 任一后，除两个登录入口
+（`POST /api/v1/auth/login`、`POST /api/v1/auth/refresh`）外全部端点都要凭据，
+含 `/ws`、`/sse/events`、`/api/v1/health`；支持 `Authorization: Bearer <jwt|token>` 与 `X-Auth-Token`，
+实时通道另可用一次一用的 `?ticket=`，静态 token 另可用 `?token=`。
 `server.cors.allow_origins` 控制跨域来源，同时约束 WebSocket 握手 `Origin`。
 默认不启用鉴权，公网或多团队环境必须显式配置，详见 [部署文档](./docs/deployment.md)。
 
