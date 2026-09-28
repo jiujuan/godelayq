@@ -24,6 +24,9 @@ var groupNamePattern = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 // ErrGroupNameInvalid 表示分组名不合规则。
 var ErrGroupNameInvalid = errors.New("invalid group name")
 
+// ErrGroupColorInvalid 表示颜色不是 #rgb/#rrggbb。
+var ErrGroupColorInvalid = errors.New("invalid group color")
+
 // ErrGroupNotFound 表示指定分组不存在。
 var ErrGroupNotFound = errors.New("group not found")
 
@@ -60,6 +63,15 @@ func ValidateGroupName(name string) error {
 		return fmt.Errorf("%w: %q, expected 1-64 characters of [A-Za-z0-9_-]", ErrGroupNameInvalid, name)
 	}
 	return nil
+}
+
+// ValidateGroupColor 检查颜色取值；空串表示"没配色"，同样合法。
+// 单独导出是给 HTTP 层在写盘之前先拒掉非法输入用（存进去的坏颜色会渲染成不可见样式）。
+func ValidateGroupColor(value string) error {
+	if value == "" || isHexColor(value) {
+		return nil
+	}
+	return fmt.Errorf("%w: %q, expected #rgb or #rrggbb", ErrGroupColorInvalid, value)
 }
 
 // 编译期钉住接口实现：GroupStore 的方法集一旦被改动，这里立刻报错，
@@ -144,8 +156,8 @@ func (s *JSONFileGroupStore) Save(group Group) error {
 		return err
 	}
 	// 颜色给前端色板用，格式错了会渲染成不可见的样式，宁可在写入时就拒绝
-	if group.Color != "" && !isHexColor(group.Color) {
-		return fmt.Errorf("invalid group color %q, expected a #rrggbb value", group.Color)
+	if err := ValidateGroupColor(group.Color); err != nil {
+		return err
 	}
 
 	s.mu.Lock()

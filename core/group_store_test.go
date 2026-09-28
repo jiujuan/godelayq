@@ -88,8 +88,13 @@ func TestGroupStore_RejectsBadColors(t *testing.T) {
 	store, _ := newGroupStore(t)
 
 	for _, color := range []string{"red", "2563EB", "#12345", "#GGGGGG", "#2563EBextra"} {
-		if err := store.Save(Group{Name: "colors", Color: color}); err == nil {
-			t.Errorf("颜色 %q 应被拒绝", color)
+		err := store.Save(Group{Name: "colors", Color: color})
+		if err == nil {
+			t.Fatalf("颜色 %q 应被拒绝", color)
+		}
+		// HTTP 层按这个哨兵区分 400 与 500，错误必须是它而不是随手 fmt 出来的串
+		if !errors.Is(err, ErrGroupColorInvalid) {
+			t.Errorf("颜色 %q 的错误应能识别为 ErrGroupColorInvalid，实际 %v", color, err)
 		}
 	}
 
