@@ -265,6 +265,7 @@ func (s *Server) require(check func(Principal) bool) gin.HandlerFunc {
 			return
 		}
 		if !check(principal) {
+			s.logAccessRejection(principal, "route role requirement")
 			c.AbortWithStatusJSON(http.StatusForbidden, ErrorResponse{
 				Code:    http.StatusForbidden,
 				Message: "insufficient role",
@@ -274,6 +275,19 @@ func (s *Server) require(check func(Principal) bool) gin.HandlerFunc {
 
 		c.Next()
 	}
+}
+
+// allowRole 判断当前请求是否达到 min 档位；未启用鉴权时视为达到。
+//
+// 只给"档位要求取决于请求体"的端点用（例如 batch-ops 里混进 force-pause）：
+// 中间件在解析 body 之前就得决定放不放行，这类判断只能落在处理器里。
+// 路由上写死的档位一律走 RequireRole，不要两处各判一套。
+func (s *Server) allowRole(c *gin.Context, min core.Role) bool {
+	if !s.sec.authEnabled() {
+		return true
+	}
+	principal, ok := PrincipalFrom(c)
+	return ok && principal.Role.AtLeast(min)
 }
 
 // logAccessRejection 记录被权限层挡下的请求，便于事后排查配错的角色。

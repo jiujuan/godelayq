@@ -458,4 +458,14 @@ func TestAccessLogCarriesAuthenticatedIdentity(t *testing.T) {
 	assert.Contains(t, lines, `who=`+testViewerName)
 	assert.Contains(t, lines, "role=viewer")
 	assert.Contains(t, lines, "status=403")
+
+	// 权限层拒绝额外记一条 warn：翻 403 状态码要逐条看访问日志，
+	// 而"谁在被拒"通常是配错了角色，值得单独一条能 grep 到的记录
+	denied := 0
+	for _, line := range strings.Split(lines, "\n") {
+		if strings.Contains(line, "access denied") && strings.Contains(line, "who="+testViewerName) {
+			denied++
+		}
+	}
+	assert.NotZero(t, denied, "403 应留下 access denied 记录")
 }
