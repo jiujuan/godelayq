@@ -27,6 +27,12 @@ function isControlFrame(payload: Record<string, unknown>): boolean {
   return typeof payload.action === 'string'
 }
 
+/** 订阅过滤（§4.5）：发给服务端的 WSFilter 子集，只暴露 Monitor 用得上的两维 */
+export interface RealtimeFilter {
+  jobTypes: string[]
+  eventTypes: string[]
+}
+
 export const useRealtimeStore = defineStore('realtime', () => {
   const state = ref<ConnectionState>('idle')
   const events = ref<JobEvent[]>([])
@@ -45,6 +51,25 @@ export const useRealtimeStore = defineStore('realtime', () => {
   let opening = false
 
   const isConnected = computed(() => state.value === 'connected')
+
+  /**
+   * 订阅过滤是服务端的（core.WSFilter）：不匹配的事件根本不发过来，
+   * 而不是收到后在浏览器里丢掉。断线重连后会自动重发一次，
+   * 否则"筛好了再挂机"会在重连瞬间变成全量流。
+   */
+  const filter = ref<RealtimeFilter>({ jobTypes: [], eventTypes: [] })
+
+  function filterFrame(): string {
+    return JSON.stringify({
+      action: 'subscribe',
+      filter: { job_types: filter.value.jobTypes, event_types: filter.value.eventTypes },
+    })
+  }
+
+  function setFilter(next: RealtimeFilter): void {
+    filter.value = next
+    if (socket?.readyState === WebSocket.OPEN) socket.send(filterFrame())
+  }
 
   /** 逐事件回调（plugins/realtime-effects.ts 用它做 Query 失效）。
       必须在这里给到每一个事件：缓冲是 newest-first 且定长截断的，
@@ -141,6 +166,10 @@ export const useRealtimeStore = defineStore('realtime', () => {
         state.value = 'connected'
         lastError.value = null
         reconnectDelay = RECONNECT_MIN
+        // 空过滤 = 服务端默认收全量，没必要为它发一帧
+        if (socket && (filter.value.jobTypes.length > 0 || filter.value.eventTypes.length > 0)) {
+          socket.send(filterFrame())
+        }
         pingTimer = setInterval(() => {
           if (socket?.readyState === WebSocket.OPEN) {
             socket.send(JSON.stringify({ action: 'ping' }))
@@ -200,7 +229,19 @@ export const useRealtimeStore = defineStore('realtime', () => {
     state.value = 'offline'
     events.value = []
     lastError.value = null
+    filter.value = { jobTypes: [], eventTypes: [] }
   }
 
-  return { state, events, received, lastError, isConnected, start, stop, setEventListener }
+  return {
+    state,
+    events,
+    received,
+    lastError,
+    filter,
+    isConnected,
+    start,
+    stop,
+    setFilter,
+    setEventListener,
+  }
 })
