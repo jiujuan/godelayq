@@ -102,6 +102,10 @@ type StatsResponse struct {
 
 	// 系统信息
 	Uptime string `json:"uptime" example:"24h30m"`
+	// SchedulingSuspended 调度总开关是否被挂起（维护窗口）。放在全角色可读的
+	// /stats 而不是 ops 专属的 /admin/runtime：挂起期间"任务为什么不出"的疑问
+	// 属于每一个看列表的人，横幅只给改得动它的人看等于不提醒。
+	SchedulingSuspended bool `json:"scheduling_suspended" example:"false"`
 }
 
 // ErrorResponse 错误响应

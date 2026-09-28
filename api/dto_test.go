@@ -11,7 +11,7 @@ import (
 
 func TestCreateJobRequest_JSONMarshaling(t *testing.T) {
 	triggerTime := time.Now().Add(1 * time.Hour)
-	
+
 	req := CreateJobRequest{
 		Name:       "test-job",
 		Delay:      "10m",
@@ -244,6 +244,8 @@ func TestStatsResponse_JSONMarshaling(t *testing.T) {
 		Failed:    3,
 		HeapSize:  12,
 		Uptime:    "24h30m15s",
+
+		SchedulingSuspended: true,
 	}
 
 	data, err := json.Marshal(resp)
@@ -259,6 +261,7 @@ func TestStatsResponse_JSONMarshaling(t *testing.T) {
 	assert.Equal(t, 3, decoded.Failed)
 	assert.Equal(t, 12, decoded.HeapSize)
 	assert.Equal(t, "24h30m15s", decoded.Uptime)
+	assert.True(t, decoded.SchedulingSuspended)
 }
 
 func TestStatsResponse_ZeroValues(t *testing.T) {
@@ -274,6 +277,9 @@ func TestStatsResponse_ZeroValues(t *testing.T) {
 	data, err := json.Marshal(resp)
 	require.NoError(t, err)
 
+	// 不带 omitempty：挂起与否是必须说清的状态，字段缺席会让前端只能猜
+	assert.Contains(t, string(data), `"scheduling_suspended":false`)
+
 	var decoded StatsResponse
 	err = json.Unmarshal(data, &decoded)
 	require.NoError(t, err)
@@ -282,6 +288,7 @@ func TestStatsResponse_ZeroValues(t *testing.T) {
 	assert.Equal(t, 0, decoded.Running)
 	assert.Equal(t, 0, decoded.Completed)
 	assert.Equal(t, 0, decoded.Failed)
+	assert.False(t, decoded.SchedulingSuspended)
 }
 
 func TestErrorResponse_JSONMarshaling(t *testing.T) {

@@ -65,6 +65,31 @@ func TestSchedulerSuspendSwitchIsIdempotent(t *testing.T) {
 	assert.Contains(t, recorder.Body.String(), `"suspended":false`)
 }
 
+// 挂起状态在 /stats 上也得可见：横幅是给"发现任务怎么不跑了"的所有人看的，
+// 只绑在 ops 专属的 /admin/runtime 上，就等于只有能改它的人收到提示。
+func TestStatsReportsSchedulingSuspended(t *testing.T) {
+	srv := newSecurityServer(t, accountsSecurity(t))
+	viewer := login(t, srv, testViewerName, testPassword)
+
+	readStats := func() StatsResponse {
+		recorder := doGet(t, srv, "/api/v1/stats", bearer(viewer.AccessToken))
+		require.Equal(t, http.StatusOK, recorder.Code)
+
+		var stats StatsResponse
+		require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &stats), recorder.Body.String())
+		return stats
+	}
+
+	assert.False(t, readStats().SchedulingSuspended)
+
+	srv.scheduler.Suspend()
+	assert.True(t, readStats().SchedulingSuspended,
+		"挂起期间 /stats 必须说真话，否则前端只能靠猜")
+
+	srv.scheduler.Unsuspend()
+	assert.False(t, readStats().SchedulingSuspended)
+}
+
 func TestClearEventHistoryReportsCount(t *testing.T) {
 	srv := newSecurityServer(t, Security{})
 	require.NoError(t, srv.scheduler.Schedule(&core.Job{

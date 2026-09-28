@@ -422,6 +422,10 @@ func (s *Server) RetryJob(c *gin.Context) {
 func (s *Server) GetStats(c *gin.Context) {
 	snapshots, _ := s.store.LoadAll()
 
+	// 一次取齐调度器的实时值：Running/HeapSize/Suspended 分三次读会拿到三个不同瞬间，
+	// "堆里还压着任务却显示未挂起"这种自相矛盾的组合，正是横幅最不该出现的时刻
+	sched := s.scheduler.RuntimeStats()
+
 	stats := StatsResponse{
 		Uptime: time.Since(s.startTime).String(),
 	}
@@ -443,8 +447,9 @@ func (s *Server) GetStats(c *gin.Context) {
 		}
 	}
 
-	stats.Running = s.scheduler.RunningCount()
-	stats.HeapSize = s.scheduler.HeapLen()
+	stats.Running = sched.Running
+	stats.HeapSize = sched.HeapSize
+	stats.SchedulingSuspended = sched.Suspended
 
 	c.JSON(200, stats)
 }
