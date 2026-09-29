@@ -118,3 +118,86 @@ go test ./executor -run 'Artifact|Purge|Tail' -v
 - 风险：`PurgeOrphans` 依赖 `store.LoadAll()`。`store.history_limit: -1`（不留痕）的部署里终态快照会被立刻删除，于是任务一跑完产物就成"孤儿"。必须在 `Start` 的第一次扫描前把这条写进注释和日志，并推荐做法：`executors.output.ttl` 与 `history_ttl` 一起配置。测试要覆盖 `history_limit:-1` 场景（`live` 集合里没有终态任务，产物被删是预期行为，因此更稳妥的默认是"孤儿清理只在启动时跑一次，周期清理只按 TTL"）。**采用这个更保守的方案**：`Start` 里周期任务只跑 `PurgeExpired`，`PurgeOrphans` 只在启动时跑一次。
 - 风险：Windows 上没有权限位语义，断言要跳过，避免制造只在全平台通过的测试。
 - 回滚：新增文件为主，`main.go` 的装配是一个独立提交点，可单独 revert。
+
+## 10. 实现记录（2026-09-30）
+
+改动文件：新增 `executor/artifact.go`、`executor/artifact_test.go`；
+改 `cmd/server/main.go`（`runtimeDeps.newArtifactStore`、`run` 的创建与关闭、`liveJobIDs`）与
+`cmd/server/main_test.go`、`cmd/server/main_integration_test.go`。`core/` 与 `api/` 一行未改（DoD 第 5 条）。
+
+### 与卡片的偏离与补充
+
+1. **`Start` 返回 `<-chan struct{}`，并且第一轮扫描是同步的**。卡片只写 `Start(ctx, live)`。
+   返回通道是给关闭路径的 join 点：`run` 里 `cancel(); <-done` 才能保证清理协程先退、存储后关
+   （否则协程可能在存储已关闭后再读一次任务集合）。同步跑第一轮有两个好处：
+   调用方在开始服务之前就把产物清干净，测试也不用和协程调度抢顺序就能断言删除结果
+   （实现过程中先写成"协程内跑第一轮"，`TestStart_StopsWithContext` 立刻出现断言比删除早的竞态，
+   于是改成同步——这个竞态是真实存在的，不是为了让测试好写而做的取舍）。
+2. **任务 ID 的校验比卡片更严**：只允许字母、数字与 `-`，长度 ≤128。
+   因此 `..`、分隔符、绝对路径、空白、非 ASCII 以及**点号**全部被拒（UUIDv7 里没有点号）。
+   写（`Open`）、读（`Read`/`Tail`/`Exists`）、删（`Remove`）四条入口共用同一个校验函数，
+   `TestOpen_RejectsBadJobID` 断言被拒的输入"整棵树没有任何变化"。
+3. **`attempt` 允许 0，拒绝负数**。卡片没写取值下界。把 0 判错并没有增加安全性（文件名 `a0.out`
+   不会与任何真实尝试冲突，真实尝试从 1 起：`core` 在调用处理函数之前先自增 `Attempts`），
+   却会让"按自己的习惯计数"的自行接入程序读不到自己的产物。负数会拼出 `a-1.out` 这种带减号的名字，仍然拒绝。
+4. **新增卡片未列的出口**：`Dir()`、`MaxBytes()`、`TTL()` 三个访问器，以及哨兵错误 `ErrArtifactMissing`。
+   访问器给 E07 的响应与启动日志用；`ErrArtifactMissing` 让接口能把"产物不存在（404）"
+   与"读盘出错（500）"分开，而不是比 `os.ErrNotExist` 的原始文本。
+5. **`Read` 的 `maxBytes<=0` 表示不限制，`Tail` 的 `n<=0` 返回空内容并报告截断**。卡片只写了正数用法，
+   两个零值语义在这里固定下来并各有用例，避免 E07 再猜一次。
+6. **名字不像任务 ID 的条目不参与清理**（记一条 warn）：`jobDirs` 只认校验得过的目录名。
+   有人把别的目录放进产物根目录时，清理不会替别人做决定。用例 `TestJobDirs_IgnoresUnusableNames`。
+7. **产物存储只在 `executors.enabled=true` 时创建**（卡片 §4.5 没提这个开关）。
+   否则关着执行器的部署每次启动都会 `mkdir ./data/exec`，把"这次没启用"表现成"在写文件"。
+   `newArtifactStore` 仍然列入依赖完整性检查：配置打开却没有装配闭包会直接报"依赖不完整"。
+8. **闭包签名收 `core.Config`**（与 `newExecutorRegistry` 对称），`core.ExecutorOutputConfig` 到
+   `ArtifactOptions` 的映射放在 `defaultRuntimeDeps` 里，和 `cfg.Store` → `StoreOptions` 的既有写法一致。
+9. **`Open` 的失败路径**：建 stdout 成功、建 stderr 失败时会先关掉已经打开的句柄再返回错误，
+   不留"开着句柄的半套产物"。
+10. **卡片 §9 的保守方案已采用**：`PurgeOrphans` 只由 `sync.Once` 在启动那一轮执行，
+    周期任务（每 24 小时）只跑 `PurgeExpired`；`live` 返回错误时整轮跳过并记 warn，不返回错误、不删文件。
+
+### 验证结果
+
+- 单元测试：`executor/artifact_test.go` 新增 21 个用例（含 §5 要求的 11 条，另补边界写入、`io.Copy` 契约、
+  未知 stream、缺失文件的哨兵错误、TTL=0 不删、双份 Close 幂等、Remove 空操作等 10 条）；
+  `cmd/server` 新增 3 条（产物存储构造失败不启动且存储已关、清理协程随 run 退出、`liveJobIDs` 包装），
+  并把 `TestRun_WithIncompleteDependencies` 扩成"缺登记表"和"缺产物存储"两种缺失。
+- 截断契约有专门用例：`TestArtifactWriter_RespectsMaxBytes` 写 3 倍上限，断言文件大小正好等于上限、
+  `Truncated=true`、且**每一次** `Write` 都返回 `len(p)`；`TestArtifactWriter_SmallWritesPastLimit`
+  覆盖"边界落在一次写入中间"以及"到顶之后继续写仍满额返回"。返回少字节会让 `io.Copy`
+  报 `ErrShortWrite`、`os/exec` 因此中断子进程，这与"只截断输出、不打断执行"相反，注释里写明了。
+- `go build ./...`、`go vet ./...`、`go test ./... -race -count=1` 全绿；
+  linux、darwin 交叉编译与 `-tags dashboard` 构建通过；改动文件按 LF 副本 `gofmt -l` 无输出。
+- `TestArtifactStore_Permissions` 在 Windows 上跳过（NTFS 权限不由 mode bits 表达，`os.Chmod` 只影响只读位），
+  Unix 分支断言目录 `0750`、两个流文件与 meta 文件都是 `0640`。
+  本机 WSL 有 Linux 但没有 Go，这一条在本机没跑过真实 Unix 分支，需要在 Linux 或 CI 上补一次（已登记）。
+- 真实进程冒烟（二进制、配置、`jobs.json`、产物根目录全在系统临时目录，跑完已删除；
+  仓库 `configs/config.yaml` 与 `data/` 未被写入）：产物根目录预置五种条目——
+  存活任务且新鲜的目录、存活任务但目录时间 8 天前的目录、不在 `jobs.json` 里的"幽灵"目录、
+  名字带点号的别人的目录（时间也 8 天前）、根目录下的散文件；配置 `ttl: 168h`。
+  启动日志依次是
+  `WARN artifact entry is not a job id, leaving it alone name=someone.elses.data`、
+  `INFO artifact orphan directories purged count=1`、同一句 warn、
+  `INFO artifact expired directories purged count=1 ttl=168h0m0s`。
+  结果：幽灵目录（孤儿）与 8 天前的存活目录（过期）被删；存活且新鲜的目录连同 `a1.out`/`a1.meta.json` 保留；
+  `someone.elses.data/keep.txt` 与 `loose.txt` 未被触碰。
+  `POST /api/v1/jobs` 触发一次整文件重写后 `jobs.json` 三条记录照常、`GET /jobs` 返回 200 且字段完整
+  （DoD 第 5 条：本卡不影响 jobs.json 的任何行为）。
+  全程只有一条 ERROR——E04 的"开了执行器却没配鉴权"横幅，属预期。
+  优雅关闭时"取消 ctx 并等待清理协程退出"这条路径由单测覆盖：冒烟用 `taskkill /F` 结束进程，走不到该分支。
+
+- **`io.Copy` 契约单独验过**：`TestArtifactWriter_IOCopyContract` 把限制写入器交给 `io.Copy`，
+  源是 4 倍上限的流，断言 `io.Copy` 返回"完整源长度 + nil 错误"、文件正好等于上限——
+  这正是 E09 挂 `exec.Cmd.Stdout` 的前提。至于"边跑进程边落盘"要等 E09 端到端确认，此处不声称已验证。
+
+### 留给后续卡片的接口形状
+
+- E07：`Read(jobID, attempt, "out", maxBytes)` / `Tail(...)` 取内容，`Exists` 判有无，
+  `ErrArtifactMissing` 对应 404；`Artifact.meta.json` 目前没人读，E07 若要展示执行侧结论再约定内容结构。
+- E09：`Open(job.ID, job.Attempts)` → 把 `Stdout()/Stderr()` 直接挂给 `exec.Cmd` →
+  `Close()` 拿 `ArtifactInfo` 填 `core.ExecMeta` 的 `OutBytes/ErrBytes/Truncated`，`WriteMeta` 记执行侧结论。
+- E14：崩溃恢复把 running 的执行器任务置为 paused 时，产物目录已经存在（`Open` 在尝试开始时建），
+  `Meta.Artifact` 应写 `available`，`Exists` 用来判断该不该给"查看输出"的入口。
+- 配置侧：`executors.output.ttl` 要与 `store.history_ttl` 配对设置——
+  留痕先被清掉的话，下次启动的孤儿清理就会把对应产物一起删（这在 §9 与 PurgeOrphans 注释里都写着）。

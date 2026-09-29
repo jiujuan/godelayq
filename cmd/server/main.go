@@ -43,10 +43,13 @@ type runtimeDeps struct {
 	// newExecutorRegistry 建档位登记表（加载 + 探测）。它必须显式提供：
 	// 缺了它执行器会静默不注册，开关打开也看不出问题。
 	newExecutorRegistry func(core.Config, *slog.Logger) (*executor.Registry, error)
-	newServer           func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry) (serverAPI, error)
-	notifySignals       signalNotifier
-	timeout             time.Duration
-	logger              *slog.Logger
+	// newArtifactStore 建输出产物的文件存储与清理协程，只在 executors.enabled=true 时调用。
+	// 与登记表一样列入依赖完整性检查：少了它输出会静默无处安放。
+	newArtifactStore func(core.Config, *slog.Logger) (*executor.ArtifactStore, error)
+	newServer        func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry) (serverAPI, error)
+	notifySignals    signalNotifier
+	timeout          time.Duration
+	logger           *slog.Logger
 }
 
 // defaultRuntimeDeps 把配置注入各构造闭包，run() 本身不再关心具体取值来源
@@ -65,6 +68,13 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 			return core.NewScheduler(store, retryPolicy, eventBus, core.WithLogger(logger))
 		},
 		newExecutorRegistry: executor.NewRegistry,
+		newArtifactStore: func(cfg core.Config, logger *slog.Logger) (*executor.ArtifactStore, error) {
+			return executor.NewArtifactStore(executor.ArtifactOptions{
+				Dir:      cfg.Executors.Output.Dir,
+				MaxBytes: cfg.Executors.Output.MaxBytes,
+				TTL:      cfg.Executors.Output.TTL,
+			}, logger)
+		},
 		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry) (serverAPI, error) {
 			coreScheduler, ok := scheduler.(*core.Scheduler)
 			if !ok {
@@ -123,7 +133,7 @@ func main() {
 
 func run(deps runtimeDeps) error {
 	if deps.newStore == nil || deps.newScheduler == nil || deps.newExecutorRegistry == nil ||
-		deps.newServer == nil || deps.notifySignals == nil {
+		deps.newArtifactStore == nil || deps.newServer == nil || deps.notifySignals == nil {
 		return fmt.Errorf("runtime dependencies are incomplete")
 	}
 
@@ -165,6 +175,23 @@ func run(deps runtimeDeps) error {
 			"hint", "set server.auth.token or server.auth.users before exposing executors")
 	}
 
+	if cfg.Executors.Enabled {
+		// 产物目录只在打开执行器时创建：关闭状态下不可能有输出需要安放，
+		// 无谓地建出 ./data/exec 会让"这次部署没启用执行器"看起来像在写文件。
+		artifacts, err := deps.newArtifactStore(cfg, deps.logger)
+		if err != nil {
+			// 目录建不起来等于输出无处可写，与档位配置非法同级：不让进程带着"结果一定会丢"启动。
+			return err
+		}
+		cleanupCtx, stopCleanup := context.WithCancel(context.Background())
+		cleanerStopped := artifacts.Start(cleanupCtx, liveJobIDs(store))
+		// 先停清理协程再关存储（后声明的先执行）：否则协程可能在存储已关闭后再去读一次任务集合。
+		defer func() {
+			stopCleanup()
+			<-cleanerStopped
+		}()
+	}
+
 	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors)
 	if err != nil {
 		return err
@@ -196,6 +223,22 @@ func run(deps runtimeDeps) error {
 	scheduler.Stop()
 	deps.logger.Info("server exited")
 	return nil
+}
+
+// liveJobIDs 把存储里的任务 ID 集合包成产物清理需要的"还在不在"判断。
+// 读不出来时返回错误，交由 ArtifactStore 跳过本轮——宁可不删，也不要在信息不全时删文件。
+func liveJobIDs(store core.Store) func() (map[string]bool, error) {
+	return func() (map[string]bool, error) {
+		snapshots, err := store.LoadAll()
+		if err != nil {
+			return nil, err
+		}
+		live := make(map[string]bool, len(snapshots))
+		for _, snapshot := range snapshots {
+			live[snapshot.ID] = true
+		}
+		return live, nil
+	}
 }
 
 // registerHandlers 注册示例处理函数，以及配置里声明的执行器档位。
