@@ -401,3 +401,5 @@ logging:
 - [部署文档](./docs/deployment.md)
 - [核心模块设计分析](./docs/core-scheduler-heap-event-load-analysis.md)
 - [Web 控制台设计文档](./docs/design/web-console-design.md)（`web/` 的技术选型、页面与后端改造方案，含里程碑进度）
+- [执行器设计文档](./docs/design/executor-design.md)（shell/脚本/HTTP 执行层的白名单档位、结果通道与权限模型；**设计定稿，尚未实现**）
+  - 实施拆分：[执行器任务卡 TASK-E01 … E19](./docs/design/tasks/executor/README.md)
