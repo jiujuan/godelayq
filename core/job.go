@@ -4,6 +4,7 @@ import (
 	"context"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // JobStatus 任务状态
@@ -57,6 +58,14 @@ func (s JobStatus) IsTerminal() bool {
 	return s == StatusSuccess || s == StatusFailed || s == StatusCancelled
 }
 
+// ExecMeta.Artifact 的取值。空串表示"这次执行谈不上产物"（还没执行过，或执行器没落盘）。
+const (
+	// ArtifactAvailable 表示产物文件在磁盘上，正文可通过 GET /jobs/:id/result 读到。
+	ArtifactAvailable = "available"
+	// ArtifactPurged 表示摘要还在、文件已被清理（按 TTL 过期或判为孤儿），结果只剩结论。
+	ArtifactPurged = "purged"
+)
+
 // ExecMeta 是一次执行的结论摘要，随任务快照落盘。
 //
 // 完整输出不在这里：JSON 存储每次合并落盘都是整文件重写，终态留痕默认上千条，
@@ -87,6 +96,28 @@ type ExecMeta struct {
 	Preview string `json:"preview,omitempty"`
 	// Artifact 是产物文件的状态：available | purged | 空（还没有产物可言）
 	Artifact string `json:"artifact,omitempty"`
+}
+
+// TrimExecPreview 返回 text 尾部最多 limit 字节，起点落在字符边界上；limit <= 0 返回空串。
+//
+// 从尾部直接数 limit 字节会把一个多字节字符切成一半，接口与事件里就会多出替换字符，
+// 所以切完再跳过开头的 continuation 字节，预览只会比 limit 短，不会更长。
+// 执行侧、事件侧与接口侧共用这一份实现：各写一遍裁剪规则迟早算出不同长度的预览。
+func TrimExecPreview(text string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+
+	data := []byte(text)
+	if len(data) <= limit {
+		return text
+	}
+
+	tail := data[len(data)-limit:]
+	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
+		tail = tail[1:]
+	}
+	return string(tail)
 }
 
 // Job 延迟任务结构

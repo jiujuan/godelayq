@@ -596,3 +596,26 @@ func TestJobSnapshot_OmitsExecWhenAbsent(t *testing.T) {
 		t.Errorf("带 exec 的快照解码失败: %v", err)
 	}
 }
+
+// TestTrimExecPreview 检查输出预览的裁剪规则：取尾部、不超过上限、起点落在字符边界上。
+// 执行侧写预览、事件侧与接口侧各自再裁一次，三处都调这一个函数，所以规则只在这里测。
+func TestTrimExecPreview(t *testing.T) {
+	if got := TrimExecPreview("abcdefghij", 8); got != "cdefghij" {
+		t.Errorf("尾部裁剪不符，实际 %q", got)
+	}
+	if got := TrimExecPreview("abcdefghij", 20); got != "abcdefghij" {
+		t.Errorf("短于上限时应原样返回，实际 %q", got)
+	}
+	if got := TrimExecPreview("abcdefghij", 0); got != "" {
+		t.Errorf("上限为 0 表示不带预览，实际 %q", got)
+	}
+
+	// 一个汉字三个字节：直接从尾部数四个字节会把"你"切成一半，接口里就多出一个替换字符
+	trimmed := TrimExecPreview("abc你好", 4)
+	if trimmed != "好" {
+		t.Errorf("裁剪起点要退到字符边界，实际 %q", trimmed)
+	}
+	if len(TrimExecPreview("a中b", 2)) > 2 {
+		t.Error("裁剪结果不能超过上限")
+	}
+}

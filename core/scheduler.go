@@ -48,6 +48,11 @@ type Scheduler struct {
 	queueCapacity int // 0 表示与 concurrency 相等
 	workCh        chan *Job
 
+	// eventPreviewLimit 是完成/失败事件里输出预览的字节上限（executors.output.inline_preview）。
+	// 事件会广播给全部 WS/SSE 订阅者，并在 api 的内存缓冲里留下最近若干条，
+	// 因此事件只带结论，输出正文留在产物文件里。受 s.mu 保护：装配期写入，执行协程读取。
+	eventPreviewLimit int
+
 	// 任务注册表，按 HandlerKey（Type，回退 Name）绑定Handler（用于从持久化恢复）
 	handlers map[string]Handler
 
@@ -91,8 +96,10 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 		handlers:    make(map[string]Handler),
 		cancelMap:   make(map[string]context.CancelFunc),
 		forcedPause: make(map[string]struct{}),
-		eventBus:    eventBus,
-		logger:      resolveLogger(settings.logger),
+		// 预览上限默认取配置默认值：不装配执行器的程序也一样，事件里的预览不会没头没尾。
+		eventPreviewLimit: DefaultExecInlinePreview,
+		eventBus:          eventBus,
+		logger:            resolveLogger(settings.logger),
 	}
 }
 
@@ -126,6 +133,26 @@ func (s *Scheduler) SetQueueCapacity(n int) {
 		return
 	}
 	s.queueCapacity = n
+}
+
+// SetEventPreviewLimit 设置完成/失败事件里输出预览的字节上限，需在 Start 之前调用。
+// 取值来自 executors.output.inline_preview，由装配方传入；传入非正数时回退到
+// DefaultExecInlinePreview，避免一次配置笔误让事件里连一行摘要都不剩。
+//
+// 只传一个字节数而不是传配置结构：core 不依赖执行器包，而事件是这里发的，
+// 尺寸限制必须由发事件的一方执行，否则两条限制会各算各的。
+func (s *Scheduler) SetEventPreviewLimit(n int) {
+	if n <= 0 {
+		n = DefaultExecInlinePreview
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		s.logger.Warn("SetEventPreviewLimit ignored: scheduler already running", "inline_preview", n)
+		return
+	}
+	s.eventPreviewLimit = n
 }
 
 // RegisterHandler 注册任务类型对应的处理函数
@@ -997,6 +1024,7 @@ func (s *Scheduler) executeJob(job *Job) {
 			JobName:   job.Name,
 			Status:    StatusSuccess,
 			Timestamp: time.Now(),
+			Data:      s.eventData(job, nil),
 			Metadata: map[string]interface{}{
 				"duration_ms": time.Since(job.UpdatedAt).Milliseconds(),
 			},
@@ -1015,14 +1043,13 @@ func (s *Scheduler) executeJob(job *Job) {
 	timedOut := errors.Is(err, context.DeadlineExceeded) || errors.Is(execCtx.Err(), context.DeadlineExceeded)
 
 	// 发布失败事件
-	errData, _ := json.Marshal(map[string]string{"error": err.Error()})
 	s.eventBus.Publish(Event{
 		Type:      EventJobFailed,
 		JobID:     job.ID,
 		JobName:   job.Name,
 		Status:    StatusFailed,
 		Timestamp: time.Now(),
-		Data:      errData,
+		Data:      s.eventData(job, err),
 		Metadata: map[string]interface{}{
 			"retry_count": job.RetryCount,
 			"max_retries": job.MaxRetries,
@@ -1036,6 +1063,48 @@ func (s *Scheduler) executeJob(job *Job) {
 		s.logger.Error("job failed", "job_id", job.ID, "error", err)
 	}
 	s.handleFailure(job)
+}
+
+// eventData 组装事件的附加数据：失败时带 error，有执行结论时带 result，
+// 两者都没有则返回 nil（事件的 data 字段是 omitempty，于是整个键不出现在 JSON 里）。
+// 只带 error 时的输出与改动前逐字节一致——既有测试断言的就是那份形状。
+func (s *Scheduler) eventData(job *Job, failure error) json.RawMessage {
+	fields := make(map[string]interface{}, 2)
+	if failure != nil {
+		fields["error"] = failure.Error()
+	}
+	if summary, ok := s.eventResult(job); ok {
+		fields["result"] = summary
+	}
+	if len(fields) == 0 {
+		return nil
+	}
+
+	// ExecMeta 的字段全是可以编码的标量，这里不会失败；忽略错误与既有事件发布处一致。
+	data, _ := json.Marshal(fields)
+	return data
+}
+
+// eventResult 取出要放进事件的执行结论摘要。第二个返回值为 false 表示这次执行没有结论：
+// 不是执行器任务，或处理器没写 Job.Exec。
+//
+// 预览按 eventPreviewLimit 再裁一次：摘要落盘之后配置可能已经改小，而一条事件会推给
+// 全部订阅者并在内存缓冲里留着。裁剪前先复制——同一个 ExecMeta 对象也被任务快照引用，
+// 直接改它会改到接口读到的内容。
+func (s *Scheduler) eventResult(job *Job) (ExecMeta, bool) {
+	if job.Exec == nil {
+		return ExecMeta{}, false
+	}
+
+	s.mu.RLock()
+	limit := s.eventPreviewLimit
+	s.mu.RUnlock()
+
+	summary := *job.Exec
+	if limit > 0 && len(summary.Preview) > limit {
+		summary.Preview = TrimExecPreview(summary.Preview, limit)
+	}
+	return summary, true
 }
 
 // handleInterrupted 处理"执行被打断"：既不记为失败，也不消耗重试次数。

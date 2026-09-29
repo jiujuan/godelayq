@@ -34,10 +34,7 @@ func NewResult(profile *Profile) *Result {
 // 取哪条流：stdout 非空就取 stdout，否则取 stderr。脚本失败时往往只有 stderr 有内容，
 // 列表与事件里那一行摘要要靠它说明"为什么失败"。
 // limit <= 0 表示不带预览，Preview 置空。
-//
-// 裁剪按字符边界：直接从尾部数 limit 字节会把一个多字节字符切成一半，
-// 接口里就会出现替换字符；所以切完之后跳过开头的 continuation 字节，
-// 保证预览从一个完整字符开始。结果只会比 limit 短，不会更长。
+// 裁剪规则（含字符边界处理）见 core.TrimExecPreview。
 func (r *Result) SetPreview(limit int) {
 	if limit <= 0 {
 		r.Meta.Preview = ""
@@ -48,18 +45,16 @@ func (r *Result) SetPreview(limit int) {
 	if len(source) == 0 {
 		source = r.Stderr
 	}
-	r.Meta.Preview = string(tailWithinLimit(source, limit))
+	r.Meta.Preview = core.TrimExecPreview(string(source), limit)
 }
 
 // TrimPreview 返回 text 尾部最多 limit 字节，起点落在字符边界上；limit <= 0 返回空串。
 //
-// 导出是因为接口在把摘要透出去之前要用同一条规则再裁一次（TASK-E05）：
-// 两边各写一份裁剪实现，迟早会算出不一样长的预览。
+// 规则本身在 core（core.TrimExecPreview）：执行侧写预览、事件侧再裁一次、接口侧透出去之前
+// 还要再裁一次，三处必须算出同样长的字符串，各写一遍迟早分叉。
+// 这里保留导出名，api 层照旧调它。
 func TrimPreview(text string, limit int) string {
-	if limit <= 0 {
-		return ""
-	}
-	return string(tailWithinLimit([]byte(text), limit))
+	return core.TrimExecPreview(text, limit)
 }
 
 // Truncate 把两条流各自裁剪到 maxBytes 并记账：
