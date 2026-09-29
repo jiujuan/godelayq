@@ -4,6 +4,12 @@
 自动查找，文件不存在则使用代码默认值。任何键都可以用环境变量覆盖，前缀 `GODELAYQ_`、
 层级用下划线连接（如 `GODELAYQ_SERVER_PORT=9090`、`GODELAYQ_SCHEDULER_WORKERS=32`）。
 
+仓库里入库的是模板 `configs/config.example.yaml`；`configs/config.yaml` 已被 `.gitignore`
+排除，部署前先 `cp configs/config.example.yaml configs/config.yaml` 再填凭据。
+两份的键由 `core.TestExampleConfigMatchesLocal` 钉住，改一份就要同步另一份。
+生产机器上更省事的做法是干脆不放这个文件：全部键都能走环境变量，凭据交给
+`EnvironmentFile` 或编排系统注入。
+
 ```bash
 ./godelayq-server -config=/etc/godelayq/config.yaml
 ```
@@ -120,9 +126,11 @@ go build -tags dashboard -o godelayq-server ./cmd/server
 1. 启用鉴权。两种凭据可以并存：
    - **控制台账号** `server.auth.users`：只存 bcrypt 哈希（`go run ./cmd/hashpassword` 生成，
      cost 至少 10），配 `server.auth.jwt.secret` 签发 JWT。哈希写进配置文件是可以的（它不可逆），
-     **签名密钥不要落盘**：用 `GODELAYQ_SERVER_AUTH_JWT_SECRET` 注入，systemd 下放进
-     `EnvironmentFile=/etc/godelayq/auth.env`（权限 0600）。轮换密钥会让全部已发令牌立即失效，
-     所有人都要重新登录。账号本身不支持环境变量覆盖，增删账号需重启进程。
+     **签名密钥不要落盘**：先用 `go run ./cmd/gensecret` 生成（密钥走 stdout，赋值语句走 stderr，
+     `export X=$(go run ./cmd/gensecret)` 拿到的是纯密钥），再用 `GODELAYQ_SERVER_AUTH_JWT_SECRET`
+     注入，systemd 下放进 `EnvironmentFile=/etc/godelayq/auth.env`（权限 0600）。
+     轮换密钥会让全部已发令牌立即失效，所有人都要重新登录。账号本身不支持环境变量覆盖，
+     增删账号需重启进程。
    - **静态 token** `server.auth.token`：给脚本与 CI 用的全局口令，身份是 `machine`
      （能读写任务，没有 admin/ops 能力）。同样优先用 `GODELAYQ_SERVER_AUTH_TOKEN` 注入。
 2. 按人分配角色（`viewer`/`operator`/`admin`/`ops`）。最小可用的一组通常是：一个 `ops` 给值班、

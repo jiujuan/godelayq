@@ -1,1 +1,4 @@
 .vscode
+
+# 实际运行配置含本机凭据，入库的是同结构的 config.example.yaml
+configs/config.yaml

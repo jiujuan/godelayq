@@ -1,4 +1,11 @@
-# godelayq 运行配置
+# godelayq 运行配置模板（入库的就是这一份）
+# 本文件不含任何真实凭据，可以提交；实际的运行配置是同级目录下的 config.yaml，
+# 那份已被 .gitignore 排除，克隆仓库后先复制一份再填凭据：
+#   cp configs/config.example.yaml configs/config.yaml
+#
+# 两份文件的键必须一一对应：改了任意一份的键（增删、重命名、调层级），
+# 就要同步另一份，core.TestExampleConfigMatchesLocal 会在漏改时报错。
+#
 # 通过 ./godelayq-server -config=configs/config.yaml 指定；
 # 留空时按 ./configs/config.yaml 自动查找，文件不存在则使用代码默认值。
 #

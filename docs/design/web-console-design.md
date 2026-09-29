@@ -986,8 +986,11 @@ var dist embed.FS
 5. **账号写在配置文件里**：加/停用户要重启进程；无密码策略、无锁定、无自助改密。
    在线用户管理（`data/users.json` + bcrypt 重写）是明确的二期。
 6. **密钥轮换**：`server.auth.jwt.secret` 一改，所有已发 token 立刻失效；生产必须走
-   `GODELAYQ_SERVER_AUTH_JWT_SECRET`，禁止把明文密钥提交进 `configs/config.yaml`
-   （该文件已入库，需在注释里显式警告）。
+   `GODELAYQ_SERVER_AUTH_JWT_SECRET`（密钥用 `go run ./cmd/gensecret` 生成），禁止把明文密钥
+   写进配置文件。落地时把 `configs/config.yaml` 整个移出版本库（`.gitignore`），
+   入库的只有同结构的 `configs/config.example.yaml`，两份键由
+   `core.TestExampleConfigMatchesLocal` 比对——原来"文件入库、靠注释警告"的写法，
+   只要有人图省事在本机填一次真凭据，`git add -A` 就会把它推出去。
 7. **EventHistory 内存上限**：2000 job × 100 条 Event 粗估 <10MB，可接受；如需上限
    可调再开配置。
 8. **Query 失效风暴**：高频事件下 debounce 策略（500ms 合并）需在实现时压测一次。

@@ -180,7 +180,7 @@ godelayq/
 │       └── styles/           # tokens.css：蓝白灰主题变量
 │
 ├── configs/
-│   └── config.yaml           # 运行配置样例
+│   └── config.example.yaml   # 运行配置模板（入库的就是这一份；本机那份含凭据、已 gitignore）
 │
 ├── job_queue/                # 目录加载器的示例任务文件（demo2 监控此目录）
 ├── data/                     # 默认 store.path 的数据文件（仓库内是空占位）
@@ -282,6 +282,9 @@ cd godelayq
 # 下载依赖
 go mod download
 
+# 准备本机配置（含凭据的那份不入库，仓库里只有模板）
+cp configs/config.example.yaml configs/config.yaml
+
 # 编译
 go build -o godelayq-server ./cmd/server
 
@@ -291,6 +294,11 @@ go build -o godelayq-server ./cmd/server
 # 使用配置文件（留空则自动查找 configs/config.yaml，找不到就用代码默认值）
 ./godelayq-server -config=configs/config.yaml
 ```
+
+`configs/config.yaml` 由 `.gitignore` 排除：它装着静态 token、JWT 签名密钥与控制台账号，
+提交就等于把凭据推到公开仓库。入库的是同结构的 `configs/config.example.yaml`，
+两份的键由 `core.TestExampleConfigMatchesLocal` 比对，改任意一份都要同步另一份。
+不复制模板也能跑——文件不存在时进程用代码默认值，只是鉴权处于关闭状态。
 
 ### 前端控制台的两种部署形态
 

@@ -1,12 +1,15 @@
 package core
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/spf13/viper"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -397,4 +400,37 @@ func TestConfig_NormalizedFillsJWTDefaults(t *testing.T) {
 	kept := normalized
 	kept.Server.Auth.JWT.AccessTTL = time.Minute
 	assert.Equal(t, time.Minute, kept.Normalized().Server.Auth.JWT.AccessTTL)
+}
+
+// TestExampleConfigMatchesLocal 钉住 config.yaml 与 config.example.yaml 的键集合。
+// 前者含本机凭据、已被 .gitignore 排除，两份只能靠人肉同步，而漂移在运行期没有任何征兆：
+// 模板少一个键，新人照它配出来的进程就静默用着默认值；反过来模板多一个键，
+// UnmarshalExact 会让对方一启动就报"未知键"。
+func TestExampleConfigMatchesLocal(t *testing.T) {
+	const example = "../configs/config.example.yaml"
+	const local = "../configs/config.yaml"
+
+	if _, err := os.Stat(local); err != nil {
+		t.Skipf("本机没有 %s（克隆后需 cp configs/config.example.yaml configs/config.yaml），跳过比对", local)
+	}
+
+	exampleKeys, err := configKeys(example)
+	require.NoError(t, err)
+	localKeys, err := configKeys(local)
+	require.NoError(t, err)
+
+	assert.Equal(t, exampleKeys, localKeys, "两份配置的键不一致，按提示补齐另一份")
+}
+
+// configKeys 返回配置文件里全部叶子键的扁平路径，已排序好做集合比较。
+func configKeys(path string) ([]string, error) {
+	v := viper.New()
+	v.SetConfigFile(path)
+	if err := v.ReadInConfig(); err != nil {
+		return nil, fmt.Errorf("read %s failed: %w", path, err)
+	}
+
+	keys := v.AllKeys()
+	sort.Strings(keys)
+	return keys, nil
 }
