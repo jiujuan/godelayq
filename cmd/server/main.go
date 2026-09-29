@@ -113,7 +113,11 @@ func main() {
 	slog.SetDefault(logger)
 
 	if err := run(defaultRuntimeDeps(cfg, logger)); err != nil {
-		log.Fatal(err)
+		// Go 1.26 起标准库 log 桥接到 slog.Default()：走 log.Fatal 只会留下一条
+		// 级别为 INFO 的记录，按 level=error 采集的告警不会触发。
+		// 所以先用配置好的日志器按 error 级记一次，退出码由 os.Exit 给出。
+		logger.Error("server exited with error", "error", err)
+		os.Exit(1)
 	}
 }
 
