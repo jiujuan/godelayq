@@ -41,6 +41,11 @@ type Submission struct {
 
 	// Timeout 是 payload 请求的单次执行超时，写法同 Go 的时长字面量（"90s"）。
 	Timeout string
+
+	// TimeoutValue 是 Timeout 解析之后的时长，0 表示 payload 没请求。
+	// 单列一个字段而不是让执行侧把文本再解析一遍：写法与上限已在同一次校验里判过，
+	// 解析在这里不可能失败，执行侧拿到的是判过上限的那个值。
+	TimeoutValue time.Duration
 }
 
 // positionalKey 是 args 里承载位置参数的保留键。它不是档位能声明的参数名
@@ -144,10 +149,13 @@ func ValidateSubmission(p *Profile, payload []byte) (*Submission, error) {
 		}
 	}
 
-	// 超时的两条规则在同一次解析里检查：写法是否合法、有没有超过档位允许的上限
-	if err := checkTimeoutWithinProfile(p, sub.Timeout); err != nil {
+	// 超时的两条规则在同一次解析里检查：写法是否合法、有没有超过档位允许的上限。
+	// 解析结果留在 Submission 里给执行侧用，文本与值不各解析一遍。
+	requested, err := checkTimeoutWithinProfile(p, sub.Timeout)
+	if err != nil {
 		return nil, err
 	}
+	sub.TimeoutValue = requested
 	return sub, nil
 }
 
@@ -403,15 +411,18 @@ func ParseTimeout(raw string) (time.Duration, error) {
 // 调用方以为自己的 10 分钟生效了、实际 5 分钟被杀，比当场拒绝更难解释。
 // 档位自身的 timeout 已在加载时被夹进全局 max_timeout（见 effectiveTimeout），
 // 所以和档位比一次就同时守住了上限。
-func checkTimeoutWithinProfile(p *Profile, raw string) error {
+//
+// 返回第二个值是想让调用方少解析一次：写法合法与不超过上限都判过了，
+// 这个时长就是可以用的。
+func checkTimeoutWithinProfile(p *Profile, raw string) (time.Duration, error) {
 	requested, err := ParseTimeout(raw)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	if requested > p.Timeout {
-		return fmt.Errorf("timeout %v exceeds the %v allowed by profile %q", requested, p.Timeout, p.Name)
+		return 0, fmt.Errorf("timeout %v exceeds the %v allowed by profile %q", requested, p.Timeout, p.Name)
 	}
-	return nil
+	return requested, nil
 }
 
 // EffectiveTimeout 合成一次执行真正生效的超时：payload 请求值优先，其次档位声明值，
@@ -420,13 +431,20 @@ func checkTimeoutWithinProfile(p *Profile, raw string) error {
 // 结果永远大于 0——"没填超时"不等于"无限运行"（设计文档 §2 的 D5）：
 // 一个没有期限的子进程会一直占着执行池的名额，取消不掉也等不到结论。
 func (p *Profile) EffectiveTimeout(requested time.Duration, cfg core.Config) time.Duration {
-	normalized := cfg.Normalized()
+	return p.timeoutWithin(cfg.Normalized().Executors, requested)
+}
 
-	floor := normalized.Executors.DefaultTimeout
+// timeoutWithin 是 EffectiveTimeout 的实现，入参已经是归一化过的那一节配置。
+//
+// 执行侧（TASK-E09）手上只有 core.ExecutorsConfig——装配时整份配置归一化过一次，
+// 再传 core.Config 进来只会让同一条归一化逻辑跑两遍。两条路径的合成规则必须一致，
+// 所以这里只拆参数，不复制规则。
+func (p *Profile) timeoutWithin(ec core.ExecutorsConfig, requested time.Duration) time.Duration {
+	floor := ec.DefaultTimeout
 	if floor <= 0 {
 		floor = core.DefaultExecDefaultTimeout
 	}
-	ceiling := normalized.Executors.MaxTimeout
+	ceiling := ec.MaxTimeout
 	if ceiling <= 0 {
 		ceiling = core.DefaultExecMaxTimeout
 	}

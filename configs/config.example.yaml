@@ -86,7 +86,8 @@ executors:
   runtime_allow: [bash, sh, cmd, pwsh, node, php, python, java]
   # 传给子进程的环境变量键名白名单。GODELAYQ_ 前缀的键即使在列表里也会被强制排除：
   # 服务端的 token 与 JWT 密钥就存放在进程环境的 GODELAYQ_* 里。
-  # Windows 上建议补 SystemRoot、COMSPEC、PATHEXT，否则部分解释器起不来。
+  # Windows 的 SystemRoot、COMSPEC、PATHEXT 与 PATH 由执行器无条件透传（子进程启动必需的最小集），
+  # 再写一遍到本列表里是正常配置，不是多余项，也不是漏洞。
   env_allow: [PATH, LANG, LC_ALL, TZ, HOME]
   # 执行器专用执行池的协程数，与 scheduler.workers 分池：
   # 共池时分钟级的脚本会长时间占住共享执行名额。留空/删掉本项用默认 4；

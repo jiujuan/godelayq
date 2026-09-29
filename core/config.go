@@ -390,6 +390,9 @@ func (e ExecutorsConfig) Validate() error {
 	if err := checkExecNameList("env_allow", e.EnvAllow); err != nil {
 		return err
 	}
+	// 这里的键名不检查大小写：执行侧按折大小写的方式比较（Windows 的环境变量名不区分大小写），
+	// 并且无条件透传 SystemRoot/COMSPEC/PATHEXT/PATH 这几个子进程启动必需的键。
+	// 把它们再写一遍进 env_allow 是正常配置，不是安全漏洞；本节关于环境变量的红线只有下面那条。
 	for _, key := range e.EnvAllow {
 		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(key)), "GODELAYQ_") {
 			// 服务端的凭据与 JWT 密钥都以 GODELAYQ_ 前缀出现在进程环境里，

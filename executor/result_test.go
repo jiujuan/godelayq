@@ -36,20 +36,20 @@ func TestSetPreview_TailAtCharBoundary(t *testing.T) {
 }
 
 func TestSetPreview_PicksSourceAndLimits(t *testing.T) {
-	t.Run("stdout 为空时用 stderr", func(t *testing.T) {
-		result := &Result{Stderr: []byte("runtime error: exit status 71")}
+	t.Run("stderr 非空时优先用它", func(t *testing.T) {
+		result := &Result{Stdout: []byte("partial progress"), Stderr: []byte("runtime error: exit status 71")}
 		result.SetPreview(200)
 		assert.Equal(t, "runtime error: exit status 71", result.Meta.Preview)
 	})
 
-	t.Run("stdout 非空时不看 stderr", func(t *testing.T) {
-		result := &Result{Stdout: []byte("ok"), Stderr: []byte("noise")}
+	t.Run("stderr 为空时回落到 stdout", func(t *testing.T) {
+		result := &Result{Stdout: []byte("ok")}
 		result.SetPreview(200)
 		assert.Equal(t, "ok", result.Meta.Preview)
 	})
 
 	t.Run("比上限短就整段保留", func(t *testing.T) {
-		result := &Result{Stdout: []byte("short output")}
+		result := &Result{Stderr: []byte("short output")}
 		result.SetPreview(2048)
 		assert.Equal(t, "short output", result.Meta.Preview)
 	})
@@ -68,6 +68,19 @@ func TestSetPreview_PicksSourceAndLimits(t *testing.T) {
 		result.SetPreview(64)
 		assert.Empty(t, result.Meta.Preview)
 	})
+}
+
+// TestChoosePreview 直接钉住选择规则本身：执行侧从产物文件取两条流的尾部后调它，
+// 摘要里那一行到底是 stdout 还是 stderr 由这里决定（TASK-E09 §3.5）。
+func TestChoosePreview(t *testing.T) {
+	assert.Equal(t, "boom", ChoosePreview([]byte("running"), []byte("boom"), 64))
+	assert.Equal(t, "running", ChoosePreview([]byte("running"), nil, 64))
+	assert.Empty(t, ChoosePreview(nil, nil, 64))
+	assert.Empty(t, ChoosePreview([]byte("running"), []byte("boom"), 0))
+
+	// 裁剪与字符边界由 core 的同一套规则负责，这里不重复实现
+	assert.Equal(t, "6789", ChoosePreview(nil, []byte("0123456789"), 4))
+	assert.Equal(t, "好", ChoosePreview(nil, []byte("请你看你好"), 3))
 }
 
 func TestTruncate_SetsFlag(t *testing.T) {

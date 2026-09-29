@@ -1,8 +1,6 @@
 package executor
 
 import (
-	"unicode/utf8"
-
 	"godelayq/core"
 )
 
@@ -31,21 +29,31 @@ func NewResult(profile *Profile) *Result {
 
 // SetPreview 把输出尾部（最多 limit 字节）写进 Meta.Preview。
 //
-// 取哪条流：stdout 非空就取 stdout，否则取 stderr。脚本失败时往往只有 stderr 有内容，
-// 列表与事件里那一行摘要要靠它说明"为什么失败"。
+// 取哪条流：stderr 优先，它为空时才用 stdout。理由见 ChoosePreview。
 // limit <= 0 表示不带预览，Preview 置空。
 // 裁剪规则（含字符边界处理）见 core.TrimExecPreview。
 func (r *Result) SetPreview(limit int) {
+	r.Meta.Preview = ChoosePreview(r.Stdout, r.Stderr, limit)
+}
+
+// ChoosePreview 在两条流的尾部文本之间做选择并裁到 limit 字节。
+//
+// 执行器采集到的两条流都会完整落盘，摘要里只放得下一条，而"这一行字要解释为什么失败"：
+// 脚本失败时最有用的信息几乎都在 stderr，所以它优先，stdout 只在 stderr 为空时补位。
+// 进程根本没跑起来时两条都为空，预览也就为空——错误文本在 ExitError 里，不在这里。
+//
+// 入参是已经取好的尾部（执行侧从产物文件反向读 limit 字节），本函数只负责选一条再裁一次。
+// limit <= 0 返回空串。
+func ChoosePreview(stdout, stderr []byte, limit int) string {
 	if limit <= 0 {
-		r.Meta.Preview = ""
-		return
+		return ""
 	}
 
-	source := r.Stdout
+	source := stderr
 	if len(source) == 0 {
-		source = r.Stderr
+		source = stdout
 	}
-	r.Meta.Preview = core.TrimExecPreview(string(source), limit)
+	return core.TrimExecPreview(string(source), limit)
 }
 
 // TrimPreview 返回 text 尾部最多 limit 字节，起点落在字符边界上；limit <= 0 返回空串。
@@ -77,17 +85,4 @@ func (r *Result) Truncate(maxBytes int) {
 
 	r.Meta.OutBytes = int64(len(r.Stdout))
 	r.Meta.ErrBytes = int64(len(r.Stderr))
-}
-
-// tailWithinLimit 返回 data 的尾部最多 limit 个字节，起点落在字符边界上。
-func tailWithinLimit(data []byte, limit int) []byte {
-	if len(data) <= limit {
-		return data
-	}
-
-	tail := data[len(data)-limit:]
-	for len(tail) > 0 && !utf8.RuneStart(tail[0]) {
-		tail = tail[1:]
-	}
-	return tail
 }
