@@ -39,10 +39,12 @@
 3. 文件权限：`jobs.json` 与 `data/exec/` 里的产物都会包含任务参数与输出，可能含敏感值；按凭据文件的等级设权限（`0640` 起），并说明"参数掩码只作用于 HTTP 响应，不作用于磁盘"（E16 的结论）。
 4. 时长关系：`scheduler.shutdown_timeout` 建议 ≥ 10 秒，因为取消执行器任务需要"终止 + 宽限 + 等待输出收尾"三段（E10 的结论），5 秒默认值下关闭会被拖到强制退出。
 5. Windows 限制：`taskkill /T /F` 不是原子操作，极端情况下可能有派生进程残留（E11 第 3.3 条），彻底方案是 Job Object，尚未实现。
-6. `deny_private_ranges: false` 只允许在开发机使用；关闭后 HTTP 档位可以访问回环与内网。
-7. `restore_policy: pause` 的运维含义：崩溃后会出现一批 `paused` 的执行器任务，需要人工确认后恢复（E14），并给出确认与批量恢复的操作步骤（`POST /jobs/batch-ops`）。
-8. 保留策略：`executors.output.ttl` 与 `store.history_ttl`、`history_limit` 的配对建议（E06 第 9 条：`history_limit: -1` 时产物会在下次启动的孤儿清理中被删）。
-9. 反向代理注意事项沿用现有章节，补一句：`/api/v1/jobs/:id/result` 的响应不缓存（`no-store`），不要把 `/api` 整体配成可缓存。
+6. Windows 的输出编码：控制台程序写出的文本是系统本地代码页（中文 Windows 是 GBK），产物文件按原样字节保存，因此接口与 `meta.json` 里的尾部预览会把非 UTF-8 字节显示成替换字符（E11 第 10 节第 11 条）。要么在文档里给出"用 `chcp 65001` 或在脚本里重定向编码"的口径，要么按档位声明代码页转码——本卡只做文档，转码需求若要实现就开新任务卡。
+7. Windows 的 `script` 档位限制：`cmd`、`pwsh` 这类解释器必须带 `/c`、`-File` 之类的开关才会执行文件，而 `script` 档位生成的命令行是 `[解释器, 脚本路径]`（E11 第 10 节第 9 条）。当前可用写法是 `kind: binary` + `fixed_args: [/c, 脚本名]`，文档要写明这条差异，并说明参数形状的改造归后续任务卡。
+8. `deny_private_ranges: false` 只允许在开发机使用；关闭后 HTTP 档位可以访问回环与内网。
+9. `restore_policy: pause` 的运维含义：崩溃后会出现一批 `paused` 的执行器任务，需要人工确认后恢复（E14），并给出确认与批量恢复的操作步骤（`POST /jobs/batch-ops`）。
+10. 保留策略：`executors.output.ttl` 与 `store.history_ttl`、`history_limit` 的配对建议（E06 第 9 条：`history_limit: -1` 时产物会在下次启动的孤儿清理中被删）。
+11. 反向代理注意事项沿用现有章节，补一句：`/api/v1/jobs/:id/result` 的响应不缓存（`no-store`），不要把 `/api` 整体配成可缓存。
 
 ### 3.3 `README.md`
 
