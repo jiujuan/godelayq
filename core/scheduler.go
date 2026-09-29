@@ -210,14 +210,18 @@ func (s *Scheduler) Schedule(job *Job) error {
 		job.TriggerAt = next
 	}
 
-	s.heap.PushItem(job)
-
-	// 持久化
+	// 持久化必须在入堆之前：任务一进堆就可能被 worker 取走，worker 会就地改写
+	// Status/Attempts/UpdatedAt（executeJob 开头那三行），而快照是这些字段的读取方。
+	// 反过来先入堆再落盘，等于允许"执行中的任务被同一个指针读一次状态"，
+	// -race 下会在 Resume→Schedule 这条路径上判为数据竞争（同一指针，两个协程）。
+	// 落盘失败只记日志、照常入堆，与之前的容错口径一致。
 	if s.store != nil {
 		if err := s.store.Save(job); err != nil {
 			s.logger.Error("failed to persist job", "job_id", job.ID, "error", err)
 		}
 	}
+
+	s.heap.PushItem(job)
 
 	// 通知调度循环可能有更早的任务
 	s.notifyNewJob()
