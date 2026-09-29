@@ -2,7 +2,7 @@
 /* 任务表格：列与行操作按 §4.6 的口径来，能力的有无一律由调用方按角色传入。
    这里只负责"置灰 + 悬浮说明缺哪一档"，真正拦住越权请求的是服务端 RBAC。 */
 import { computed } from 'vue'
-import { Eye, Loader, Pencil, RotateCcw, SkipForward, SquarePen, Trash2 } from 'lucide-vue-next'
+import { FileText, Loader, Pencil, RotateCcw, SkipForward, SquarePen, Trash2 } from 'lucide-vue-next'
 import JobStatusBadge from './JobStatusBadge.vue'
 import type { Job, JobStatus } from '../../api/types'
 import { formatDateTime, shortJobId } from '../../display'
@@ -13,7 +13,7 @@ type ActionKey = 'open' | 'edit' | 'pause' | 'resume' | 'cancel' | 'retry' | 'fo
 interface RowAction {
   key: ActionKey
   label: string
-  icon: typeof Eye
+  icon: typeof FileText
   /** write = operator 档；force = admin 档 */
   tier: 'none' | 'write' | 'force'
   danger?: boolean
@@ -21,26 +21,25 @@ interface RowAction {
 
 // 状态决定"能做什么"，与后端 jobOpFailure 的 409 口径一致：
 // running 不给 pause（要中断就走 force-pause），paused 只给恢复与取消。
+// 详情对所有状态常驻：它是只读入口，viewer 就该能看，不该被状态或角色挡在外面。
+const DETAIL: RowAction = { key: 'open', label: '详情', icon: FileText, tier: 'none' }
+
 const ACTIONS: Record<JobStatus, RowAction[]> = {
   pending: [
+    DETAIL,
     { key: 'edit', label: '编辑', icon: Pencil, tier: 'write' },
     { key: 'pause', label: '暂停', icon: SkipForward, tier: 'write' },
     { key: 'cancel', label: '取消', icon: Trash2, tier: 'write', danger: true },
   ],
   paused: [
+    DETAIL,
     { key: 'resume', label: '恢复', icon: RotateCcw, tier: 'write' },
     { key: 'cancel', label: '取消', icon: Trash2, tier: 'write', danger: true },
   ],
-  running: [
-    { key: 'open', label: '查看', icon: Eye, tier: 'none' },
-    { key: 'force-pause', label: '强制暂停', icon: SquarePen, tier: 'force' },
-  ],
-  failed: [
-    { key: 'retry', label: '重试', icon: RotateCcw, tier: 'write' },
-    { key: 'open', label: '查看', icon: Eye, tier: 'none' },
-  ],
-  success: [{ key: 'open', label: '查看', icon: Eye, tier: 'none' }],
-  cancelled: [{ key: 'open', label: '查看', icon: Eye, tier: 'none' }],
+  running: [DETAIL, { key: 'force-pause', label: '强制暂停', icon: SquarePen, tier: 'force' }],
+  failed: [DETAIL, { key: 'retry', label: '重试', icon: RotateCcw, tier: 'write' }],
+  success: [DETAIL],
+  cancelled: [DETAIL],
 }
 
 interface Props {
