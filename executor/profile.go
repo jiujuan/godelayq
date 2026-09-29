@@ -495,6 +495,12 @@ func checkArgs(declared []core.ExecutorArg, index int, name string) ([]ArgSpec, 
 			return nil, profileError(index, name,
 				"args[%d] name %q must be lower-case letters, digits or underscore", i, arg.Name)
 		}
+		if argName == positionalKey {
+			// 保留键给位置参数用（见 args.go 的 takePositional）。允许声明这个名字的话，
+			// 一个数组值会撞上"具名参数的值只能是字符串或数字"这条规则，报错看不出为什么。
+			return nil, profileError(index, name,
+				"args[%d] %q is reserved for positional values and cannot be declared", i, argName)
+		}
 		if seen[argName] {
 			return nil, profileError(index, name, "args[%d] %q is declared twice", i, argName)
 		}
