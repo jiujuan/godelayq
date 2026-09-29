@@ -9,7 +9,8 @@ import (
 	"github.com/spf13/viper"
 )
 
-// DefaultConfigPath 是约定的配置文件位置
+// DefaultConfigPath 是约定的配置文件位置。它已被 .gitignore 排除（装着本机凭据），
+// 入库的模板是同目录的 config.example.yaml；文件不存在不是错误，进程按代码默认值启动。
 const DefaultConfigPath = "configs/config.yaml"
 
 // 控制台令牌的默认有效期。访问令牌取短，靠 refresh 续期，缩短被盗用窗口。
