@@ -24,6 +24,90 @@ export interface Job {
   updated_at: string
   /** 后端算好的剩余时长；仅 pending 有值 */
   next_run_in?: string
+  /** 最近一次执行的结论摘要；非执行器任务没有这个字段 */
+  exec?: ExecMeta
+}
+
+/** 一次执行的结论摘要（core.ExecMeta）。输出正文不在这里，走 /jobs/:id/result */
+export interface ExecMeta {
+  kind: 'script' | 'binary' | 'http' | string
+  /** 档位名，不含 exec. 前缀 */
+  profile: string
+  exit_code?: number
+  /** 终止进程的信号名，正常退出为空 */
+  signal?: string
+  http_status?: number
+  duration_ms: number
+  out_bytes: number
+  err_bytes: number
+  /** 任一流超过落盘上限，后面的内容没被采集 */
+  truncated?: boolean
+  /** 参数或脚本本身的问题，重试不会变好 */
+  permanent?: boolean
+  /** 输出尾部预览，字节上限由 executors.output.inline_preview 控制 */
+  preview?: string
+  /** available=文件还在 | purged=已被清理 | 缺省=还没有产物可言 */
+  artifact?: 'available' | 'purged' | ''
+}
+
+/** GET /jobs/:id/result（JobResultResponse） */
+export interface JobResultResponse {
+  job_id: string
+  attempt: number
+  stream: 'out' | 'err'
+  /** false 表示产物文件已经不在了，不代表"这次执行没有输出" */
+  found: boolean
+  /** 文件里的总量，与本次返回的字节数可以不同 */
+  size_bytes: number
+  returned_bytes: number
+  truncated: boolean
+  /** 该次尝试的结论摘要；非执行器任务为 null */
+  meta: ExecMeta | null
+  content: string
+}
+
+/** GET /jobs/:id/result 的查询参数，省略即取后端默认值 */
+export interface JobResultQuery {
+  /** 省略表示最近一次已结束的尝试 */
+  attempt?: number
+  stream?: 'out' | 'err'
+  from?: 'tail' | 'head'
+  max_bytes?: number
+}
+
+/** GET /executors 里的一条档位声明（ExecutorProfileResponse） */
+export interface ExecutorProfile {
+  /** 注册键，形如 exec nightly_report */
+  key: string
+  name: string
+  kind: 'script' | 'binary' | 'http' | string
+  /** 这台机器现在能不能跑（程序在不在 PATH、文件在不在） */
+  runtime_ok: boolean
+  /** runtime_ok=false 时的原因，可直接显示 */
+  reason: string
+  timeout: string
+  max_parallel: number
+  args: ExecutorArgSpec[]
+  /** 允许 payload 注入的环境变量键名；取值一律不外露 */
+  env_allow: string[]
+  /** 仅 http 档位有，给的是模板原文（含 {占位符}） */
+  url?: string
+}
+
+export interface ExecutorArgSpec {
+  name: string
+  required: boolean
+  default: string
+  pattern: string
+  /** 值属于凭据：不进日志、不进响应，表单要按密码框处理 */
+  secret: boolean
+}
+
+export interface ExecutorListResponse {
+  enabled: boolean
+  profiles: ExecutorProfile[]
+  /** 提交执行器任务的最低档位；后端在 TASK-E16 之前固定给 null */
+  required_role: string | null
 }
 
 export interface ListJobsResponse {
