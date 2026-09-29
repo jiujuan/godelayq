@@ -171,7 +171,8 @@ executors:
       kind: http
       method: POST
       url_template: "https://api.internal/v1/tenants/{tenant}/rebuild"
-      params: [ { name: tenant, pattern: '^[a-z0-9-]{1,32}$' } ]   # 禁 `/` `?` `#` `@` `..`
+      # URL 占位符仍然声明在 args 里（配置只有一套参数结构），payload 用 params 提供值
+      args: [ { name: tenant, required: true, pattern: '^[a-z0-9-]{1,32}$' } ]   # 禁 `/` `?` `#` `@` `..`
       allowed_hosts: ["api.internal"]
       headers: { "X-Source": ["godelayq"] }        # 固定
       header_allow: ["X-Trace-Id"]                 # payload 可覆盖的白名单
@@ -205,9 +206,20 @@ SSRF 防护必须在**拨号层**做，不是拼 URL 时做一次字符串判断
 
 ### 6.1 档位与注册（executor/profile.go、cmd/server/main.go）
 
-- `executor.LoadProfiles(cfg.Executors)` 做全部静态校验：name 合法且不冲突、`script`/`program` 解析后仍在 `workspace` 内（`filepath.Abs` + 前缀比较，拒 `..` 与符号链接逃逸）、`args_render` 引用的键都已声明、`env` 不含控制字符、timeout 落在 `[default,max]` 内。**任一项不过就启动失败**，与 `LoadConfig` 的"未知键即报错"同一口径。
+- 档位配置结构体定义在 `core/config.go`（`ExecutorCommand`/`ExecutorArg`/`ExecutorPositional`，与 `UserConfig`
+  等既有配置结构同处）；`executor.LoadProfiles(cfg core.Config)` 只做校验与解析，产出运行期 `Profile`。
+  方向固定为 `executor → core`，`core` 不依赖本包（TASK-E12 的 DoD 有断言）。
+  `LoadProfiles` 做全部静态校验：name 合法且不与其他档位重名、`script`/`program`/`cwd` 解析后仍在 `workspace` 内
+  （绝对路径、`..`、符号链接三种逃逸写法都拒；Windows 上 `filepath.IsAbs("/tmp/x")` 返回 false，
+  所以以分隔符开头的写法一律拒绝）、`args_render` 引用的键都已声明、正则能编译、
+  `env` 不含 `GODELAYQ_` 前缀、timeout 落在 `[default,max]` 内。**任一项不过就启动失败**，
+  与 `LoadConfig` 的"未知键即报错"同一口径。
+  文件是否存在、程序是否在 PATH 里属于探测（E03），不在这里让进程起不来；
+  与代码注册键的重名冲突属于注册环节（E04）。
 - `Register(s *core.Scheduler)` 为每个 profile 注册 `Handler` 闭包（`exec.<name>`），并 `RegisterHandlerClass(..., core.JobClassExec)`。
-- `Registry` 独立于注册表暴露给 api 层（`api.WithExecutorRegistry(r)`，缺失即 `/executors` 返回 503——照 `requireGroupStore` 的先例）。
+- `Registry` 独立于注册表暴露给 api 层（`api.WithExecutorRegistry(r)`）。未注入时 `GET /executors` 返回
+  `{"enabled":false,"profiles":[]}`——默认关闭不是错误态；只有真正需要读产物文件的
+  `GET /jobs/:id/result` 在未注入时才 503（照 `requireGroupStore` 的先例）。
 - `cmd/server/main.go` 的 `registerHandlers` 改为"示例 Handler + 配置档位"两部分；`executors.enabled: false` 时一个 `exec.` 键都不注册，`GET /job-types` 与提交侧行为回到今天的样子。
 
 ### 6.2 进程 runner（proc.go / proc_unix.go / proc_win.go）
