@@ -368,6 +368,25 @@ func (a *ArtifactStore) Exists(jobID string, attempt int) bool {
 	return err == nil && info.Mode().IsRegular()
 }
 
+// Stat 返回某个流已落盘的字节数；文件不存在时给出 ErrArtifactMissing。
+//
+// 接口需要它才能把"文件里一共多少"与"这次返回了多少"分开说清（TASK-E07 的 size_bytes）：
+// Read/Tail 只报告内容与是否截断，长度不足以还原原始大小。
+func (a *ArtifactStore) Stat(jobID string, attempt int, stream string) (int64, error) {
+	path, err := a.pathOf(jobID, attempt, stream)
+	if err != nil {
+		return 0, err
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, a.wrapOpenError(err, jobID, attempt, stream)
+	}
+	if !info.Mode().IsRegular() {
+		return 0, fmt.Errorf("artifact: job %s attempt %d stream %s is not a regular file", jobID, attempt, stream)
+	}
+	return info.Size(), nil
+}
+
 // Read 读取某个流的内容，最多 maxBytes 字节。
 //
 // 超限从头部保留、尾部去掉并置 truncated：看"这次执行开头在说什么"比看结尾更有用，

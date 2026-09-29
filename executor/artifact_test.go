@@ -304,6 +304,38 @@ func TestRead_MissingFileIsSentinel(t *testing.T) {
 	assert.ErrorIs(t, err, ErrArtifactMissing)
 }
 
+// TestStat 检查读侧的"文件里一共多少"：接口要把它与"这次返回了多少"分开说，
+// 而 Read/Tail 只报告内容与是否截断，长度还原不出原始大小。
+func TestStat(t *testing.T) {
+	store := artifactStoreFor(t, 1<<20, 0, nil)
+
+	writer, err := store.Open("job-stat", 2)
+	require.NoError(t, err)
+	_, err = writer.Stdout().Write([]byte("1234567890"))
+	require.NoError(t, err)
+	_, err = writer.Close()
+	require.NoError(t, err)
+
+	size, err := store.Stat("job-stat", 2, "out")
+	require.NoError(t, err)
+	assert.Equal(t, int64(10), size)
+
+	// 没写过的那条流文件是建出来的空文件：大小 0，不算缺失
+	size, err = store.Stat("job-stat", 2, "err")
+	require.NoError(t, err)
+	assert.Zero(t, size)
+
+	// 另一次尝试、不存在的任务、非法流名各自都要有明确答复
+	_, err = store.Stat("job-stat", 3, "out")
+	assert.ErrorIs(t, err, ErrArtifactMissing)
+
+	_, err = store.Stat("job-stat", 2, "stdout")
+	assert.Error(t, err, "流名不在 out/err 之内，不该被算成文件不存在")
+
+	_, err = store.Stat("job/../etc", 1, "out")
+	assert.Error(t, err, "带路径写法的任务 ID 要在拼路径之前挡掉")
+}
+
 func TestPurgeExpired(t *testing.T) {
 	now := time.Now()
 	store := artifactStoreFor(t, 4096, 7*24*time.Hour, func() time.Time { return now })
