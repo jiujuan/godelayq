@@ -105,3 +105,95 @@ go build ./... && go vet ./... && go test ./... -race
 - 风险：默认安全集里含 `/` 与 `:`，对路径类参数够用，但也允许 `--file=/etc/passwd` 这种"值本身是路径"的写法。真正的防线是档位脚本不解释参数为路径，这一点只能靠配置审查。缓解：在档位注释规范里建议对路径型参数显式写 `pattern`。
 - 风险：`AllowDash` 加在 E02 的结构上会导致 E02 的测试改动，提交时把该改动放进本卡提交并在提交信息里说明，避免两个卡各自改同一结构造成冲突。
 - 回滚：纯新增包，无外部影响，可单独 revert。
+
+## 10. 实现记录（2026-09-30）
+
+改动文件：新增 `executor/args.go`、`executor/args_test.go`；改 `executor/profile.go`
+（拒绝把保留键声明成参数名、`env` 键折回大写）与 `executor/profile_test.go`
+（既有用例改写 + 一条走配置文件的用例）。api 与 core 一行未改（§8 的口径：接线归 E16）。
+
+### 与卡片的偏离与补充
+
+1. **`Submission` 多了一个 `Positional []string` 字段**（卡片 §3.3 特意用保留键就是为了不加字段）。
+   冲突点在卡片内部：§3.1 把 `Args` 的值类型限定成"字符串与数字"，而 §3.3 要位置参数是
+   `args` 里的一个字符串数组。两者在同一张 map 上无法共存，所以**线上格式不变**
+   （payload 仍写 `"args":{"_positional":["a.csv","b.csv"]}`），只在解码后的 Go 形态里单列一个字段。
+   `fillValues` 会跳过这个键，档位里也不允许声明它（第 4 条）。
+2. **顶层键的拒绝没有用 `DisallowUnknownFields`**，改成"先解成 map，再按白名单逐个筛键"。
+   标准库报的是 `json: unknown field "cmd"`：键名在里面，但对调用方没有意义，也报不出
+   "这个档位允许哪几个键"，而且一遇错就停。现在的错误是
+   `payload key "cmd" is not accepted by profile "nightly_report" (allowed keys: args, env, timeout)`。
+   §4.1 设想的 `decodeStrict([]byte, any)` 因此变成一个更小的工具：解码一个已经筛过键名的值。
+3. **`AllowDash` 早在 E02 就落地了**（`core.ExecutorArg.AllowDash` 与 `executor.ArgSpec.AllowDash`），
+   本卡没有再加字段，只补规则与用例（卡片 §3.2/§4.2 以为要在这里加）。§9 预判的"改动 E02 结构
+   造成两张卡冲突"因此不存在，但第 6 条确实改了 E02 的函数，改动一并放进本卡提交。
+4. **`checkArgs` 现在拒绝把 `_positional` 声明成参数名**：允许的话，一个数组值会撞上
+   "值只能是字符串或数字"，错误信息看不出是被保留键拦下的。
+5. **位置参数的减号开头没有例外**：档位结构里位置参数没有 `allow_dash` 字段，
+   所以一律拒绝，并在错误里说明理由（`args._positional[0]: value "--curl" starts with "-", ...`）。
+6. **档位 `env` 的键读进来时折回大写**（改 `buildProfile`）。冒烟跑真实 YAML 才暴露：
+   viper 解码映射会把键统一变小写，`configs/config.example.yaml` 里示例写法
+   `env: { REPORT_HOME: /srv/report }` 按原逻辑会以 `env key "report_home" must be upper-case`
+   直接启动失败。折回大写只改变"本来会被拒的写法"，原先合法的写法不变；同时让 `env`（键）与
+   `env_allow`（列表值，viper 不折叠）两侧大小写一致，"档位固定变量不许被 payload 覆盖"那条检查才成立。
+   连带改了 E02 的一条用例（小写键被拒 → 减号键被拒）并新增 `TestLoadProfiles_ConfigFileEnvKeys`。
+7. **模板引用了既无默认值也没被提供的参数时 `Render` 报错**，而不是拼出 `--day=`：
+   卡片 §3.3 只写了反向情况（未使用的已声明参数不产生任何项）。空值参数在多数程序里表示
+   "开关被关掉"或"路径为空"，静默传过去比拒绝更难解释。
+8. **`argv[0]` 的写法固定**：script 用解释器名（探测得到的绝对路径留给 E09 替换）、
+   workspace 内产物用绝对路径（子进程工作目录由 `cmd.Dir` 决定，相对路径会指向别处）、
+   `runtime_allow` 里的程序名按原样给（`java` → `exec.Cmd` 自己走 PATH）。
+9. **headers 与 body 的规则补齐**：headers 的键必须命中 `header_allow`（HTTP 头名不区分大小写，
+   比对也不区分），条数沿用 env 的 16 条上限（卡片没给 headers 边界，一次提交不该没有上限）；
+   body 只回答"档位让不让带体"，体的语义留给 E15。
+10. **`ParseTimeout` 单独导出**（卡片未列）：提交期校验与 E09/E16 都要解析同一种写法，
+    不留两份实现。超上限时报错不夹取（§3.2），错误里带上档位允许的值。
+11. **卡片 §5.7 与 §5.11 合成一条用例** `TestRender_ValueStaysOneElement`：
+    既断言含空格的值仍是单独一个元素，也断言 argv 里没有 `sh -c`/`cmd /c` 之类的形态。
+12. **越界键清单扩到 7 个**（卡片列 5 个，另加 `runtime`、`argv`），并断言错误里出现键名本身。
+
+### 验证结果
+
+- 单元测试：`executor/args_test.go` 14 个测试函数（含子测试），§5 要求的 11 项全部覆盖。
+  其中三条是白名单本身的守卫，注释里写明"这几条失败意味着 D1/D2 不起作用"：
+  顶层越界键、`args` 里未声明的键、`args` 的值类型（布尔/null/对象/数组全拒）。
+- 设计文档 §5.2/§5.3 的两条示例档位原样进用例（DoD 最后一条）：
+  `node <workspace>/scripts/report.mjs --day=yesterday --level=debug` 与
+  `<workspace>/bin/etl --window=20260929 a.csv b.csv`、`java -jar app/app.jar` 都逐元素断言相等；
+  §5.2 的示例 payload 带 `env`，而那条档位没声明 `env_allow`，用例断言它被拒——
+  文档与代码在同一处口径上对齐。
+- `go build ./...`、`go vet ./...`、`go test ./... -race -count=1` 全绿
+  （api 41s / core 8s / cmd 5s / executor 1.7s）；linux、darwin 交叉编译与 `-tags dashboard` 通过；
+  新增与改动文件 `gofmt -l` 无输出。
+- 真实链路冒烟（系统临时目录里一份 YAML → `core.LoadConfig` → `LoadProfiles` →
+  `ValidateSubmission` → `Render`，跑完已删除，仓库 `configs/`、`data/` 未被写入）。
+  五条档位全部加载；七条应通过的 payload 打出 argv，例如
+  `{"args":{"window":"20260929","_positional":["input/a.csv","b.csv"]}}` →
+  `[<workspace>\bin\etl --window=20260929 input/a.csv b.csv]`（4 个元素，路径与参数分列）；
+  二十四条应被拒的 payload 各得一句可执行的错误，摘几条：
+  `{"cmd":"ls"}` → `payload key "cmd" is not accepted by profile "nightly_report" (allowed keys: args, env, timeout)`；
+  `{"args":{"day":true}}` → `args.day: value type is not accepted: use a string or a number, got a boolean`；
+  `{"args":{"token":"0000000"}}`（secret）→ `args.token: value "<redacted>" does not match pattern ^[a-f0-9]{8}$`；
+  `{"args":{"day":"today"},"env":{"REPORT_HOME":"/tmp"}}` → `env.REPORT_HOME: fixed by profile ... cannot be overridden`；
+  `{"args":{"day":"today"},"timeout":"4h"}` → `timeout 4h0m0s exceeds the 10m0s allowed by profile ...`；
+  两个对象拼在一起 → `payload must be one JSON object`。
+  生效超时四组：`10m0s`（档位值）、`1m30s`（payload 值）、`30m0s`（超全局上限被夹住）、`5m0s`（全局默认）。
+- 冒烟顺带暴露两件事，都已处置或登记：第 6 条的 viper 键名折叠（已修）；
+  YAML 单引号里的 `pattern` 若写成 `'\d'`，档位能正常加载但正则永远不匹配
+  ——`checkArgs` 只保证"能编译"，不保证写法意图。建议 E19 在文档里点一句"正则用单引号、单反斜杠"。
+
+### 未验证
+
+- `Render` 的 argv 交给 `exec.Cmd` 之后的行为要等 E09（本卡不启动任何进程，§8）。
+- http 档位的 `params` → URL 渲染、headers/body 的实际语义归 E15。
+- 本卡没有 HTTP 侧可观测的现象：`ValidateSubmission` 还没被 api 调用（接线归 E16），
+  所以 400 响应里的 details 文本此刻只能在库层面看到。
+
+### 留给后续卡片的接口形状
+
+- E09：`sub, err := ValidateSubmission(profile, job.Payload)` → `argv, err := profile.Render(sub)` →
+  `timeout := profile.EffectiveTimeout(mustParseTimeout(sub.Timeout), cfg)`；
+  `submission.Env` 是 payload 请求注入的变量，与 `profile.Env` 合并时档位固定值优先（已在 E08 挡住覆盖）。
+- E15：http 档位用 `sub.Params`（已过 `args` 声明的正则）渲染 `URLTemplate`，
+  `sub.Headers` 已过 `header_allow`，`sub.Body` 是档位允许形态下的请求体原文。
+- E16：400 的 `details` 直接用这里返回的错误文本；secret 参数的值不会出现在文本里。
