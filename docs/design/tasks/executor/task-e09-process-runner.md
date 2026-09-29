@@ -147,3 +147,167 @@ curl -s "localhost:8080/api/v1/jobs/<id>/result" | grep -o '"content":"[^"]*"'
 - 风险：信号量在 `Handler` 内等待会占住 worker 名额。已限定"等待上限等于有效超时"，但仍然是占用；这条要在 E13 的卡片里作为前置事实引用。
 - 风险：Windows 与 Unix 的 `ProcessState.Sys` 类型不同（`syscall.WaitStatus` vs 不存在），信号解析必须放在平台文件里（E10/E11），本卡的 `proc.go` 只调用 `signalOf(cmd.ProcessState)` 这个平台函数，默认实现返回空字符串。
 - 回滚：Runner 是新增，`Register` 改回 `StubHandler` 即可退回 E04 的状态，风险集中在 `main.go` 的一行改动。
+
+---
+
+## 10. 实现记录（2026-09-30）
+
+改动文件：新增 `executor/proc.go`、`executor/env.go`、`executor/exit.go`、
+`executor/proc_unix.go`、`executor/proc_windows.go` 与 `executor/proc_test.go`、
+`executor/env_test.go`、`executor/exit_test.go`；删除 `executor/handler_stub.go`；
+改 `executor/register.go`（注册真实执行器）、`executor/args.go`（生效超时的参数拆分、
+`Submission.TimeoutValue`）、`executor/result.go`（预览改为 stderr 优先并抽出选择规则）、
+`core/config.go` 与 `configs/config.example.yaml`/`configs/config.yaml`（`env_allow` 注释）、
+`cmd/server/main.go` 与 `cmd/server/*_test.go`（装配与新增的装配检查）。
+core 的调度器一行未改：超时与取消的分类靠 `ExitError.Is` 接入（§6.3 的口径）。
+
+### 与卡片的偏离与补充
+
+1. **输出接法用的是 `cmd.Stdout`/`cmd.Stderr` 直接挂写入器，没有自建拷贝协程**（§3.4 要求自建）。
+   核实标准库后确认这条要求已由 `os/exec` 满足：`Cmd.Start` 为每个非 `*os.File` 的 writer
+   建管道并起拷贝协程，`Cmd.Wait` 里的 `awaitGoroutines`（`src/os/exec/exec.go`）会等这些协程结束，
+   `WaitDelay` 非 0 时才会强行关管道并返回 `ErrWaitDelay`。
+   反过来，手写 `StdoutPipe` + `WaitGroup` 要与 `Wait` 关闭父端句柄竞争，是更差的那条路。
+   §5.3 的完整性用例照写并通过：子进程输出 2,040,000 字节（远超管道缓冲），
+   产物文件字节数与摘要 `out_bytes` 一致，一个字节都不差。
+2. **`ExitError` 的永久失败标记只有一个方法，字段改名 `Retryable`**（§3.3 同时列了
+   字段 `Permanent bool` 与方法 `Permanent() bool`，Go 里同名不能共存）。
+   字段取反向语义：结构体零值就是"不重试"。若字段叫 `Permanent`，漏写它的构造点会默认允许重试，
+   一个分类不明的失败会被反复投给同一个脚本。E12 要读的接口 `Permanent() bool` 不变，
+   `executor/exit.go` 里有一条 `var _ interface{ Permanent() bool } = (*ExitError)(nil)` 的编译期断言。
+3. **`ExitError` 多两个字段**：`Profile`（档位名，让每条错误自带归属）与 `Detail`（底层错误，
+   `Unwrap` 暴露，所以 E08 的哨兵错误 `ErrWrongKind` 仍能从执行层的错误里读出来）。
+   `Reason` 只放类别文本，测试与事件都按它分类。
+4. **新增 `classifyFailure`**（把分类集中到一处）：按"上下文结束 → `ErrWaitDelay` →
+   退出码 → 起进程失败"的顺序归类，`Runner` 各分支不再手写布尔。
+   E12 只需读 `Permanent()`；§5.1/§5.6 的期望值由这一个函数决定，`executor/exit_test.go` 逐分支覆盖。
+5. **`cmd.WaitDelay` 提前在本卡设置**（卡片把它列在 E10 §3.2）。原因在 Windows 上实测暴露：
+   子进程退出后输出管道仍可能被派生进程持有，`Wait` 会一直等拷贝结束，Handler 不返回、
+   worker 名额也不释放。常量 `outputWaitDelay = 5s`；E10 §3.5 那条
+   "`killGrace`/`WaitDelay`/`shutdown_timeout` 的关系二选一"仍归 E10 定稿，届时改这个常量即可。
+6. **`ErrWaitDelay` 单独一类，且判定为永久失败**：进程可能已经正常退出（退出码已填），
+   问题是输出没收全；重跑会把脚本的副作用再做一遍，比缺一截输出更糟。
+7. **默认取消只 `Kill` 直接子进程**（§8 的范围）。平台函数落在两个文件里：
+   `proc_windows.go`（`//go:build windows`）与 `proc_unix.go`（`//go:build !windows`）
+   各提供 `signalOf(*os.ProcessState) string` 的默认实现（返回空串）。
+   E10 改 `proc_unix.go` 里的 `signalOf` 并加 `sysProcAttr`/`killTree`，
+   E11 扩 `proc_windows.go` 加 `sysProcAttr`/`killTree`——两个文件本卡就建好，后续只往里加函数，
+   不会出现同名函数被两个平台文件同时定义的情况。
+8. **档位并发许可用带缓冲通道，不是 `semaphore.Weighted`**（§3.2/§4 写的是后者）。
+   `golang.org/x/sync` 目前是间接依赖，为一个"占一个名额/退一个名额"的语义把它转成直接依赖不值得；
+   等待上限、取消响应、等满按超时处理这三条行为都照卡片实现（§4 的三条要点都有用例）。
+9. **`argv[0]` 换成探测得到的绝对路径**（E08 §10 第 8 条留给本卡）。
+   `NewRunner` 内部调一次 `Probe` 取路径：与登记表启动那次重复几次文件系统查询，
+   换来的是"拿到一个 Profile 就能构造可执行的 Runner"，不依赖调用方先探过。
+   探测不可用时保留档位里的写法，让操作系统报"找不到文件"——错误更接近真实原因。
+10. **预览从产物文件反向读，内存里不留输出副本**：`ArtifactStore.Tail`（`executor/artifact.go:430`）
+    读 `inline_preview` 字节。`Result` 在执行路径上只承担摘要装配（`NewResult`/`Meta`），
+    `Stdout`/`Stderr` 两个字段留给后续（http 档位）使用。
+11. **预览的选择规则从 stdout 优先改成 stderr 优先**（§3.5），规则抽成 `ChoosePreview`，
+    `Result.SetPreview` 与执行侧共用一条。E06 的 `result_test.go` 里"stdout 非空时不看 stderr"
+    那条用例按新规则改写，并加了一条直接测 `ChoosePreview` 的用例。
+    冒烟里两条流都有内容的失败任务，预览确实取自 stderr。
+12. **`Submission` 多一个 `TimeoutValue` 字段**：`ValidateSubmission` 解析文本时就把它留下，
+    执行侧不再解析一次文本。`checkTimeoutWithinProfile` 相应返回解析结果（内部函数，调用方只有一处）。
+13. **`Profile.EffectiveTimeout` 的实现拆成 `timeoutWithin`**：Runner 手上只有
+    `core.ExecutorsConfig`（装配时整份配置已归一化），旧签名要 `core.Config`。
+    拆参数不复制规则，两条路径的合成结果一致；E08 的既有测试仍走 `EffectiveTimeout`。
+14. **`Register` 签名扩成 `(registrar, reg, cfg, artifacts, logger)`**：真实执行器需要
+    executors 一节求生效超时、需要产物存储写输出。`cmd/server/main.go` 的 `registerHandlers` 同步。
+15. **新增一条装配检查**（卡片未列）：`cfg.Executors.Enabled` 为真但没传产物存储时，
+    `registerHandlers` 直接返回错误。判断依据用运行配置而不是登记表开关——
+    决定"这次启动要不要存储"的是前者；登记表在测试替身里可以与运行配置不一致。
+16. **http 档位仍然注册 `Runner`，但执行分支明确回指 TASK-E15**：
+    `Reason: "http profiles are executed by the http executor, which lands in TASK-E15"`，永久失败。
+    这样注册链路只有一条构造路径，也不会留下一个占位文件等人来删（§3.7 要求删除 `handler_stub.go`，已删）。
+17. **`BuildEnv` 永不返回 nil**（卡片未列，但这是白名单能否成立的前提）：
+    `os/exec` 把 `nil` 解释成"继承当前进程的全部环境变量"，返回 nil 等于把服务凭据整包交给子进程。
+    另外键名比较在 Windows 折成小写（`os.Environ()` 里是 `SystemRoot` 这类混合写法，
+    逐字比较会让整条白名单失效），Unix 保持逐字（那里 `PATH` 与 `Path` 是两个变量）。
+18. **最低必要集常量 `minimumEnvKeys`**（§3.2 要求）：`PATH`/`SystemRoot`/`COMSPEC`/`PATHEXT`
+    无条件透传。按 §3.2 的后半句，在 `core/config.go` 的 `env_allow` 校验处补了注释，
+    两份配置示例的对应说明也从"建议补 SystemRoot…"改成"由执行器无条件透传，再写一遍是正常配置"。
+19. **覆盖顺序与 §3.2 有一处差别，差别来自 E08**：卡片写"payload 覆盖档位值"，
+    实际 `checkSubmissionEnv`（`executor/args.go:332`）已经禁止 payload 覆盖档位固定的键。
+    代码仍按 进程 → 档位 → payload 的顺序写入（与卡片一致），只是第三层只会新增键，不会改写第二层。
+20. **`meta.json` 的内容结构在本卡定下来**：写的是 `core.ExecMeta` 本身
+    （`WriteMeta(result.Meta)`，`executor/artifact.go:274`）。E06/E07 都没定这个结构，
+    现在产物目录里那份文件与快照里的摘要是同一套字段，排障时可以直接对读。
+21. **"没起进程"的路径不写 `DurationMs`**（§3.5 说三个字段必填）：`invalid submission`、
+    `cannot build the command line`、`concurrency limit` 都是校验或排队失败，没有等待过程；
+    写一个耗时数字反而会被读成"进程跑过这么久"。这三类都不建产物目录，
+    `Artifact` 留空，接口侧仍是 E07 的 404（冒烟已验证）。
+    真正起过进程但失败（程序缺失）的路径 `duration_ms` 有值、`Artifact=available`。
+
+### 验证结果
+
+单元测试（`go test ./executor -count=1 -v`，全部通过，无 skip）：
+
+- §5 的十一条：`TestRunner_ExitCode`、`TestRunner_SuccessPreview`、
+  `TestRunner_LargeOutputComplete`（2,040,000 字节完整落盘）、`TestPreview_PrefersStderr`
+  （两条都有则取 stderr；只有 stdout 则回落）、`TestRunner_BadSubmissionNeverStartsProcess`
+  （断言产物根目录为空）、`TestRunner_ProgramMissing`（`ExitCode` 保持 0）、
+  `TestBuildEnv_*`（凭据前缀即使在白名单里也排除、三层合并、白名单外丢弃、
+  Windows 启动变量透传、键名有序且唯一、空档位返回非 nil）、`TestExitError_Is`
+  （四种组合）、`TestMaxParallel`、`TestRunner_NoSecretInLogs`、
+  `TestRegister_HandlerRunsTheProfile`（注册链路已是真实执行器）。
+- 补充分支：`TestRunner_RetryOnExitKeepsRetry`、`TestRunner_OutputCappedAndTruncated`、
+  `TestRunner_Timeout`、`TestRunner_Cancelled`、`TestRunner_HttpProfileIsNotExecutedByProcessRunner`、
+  `TestRunner_WithoutArtifactStore`、`TestClassifyFailure_*`（五个分支各一条）、
+  `TestClassifyExit`、`TestChoosePreview`、`TestRegisterHandlers_MissingArtifactStoreFails`（cmd/server）。
+- 全仓：`go build ./...`、`go vet ./...`、`go test ./... -race -count=1` 全绿
+  （api 42.8s / core 8.0s / executor 3.3s / cmd/server 5.3s）。
+- 跨平台：`GOOS=linux GOARCH=amd64`、`GOOS=darwin GOARCH=arm64`、`GOOS=windows` 的
+  build + vet 均通过（平台文件按 `!windows` / `windows` 各自成立），`-tags dashboard` 构建通过。
+- 冒烟（真实进程 + REST，Windows 上一份独立配置，鉴权用静态 token）：
+  - `exec.hello`（`kind: binary`、`program: cmd`、`fixed_args: [/c, echo hi]`、
+    必填参数 `day`、`env: REPORT_HOME`、`env_allow: [TRACE_ID]`）提交
+    `{"args":{"day":"today"}}` → 任务 success，摘要
+    `out_bytes=16`、`preview="hi --day=today\r\n"`、`artifact=available`、`duration_ms=24`；
+    `GET /jobs/:id/result` 读到同一行内容，`size_bytes=16`。参数值作为**一个 argv 元素**追加，
+    命令行里没有 shell 拼接的痕迹。
+  - `exec.failing`（`echo boom 1>&2& exit /b 3`）→ 任务 failed，摘要 `exit_code=3`、
+    `err_bytes=7`、`permanent=true`、`preview="boom \r\n"`（取自 stderr）；
+    `job.failed` 事件的 `data` 同时带 `error` 文本 `profile "failing": exit status 3`
+    与 `result` 摘要——E07 的读侧第一次由真实退出码验证。
+  - 越界提交（`{"args":{"nope":"x"}}`）→ 任务 failed，摘要只有 `kind`/`profile`（无字节数、无产物标记），
+    产物根目录里**没有**对应任务目录，`/result` 返回 `found=false`。证明校验失败时确实没起进程。
+  - `exec.envprobe`（`fixed_args: [/c, set]`）在服务进程环境里确有
+    `GODELAYQ_SERVER_AUTH_TOKEN` 与 `GODELAYQ_SERVER_AUTH_JWT_SECRET` 的情况下执行，
+    payload 注入 `PROBE_VAR`：子进程 dump 出的环境只有 10 行，含 `PATH`、`SYSTEMROOT`、
+    `COMSPEC`、`PATHEXT`、档位固定的 `REPORT_HOME`、payload 的 `PROBE_VAR=from-payload`；
+    全文不含 `GODELAYQ_`，也不含那两个凭据值。服务端 token 同时是 HTTP 鉴权凭据，
+    它出现在请求头里、出现在服务进程环境里，但没有出现在子进程里。
+  - 产物目录：每个任务 `<job_id>/a1.out`、`a1.err`、`a1.meta.json`；
+    `meta.json` 内容与快照里的 `exec` 摘要一致（第 20 条）。
+  - 执行器日志只有 `job_id`/`handler_key`/`profile`/`kind`/`exit_code`/`duration_ms`/`truncated`
+    七个字段，没有 payload、没有 argv、没有 env（§3.6）。
+
+### 未验证
+
+- Unix 上的真实进程行为：本机是 Windows，`sh -c` 分支与 SIGKILL/SIGTERM 的信号名解析
+  只写了默认实现，`signalOf` 在 `!windows` 上仍返回空串。需要 Linux/CI 实跑（既有登记项）。
+- 整棵进程树的终止：本卡只杀直接子进程。超时用例在 Windows 上是靠 `WaitDelay` 才让
+  Handler 返回的（`cmd /c ping` 的孙进程仍活着），这条正是 E10/E11 要消掉的现象。
+- 取消路径经 REST 的实际效果（`handleInterrupted` 不消耗重试）只有单测覆盖；
+  冒烟没提交长任务再 `POST /jobs/:id/cancel`。
+- 优雅关闭期间在途执行的表现（E10 §3.5 的时长关系）。
+- `max_parallel` 等待期间占住 worker 名额的实际后果：本卡只验证了等待上限与失败归类。
+- 提交期 400 与角色门禁：api 仍未调用 `ValidateSubmission`（E16），越界 payload 现在是
+  "任务失败"而不是"提交被拒"。
+
+### 留给后续卡片的接口形状
+
+- E10：改 `proc_unix.go` 的 `signalOf`（从 `syscall.WaitStatus` 取信号名）并加
+  `sysProcAttr`/`signalGroup`/`killTree`；`proc.go` 里需要接的三行是
+  `cmd.SysProcAttr`、`cmd.Cancel`、`cmd.WaitDelay`（本卡已给后者的常量 `outputWaitDelay`）。
+- E11：扩 `proc_windows.go`，`signalOf` 保持空串即可（Windows 无信号概念）。
+- E12：`errors.As(err, &failure)` 后读 `failure.Permanent()`；退出码规则已收在
+  `classifyExit`，超时/取消/`ErrWaitDelay` 三条分支的标记由 `classifyFailure` 统一给。
+- E13：本卡的许可等待上限等于生效超时，等待期间仍占 worker（§4 已写明）。
+- E14：产物按 `Open(job.ID, job.Attempts)` 分 attempt 建文件；崩溃恢复置 paused 时
+  `Artifact` 已是 `available`（E06 §10 的约定）。
+- E15：http 档位要替换的是 `Runner.Handler` 里那条 `KindHTTP` 分支的返回文本；
+  注册链路不必再改。摘要里的 `HTTPStatus` 字段本卡没碰。
+- E16：api 层调 `ValidateSubmission` 做 400 时，错误文本可直接复用——
+  `invalid submission` 这条 `Reason` 与 `Detail` 里的 E08 文本已经带"哪个键、为什么、允许什么"。
