@@ -27,6 +27,8 @@ type Config struct {
 	Scheduler SchedulerConfig `mapstructure:"scheduler"`
 	Store     StoreConfig     `mapstructure:"store"`
 	Logging   LoggingConfig   `mapstructure:"logging"`
+	// Executors 执行层（脚本/二进制/HTTP 任务）；默认关闭，详见 ExecutorsConfig。
+	Executors ExecutorsConfig `mapstructure:"executors"`
 }
 
 // ServerConfig HTTP 接入层配置
@@ -173,6 +175,208 @@ type LoggingConfig struct {
 	Format string `mapstructure:"format"`
 }
 
+// 执行器配置的默认值。执行能力默认关闭（ExecutorsConfig.Enabled），
+// 关闭时这些取值全部不参与行为，只在打开之后生效。
+const (
+	DefaultExecConcurrency    = 4
+	DefaultExecInlinePreview  = 2048
+	DefaultExecMaxOutputBytes = 262144
+	DefaultExecOutputDir      = "./data/exec"
+	DefaultExecOutputTTL      = 7 * 24 * time.Hour
+	DefaultExecWorkspace      = "./exec-workspace"
+	DefaultExecRequiredRole   = "admin"
+	DefaultExecRestorePolicy  = "pause"
+	DefaultExecDefaultTimeout = 5 * time.Minute
+	DefaultExecMaxTimeout     = 30 * time.Minute
+)
+
+// ExecutorsConfig 是执行层（脚本 / 二进制 / HTTP 任务）的配置。
+// 设计依据见 docs/design/executor-design.md：可执行内容由配置声明的档位决定，
+// 不提供自由命令行，因此 Enabled 默认 false——打开它等于把"能提交任务"扩展成"能执行命令"。
+type ExecutorsConfig struct {
+	// Enabled 执行器总开关。false 时一个 exec.* 处理函数都不注册，本节其它取值全部不生效。
+	Enabled bool `mapstructure:"enabled"`
+
+	// RequiredRole 提交执行器任务所需的最低档位：operator|admin|ops，空表示 DefaultExecRequiredRole。
+	// machine（静态 token 的身份）的档位等同 operator，所以默认值 admin 把脚本凭据挡在执行能力之外；
+	// viewer 被 Validate 拒绝：只读身份不该有执行能力。
+	RequiredRole string `mapstructure:"required_role"`
+
+	// Workspace 档位里 script/program/cwd 的根目录：这些相对路径解析后必须仍落在它之内。
+	// 留空表示 DefaultExecWorkspace，不是"不限制目录"。
+	Workspace string `mapstructure:"workspace"`
+
+	// RuntimeAllow 允许档位使用的解释器或程序名白名单；空表示内置默认列表。
+	RuntimeAllow []string `mapstructure:"runtime_allow"`
+
+	// EnvAllow 传给子进程的环境变量键名白名单；空表示内置默认列表。
+	// GODELAYQ_ 前缀的键即使在列表里也会被强制排除（见 Validate）：服务凭据不进子进程。
+	EnvAllow []string `mapstructure:"env_allow"`
+
+	// Concurrency 执行器专用执行池的协程数；0 表示 DefaultExecConcurrency。
+	// 与普通任务分池的原因见设计文档 §6.5：共池时分钟级的脚本会长时间占住执行名额。
+	Concurrency int `mapstructure:"concurrency"`
+
+	// QueueCapacity 执行器队列容量；0 表示与 Concurrency 相等。
+	// 队列满时任务留在堆与存储里等空位，不会无限堆积在内存。
+	QueueCapacity int `mapstructure:"queue_capacity"`
+
+	// DefaultTimeout 档位未声明 timeout 时的单次执行超时。
+	// 打开 Enabled 后必须是正值：执行器任务不存在"不限制"，否则挂死的进程会一直占住名额。
+	DefaultTimeout time.Duration `mapstructure:"default_timeout"`
+
+	// MaxTimeout 单次执行超时的上限。档位或任务请求里超过它的值会被拒绝，而不是静默夹取——
+	// 让调用方在提交时就看到上限，比执行到一半被中止更好排查。0 表示 DefaultExecMaxTimeout。
+	MaxTimeout time.Duration `mapstructure:"max_timeout"`
+
+	// RestorePolicy 重启时如何处理"崩溃瞬间仍在执行"的执行器任务：
+	// pause（默认）置为 paused 等人工确认——副作用结果未知时不替人决定；
+	// replay 则照常重新入队。其它取值由 Validate 拒绝。
+	RestorePolicy string `mapstructure:"restore_policy"`
+
+	// LoaderAllow 是否允许目录任务加载器接受 exec. 前缀的任务文件，默认 false。
+	// 注意当前服务端二进制并不启用加载器（LoaderOptions 只在库使用与 examples/demo2 中出现），
+	// 因此本项约束的是自行接入 DirectoryLoader 的程序，见设计文档 §6.9。
+	LoaderAllow bool `mapstructure:"loader_allow"`
+
+	// Output 执行输出的截断与保留策略
+	Output ExecutorOutputConfig `mapstructure:"output"`
+
+	// Commands 档位列表。正式结构在 executor 包（TASK-E02）定义，
+	// 这里先用宽松类型打通配置解码；代价是档位内部的键名拼错此时不会被发现
+	// （UnmarshalExact 只保证本节顶层键合法）。
+	Commands []map[string]any `mapstructure:"commands"`
+}
+
+// ExecutorOutputConfig 执行输出（stdout/stderr）的落盘与预览参数。
+type ExecutorOutputConfig struct {
+	// InlinePreview 事件与任务快照里携带的输出尾部预览字节数；0 表示 DefaultExecInlinePreview。
+	// 完整输出落在 Dir 下的产物文件，不进 jobs.json——那里每次落盘都是整文件重写。
+	InlinePreview int `mapstructure:"inline_preview"`
+
+	// MaxBytes 单条流（stdout 或 stderr）的落盘上限；0 表示 DefaultExecMaxOutputBytes。
+	// 达到上限即停止写入并标记截断，不静默丢弃也不报错中断执行。
+	MaxBytes int `mapstructure:"max_bytes"`
+
+	// Dir 产物目录；空表示 DefaultExecOutputDir。与 store.path 分开放，便于单独设权限与清理。
+	Dir string `mapstructure:"dir"`
+
+	// TTL 产物保留时长，如 168h；0 表示不按时间清理（只做启动时的孤儿清理）。
+	// 默认 DefaultExecOutputTTL；建议与 store.history_ttl 一起配置，见设计文档 §6.4。
+	TTL time.Duration `mapstructure:"ttl"`
+}
+
+// Validate 校验执行器配置自身的取值。
+//
+// 只有 Enabled 为 true 时才收紧"必须显式配置"这类约束：关闭状态下 0 值与留空是正常写法，
+// 不该逼每个部署都抄一遍完整配置。反向的例外是 loader_allow：它开了却没开执行器，
+// 只能是配置写错，静默接受会让人以为文件投递通道已经打通。
+func (e ExecutorsConfig) Validate() error {
+	if role := strings.TrimSpace(e.RequiredRole); role != "" {
+		parsed, ok := ParseRole(role)
+		if !ok {
+			return fmt.Errorf("executors.required_role %q is invalid, use operator|admin|ops", role)
+		}
+		if !parsed.AtLeast(RoleOperator) {
+			// machine 不是可填档位，ParseRole 已经把它拒了；这里拦的是只读档
+			return fmt.Errorf("executors.required_role must be operator, admin or ops, got %q", role)
+		}
+	}
+
+	switch strings.TrimSpace(e.RestorePolicy) {
+	case "", "pause", "replay":
+	default:
+		return fmt.Errorf("executors.restore_policy %q is invalid, use pause or replay", e.RestorePolicy)
+	}
+
+	if e.Workspace != "" && strings.TrimSpace(e.Workspace) == "" {
+		return fmt.Errorf("executors.workspace must not be whitespace")
+	}
+	if e.Output.Dir != "" && strings.TrimSpace(e.Output.Dir) == "" {
+		return fmt.Errorf("executors.output.dir must not be whitespace")
+	}
+
+	if err := checkExecNameList("runtime_allow", e.RuntimeAllow); err != nil {
+		return err
+	}
+	if err := checkExecNameList("env_allow", e.EnvAllow); err != nil {
+		return err
+	}
+	for _, key := range e.EnvAllow {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(key)), "GODELAYQ_") {
+			// 服务端的凭据与 JWT 密钥都以 GODELAYQ_ 前缀出现在进程环境里，
+			// 把它们列进子进程白名单是配置错误，不是运维选择
+			return fmt.Errorf("executors.env_allow must not contain %q: GODELAYQ_ prefixed keys hold server credentials", key)
+		}
+	}
+
+	if e.Concurrency < 0 {
+		return fmt.Errorf("executors.concurrency must not be negative, got %d", e.Concurrency)
+	}
+	if e.QueueCapacity < 0 {
+		return fmt.Errorf("executors.queue_capacity must not be negative, got %d", e.QueueCapacity)
+	}
+	if e.DefaultTimeout < 0 {
+		return fmt.Errorf("executors.default_timeout must not be negative, got %v", e.DefaultTimeout)
+	}
+	if e.MaxTimeout < 0 {
+		return fmt.Errorf("executors.max_timeout must not be negative, got %v", e.MaxTimeout)
+	}
+	if e.Output.InlinePreview < 0 {
+		return fmt.Errorf("executors.output.inline_preview must not be negative, got %d", e.Output.InlinePreview)
+	}
+	if e.Output.MaxBytes < 0 {
+		return fmt.Errorf("executors.output.max_bytes must not be negative, got %d", e.Output.MaxBytes)
+	}
+	if e.Output.TTL < 0 {
+		return fmt.Errorf("executors.output.ttl must not be negative, got %v", e.Output.TTL)
+	}
+
+	if !e.Enabled {
+		if e.LoaderAllow {
+			return fmt.Errorf("executors.loader_allow requires executors.enabled to be true")
+		}
+		return nil
+	}
+
+	// 开启执行器后，0 值不再按"用默认值"放过：写显式 0 的人想要的是"不配置"，
+	// 而这两者在执行器上后果差别很大，宁可报错让他删掉这一项或填个真实值。
+	if e.Concurrency < 1 {
+		return fmt.Errorf("executors.concurrency must be at least 1 when executors.enabled is true, got %d (omit the key to use %d)", e.Concurrency, DefaultExecConcurrency)
+	}
+	if e.DefaultTimeout <= 0 {
+		return fmt.Errorf("executors.default_timeout must be positive when executors.enabled is true, got %v (omit the key to use %v)", e.DefaultTimeout, DefaultExecDefaultTimeout)
+	}
+	if e.MaxTimeout <= 0 {
+		return fmt.Errorf("executors.max_timeout must be positive when executors.enabled is true, got %v (omit the key to use %v)", e.MaxTimeout, DefaultExecMaxTimeout)
+	}
+	if e.DefaultTimeout > e.MaxTimeout {
+		return fmt.Errorf("executors.default_timeout %v must not exceed executors.max_timeout %v", e.DefaultTimeout, e.MaxTimeout)
+	}
+	if e.Output.MaxBytes < 1024 {
+		return fmt.Errorf("executors.output.max_bytes must be at least 1024 when executors.enabled is true, got %d", e.Output.MaxBytes)
+	}
+
+	return nil
+}
+
+// checkExecNameList 校验白名单列表的每一项：不能是空白项、不能带首尾空格或控制字符。
+// 这三条都会让白名单出现"看起来配了但永远匹配不上"的项，属于必须启动即报的写法。
+func checkExecNameList(field string, list []string) error {
+	for _, item := range list {
+		if strings.TrimSpace(item) == "" {
+			return fmt.Errorf("executors.%s must not contain an empty entry", field)
+		}
+		if item != strings.TrimSpace(item) {
+			return fmt.Errorf("executors.%s entries must not have surrounding spaces, got %q", field, item)
+		}
+		if strings.ContainsFunc(item, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+			return fmt.Errorf("executors.%s entries must not contain control characters, got %q", field, item)
+		}
+	}
+	return nil
+}
+
 // DefaultConfig 返回与代码内置默认值一致的配置
 func DefaultConfig() Config {
 	return Config{
@@ -208,6 +412,28 @@ func DefaultConfig() Config {
 		Logging: LoggingConfig{
 			Level:  "info",
 			Format: "text",
+		},
+		Executors: ExecutorsConfig{
+			// 默认关闭：打开执行器等于把任务提交权限扩展成命令执行权限，
+			// 必须由部署方显式决定（Enabled 为 true 时同时应配置 server.auth）。
+			Enabled:        false,
+			RequiredRole:   DefaultExecRequiredRole,
+			Workspace:      DefaultExecWorkspace,
+			RuntimeAllow:   []string{"bash", "sh", "cmd", "pwsh", "node", "php", "python", "java"},
+			EnvAllow:       []string{"PATH", "LANG", "LC_ALL", "TZ", "HOME"},
+			Concurrency:    DefaultExecConcurrency,
+			QueueCapacity:  0, // 与 Concurrency 相等
+			DefaultTimeout: DefaultExecDefaultTimeout,
+			MaxTimeout:     DefaultExecMaxTimeout,
+			RestorePolicy:  DefaultExecRestorePolicy,
+			LoaderAllow:    false,
+			Output: ExecutorOutputConfig{
+				InlinePreview: DefaultExecInlinePreview,
+				MaxBytes:      DefaultExecMaxOutputBytes,
+				Dir:           DefaultExecOutputDir,
+				TTL:           DefaultExecOutputTTL,
+			},
+			Commands: nil,
 		},
 	}
 }
@@ -252,6 +478,24 @@ func LoadConfig(path string) (Config, error) {
 		"store.groups_path",
 		"logging.level",
 		"logging.format",
+		// 执行器：只绑定标量与简单列表。executors.commands 是"名字+参数+路径"的嵌套列表，
+		// 与 server.auth.users 同一条限制：逗号分隔 hook 无法表达，且把可执行内容塞进
+		// 环境变量很容易被 `ps eww` 之类的旁路读到。
+		"executors.enabled",
+		"executors.required_role",
+		"executors.workspace",
+		"executors.runtime_allow",
+		"executors.env_allow",
+		"executors.concurrency",
+		"executors.queue_capacity",
+		"executors.default_timeout",
+		"executors.max_timeout",
+		"executors.restore_policy",
+		"executors.loader_allow",
+		"executors.output.inline_preview",
+		"executors.output.max_bytes",
+		"executors.output.dir",
+		"executors.output.ttl",
 	} {
 		if err := v.BindEnv(key, "GODELAYQ_"+strings.ToUpper(strings.ReplaceAll(key, ".", "_"))); err != nil {
 			return cfg, fmt.Errorf("bind env for %q failed: %w", key, err)
@@ -333,6 +577,10 @@ func (c Config) Validate() error {
 		return err
 	}
 
+	if err := c.Executors.Validate(); err != nil {
+		return err
+	}
+
 	for _, origin := range c.Server.CORS.AllowOrigins {
 		if strings.TrimSpace(origin) == "" {
 			return fmt.Errorf("server.cors.allow_origins must not contain an empty entry")
@@ -398,6 +646,42 @@ func (c Config) Normalized() Config {
 	}
 	if c.Logging.Format == "" {
 		c.Logging.Format = defaults.Logging.Format
+	}
+
+	// 执行器：0 值与留空一律回到默认（Enabled 为 false 时这些取值本身不生效，
+	// 但归一化后传给 executor 包就不必再各自判空补默认）。
+	if c.Executors.RequiredRole == "" {
+		c.Executors.RequiredRole = defaults.Executors.RequiredRole
+	}
+	if c.Executors.Workspace == "" {
+		c.Executors.Workspace = defaults.Executors.Workspace
+	}
+	if len(c.Executors.RuntimeAllow) == 0 {
+		c.Executors.RuntimeAllow = defaults.Executors.RuntimeAllow
+	}
+	if len(c.Executors.EnvAllow) == 0 {
+		c.Executors.EnvAllow = defaults.Executors.EnvAllow
+	}
+	if c.Executors.Concurrency == 0 {
+		c.Executors.Concurrency = defaults.Executors.Concurrency
+	}
+	if c.Executors.DefaultTimeout == 0 {
+		c.Executors.DefaultTimeout = defaults.Executors.DefaultTimeout
+	}
+	if c.Executors.MaxTimeout == 0 {
+		c.Executors.MaxTimeout = defaults.Executors.MaxTimeout
+	}
+	if c.Executors.RestorePolicy == "" {
+		c.Executors.RestorePolicy = defaults.Executors.RestorePolicy
+	}
+	if c.Executors.Output.InlinePreview == 0 {
+		c.Executors.Output.InlinePreview = defaults.Executors.Output.InlinePreview
+	}
+	if c.Executors.Output.MaxBytes == 0 {
+		c.Executors.Output.MaxBytes = defaults.Executors.Output.MaxBytes
+	}
+	if c.Executors.Output.Dir == "" {
+		c.Executors.Output.Dir = defaults.Executors.Output.Dir
 	}
 	return c
 }

@@ -434,3 +434,190 @@ func configKeys(path string) ([]string, error) {
 	sort.Strings(keys)
 	return keys, nil
 }
+
+func TestExecutorsDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+
+	assert.False(t, cfg.Executors.Enabled, "执行能力必须默认关闭：打开它等于把提交任务的权限扩展成执行命令的权限")
+	assert.Equal(t, "admin", cfg.Executors.RequiredRole)
+	assert.Equal(t, DefaultExecWorkspace, cfg.Executors.Workspace)
+	assert.Equal(t, []string{"bash", "sh", "cmd", "pwsh", "node", "php", "python", "java"}, cfg.Executors.RuntimeAllow)
+	assert.Equal(t, []string{"PATH", "LANG", "LC_ALL", "TZ", "HOME"}, cfg.Executors.EnvAllow)
+	assert.Equal(t, DefaultExecConcurrency, cfg.Executors.Concurrency)
+	assert.Zero(t, cfg.Executors.QueueCapacity, "0 表示与本节 concurrency 相等，由执行器侧解释")
+	assert.Equal(t, DefaultExecDefaultTimeout, cfg.Executors.DefaultTimeout)
+	assert.Equal(t, DefaultExecMaxTimeout, cfg.Executors.MaxTimeout)
+	assert.Equal(t, "pause", cfg.Executors.RestorePolicy)
+	assert.False(t, cfg.Executors.LoaderAllow)
+	assert.Equal(t, DefaultExecInlinePreview, cfg.Executors.Output.InlinePreview)
+	assert.Equal(t, DefaultExecMaxOutputBytes, cfg.Executors.Output.MaxBytes)
+	assert.Equal(t, DefaultExecOutputDir, cfg.Executors.Output.Dir)
+	assert.Equal(t, DefaultExecOutputTTL, cfg.Executors.Output.TTL)
+	assert.Nil(t, cfg.Executors.Commands)
+
+	assert.NoError(t, cfg.Validate())
+
+	normalized := cfg.Normalized()
+	assert.Equal(t, cfg.Executors, normalized.Executors, "默认值经归一化不应发生变化")
+	assert.Zero(t, normalized.Executors.QueueCapacity, "queue_capacity 的 0 有含义（与并发数相等），不能被补成别的值")
+
+	// 默认值里的列表每次都是新切片：否则某个使用者改写列表会波及后续拿到的默认配置
+	runtimes := DefaultConfig().Executors.RuntimeAllow
+	runtimes[0] = "mutated"
+	assert.Equal(t, "bash", DefaultConfig().Executors.RuntimeAllow[0])
+
+	// 只打开开关、其它一律用默认，必须是合法配置
+	enabled := cfg
+	enabled.Executors.Enabled = true
+	assert.NoError(t, enabled.Validate())
+}
+
+func TestExecutorsValidate_Rejects(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"role machine is not configurable", "executors:\n  required_role: machine\n", `required_role "machine"`},
+		{"role viewer cannot execute", "executors:\n  required_role: viewer\n", "must be operator, admin or ops"},
+		{"role typo", "executors:\n  required_role: admm\n", `required_role "admm" is invalid`},
+		{"restore policy", "executors:\n  restore_policy: skip\n", `restore_policy "skip" is invalid`},
+		{"workspace is whitespace", "executors:\n  workspace: \"   \"\n", "workspace must not be whitespace"},
+		{"output dir is whitespace", "executors:\n  output:\n    dir: \" \"\n", "output.dir must not be whitespace"},
+		{"empty runtime entry", "executors:\n  runtime_allow: [bash, \"\"]\n", "runtime_allow must not contain an empty entry"},
+		{"padded runtime entry", "executors:\n  runtime_allow: [\" node \"]\n", "must not have surrounding spaces"},
+		{"env allow would leak server credential", "executors:\n  env_allow: [PATH, GODELAYQ_SERVER_AUTH_TOKEN]\n", "GODELAYQ_ prefixed keys hold server credentials"},
+		{"negative concurrency", "executors:\n  concurrency: -1\n", "concurrency must not be negative"},
+		{"negative queue capacity", "executors:\n  queue_capacity: -2\n", "queue_capacity must not be negative"},
+		{"negative default timeout", "executors:\n  default_timeout: -1m\n", "default_timeout must not be negative"},
+		{"negative max timeout", "executors:\n  max_timeout: -1m\n", "max_timeout must not be negative"},
+		{"negative inline preview", "executors:\n  output:\n    inline_preview: -1\n", "inline_preview must not be negative"},
+		{"negative max bytes", "executors:\n  output:\n    max_bytes: -1\n", "max_bytes must not be negative"},
+		{"negative ttl", "executors:\n  output:\n    ttl: -1h\n", "ttl must not be negative"},
+		{"loader allow without enabled", "executors:\n  loader_allow: true\n", "requires executors.enabled to be true"},
+		{"concurrency zero while enabled", "executors:\n  enabled: true\n  concurrency: 0\n", "concurrency must be at least 1"},
+		{"default timeout zero while enabled", "executors:\n  enabled: true\n  default_timeout: 0s\n", "default_timeout must be positive"},
+		{"max timeout zero while enabled", "executors:\n  enabled: true\n  max_timeout: 0s\n", "max_timeout must be positive"},
+		{"default timeout exceeds max", "executors:\n  enabled: true\n  default_timeout: 2h\n  max_timeout: 30m\n", "must not exceed executors.max_timeout"},
+		{"output cap too small while enabled", "executors:\n  enabled: true\n  output:\n    max_bytes: 512\n", "max_bytes must be at least 1024"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadConfig(writeConfigFile(t, tc.yaml))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want)
+		})
+	}
+}
+
+func TestExecutorsValidate_AllowsUnsetWhenDisabled(t *testing.T) {
+	// 关闭执行器时，"没填"与"写 0"都不该报错：默认部署不该被要求抄一遍完整配置。
+	// 对照 Rejects 用例里的 concurrency: 0 / default_timeout: 0s —— 打开开关后同样写法会被拒。
+	cfg, err := LoadConfig(writeConfigFile(t,
+		"executors:\n  enabled: false\n  concurrency: 0\n  default_timeout: 0s\n  max_timeout: 0s\n  output:\n    max_bytes: 0\n"))
+	require.NoError(t, err)
+	assert.False(t, cfg.Executors.Enabled)
+
+	normalized := cfg.Normalized()
+	assert.Equal(t, DefaultExecConcurrency, normalized.Executors.Concurrency)
+	assert.Equal(t, DefaultExecDefaultTimeout, normalized.Executors.DefaultTimeout)
+	assert.Equal(t, DefaultExecMaxTimeout, normalized.Executors.MaxTimeout)
+	assert.Equal(t, DefaultExecMaxOutputBytes, normalized.Executors.Output.MaxBytes)
+	assert.Equal(t, DefaultExecOutputTTL, normalized.Executors.Output.TTL,
+		"ttl 的 0 表示不按时间清理，是有意的取值，不能被补成默认时长")
+
+	// 归一化之后的配置必须是"打开开关就能直接用"的，否则默认值本身有毛病
+	normalized.Executors.Enabled = true
+	assert.NoError(t, normalized.Validate())
+}
+
+func TestLoadConfig_ExecutorsFromYAML(t *testing.T) {
+	path := writeConfigFile(t, `
+executors:
+  enabled: true
+  required_role: ops
+  workspace: /srv/exec
+  runtime_allow:
+    - bash
+    - node
+  env_allow:
+    - PATH
+    - TZ
+  concurrency: 2
+  queue_capacity: 8
+  default_timeout: 1m
+  max_timeout: 10m
+  restore_policy: replay
+  loader_allow: true
+  output:
+    inline_preview: 512
+    max_bytes: 4096
+    dir: /var/lib/godelayq/exec
+    ttl: 48h
+  commands:
+    - name: nightly_report
+      kind: script
+      runtime: node
+`)
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+
+	assert.True(t, cfg.Executors.Enabled)
+	assert.Equal(t, "ops", cfg.Executors.RequiredRole)
+	assert.Equal(t, "/srv/exec", cfg.Executors.Workspace)
+	assert.Equal(t, []string{"bash", "node"}, cfg.Executors.RuntimeAllow)
+	assert.Equal(t, []string{"PATH", "TZ"}, cfg.Executors.EnvAllow)
+	assert.Equal(t, 2, cfg.Executors.Concurrency)
+	assert.Equal(t, 8, cfg.Executors.QueueCapacity)
+	assert.Equal(t, time.Minute, cfg.Executors.DefaultTimeout)
+	assert.Equal(t, 10*time.Minute, cfg.Executors.MaxTimeout)
+	assert.Equal(t, "replay", cfg.Executors.RestorePolicy)
+	assert.True(t, cfg.Executors.LoaderAllow)
+	assert.Equal(t, 512, cfg.Executors.Output.InlinePreview)
+	assert.Equal(t, 4096, cfg.Executors.Output.MaxBytes)
+	assert.Equal(t, "/var/lib/godelayq/exec", cfg.Executors.Output.Dir)
+	assert.Equal(t, 48*time.Hour, cfg.Executors.Output.TTL)
+
+	// 档位内容在 TASK-E02 之前按原样收下（宽松类型），这里只钉住"能被读出来"
+	require.Len(t, cfg.Executors.Commands, 1)
+	assert.Equal(t, []map[string]any{
+		{"name": "nightly_report", "kind": "script", "runtime": "node"},
+	}, cfg.Executors.Commands)
+}
+
+func TestLoadConfig_ExecutorsEnvOverrides(t *testing.T) {
+	path := writeConfigFile(t, "executors:\n  enabled: true\n")
+
+	t.Setenv("GODELAYQ_EXECUTORS_CONCURRENCY", "8")
+	t.Setenv("GODELAYQ_EXECUTORS_RUNTIME_ALLOW", "node,php")
+	t.Setenv("GODELAYQ_EXECUTORS_OUTPUT_TTL", "24h")
+	t.Setenv("GODELAYQ_EXECUTORS_REQUIRED_ROLE", "operator")
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	assert.Equal(t, 8, cfg.Executors.Concurrency)
+	assert.Equal(t, []string{"node", "php"}, cfg.Executors.RuntimeAllow,
+		"列表键可用逗号分隔的环境变量覆盖")
+	assert.Equal(t, 24*time.Hour, cfg.Executors.Output.TTL)
+	assert.Equal(t, "operator", cfg.Executors.RequiredRole)
+	assert.Equal(t, DefaultExecMaxOutputBytes, cfg.Executors.Output.MaxBytes, "未被覆盖的键保持默认值")
+}
+
+func TestLoadConfig_RejectsUnknownExecutorsKeys(t *testing.T) {
+	// 这一条固定了"不提供绕过白名单的命令入口"：raw 模式相关的键在配置里根本不存在，
+	// 写进来会启动失败，而不是被静默忽略后让人以为已经打开了某种自由命令行能力。
+	_, err := LoadConfig(writeConfigFile(t, "executors:\n  allow_raw_command: true\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse config failed")
+
+	_, err = LoadConfig(writeConfigFile(t, "executors:\n  output:\n    keep_everything: true\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse config failed")
+
+	// 已知限制（有意保留到 TASK-E02）：档位内部用宽松类型接收，键名拼错此时发现不了。
+	// 这条特征化测试的作用是在 E02 换成正式结构时失败，提醒连同注释一起改掉。
+	cfg, err := LoadConfig(writeConfigFile(t, "executors:\n  commands:\n    - nmae: nightly\n"))
+	require.NoError(t, err)
+	require.Len(t, cfg.Executors.Commands, 1)
+	assert.Equal(t, "nightly", cfg.Executors.Commands[0]["nmae"])
+}

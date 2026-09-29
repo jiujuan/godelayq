@@ -66,3 +66,71 @@ store:
 logging:
   level: info           # debug|info|warn|error；排障时可临时改 debug
   format: text          # text=人读友好，json=便于日志采集端索引
+
+# 执行器：由配置声明的可执行任务（脚本 / 已编译产物 / HTTP 请求）。
+# 设计依据见 docs/design/executor-design.md，实施进度见 docs/design/tasks/executor/README.md。
+executors:
+  # 总开关。false 时 exec.* 任务类型一个都不注册，下面所有取值全部不生效。
+  # 打开它等于把"能提交任务"扩展成"能执行命令"，所以必须同时配置上面的 server.auth
+  # （token 或 users 任一）；未启用鉴权只记一条 error 级启动日志，不会拒绝启动。
+  # 开发环境可用环境变量临时打开：GODELAYQ_EXECUTORS_ENABLED=true
+  enabled: false
+  # 提交 exec.* 任务所需的最低档位：operator|admin|ops；留空用默认 admin。
+  # 静态 token 的身份是 machine，档位等同 operator，因此默认的 admin 会拒绝脚本凭据提交执行任务。
+  # 降到 operator 意味着"CI 里泄漏一个 token 就能执行命令"，请先评审再改。
+  required_role: admin
+  # 档位里 script/program/cwd 的根目录：相对路径解析后必须仍落在它之内，
+  # 越界（绝对路径、.. 或符号链接指向外部）启动即报错。留空用默认 ./exec-workspace。
+  workspace: ./exec-workspace
+  # 允许档位使用的解释器/程序名白名单。逗号分隔覆盖：GODELAYQ_EXECUTORS_RUNTIME_ALLOW=node,bash
+  runtime_allow: [bash, sh, cmd, pwsh, node, php, python, java]
+  # 传给子进程的环境变量键名白名单。GODELAYQ_ 前缀的键即使在列表里也会被强制排除：
+  # 服务端的 token 与 JWT 密钥就存放在进程环境的 GODELAYQ_* 里。
+  # Windows 上建议补 SystemRoot、COMSPEC、PATHEXT，否则部分解释器起不来。
+  env_allow: [PATH, LANG, LC_ALL, TZ, HOME]
+  # 执行器专用执行池的协程数，与 scheduler.workers 分池：
+  # 共池时分钟级的脚本会长时间占住共享执行名额。留空/删掉本项用默认 4；
+  # 显式写 0 会被拒（enabled=true 时要求 >=1），与"0=用默认值"的其它配置不同，
+  # 这是为了让打开执行器的部署必须明确表态。
+  concurrency: 4
+  # 执行器队列容量；0 表示与本节 concurrency 相等。队列满时任务留在堆与存储里等空位
+  queue_capacity: 0
+  # 单次执行超时的默认值与上限：档位没写 timeout 时用 default_timeout；
+  # 超过 max_timeout 的档位或任务请求会被直接拒绝（不是静默夹取）。
+  # 执行器任务没有"不限制"这种取值——挂死的进程会一直占住执行名额。
+  default_timeout: 5m
+  max_timeout: 30m
+  # 重启时如何处理"崩溃瞬间仍在执行"的执行器任务：
+  #   pause  = 置为 paused，等人工确认后恢复（默认；外部副作用的结果未知，不替人决定）
+  #   replay = 照常重新入队（重复执行的后果由部署方承担）
+  # 只影响崩溃场景：优雅关闭（SIGTERM）打断的任务仍按既有语义回到待执行。
+  restore_policy: pause
+  # 是否允许目录任务加载器接受 exec.* 前缀的任务文件，默认 false：
+  # 能往监控目录写文件不等于能执行命令。注意服务端二进制当前并不启用加载器，
+  # 本项约束的是自行接入 core.DirectoryLoader 的程序。
+  loader_allow: false
+  output:
+    # 事件与任务详情里携带的输出尾部预览字节数；完整输出在下面的产物目录。0 用默认 2048
+    inline_preview: 2048
+    # 单条流（stdout 或 stderr）的落盘上限，达到即停止写入并标记截断。0 用默认 262144；
+    # enabled=true 时最小 1024
+    max_bytes: 262144
+    # 产物目录，与 store.path 分开放，便于单独设权限与清理
+    dir: ./data/exec
+    # 产物保留时长；0 表示不按时间清理（只做启动时的孤儿清理）。
+    # 建议与上面的 store.history_ttl 配对：留痕被清掉后，对应产物会在下次启动的孤儿清理中删除
+    ttl: 168h
+  # 档位列表：能执行什么完全由这里决定，不提供自由命令行，也不接受任务里内联源码。
+  # 与 server.auth.users 同理，这里故意不写 []（解开示例即可启用，写 [] 再挂列表项会让 YAML 报错）。
+  # 本节的正式结构在 executor 包中定义，当前只有顶层 commands 键被识别，
+  # 档位内部的键名拼错此时不会被配置校验发现。字段与校验规则见设计文档 §5。
+  commands:
+  #  - name: nightly_report          # 注册后的任务类型名是 exec.nightly_report
+  #    kind: script                  # script | binary | http
+  #    runtime: node
+  #    script: scripts/report.mjs    # 相对 workspace，文件必须已存在
+  #    args:
+  #      - { name: day, required: true, pattern: '^(yesterday|today)$' }
+  #    args_render: ["--day={day}"]
+  #    timeout: 10m
+  #    max_parallel: 1
