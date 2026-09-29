@@ -298,7 +298,7 @@ function createGroup(): void {
         :model-value="form.timeout"
         :disabled="busy"
         placeholder="留空不限制"
-        hint="只有检查 ctx 的 Handler 才可能被超时中止"
+        hint="如 90s、2m、1h30m：单位只有 ns/us/ms/s/m/h，必须带单位（30 无效，也没有 d）；只有检查 ctx 的 Handler 才可能被超时中止"
         @update:model-value="form.timeout = $event"
       />
       <UiInput

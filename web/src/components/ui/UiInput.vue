@@ -8,6 +8,8 @@ interface Props {
   placeholder?: string
   autocomplete?: string
   error?: string | null
+  /** 输入框下方的灰色说明；error 存在时让位给报错 */
+  hint?: string
   disabled?: boolean
   autofocus?: boolean
 }
@@ -45,5 +47,6 @@ const invalid = computed(() => Boolean(props.error))
       @input="emit('update:modelValue', ($event.target as HTMLInputElement).value)"
     />
     <p v-if="error" class="text-xs text-[var(--color-status-failed)]">{{ error }}</p>
+    <p v-else-if="hint" class="text-xs text-[var(--color-text-muted)]">{{ hint }}</p>
   </div>
 </template>
