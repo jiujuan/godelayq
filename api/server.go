@@ -13,6 +13,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"godelayq/core"
+	"godelayq/executor"
 )
 
 // Server HTTP API 服务器
@@ -43,6 +44,9 @@ type Server struct {
 	// /api/v1/groups 各端点据此返回 503（任务的 group 标签不受影响，
 	// 它本来就存在任务快照里）。
 	groups core.GroupStore
+	// executors 是执行器档位登记表；nil 表示这次部署没装配执行器（开关关闭，
+	// 或测试直接构造 Server）。读它的端点在 TASK-E07/E13 加入，本卡只提供注入。
+	executors *executor.Registry
 	// history 是事件总线的内存订阅者，为详情页时间线与 Dashboard 提供最近事件
 	history *EventHistory
 	// console 是嵌入的前端产物根；nil 表示这次部署只提供 API（开发形态）。
@@ -65,6 +69,13 @@ type Option func(*Server)
 // 但任务上的 group 标签照常读写——两者是两份数据，不要混用。
 func WithGroupStore(store core.GroupStore) Option {
 	return func(s *Server) { s.groups = store }
+}
+
+// WithExecutorRegistry 注入执行器档位登记表。传 nil 与不注入等价：
+// 登记表在开关关闭时也是非 nil 的空表，所以"没装配"只有测试直接构造 Server 那一种情况。
+// 端点尚未实现（TASK-E07），这里先只把依赖接进来，避免那时再改一次装配。
+func WithExecutorRegistry(reg *executor.Registry) Option {
+	return func(s *Server) { s.executors = reg }
 }
 
 // NewServer 创建API服务器。sec 为零值时不鉴权、接受任意跨域来源；

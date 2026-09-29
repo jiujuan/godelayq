@@ -94,3 +94,75 @@ curl -s -X POST localhost:8080/api/v1/jobs -H 'Content-Type: application/json' \
 - 风险：`run` 的装配顺序改动会影响优雅关闭路径的既有测试（`api/shutdown_test.go`、`main_integration_test.go`）。要求只在指定位置插入，不改 `scheduler.Start()` 与 `server.Start()` 的相对顺序。
 - 风险：桩处理函数容易在后续卡片里被忘记替换，导致"看起来接通了但永远失败"。E09 的 DoD 里必须写明删除 `StubHandler`。
 - 回滚：本卡涉及 `main.go` 与 `api/server.go` 的结构改动，回滚用 `git revert` 单个提交；登记表是新增类型，不会被其它已发布代码引用。
+
+## 10. 实现记录（2026-09-30）
+
+改动文件：新增 `executor/register.go`、`executor/handler_stub.go` 及 `executor/register_test.go`；
+改 `cmd/server/main.go`、`cmd/server/main_test.go`、`cmd/server/main_integration_test.go`、`api/server.go`。
+
+### 与卡片的偏离与补充
+
+1. **`Register` 返回 `(Registration, error)`**（卡片 §3.2 的签名写 `int`，正文又要 `registered`/`unavailable` 两个计数）。
+   `Registration{Total, Registered, Unavailable}` 一次把三个数都给出来，直接进启动日志。
+2. **查重接口导出为 `Registrar`**（卡片写的是私有的 `schedulerRegistrar`）：
+   它出现在导出函数 `Register` 的签名里，照 `core.GroupStore` 的体例用导出接口与导出类型。
+   `executor/register_test.go` 里有 `var _ Registrar = (*core.Scheduler)(nil)`，方法名再改动会在编译期暴露。
+3. **键冲突时一个都不注册**（卡片建议"检测到冲突就停止并返回已注册数量+错误"）。
+   实现改成先对全部键查重、再全部写入：冲突时注册表保持原样，不会出现"注册了一半的档位"。
+   `TestRegister_KeyConflict` 钉住这条语义（断言 `Registered==0` 且假注册表里只剩预先占用的那个键）。
+4. **`registerHandlers` 多一个参数**：`registerHandlers(server serverAPI, scheduler schedulerAPI, reg *executor.Registry, logger *slog.Logger) error`。
+   卡片只给了 `server`，但 `api.Server` 只把 `RegisterJobHandler` 转发给调度器、没有转发 `LookupHandler`，
+   而注册档位需要"查重 + 写入"落在同一张表上，因此示例仍走 `server`、档位走 `scheduler`。
+   真实进程里两者是同一张表（`api/server.go` 的 `RegisterJobHandler` 就是转发），
+   `TestRun_RegistersHandlersStartsAndStops` 断言了两件事：档位出现在调度器表里、且没有经过 `RegisterJobHandler`。
+5. **`requireExecutorRegistry()` 守卫推迟到 E07**（卡片 §3.4 要求本卡加）。
+   本卡没有任何端点读登记表，加了就是一个不被调用的函数与一个 503 分支。
+   `api.WithExecutorRegistry` 与 `Server.executors` 字段已就位，E07 加端点时同批补守卫与测试。
+6. **`runtimeDeps.newServer` 多一个参数**（`executors *executor.Registry`）：
+   登记表要在 `run` 里构造一次，同时交给调度器注册与 `api.Server` 注入，两处必须是同一个实例。
+   `newExecutorRegistry` 列入依赖完整性检查：少了它执行器会静默不注册，`TestRun_WithIncompleteDependencies` 覆盖了这条。
+7. **空登记表不写注册日志**：`enabled=false` 时每次启动会多一行 `total=0` 的 INFO，属于噪音。
+   现在只在"开关打开却没有档位"时记 warn（卡片 §3.6 要求的那条），关闭状态下 `Register` 完全静默。
+8. **`TestRegisterHandlers_ConflictFails` 的构造方式与卡片不同**：卡片写"档位名与 `payment_check` 冲突"，
+   但注册键固定带 `exec.` 前缀、档位名字符集里又没有 `.`，所以档位不可能撞上任一示例名。
+   测试改为预先占用 `exec.a`（对应"以后有代码以 exec. 前缀注册内置处理函数"这种真实冲突来源）。
+   也就是说本卡的冲突检查今天不会被触发，它是给后续处理函数用的护栏，错误信息里带上档位名以便定位。
+
+### 附带修复：启动失败的日志级别
+
+`cmd/server/main.go` 里 `run` 返回错误原本只走 `log.Fatal(err)`。本机 Go 1.26.4 实测：
+标准库 `log` 已桥接到 `slog.Default()`，且固定用 **INFO** 级别写 `msg=<错误文本>`，
+于是"档位越界导致启动失败"在日志里是一条 INFO 记录，按 `level=error` 采集的告警不会触发（stderr 也不再是它的去向）。
+现改为 `logger.Error("server exited with error", "error", err)` + `os.Exit(1)`：级别正确、退出码不变、
+`main()` 之前那两处 `log.Fatalf`（日志器还没建起来）保持原样。这条修复单独一个 `fix` 提交，不与本卡的装配混在一起。
+
+### 验证结果
+
+- 单元测试：`go test ./executor ./cmd/server -race -count=1` 通过。新增用例 8 条
+  （executor 5 条：全量注册、键冲突、空表、空表且开关打开的 warn、桩处理函数；
+  cmd/server 3 条：带档位的注册总数、冲突返回错误、登记表构造失败时不启动且关闭存储、鉴权未开时的 error 横幅）。
+- `go build ./...`、`go vet ./...`、`go test ./... -race` 全绿；`GOOS=linux/darwin` 交叉编译与 `-tags dashboard` 构建均通过。
+- 真实进程冒烟（临时二进制装在系统临时目录，配置与 workspace 也在临时目录，跑完已删除；
+  仓库的 `configs/config.yaml`、`data/` 未被写入）：
+  - 两条档位（一条解释器存在、一条解释器不存在）+ `enabled: true` + 未配鉴权，启动日志依次为
+    `WARN executor profile unavailable profile=hello_absent handler_key=exec.hello_absent reason="runtime \"godelayq-no-such-runtime\" not found in PATH"`、
+    `ERROR executors are enabled while server authentication is disabled`、
+    `INFO executor handlers registered total=2 registered=2 unavailable=1`。**E03 §10 第 6 条遗留的手工验证在此补做完成。**
+  - `GET /api/v1/job-types` → `["data_sync","email_send","exec.hello_absent","exec.hello_present","payment_check","report_generate"]`。
+  - `POST /api/v1/jobs`（`exec.hello_present`，delay 2s）→ 201；触发后事件为
+    `job.failed` + `data.error="executor exec.hello_present: not implemented yet"`，
+    服务端日志有 `INFO executor stub invoked job_id=… handler_key=exec.hello_present`。
+    这正是 DoD 要区分的两点：不是 `no handler registered`，而是执行器尚未实现。
+    不可用档位此刻也能提交成功——提交期的拒绝属于 E16。
+  - `enabled: false` 的同一条档位配置：`/job-types` 仍是原有四个名字，整份日志里 `executor` 关键字出现 0 次（DoD 第 1 条）。
+  - 越界档位 `script: ../../evil.sh` + `enabled: true`：进程退出码 1，
+    日志 `ERROR server exited with error error="executors.commands[0] \"escape_attempt\": script \"../../evil.sh\" must not climb out of executors.workspace"`。
+
+### 留给后续卡片的接口形状
+
+- E07：`api.Server.executors` 已注入，加 `/executors` 端点时同批补 `requireExecutorRegistry()` 的 503 守卫。
+- E09：把 `Register` 里的 `profile.StubHandler()` 换成 `Runner.Handler()`，并删除 `executor/handler_stub.go`（该卡 §5 第 7 条与 DoD 已登记）。
+- E13：`Registration` 的三个计数是分流后仍然有效的观测点，日志字段名不要改。
+- E16：提交期要用 `Registry.Available(key)` 拿原因、`Registry.RequiredRole()` 拿档位，本卡已保证两者存在。
+
+

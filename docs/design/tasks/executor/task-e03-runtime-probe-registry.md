@@ -117,6 +117,7 @@ go test ./executor -race -v
    所以"启动后日志里看到 warn"这条只能以两种方式替代——
    `TestNewRegistry_FromConfigFile`（真实 YAML → `core.LoadConfig` → `NewRegistry`，混合可用与不可用档位），
    以及一次临时冒烟程序（见下）。E04 完成后应当回到这条手工验证再走一遍。
+   **已于 2026-09-30 在 E04 补做**：真实服务端进程里看到了这条 warn，原文与档位名见 E04 卡 §10 的验证结果。
 
 ### 验证结果
 

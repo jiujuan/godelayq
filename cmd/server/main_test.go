@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -12,12 +13,72 @@ import (
 	"time"
 
 	"godelayq/core"
+	"godelayq/executor"
 )
 
-func TestRegisterHandlers_RegistersAllSupportedJobTypes(t *testing.T) {
-	server := newFakeServer()
+// quietLogger 吞掉测试不关心的日志，避免注册计数混进 go test 的输出。
+func quietLogger() *slog.Logger {
+	return slog.New(slog.NewTextHandler(io.Discard, nil))
+}
 
-	registerHandlers(server)
+// disabledRegistry 造一个开关关闭时空着的登记表，等价于"这次部署没有执行器"。
+func disabledRegistry(t *testing.T) *executor.Registry {
+	t.Helper()
+
+	reg, err := executor.NewRegistry(core.DefaultConfig(), quietLogger())
+	if err != nil {
+		t.Fatalf("build disabled registry: %v", err)
+	}
+	return reg
+}
+
+// scriptRegistry 造一个启用状态的登记表，每个名字一条脚本档位。
+// runtime 用当前测试程序自身：它一定存在且在 PATH 里，因此探测结论为可用，
+// 断言不必依赖目标机器装了 node 或 php。
+func scriptRegistry(t *testing.T, names ...string) *executor.Registry {
+	t.Helper()
+
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test executable: %v", err)
+	}
+
+	workspace := t.TempDir()
+	cfg := core.DefaultConfig()
+	cfg.Executors.Enabled = true
+	cfg.Executors.Workspace = workspace
+	cfg.Executors.RuntimeAllow = append(cfg.Executors.RuntimeAllow, executable)
+
+	for _, name := range names {
+		scriptRel := "scripts/" + name + ".mjs"
+		scriptAbs := filepath.Join(workspace, filepath.FromSlash(scriptRel))
+		if err := os.MkdirAll(filepath.Dir(scriptAbs), 0o750); err != nil {
+			t.Fatalf("create script dir: %v", err)
+		}
+		if err := os.WriteFile(scriptAbs, []byte("console.log('ok')\n"), 0o600); err != nil {
+			t.Fatalf("create script file: %v", err)
+		}
+		cfg.Executors.Commands = append(cfg.Executors.Commands, core.ExecutorCommand{
+			Name:    name,
+			Kind:    "script",
+			Runtime: executable,
+			Script:  scriptRel,
+		})
+	}
+
+	reg, err := executor.NewRegistry(cfg, quietLogger())
+	if err != nil {
+		t.Fatalf("build executor registry: %v", err)
+	}
+	return reg
+}
+
+func TestRegisterHandlers_RegistersAllSupportedJobTypes(t *testing.T) {
+	server, scheduler := newRegisteredPair()
+
+	if err := registerHandlers(server, scheduler, disabledRegistry(t), quietLogger()); err != nil {
+		t.Fatalf("expected registerHandlers to succeed, got %v", err)
+	}
 
 	expected := []string{"payment_check", "email_send", "data_sync", "report_generate"}
 	if len(server.registered) != len(expected) {
@@ -29,6 +90,55 @@ func TestRegisterHandlers_RegistersAllSupportedJobTypes(t *testing.T) {
 			t.Fatalf("expected handler %q to be registered", name)
 		}
 	}
+}
+
+func TestRegisterHandlers_WithProfiles(t *testing.T) {
+	server, scheduler := newRegisteredPair()
+
+	if err := registerHandlers(server, scheduler, scriptRegistry(t, "a", "b"), quietLogger()); err != nil {
+		t.Fatalf("expected registerHandlers to succeed, got %v", err)
+	}
+
+	// 四个示例 + 两条档位；档位键带 exec. 前缀，与示例名不可能重合
+	if len(scheduler.registered) != 6 {
+		t.Fatalf("expected 6 scheduler handlers, got %d: %v", len(scheduler.registered), scheduler.registeredKeys())
+	}
+	for _, name := range []string{"exec.a", "exec.b"} {
+		if _, ok := scheduler.registered[name]; !ok {
+			t.Fatalf("expected executor handler %q to be registered", name)
+		}
+	}
+
+	// 示例仍按原路径注册，档位不会因为它们绕过 api.Server 而丢掉转发关系
+	if len(server.registered) != 4 {
+		t.Fatalf("expected 4 handlers on the server, got %d", len(server.registered))
+	}
+}
+
+func TestRegisterHandlers_ConflictFails(t *testing.T) {
+	server, scheduler := newRegisteredPair()
+	// 占用档位将要使用的键，模拟配置与代码对不上的情况
+	scheduler.RegisterHandler("exec.a", func(context.Context, *core.Job) error { return nil })
+
+	err := registerHandlers(server, scheduler, scriptRegistry(t, "a", "b"), quietLogger())
+	if err == nil {
+		t.Fatal("expected a conflict error")
+	}
+	if !strings.Contains(err.Error(), "exec.a") {
+		t.Fatalf("expected the conflicting key in %q", err.Error())
+	}
+	if _, ok := scheduler.registered["exec.b"]; ok {
+		t.Fatal("expected no partial registration when a key conflicts")
+	}
+}
+
+// newRegisteredPair 造一对测试替身：假服务把注册转发给假调度器，
+// 与真实进程里 api.Server 转发给 core.Scheduler 的关系一致。
+func newRegisteredPair() (*fakeServer, *spyScheduler) {
+	server := newFakeServer()
+	scheduler := newSpyScheduler()
+	server.onRegister = scheduler.RegisterHandler
+	return server, scheduler
 }
 
 func TestHandlePaymentCheck(t *testing.T) {
@@ -183,7 +293,8 @@ func TestHandlers_LogPayload(t *testing.T) {
 func TestDefaultRuntimeDeps(t *testing.T) {
 	deps := defaultRuntimeDeps(core.DefaultConfig(), slog.Default())
 
-	if deps.newStore == nil || deps.newScheduler == nil || deps.newServer == nil || deps.notifySignals == nil {
+	if deps.newStore == nil || deps.newScheduler == nil || deps.newExecutorRegistry == nil ||
+		deps.newServer == nil || deps.notifySignals == nil {
 		t.Fatal("expected all runtime dependencies to be set")
 	}
 	if deps.timeout != core.DefaultConfig().Scheduler.ShutdownTimeout {
