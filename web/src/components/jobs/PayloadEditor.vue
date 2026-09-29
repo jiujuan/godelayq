@@ -10,6 +10,8 @@ interface Props {
   label?: string
   error?: string | null
   hint?: string
+  /** 空框时的示例：textarea 的 placeholder 支持换行，正好放一段最小可用 JSON */
+  placeholder?: string
   disabled?: boolean
   rows?: number
 }
@@ -17,6 +19,7 @@ interface Props {
 const props = withDefaults(defineProps<Props>(), {
   label: 'payload',
   rows: 8,
+  placeholder: '',
 })
 
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
@@ -33,6 +36,7 @@ const invalid = computed(() => Boolean(props.error))
     <textarea
       :value="modelValue"
       :rows="rows"
+      :placeholder="placeholder"
       :disabled="disabled"
       spellcheck="false"
       aria-label="payload JSON"

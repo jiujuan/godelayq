@@ -7,6 +7,8 @@
  *
  * 触发方式三选一在提交时塌缩成一个：后端看到 delay / trigger_at / cron_expr 只应有一个非空。 */
 import { computed, reactive, ref, watch } from 'vue'
+import { RouterLink } from 'vue-router'
+import { ExternalLink } from 'lucide-vue-next'
 import CronPicker from './CronPicker.vue'
 import PayloadEditor from './PayloadEditor.vue'
 import UiButton from '../ui/UiButton.vue'
@@ -53,6 +55,14 @@ const form = reactive({
 })
 
 const quickDelays = ['1m', '10m', '1h', '24h']
+
+/** 空框时贴在 payload 输入区里的最小示例。textarea 的 placeholder 支持换行，
+    用户照着改两个键就能提交，比在框外写一段说明更省事。 */
+const payloadPlaceholder = `{
+  "order_id": "ORD-2024-001",
+  "amount": "199.99",
+  "notify": { "email": "ops@example.com" }
+}`
 const newGroupName = ref('')
 const showingGroupInput = ref(false)
 
@@ -257,11 +267,24 @@ function createGroup(): void {
       </label>
     </fieldset>
 
+    <div class="flex items-center justify-between">
+      <span class="text-sm font-medium text-[var(--color-text)]">payload 写什么</span>
+      <RouterLink
+        :to="{ name: 'job-template' }"
+        target="_blank"
+        class="flex items-center gap-1 text-xs text-[var(--color-primary)] hover:underline"
+      >
+        <ExternalLink :size="12" aria-hidden="true" />
+        打开任务模板与示例（新标签页）
+      </RouterLink>
+    </div>
+
     <PayloadEditor
       :model-value="form.payload"
       :disabled="busy"
       :error="payloadError"
-      hint="合法 JSON，留空表示不带 payload"
+      :placeholder="payloadPlaceholder"
+      hint="合法 JSON，字段由该任务类型的 Handler 定义；留空表示不带 payload"
       @update:model-value="form.payload = $event"
     />
 
