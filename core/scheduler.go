@@ -19,6 +19,21 @@ import (
 // workers 配置口径一致。
 const DefaultConcurrency = 100
 
+// JobClass 是任务的执行类别，决定它进哪一个执行池（TASK-E13）。
+//
+// 只有两类：普通任务与执行器任务。按档位再拆更多池不在本卡范围（卡片 §8）。
+type JobClass int
+
+const (
+	// JobClassDefault 是共享执行池：既有部署里所有任务、以及代码注册的处理函数都在这一类。
+	// 取零值是为了让"没盖章"的任务落在老池子里，而不是掉进一个不存在的池。
+	JobClassDefault JobClass = iota
+
+	// JobClassExec 是执行器档位（exec.*）：单次执行按分钟计、一次 cron 触发可能几十条到期，
+	// 因此独占一套 worker 与队列，不再和普通任务抢名额。
+	JobClassExec
+)
+
 // Scheduler 任务调度器
 type Scheduler struct {
 	heap        *QuaternaryHeap
@@ -48,6 +63,25 @@ type Scheduler struct {
 	queueCapacity int // 0 表示与 concurrency 相等
 	workCh        chan *Job
 
+	// 执行器池（TASK-E13）：与上面的默认池各自排队、各自起 worker。
+	// execConcurrency 为 0 表示这个池不存在——没打开执行器的进程连通道和协程都不建，
+	// 行为与本卡之前完全一致。
+	execConcurrency   int
+	execQueueCapacity int // 0 表示与 execConcurrency 相等
+	execCh            chan *Job
+
+	// execInFlight 已进入执行器池 Handler、尚未返回的任务数。
+	// 与 inFlight 分开计数：合成一个数字就给不出"执行器池把普通任务挤在哪儿"的读数。
+	execInFlight atomic.Int32
+
+	// execSlotFreed 容量 1、只做了非阻塞发送：执行器 worker 取走一个任务就敲一下，
+	// 叫醒正在等空位的调度循环。
+	//
+	// 两次释放只触发一次唤醒是允许的（信号是"有变化"而不是"变化次数"）：
+	// 调度循环还有一条 500ms 的兜底超时兜住漏掉的唤醒，最坏情况只是延迟一次投递，
+	// 不会死锁。别把那条兜底超时当多余代码删掉。
+	execSlotFreed chan struct{}
+
 	// eventPreviewLimit 是完成/失败事件里输出预览的字节上限（executors.output.inline_preview）。
 	// 事件会广播给全部 WS/SSE 订阅者，并在 api 的内存缓冲里留下最近若干条，
 	// 因此事件只带结论，输出正文留在产物文件里。受 s.mu 保护：装配期写入，执行协程读取。
@@ -55,6 +89,11 @@ type Scheduler struct {
 
 	// 任务注册表，按 HandlerKey（Type，回退 Name）绑定Handler（用于从持久化恢复）
 	handlers map[string]Handler
+
+	// handlerClasses 记录每个注册键声明的执行类别，与 handlers 同一把锁保护。
+	// 分开两张表而不是让 Handler 自己带类别：类别是注册方声明的部署属性，
+	// 处理函数本身不该知道自己在哪个池里跑。
+	handlerClasses map[string]JobClass
 
 	// 取消控制（与 handlers 一样受 s.mu 保护）
 	cancelMap map[string]context.CancelFunc
@@ -85,17 +124,19 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 	settings := newComponentOptions(opts...)
 
 	return &Scheduler{
-		heap:        NewQuaternaryHeap(),
-		store:       store,
-		retryPolicy: retryPolicy,
-		cronParser:  NewCronParser(),
-		stopCh:      make(chan struct{}),
-		newJobCh:    make(chan struct{}, 1),
-		resumeCh:    make(chan struct{}, 1),
-		concurrency: DefaultConcurrency,
-		handlers:    make(map[string]Handler),
-		cancelMap:   make(map[string]context.CancelFunc),
-		forcedPause: make(map[string]struct{}),
+		heap:           NewQuaternaryHeap(),
+		store:          store,
+		retryPolicy:    retryPolicy,
+		cronParser:     NewCronParser(),
+		stopCh:         make(chan struct{}),
+		newJobCh:       make(chan struct{}, 1),
+		resumeCh:       make(chan struct{}, 1),
+		concurrency:    DefaultConcurrency,
+		execSlotFreed:  make(chan struct{}, 1),
+		handlers:       make(map[string]Handler),
+		handlerClasses: make(map[string]JobClass),
+		cancelMap:      make(map[string]context.CancelFunc),
+		forcedPause:    make(map[string]struct{}),
 		// 预览上限默认取配置默认值：不装配执行器的程序也一样，事件里的预览不会没头没尾。
 		eventPreviewLimit: DefaultExecInlinePreview,
 		eventBus:          eventBus,
@@ -135,6 +176,57 @@ func (s *Scheduler) SetQueueCapacity(n int) {
 	s.queueCapacity = n
 }
 
+// SetExecConcurrency 设置执行器池的 worker 数量，需在 Start 之前调用；
+// Start 之后调用不生效并记录日志。
+//
+// 与 SetConcurrency 的一条差别要说清：这里 0 不是"回退默认值"，而是"不建这个池"。
+// 卡片 §3.3 要求 0 回退默认，但那条与 §3.7"enabled=false 时传 0（不建 exec 池）"直接冲突——
+// 回退默认会让"关掉这个池"没有表达方式，而且没装执行器的进程不该凭空多出 4 个协程。
+// 默认值 4 由配置层的 executors.concurrency 负责（Normalized 会补齐，显式写 0 会被配置校验拒绝），
+// 本 setter 不重复一遍。负数同样按关闭处理。
+func (s *Scheduler) SetExecConcurrency(n int) {
+	if n < 0 {
+		n = 0
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		s.logger.Warn("SetExecConcurrency ignored: scheduler already running", "exec_workers", n)
+		return
+	}
+	s.execConcurrency = n
+}
+
+// SetExecQueueCapacity 设置执行器队列容量，需在 Start 之前调用。
+// 0 或负数表示与 exec worker 数相等。
+//
+// 队列满时调度循环的行为与默认池不同：不阻塞，任务留在堆里等空位（见 scheduleLoop）。
+func (s *Scheduler) SetExecQueueCapacity(n int) {
+	if n < 0 {
+		n = 0
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		s.logger.Warn("SetExecQueueCapacity ignored: scheduler already running", "exec_queue_capacity", n)
+		return
+	}
+	s.execQueueCapacity = n
+}
+
+// notifyExecSlot 非阻塞敲一次"执行器池腾出了空位"，用于叫醒在等空位的调度循环。
+//
+// 信号可能被合并（容量 1，两次释放只唤醒一次），这是允许的：
+// 调度循环还有一条 500ms 的兜底超时会重新检查队列，最坏只是晚一点投递，不会卡死。
+func (s *Scheduler) notifyExecSlot() {
+	select {
+	case s.execSlotFreed <- struct{}{}:
+	default:
+	}
+}
+
 // SetEventPreviewLimit 设置完成/失败事件里输出预览的字节上限，需在 Start 之前调用。
 // 取值来自 executors.output.inline_preview，由装配方传入；传入非正数时回退到
 // DefaultExecInlinePreview，避免一次配置笔误让事件里连一行摘要都不剩。
@@ -155,11 +247,30 @@ func (s *Scheduler) SetEventPreviewLimit(n int) {
 	s.eventPreviewLimit = n
 }
 
-// RegisterHandler 注册任务类型对应的处理函数
+// RegisterHandler 注册任务类型对应的处理函数。
+// 等价于 RegisterHandlerClass(jobType, handler, JobClassDefault)——这是兼容底线：
+// 既有调用点、示例处理函数与测试都不需要知道"执行池"这个概念。
 func (s *Scheduler) RegisterHandler(jobType string, handler Handler) {
+	s.RegisterHandlerClass(jobType, handler, JobClassDefault)
+}
+
+// RegisterHandlerClass 注册处理函数并声明它的执行类别（TASK-E13）。
+//
+// 执行器档位用 JobClassExec：这类任务单次执行按分钟计，共享池会让普通任务的准时性失效。
+// 类别在注册时定下，入堆时按注册表盖章，之后改注册不会影响已经在堆里的任务——
+// 注册本来就发生在启动阶段，运行期没有人重新注册同一键。
+func (s *Scheduler) RegisterHandlerClass(jobType string, handler Handler, class JobClass) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.handlers[jobType] = handler
+	s.handlerClasses[jobType] = class
+}
+
+// classOfKey 查注册表里声明的执行类别；没登记过的键按默认池处理（零值即 JobClassDefault）。
+func (s *Scheduler) classOfKey(key string) JobClass {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.handlerClasses[key]
 }
 
 // LookupHandler 按 Handler 键（Type 优先，回退 Name）查找已注册的处理函数。
@@ -209,6 +320,10 @@ func (s *Scheduler) Schedule(job *Job) error {
 		}
 		job.TriggerAt = next
 	}
+
+	// 执行类别在入堆之前盖章：投递判断要在堆的锁里读它，那时不该再回头查注册表。
+	// 注册表里没有这个键时落在 JobClassDefault，与改动前的行为一致。
+	job.class = s.classOfKey(job.HandlerKey())
 
 	// 持久化必须在入堆之前：任务一进堆就可能被 worker 取走，worker 会就地改写
 	// Status/Attempts/UpdatedAt（executeJob 开头那三行），而快照是这些字段的读取方。
@@ -771,6 +886,9 @@ func (s *Scheduler) Restore() error {
 		job.FromSnapshot(snap)
 		// 上次崩溃时处于 Running 的任务在此复位为待执行
 		job.Status = StatusPending
+		// 类别不在快照里，按注册表重新盖章：Start 之前处理函数已经注册完，
+		// 恢复出来的执行器任务因此照样落在自己的池里。
+		job.class = s.classOfKey(job.HandlerKey())
 		// TriggerAt 已过期的任务直接入队，由调度循环立即补跑
 		s.heap.PushItem(job)
 		restored++
@@ -805,31 +923,63 @@ func (s *Scheduler) Start() {
 		queueCap = workers
 	}
 	s.workCh = make(chan *Job, queueCap)
+
+	// 执行器池：worker 数为 0 时连通道都不建（DoD 第 5 条）。
+	// 通道置 nil 也是给投递判断用的信号——nil 通道永远"没有空位"，
+	// 所以 execPoolEnabled 只要看通道是否非空。
+	execWorkers := s.execConcurrency
+	s.execCh = nil
+	if execWorkers > 0 {
+		execCap := s.execQueueCapacity
+		if execCap <= 0 {
+			execCap = execWorkers
+		}
+		s.execCh = make(chan *Job, execCap)
+	}
 	s.mu.Unlock()
 
 	if err := s.Restore(); err != nil {
 		s.logger.Error("failed to restore jobs on start", "error", err)
 	}
 
-	s.wg.Add(1 + workers)
+	// wg 必须把两个池的 worker 都算进来：Stop 靠它等在途任务收尾，
+	// 少算任何一个都会在执行器任务还在跑时就返回。
+	s.wg.Add(1 + workers + execWorkers)
 	go s.scheduleLoop()
 	for i := 0; i < workers; i++ {
-		go s.worker()
+		go s.worker(s.workCh, false)
+	}
+	for i := 0; i < execWorkers; i++ {
+		go s.worker(s.execCh, true)
 	}
 }
 
-// worker 从执行队列取任务执行，队列与 worker 数量共同构成并发上限
-func (s *Scheduler) worker() {
+// worker 从指定队列取任务执行，队列容量与 worker 数量共同构成该池的并发上限。
+//
+// exec 为 true 表示服务的是执行器池：取走一个任务就敲一次 execSlotFreed——
+// "队列里少了一个"正是调度循环在等的空位信号。
+func (s *Scheduler) worker(queue chan *Job, exec bool) {
 	defer s.wg.Done()
 
 	for {
 		select {
 		case <-s.stopCh:
 			return
-		case job := <-s.workCh:
+		case job := <-queue:
+			if exec {
+				s.notifyExecSlot()
+			}
 			s.executeJob(job)
 		}
 	}
+}
+
+// execPoolEnabled 判断这一次启动是否真的建了执行器池。
+//
+// 只在调度循环与 worker 协程里读：通道在 Start 的锁里赋值，Stop 会等这些协程全部退出，
+// 因此不存在"读的时候被并发改掉"的窗口——与既有代码读 s.workCh 的方式一致。
+func (s *Scheduler) execPoolEnabled() bool {
+	return s.execCh != nil
 }
 
 // Stop 停止调度器：不再投递新任务，取消在途任务的上下文，并等待执行协程退出。
@@ -880,12 +1030,37 @@ func (s *Scheduler) scheduleLoop() {
 			}
 		}
 
-		// 原子地取出所有已到期任务（避免 Peek 与 Pop 之间被 Cancel 的竞态）
-		if job := s.heap.PopIfDue(now); job != nil {
-			if !s.dispatch(job.(*Job)) {
+		// 原子地取出"已到期且所在池有空位"的任务（避免 Peek 与 Pop 之间被 Cancel 的竞态）。
+		// 默认池的判定恒为可投递，因此这条与改动前的 PopIfDue 走的是同一条快路径；
+		// 执行器队列满时绕开堆顶那一项，后面的普通任务照样按时投递（TASK-E13 的隔离点）。
+		if item := s.heap.PopIfDueWhere(now, s.dispatchable); item != nil {
+			if !s.dispatch(item.(*Job)) {
 				return
 			}
 			continue
+		}
+
+		// 没有"到期且可投递"的任务。两种情况要分开等法：
+		// 有到期任务但都被挡住（只有执行器队列满会走到这里）→ 等空位信号。
+		// 绝不能继续往下按 TriggerAt 等：那些任务的触发时间已经过去，
+		// 等一个已经过去的时刻等于零时长定时器忙等。
+		if s.heap.HasDue(now) {
+			// 这条 Debug 记录是"执行器队列已满、任务留在堆里等空位"的唯一现场痕迹：
+			// 有它才能写出"没有忙等"的断言（第 5.1 第四条用例按出现次数判定），
+			// 运维排障时也能看出到期任务是被哪个池挡住。
+			s.logger.Debug("due job is waiting for an executor slot",
+				"heap_size", s.heap.Len(), "exec_queue_capacity", cap(s.execCh))
+			select {
+			case <-s.stopCh:
+				return
+			case <-s.newJobCh:
+				continue
+			case <-s.execSlotFreed:
+				continue
+			case <-time.After(execBlockedRetry):
+				// 兜底：唤醒信号可能被合并或错过，最坏情况晚投递 500ms，不会死锁
+				continue
+			}
 		}
 
 		item := s.heap.Peek()
@@ -919,9 +1094,15 @@ func (s *Scheduler) scheduleLoop() {
 	}
 }
 
-// dispatch 把到期任务投入执行队列。队列满时阻塞等待空位（背压由 worker 池消化），
-// 关停信号到来时放弃投递并返回 false。
+// dispatch 把到期任务投进它那个池的队列。返回值只表达一件事：调度循环要不要继续
+// （false 表示收到停止信号）。投递失败的情况见 dispatchExec 里的说明。
 func (s *Scheduler) dispatch(job *Job) bool {
+	if job.class == JobClassExec && s.execPoolEnabled() {
+		return s.dispatchExec(job)
+	}
+
+	// 默认池保持现状：队列满时阻塞等待空位，背压由 worker 池消化。
+	// 这条不做预判是有意的——普通任务的"满则等"是 README 写明的既有行为。
 	select {
 	case <-s.stopCh:
 		return false
@@ -930,10 +1111,58 @@ func (s *Scheduler) dispatch(job *Job) bool {
 	}
 }
 
+// dispatchExec 非阻塞投递到执行器队列。
+//
+// 调度循环在弹出之前已经用 dispatchable 确认过有空位，而且这个队列只有调度循环
+// 一个生产者，所以 default 分支属于"按构造不该发生"的情形。真发生了也不能把任务丢掉：
+// 塞回堆里并等一次空位信号再试——刚弹出的任务 TriggerAt 已经过去，
+// 不等就会立刻再被弹出来，那才是卡片明确禁止的忙等。
+func (s *Scheduler) dispatchExec(job *Job) bool {
+	select {
+	case <-s.stopCh:
+		return false
+	case s.execCh <- job:
+		return true
+	default:
+	}
+
+	s.logger.Error("executor queue was full after the dispatch pre-check; job put back into the heap",
+		"job_id", job.ID, "queue_capacity", cap(s.execCh))
+	s.heap.PushItem(job)
+	s.notifyExecSlot()
+	return true
+}
+
+// execBlockedRetry 是"有到期任务但执行器队列满"时的兜底唤醒间隔。
+// 取值 500 毫秒的口径来自卡片 §3.4：够短，漏掉一次空位信号也只晚半秒；
+// 够长，不至于在这条路径上变成轮询。
+const execBlockedRetry = 500 * time.Millisecond
+
+// dispatchable 判断这条任务现在能不能进它那个池。
+//
+// 这个函数会在堆的写锁里被调用，所以只读不需要加锁的东西：任务类别是入堆时盖的章，
+// 队列空位用 channel 的 len/cap。绝不在这里查注册表——那会形成"先堆锁、后调度器锁"的
+// 加锁顺序，而包内其它路径都是先调度器锁再碰堆，将来就会死锁。
+func (s *Scheduler) dispatchable(item Item) bool {
+	job, ok := item.(*Job)
+	if !ok || job.class != JobClassExec || !s.execPoolEnabled() {
+		// 没建执行器池时档位任务照旧进共享池，包括"满了阻塞"这条背压行为
+		return true
+	}
+	return len(s.execCh) < cap(s.execCh)
+}
+
 // 执行任务（由 worker 协程调用，阻塞直到 Handler 返回）
 func (s *Scheduler) executeJob(job *Job) {
-	s.inFlight.Add(1)
-	defer s.inFlight.Add(-1)
+	// 在途计数按池分开：统计接口要能说出"执行器池正在跑几个"，
+	// 而既有的 running 字段不能因为新增一个池就读成别的含义。
+	// 执行器任务落进默认池（没建池）时仍计入 running，与改动前一致。
+	counter := &s.inFlight
+	if job.class == JobClassExec && s.execPoolEnabled() {
+		counter = &s.execInFlight
+	}
+	counter.Add(1)
+	defer counter.Add(-1)
 
 	// 发布开始事件
 	s.eventBus.Publish(Event{
@@ -1289,18 +1518,31 @@ func (s *Scheduler) HeapLen() int {
 
 // RuntimeStats 是调度与执行侧的实时占用，供运维端点读取。
 // 只有计数与开关状态，不含任务内容与凭据，因此 viewer 以外的角色才需要看到它。
+//
+// 两个池的读法要说清（TASK-E13 改了 Running 的含义范围）：
+// Running 与 QueueLength 只算**普通池**，执行器池的对应值是 ExecRunning 与 ExecQueueLength。
+// 接口侧 /stats 的 running 是两池之和（见 api 的 GetStats），
+// 想定位"执行器把名额占到什么程度"就读 /admin/runtime 的拆分值。
 type RuntimeStats struct {
 	// Started 表示调度循环与 worker 池是否在跑（Stop 之后为 false）
 	Started bool `json:"started"`
-	// Workers 配置的 worker 数量
+	// Workers 配置的普通任务执行池协程数
 	Workers int `json:"workers"`
-	// QueueCapacity 执行队列容量；未显式配置时与 Workers 相等
+	// QueueCapacity 普通任务执行队列容量；未显式配置时与 Workers 相等
 	QueueCapacity int `json:"queue_capacity"`
-	// QueueLength 已入队但尚未被 worker 取走的任务数
+	// QueueLength 普通任务里已入队但尚未被 worker 取走的数量
 	QueueLength int `json:"queue_length"`
-	// Running 已进入 Handler、尚未返回的任务数
+	// Running 普通任务里已进入 Handler、尚未返回的数量（不含执行器池，见结构体注释）
 	Running int `json:"running"`
-	// HeapSize 堆中待执行任务数
+	// ExecWorkers 执行器池的协程数；0 表示这一次启动没建这个池
+	ExecWorkers int `json:"exec_workers"`
+	// ExecQueueCap 执行器队列容量；未显式配置时与 ExecWorkers 相等
+	ExecQueueCap int `json:"exec_queue_capacity"`
+	// ExecQueueLength 执行器任务里已入队、尚未被 worker 取走的数量
+	ExecQueueLength int `json:"exec_queue_length"`
+	// ExecRunning 执行器池里已进入 Handler、尚未返回的数量
+	ExecRunning int `json:"exec_running"`
+	// HeapSize 堆中待执行任务数（两个池共用一张堆，这里是总数）
 	HeapSize int `json:"heap_size"`
 	// Suspended 调度总开关是否处于挂起
 	Suspended bool `json:"suspended"`
@@ -1319,12 +1561,21 @@ func (s *Scheduler) RuntimeStats() RuntimeStats {
 		capacity = s.concurrency
 	}
 
+	execCapacity := s.execQueueCapacity
+	if execCapacity <= 0 {
+		execCapacity = s.execConcurrency
+	}
+
 	return RuntimeStats{
 		Started:           s.running,
 		Workers:           s.concurrency,
 		QueueCapacity:     capacity,
 		QueueLength:       len(s.workCh),
 		Running:           int(s.inFlight.Load()),
+		ExecWorkers:       s.execConcurrency,
+		ExecQueueCap:      execCapacity,
+		ExecQueueLength:   len(s.execCh),
+		ExecRunning:       int(s.execInFlight.Load()),
 		HeapSize:          s.heap.Len(),
 		Suspended:         s.suspended.Load(),
 		ForcePausePending: len(s.forcedPause),

@@ -75,6 +75,76 @@ func (h *QuaternaryHeap) PopIfDue(now time.Time) Item {
 	return h.popRoot()
 }
 
+// PopIfDueWhere 原子地弹出"已到期且 allow 认可"的元素里触发时间最早的那个；
+// 一个都没有时返回 nil。allow 为 nil 与 PopIfDue 等价。
+//
+// 为什么需要它（TASK-E13）：执行器队列满时，堆顶那个执行器任务不能投递，
+// 但它后面已经到期的普通任务仍然要按时走。只认堆顶等于让一个满的执行器队列
+// 挡住整个调度循环——那正是本卡要消掉的现象。
+//
+// 代价说清楚：堆只保证父节点不晚于子节点，选"最早的可投递项"因此要遍历到期区。
+// 遇到未到期的节点即剪枝（它的子节点只会更晚），所以工作量与已到期的任务数相关，
+// 与堆的总长度无关；而且这条遍历只在"堆顶被挡住"时才走——
+// 堆顶本身可投递时走下面的常数级快路径，常态调度不因本方法变慢。
+func (h *QuaternaryHeap) PopIfDueWhere(now time.Time, allow func(Item) bool) Item {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if len(h.items) == 0 {
+		return nil
+	}
+
+	// 快路径：堆顶到期且可投递，就是它。
+	if (allow == nil || allow(h.items[0])) && !h.items[0].GetTriggerTime().After(now) {
+		return h.popRoot()
+	}
+	if h.items[0].GetTriggerTime().After(now) {
+		// 堆顶还没到期，后面更不可能到期
+		return nil
+	}
+
+	best := -1
+	var bestTime time.Time
+	h.eachDue(0, now, func(idx int) {
+		item := h.items[idx]
+		if allow != nil && !allow(item) {
+			return
+		}
+		due := item.GetTriggerTime()
+		if best == -1 || due.Before(bestTime) {
+			best, bestTime = idx, due
+		}
+	})
+	if best == -1 {
+		return nil
+	}
+	return h.removeAt(best)
+}
+
+// HasDue 判断堆里是否存在已到期元素，不弹出。
+// 调度循环用它区分"没事可做"与"有事做不了（队列满）"，后者不能按触发时间等待，
+// 因为那些任务的 TriggerAt 已经过去，等下去就是零时长定时器忙等。
+func (h *QuaternaryHeap) HasDue(now time.Time) bool {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	found := false
+	h.eachDue(0, now, func(int) { found = true })
+	return found
+}
+
+// eachDue 按"到期区"遍历下标，调用方须持有锁。
+// 遇到未到期或越界的节点即停（子节点只会更晚），因此只走到期那一层。
+func (h *QuaternaryHeap) eachDue(idx int, now time.Time, visit func(int)) {
+	if idx >= len(h.items) || h.items[idx].GetTriggerTime().After(now) {
+		return
+	}
+	visit(idx)
+	for child := 0; child < branchFactor; child++ {
+		h.eachDue(branchFactor*idx+1+child, now, visit)
+	}
+}
+
 // Peek 查看堆顶（不弹出）
 func (h *QuaternaryHeap) Peek() Item {
 	h.mu.RLock()

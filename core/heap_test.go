@@ -439,6 +439,81 @@ func TestQuaternaryHeap_PopIfDue(t *testing.T) {
 	}
 }
 
+// TestQuaternaryHeap_PopIfDueWhere 覆盖 E13 加的"绕开被挡住的堆顶"这条出口。
+func TestQuaternaryHeap_PopIfDueWhere(t *testing.T) {
+	h := NewQuaternaryHeap()
+	now := time.Now()
+
+	blocked := func(item Item) bool { return item.GetID() != "exec" }
+
+	// 空堆
+	if item := h.PopIfDueWhere(now, blocked); item != nil {
+		t.Error("空堆不该弹出任何东西")
+	}
+
+	// 堆顶未到期：即使 allow 认可它，也不能弹出
+	h.PushItem(&mockItem{id: "future", triggerAt: now.Add(time.Hour)})
+	if item := h.PopIfDueWhere(now, blocked); item != nil {
+		t.Errorf("堆顶未到期时不该弹出，实际 %v", item.GetID())
+	}
+
+	// 堆顶可投递：走常数级快路径，弹的是堆顶
+	duePlain := &mockItem{id: "plain", triggerAt: now.Add(-time.Second)}
+	h.PushItem(duePlain)
+	if item := h.PopIfDueWhere(now, blocked); item == nil || item.GetID() != "plain" {
+		t.Fatalf("堆顶可投递时应弹堆顶，实际 %v", item)
+	}
+
+	// 堆顶被挡住时，取到期区里"可投递且最早"的那一项：
+	// 后到期的普通项要优先于更早到期但被挡住的项，而更晚的未到期项绝不参与。
+	h.PushItem(&mockItem{id: "exec", triggerAt: now.Add(-3 * time.Second)})
+	h.PushItem(&mockItem{id: "plain-late", triggerAt: now.Add(-time.Second)})
+	h.PushItem(&mockItem{id: "plain-earliest", triggerAt: now.Add(-2 * time.Second)})
+	item := h.PopIfDueWhere(now, blocked)
+	if item == nil || item.GetID() != "plain-earliest" {
+		t.Fatalf("应取可投递项里最早的那个，实际 %v", item)
+	}
+	if h.Len() != 3 {
+		t.Errorf("只该弹出一条，剩余 %d", h.Len())
+	}
+
+	// 到期项全被挡住：返回 nil 而不是硬弹一个
+	if item := h.PopIfDueWhere(now, blocked); item == nil || item.GetID() != "plain-late" {
+		t.Fatalf("第二早的可投递项应接着被弹出，实际 %v", item)
+	}
+	if item := h.PopIfDueWhere(now, blocked); item != nil {
+		t.Errorf("只剩被挡住的项时应返回 nil，实际 %v", item.GetID())
+	}
+
+	// allow 为 nil 与 PopIfDue 等价
+	if item := h.PopIfDueWhere(now, nil); item == nil || item.GetID() != "exec" {
+		t.Errorf("allow 为 nil 时应等价于 PopIfDue，实际 %v", item)
+	}
+}
+
+// TestQuaternaryHeap_HasDue 覆盖调度循环用来区分"没事做"与"有事做不了"的那个查询。
+func TestQuaternaryHeap_HasDue(t *testing.T) {
+	h := NewQuaternaryHeap()
+	now := time.Now()
+
+	if h.HasDue(now) {
+		t.Error("空堆不该判定为有到期任务")
+	}
+
+	h.PushItem(&mockItem{id: "future", triggerAt: now.Add(time.Hour)})
+	if h.HasDue(now) {
+		t.Error("只有未到期项时不应判定为有到期任务")
+	}
+
+	h.PushItem(&mockItem{id: "due", triggerAt: now.Add(-time.Second)})
+	if !h.HasDue(now) {
+		t.Error("有到期项时必须判定为有到期任务，否则调度循环会按触发时间空等")
+	}
+	if h.Len() != 2 {
+		t.Errorf("HasDue 是只读查询，不得弹出任何项，剩余 %d", h.Len())
+	}
+}
+
 func TestQuaternaryHeap_LargeDataset(t *testing.T) {
 	h := NewQuaternaryHeap()
 	now := time.Now()

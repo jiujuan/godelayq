@@ -146,6 +146,11 @@ type Job struct {
 	// Handler 必须检查 ctx，否则超时只能被观测、无法中断其执行。
 	Timeout time.Duration `json:"timeout"`
 
+	// class 是执行类别，由调度器在入堆之前按注册表盖章（Scheduler.RegisterHandlerClass）。
+	// 不持久化也不进 JSON：恢复时重新查注册表，查不到就落回共享池，
+	// 最坏结果是"这条任务没有专用名额"，不是"任务消失"。
+	class JobClass
+
 	// Cron 重复任务支持
 	CronExpr string `json:"cron_expr,omitempty"` // Cron表达式，空表示一次性任务
 	IsRepeat bool   `json:"is_repeat"`
