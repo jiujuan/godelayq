@@ -63,7 +63,8 @@ func loopBody(t *testing.T, lines int, line string) string {
 //
 // 等待者必须是直接子进程本身，不能套在 cmd/sh 里面：在 Windows 上我们杀的只是那层 shell，
 // 真正还在计时的孙进程活着，还会继续占住工作目录（用例结束时清理临时目录就会失败）。
-// Windows 侧的整树终止归 TASK-E11；Unix 上进程组能整组结束，见 proc_unix.go。
+// 整棵树的终止在两个平台上分别实现（proc_unix.go 的进程组、proc_windows.go 的 taskkill /T），
+// 需要派生孙进程的用例请用 grandchildCommand 那组平台夹具，不要在这里加平台判断。
 func slowCommand(t *testing.T, seconds int) (core.ExecutorCommand, string) {
 	t.Helper()
 

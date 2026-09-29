@@ -191,7 +191,8 @@ func (r *Runner) execute(ctx context.Context, timeout time.Duration, argv []stri
 	cmd.Stdout = writer.Stdout()
 	cmd.Stderr = writer.Stderr()
 	// 平台差异只留在这里的三行里（卡片 §6/DoD 的口径）：
-	// Unix 让子进程自成进程组，取消时整组结束；Windows 的对应实现归 TASK-E11。
+	// Unix 让子进程自成进程组，取消时整组结束（proc_unix.go）；
+	// Windows 没有进程组，改用 taskkill /T 连树一起结束再兜底杀直接子进程（proc_windows.go）。
 	cmd.SysProcAttr = sysProcAttr()
 	cmd.Cancel = func() error { return killTree(cmd, killGrace) }
 	cmd.WaitDelay = processWaitDelay
