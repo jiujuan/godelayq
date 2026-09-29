@@ -118,6 +118,9 @@ curl -s -X POST localhost:8080/api/v1/jobs -H 'Content-Type: application/json' \
 5. **`requireExecutorRegistry()` 守卫推迟到 E07**（卡片 §3.4 要求本卡加）。
    本卡没有任何端点读登记表，加了就是一个不被调用的函数与一个 503 分支。
    `api.WithExecutorRegistry` 与 `Server.executors` 字段已就位，E07 加端点时同批补守卫与测试。
+   ——E07 已收口：那两条读取方（`ListExecutors`、`execPreviewLimit`）按 E07 卡片 §3.6 与设计文档 §6.1
+   做成了"未注入即默认状态"的降级而不是 503，503 守卫给了读文件的 `requireArtifacts()`。
+   处置理由见 E07 卡第 10 节第 1 条，后续卡片不要再等 `requireExecutorRegistry()` 出现。
 6. **`runtimeDeps.newServer` 多一个参数**（`executors *executor.Registry`）：
    登记表要在 `run` 里构造一次，同时交给调度器注册与 `api.Server` 注入，两处必须是同一个实例。
    `newExecutorRegistry` 列入依赖完整性检查：少了它执行器会静默不注册，`TestRun_WithIncompleteDependencies` 覆盖了这条。
@@ -161,6 +164,8 @@ curl -s -X POST localhost:8080/api/v1/jobs -H 'Content-Type: application/json' \
 ### 留给后续卡片的接口形状
 
 - E07：`api.Server.executors` 已注入，加 `/executors` 端点时同批补 `requireExecutorRegistry()` 的 503 守卫。
+  （E07 实际处置：`/executors` 按该卡 §3.6 回 `{"enabled":false,"profiles":[]}` 而不是 503，
+  守卫落在 `requireArtifacts()`；见 E07 卡第 10 节第 1 条。）
 - E09：把 `Register` 里的 `profile.StubHandler()` 换成 `Runner.Handler()`，并删除 `executor/handler_stub.go`（该卡 §5 第 7 条与 DoD 已登记）。
 - E13：`Registration` 的三个计数是分流后仍然有效的观测点，日志字段名不要改。
 - E16：提交期要用 `Registry.Available(key)` 拿原因、`Registry.RequiredRole()` 拿档位，本卡已保证两者存在。

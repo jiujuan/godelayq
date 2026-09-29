@@ -147,6 +147,7 @@ git show HEAD --stat        # 确认只改了 core/job.go、api/dto.go、executo
    `core.DefaultExecInlinePreview`。
 6. **E04 记录的"登记表字段暂无读取方"从本卡起结束**：`Server.executors` 现在被 `execPreviewLimit` 读。
    `requireExecutorRegistry()` 的 503 守卫仍然推迟到 E07（本卡没有新增端点）。
+   ——E07 已收口，且没有做成 503：处置与理由见 E07 卡第 10 节第 1 条。
 7. **回滚路径的实测口径**：Go 的 JSON 解码忽略未知键，所以带 `exec` 键的 `jobs.json` 在旧代码下照样读
    （`TestJobSnapshot_OmitsExecWhenAbsent` 的反向用例）；但要注意反向的另一半——
    本项目的 `flushLocked` 是整文件重写，任何未知键在**新代码写盘时**会被丢弃（冒烟里用一条带
@@ -188,7 +189,7 @@ git show HEAD --stat        # 确认只改了 core/job.go、api/dto.go、executo
 - E06：写入器负责"边写边裁"，写完调用 `Result.Truncate(maxBytes)` 记账、`SetPreview(inlinePreview)` 生成摘要尾部，
   并按 `Meta.Artifact` 写 `available`；`Preview` 的长度上限由 E06 传入，不要在执行侧再抄一份常量。
 - E07：`GET /jobs/:id/result` 读产物文件；`ExecMeta.Artifact=purged` 时降级为只读摘要。
-  同批补 `requireExecutorRegistry()`。
+  同批补 `requireExecutorRegistry()`。（E07 已收口：该函数没有做成 503 守卫，理由见 E07 卡第 10 节第 1 条。）
 - E12：`Meta.Permanent` 由错误分类写入，`handleFailure` 的重试判定读它（core 侧不依赖 executor）。
 - E16：响应里的 `Preview` 已经过上限裁剪；secret 参数的值不能出现在 `Preview` 里，
   这是执行侧生成预览时的责任（E08/E09 处理）。
