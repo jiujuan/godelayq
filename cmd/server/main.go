@@ -26,6 +26,9 @@ type schedulerAPI interface {
 	LookupHandler(jobType string) (core.Handler, bool)
 	SetConcurrency(n int)
 	SetQueueCapacity(n int)
+	// SetEventPreviewLimit 把输出预览的字节上限交给调度器：完成/失败事件由 core 发布，
+	// 尺寸限制必须在发事件的一方生效，而不能只在接口侧裁剪。
+	SetEventPreviewLimit(n int)
 }
 
 type serverAPI interface {
@@ -46,7 +49,7 @@ type runtimeDeps struct {
 	// newArtifactStore 建输出产物的文件存储与清理协程，只在 executors.enabled=true 时调用。
 	// 与登记表一样列入依赖完整性检查：少了它输出会静默无处安放。
 	newArtifactStore func(core.Config, *slog.Logger) (*executor.ArtifactStore, error)
-	newServer        func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry) (serverAPI, error)
+	newServer        func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore) (serverAPI, error)
 	notifySignals    signalNotifier
 	timeout          time.Duration
 	logger           *slog.Logger
@@ -75,7 +78,7 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				TTL:      cfg.Executors.Output.TTL,
 			}, logger)
 		},
-		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry) (serverAPI, error) {
+		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore) (serverAPI, error) {
 			coreScheduler, ok := scheduler.(*core.Scheduler)
 			if !ok {
 				return nil, fmt.Errorf("default server requires *core.Scheduler, got %T", scheduler)
@@ -94,6 +97,9 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 			return api.NewServer(coreScheduler, store, port, security, logger,
 				api.WithGroupStore(groups),
 				api.WithExecutorRegistry(executors),
+				// 执行器关闭时 artifacts 是 nil，等价于不注入：/jobs/:id/result 回 503，
+				// 而不是在没有任何产物文件的目录上读出"结果为空"。
+				api.WithArtifacts(artifacts),
 				// 不带 -tags dashboard 时 web.Dist 恒为 nil，这一行等价于"不提供控制台"。
 				// 写成无条件调用而不是两份装配，是为了让单二进制的差异只留在 web 包那一处。
 				api.WithConsole(web.Dist)), nil
@@ -161,6 +167,8 @@ func run(deps runtimeDeps) error {
 	}, nil)
 	scheduler.SetConcurrency(cfg.Scheduler.Workers)
 	scheduler.SetQueueCapacity(cfg.Scheduler.QueueCapacity)
+	// 事件里输出预览的字节上限：取值已在 Normalized 里补齐，非法值的兜底由调度器负责。
+	scheduler.SetEventPreviewLimit(cfg.Executors.Output.InlinePreview)
 
 	executors, err := deps.newExecutorRegistry(cfg, deps.logger)
 	if err != nil {
@@ -175,10 +183,14 @@ func run(deps runtimeDeps) error {
 			"hint", "set server.auth.token or server.auth.users before exposing executors")
 	}
 
+	// 产物存储与清理协程只在打开执行器时建。变量声明在 if 之外：
+	// 接口要拿它注入 api.Server，关闭时保持 nil，/jobs/:id/result 据此回 503。
+	var artifacts *executor.ArtifactStore
 	if cfg.Executors.Enabled {
 		// 产物目录只在打开执行器时创建：关闭状态下不可能有输出需要安放，
 		// 无谓地建出 ./data/exec 会让"这次部署没启用执行器"看起来像在写文件。
-		artifacts, err := deps.newArtifactStore(cfg, deps.logger)
+		var err error
+		artifacts, err = deps.newArtifactStore(cfg, deps.logger)
 		if err != nil {
 			// 目录建不起来等于输出无处可写，与档位配置非法同级：不让进程带着"结果一定会丢"启动。
 			return err
@@ -192,7 +204,7 @@ func run(deps runtimeDeps) error {
 		}()
 	}
 
-	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors)
+	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts)
 	if err != nil {
 		return err
 	}

@@ -75,7 +75,7 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 			t.Fatal("artifact store must not be built while executors are disabled")
 			return nil, nil
 		},
-		newServer: func(gotScheduler schedulerAPI, gotStore core.Store, port string, gotExecutors *executor.Registry) (serverAPI, error) {
+		newServer: func(gotScheduler schedulerAPI, gotStore core.Store, port string, gotExecutors *executor.Registry, gotArtifacts *executor.ArtifactStore) (serverAPI, error) {
 			if gotScheduler != scheduler {
 				t.Fatalf("expected server to receive scheduler stub, got %T", gotScheduler)
 			}
@@ -87,6 +87,10 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 			}
 			if gotExecutors != executors {
 				t.Fatal("expected server to receive the executor registry")
+			}
+			// 执行器关闭时产物存储是 nil：结果端点因此回 503，而不是读一个不存在的目录
+			if gotArtifacts != nil {
+				t.Fatal("expected no artifact store while executors are disabled")
 			}
 			return server, nil
 		},
@@ -113,6 +117,11 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 	if scheduler.concurrency != cfg.Scheduler.Workers || scheduler.queueCapacity != cfg.Scheduler.QueueCapacity {
 		t.Fatalf("expected config to reach scheduler, got workers=%d queue=%d",
 			scheduler.concurrency, scheduler.queueCapacity)
+	}
+	// 事件里的输出预览上限同样要送到调度器：这份配置没写执行器取值，
+	// 于是走 Normalized 补上的默认值，装配不该把它变成 0（0 会让事件里一行摘要都不剩）。
+	if scheduler.previewLimit != core.DefaultExecInlinePreview {
+		t.Fatalf("expected the preview limit to reach the scheduler, got %d", scheduler.previewLimit)
 	}
 
 	if scheduler.startCalls != 1 {
@@ -176,7 +185,7 @@ func TestRun_ServerStartFailureStopsScheduler(t *testing.T) {
 		},
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
-		newServer: func(gotScheduler schedulerAPI, store core.Store, port string, executors *executor.Registry) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {},
@@ -215,7 +224,7 @@ func TestRun_StoreCreationFailure(t *testing.T) {
 			t.Fatal("artifact store should not be built when store creation fails")
 			return nil, nil
 		},
-		newServer: func(gotScheduler schedulerAPI, store core.Store, port string, executors *executor.Registry) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			t.Fatal("server should not be created when store creation fails")
 			return nil, nil
 		},
@@ -246,7 +255,7 @@ func TestRun_ExecutorRegistryError(t *testing.T) {
 			t.Fatal("artifact store should not be built when the registry fails")
 			return nil, nil
 		},
-		newServer: func(gotScheduler schedulerAPI, store core.Store, port string, executors *executor.Registry) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			t.Fatal("server should not be created when the registry fails")
 			return nil, nil
 		},
@@ -288,7 +297,7 @@ func TestRun_LogsErrorWhenAuthDisabled(t *testing.T) {
 		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
 		newExecutorRegistry: executor.NewRegistry,
 		newArtifactStore:    artifactStoreFromConfig,
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -331,7 +340,7 @@ func TestRun_WithIncompleteDependencies(t *testing.T) {
 	err = run(runtimeDeps{
 		newStore:     func() (core.Store, error) { return newStubStore(), nil },
 		newScheduler: func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return newFakeServer(), nil
 		},
 		notifySignals: func(chan<- os.Signal, ...os.Signal) {},
@@ -346,7 +355,7 @@ func TestRun_WithIncompleteDependencies(t *testing.T) {
 		newStore:            func() (core.Store, error) { return newStubStore(), nil },
 		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return newFakeServer(), nil
 		},
 		notifySignals: func(chan<- os.Signal, ...os.Signal) {},
@@ -372,7 +381,7 @@ func TestRun_ArtifactStoreErrorStopsStartup(t *testing.T) {
 		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
 		newExecutorRegistry: executor.NewRegistry,
 		newArtifactStore:    staticArtifactStore(nil, wantErr),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			t.Fatal("server should not be created when the artifact store fails")
 			return nil, nil
 		},
@@ -418,7 +427,11 @@ func TestRun_ArtifactCleanerStopsWithRun(t *testing.T) {
 			stores = append(stores, artifacts)
 			return artifacts, nil
 		},
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry) (serverAPI, error) {
+		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry, gotArtifacts *executor.ArtifactStore) (serverAPI, error) {
+			// 接口拿到的必须就是 run 里那一份：换成新建的存储会读不到刚写出的产物
+			if len(stores) != 1 || gotArtifacts != stores[0] {
+				t.Errorf("expected the server to receive the built artifact store, got %p of %v", gotArtifacts, stores)
+			}
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -476,7 +489,7 @@ func TestRun_ServerStopErrorIsLoggedAndIgnored(t *testing.T) {
 		},
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
-		newServer: func(gotScheduler schedulerAPI, store core.Store, port string, executors *executor.Registry) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -509,7 +522,7 @@ func TestRun_UsesDefaultTimeoutAndLoggerWhenUnset(t *testing.T) {
 		},
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
-		newServer: func(gotScheduler schedulerAPI, store core.Store, port string, executors *executor.Registry) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -546,7 +559,7 @@ func TestRun_ServerFactoryError(t *testing.T) {
 		},
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
-		newServer: func(gotScheduler schedulerAPI, store core.Store, port string, executors *executor.Registry) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return nil, wantErr
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {},
@@ -568,6 +581,7 @@ type spyScheduler struct {
 	registered    map[string]core.Handler
 	concurrency   int
 	queueCapacity int
+	previewLimit  int
 }
 
 func newSpyScheduler() *spyScheduler {
@@ -586,6 +600,12 @@ func (s *spyScheduler) SetQueueCapacity(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.queueCapacity = n
+}
+
+func (s *spyScheduler) SetEventPreviewLimit(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.previewLimit = n
 }
 
 func (s *spyScheduler) Start() {
