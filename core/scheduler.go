@@ -1041,6 +1041,21 @@ func (s *Scheduler) executeJob(job *Job) {
 	}
 
 	timedOut := errors.Is(err, context.DeadlineExceeded) || errors.Is(execCtx.Err(), context.DeadlineExceeded)
+	permanent := isPermanentFailure(err)
+
+	// 失败事件的 metadata：retry_count/max_retries/timeout 是既有形状，
+	// permanent 只在"重试没有意义"时加上（TASK-E12 §3.4）。
+	// 只加真值不加假值是为了让既有事件的 JSON 形状一字不变；
+	// api/history.go 与前端把这个键当透传字段，不解析。
+	// 待补：docs/api.md 里 job.failed 事件的 metadata 说明还没有这一项，归 TASK-E19 统一补文档。
+	failureMetadata := map[string]interface{}{
+		"retry_count": job.RetryCount,
+		"max_retries": job.MaxRetries,
+		"timeout":     timedOut,
+	}
+	if permanent {
+		failureMetadata["permanent"] = true
+	}
 
 	// 发布失败事件
 	s.eventBus.Publish(Event{
@@ -1050,11 +1065,7 @@ func (s *Scheduler) executeJob(job *Job) {
 		Status:    StatusFailed,
 		Timestamp: time.Now(),
 		Data:      s.eventData(job, err),
-		Metadata: map[string]interface{}{
-			"retry_count": job.RetryCount,
-			"max_retries": job.MaxRetries,
-			"timeout":     timedOut,
-		},
+		Metadata:  failureMetadata,
 	})
 
 	if timedOut {
@@ -1062,7 +1073,7 @@ func (s *Scheduler) executeJob(job *Job) {
 	} else {
 		s.logger.Error("job failed", "job_id", job.ID, "error", err)
 	}
-	s.handleFailure(job)
+	s.handleFailure(job, err)
 }
 
 // eventData 组装事件的附加数据：失败时带 error，有执行结论时带 result，
@@ -1194,11 +1205,26 @@ func (s *Scheduler) handleSuccess(job *Job) {
 	}
 }
 
-// 处理失败与重试
-func (s *Scheduler) handleFailure(job *Job) {
+// 处理失败与重试。
+//
+// 三个分支的先后顺序就是判定口径（TASK-E12 §3.3），改之前先读理由：
+//  1. 强制暂停在最前：用户已经要求把这个任务停在 paused 上等技术员确认，
+//     此时错误是永久还是可重试都不该改变结果——既不消耗重试次数，也不再排期。
+//     parkForcedPause 认领中止标记的语义也依赖它先执行，后移会让暂停当场失效。
+//  2. 永久失败其次：参数写错、命令不存在这类问题，重跑只会把同一个错误再产生一遍，
+//     还白占执行名额（拼错的解释器名配 max_retries: 5 就是五条同样无用的事件）。
+//  3. 最后才是既有的"按 RetryCount 与 MaxRetries 决定重试还是落终态"。
+//
+// err 是处理函数返回的原始错误：判定要读它的 Permanent()，而 job 里没有它。
+func (s *Scheduler) handleFailure(job *Job, err error) {
 	// 同 handleSuccess：中止期间 Handler 自己报了错，也按用户意图停在 paused，
 	// 不再消耗重试次数、不再重新排期。
 	if s.parkForcedPause(job, "handler_failed_despite_cancel") {
+		return
+	}
+
+	if isPermanentFailure(err) {
+		s.markFailed(job)
 		return
 	}
 
@@ -1224,12 +1250,18 @@ func (s *Scheduler) handleFailure(job *Job) {
 		s.logger.Warn("scheduling retry", "job_id", job.ID, "next_time", nextTime)
 		s.Schedule(retryJob)
 	} else {
-		job.Status = StatusFailed
-		job.UpdatedAt = time.Now()
-		if s.store != nil {
-			if err := s.store.Update(job.ToSnapshot()); err != nil {
-				s.logger.Error("failed to persist failed job", "job_id", job.ID, "error", err)
-			}
+		s.markFailed(job)
+	}
+}
+
+// markFailed 把任务落成失败终态并落盘。
+// 重试耗尽与永久失败共用这一份收尾逻辑：状态仍是 StatusFailed，本卡不新增 JobStatus（§8）。
+func (s *Scheduler) markFailed(job *Job) {
+	job.Status = StatusFailed
+	job.UpdatedAt = time.Now()
+	if s.store != nil {
+		if err := s.store.Update(job.ToSnapshot()); err != nil {
+			s.logger.Error("failed to persist failed job", "job_id", job.ID, "error", err)
 		}
 	}
 }

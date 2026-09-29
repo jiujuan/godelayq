@@ -173,7 +173,7 @@ func TestScheduler_RetryKeepsJobID(t *testing.T) {
 		IsRepeat:   true,
 	}
 
-	scheduler.handleFailure(job)
+	scheduler.handleFailure(job, errors.New("handler failed"))
 
 	retried := scheduler.heap.Get("chain-job")
 	if retried == nil {
