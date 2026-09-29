@@ -471,9 +471,11 @@ func TestLoadProfiles_EnvAndFixedArgRules(t *testing.T) {
 			c.Env = map[string]string{"GODELAYQ_SERVER_AUTH_TOKEN": "x"}
 		}), "GODELAYQ_ prefixed keys hold server credentials")
 	})
-	t.Run("env key lower-case", func(t *testing.T) {
+	t.Run("env key with an unusable character", func(t *testing.T) {
+		// 小写不再是被拒的理由：viper 会把映射键折成小写，档位读进来时先折回大写再校验
+		// （见 TestLoadProfiles_ConfigFileEnvKeys）。减号这类字符仍然拒绝。
 		expectLoadError(t, base(func(c *core.ExecutorCommand) {
-			c.Env = map[string]string{"report_home": "/srv"}
+			c.Env = map[string]string{"report-home": "/srv"}
 		}), "upper-case letters")
 	})
 	t.Run("env value with control character", func(t *testing.T) {
@@ -813,4 +815,32 @@ func TestProfileErrorPrefix(t *testing.T) {
 	if !strings.HasPrefix(err.Error(), want) {
 		t.Fatalf("error must start with %q, got %q", want, err.Error())
 	}
+}
+
+// TestLoadProfiles_ConfigFileEnvKeys 走配置文件这一路：viper 解码映射时把键折成小写，
+// 而 configs/config.example.yaml 的写法与 envNamePattern 都是大写环境变量名。
+// 这一条固定"从 YAML 读进来仍然按大写校验并保存"，否则示例配置自己就加载不过。
+func TestLoadProfiles_ConfigFileEnvKeys(t *testing.T) {
+	workspace := t.TempDir()
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	body := `
+executors:
+  enabled: true
+  workspace: ` + filepath.ToSlash(workspace) + `
+  commands:
+    - name: nightly_report
+      kind: script
+      runtime: node
+      script: scripts/report.mjs
+      env: { REPORT_HOME: /srv/report }
+      env_allow: [TRACE_ID]
+`
+	require.NoError(t, os.WriteFile(path, []byte(body), 0o600))
+
+	cfg, err := core.LoadConfig(path)
+	require.NoError(t, err)
+	profiles := mustLoad(t, cfg)
+
+	assert.Equal(t, map[string]string{"REPORT_HOME": "/srv/report"}, profiles[0].Env)
+	assert.Equal(t, []string{"TRACE_ID"}, profiles[0].EnvAllow)
 }

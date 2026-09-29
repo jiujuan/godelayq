@@ -251,10 +251,14 @@ func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtim
 
 	// 环境变量、工作目录与超时
 	for key, value := range cmd.Env {
-		if err := checkEnvEntry(key, value, index, name); err != nil {
+		// viper 解码映射时会把键统一折成小写，所以配置里写的 REPORT_HOME 到这里已经是 report_home。
+		// 环境变量名按惯例与 envNamePattern 都要求大写，configs/config.example.yaml 的示例也是大写：
+		// 折回大写再校验，校验规则本身没变，变的只是"读进来时已被改写的写法"。
+		envKey := strings.ToUpper(key)
+		if err := checkEnvEntry(envKey, value, index, name); err != nil {
 			return nil, err
 		}
-		profile.Env[key] = value
+		profile.Env[envKey] = value
 	}
 	if err := checkNameList("env_allow", profile.EnvAllow, index, name); err != nil {
 		return nil, err
