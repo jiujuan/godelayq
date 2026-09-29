@@ -339,3 +339,34 @@ func TestSSEAcceptsPauseEventTypes(t *testing.T) {
 		assert.Equal(t, core.StatusPaused, event.Status)
 	}
 }
+
+// TestSSEReStreamsCompletedEventWithExecResult 固定 TASK-E07 的事件契约落到实时通道之后的表现：
+// 新增的只有 data.result，事件类型没多，所以既有的类型白名单与任务名过滤都照旧生效。
+// （SSE 的过滤参数是 job_types，按事件里的 JobName 匹配；卡片里写的 job_ids 就是这一条。）
+func TestSSEReStreamsCompletedEventWithExecResult(t *testing.T) {
+	srv, baseURL := newStartedServer(t)
+	defer srv.Stop(context.Background())
+
+	completed := core.Event{
+		Type:      core.EventJobCompleted,
+		JobID:     "job-exec",
+		JobName:   "exec.demo",
+		Status:    core.StatusSuccess,
+		Timestamp: time.Now(),
+		Data:      json.RawMessage(`{"result":{"kind":"script","profile":"demo","exit_code":1,"duration_ms":12,"preview":"boom"}}`),
+	}
+	unrelated := scheduledEvent("other")
+
+	stream := openSSE(t, baseURL+"/sse/events?event_types=job.completed&job_types=exec.demo")
+	stop := publishUntil(t, srv.scheduler.GetEventBus(), 10*time.Millisecond, completed, unrelated)
+	defer stop()
+
+	got := collect(t, stream, 2, 2*time.Second)
+	require.NotEmpty(t, got, "带 result 的完成事件要能送达")
+	for _, event := range got {
+		assert.Equal(t, core.EventJobCompleted, event.Type, "未订阅的类型不该漏出来：%s", event.Type)
+		assert.Equal(t, "exec.demo", event.JobName, "任务名过滤不该因为 data 变宽而失效")
+	}
+	assert.Contains(t, string(got[0].Data), `"exit_code":1`)
+	assert.Contains(t, string(got[0].Data), `"preview":"boom"`)
+}

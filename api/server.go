@@ -45,8 +45,13 @@ type Server struct {
 	// 它本来就存在任务快照里）。
 	groups core.GroupStore
 	// executors 是执行器档位登记表；nil 表示这次部署没装配执行器（开关关闭，
-	// 或测试直接构造 Server）。读它的端点在 TASK-E07/E13 加入，本卡只提供注入。
+	// 或测试直接构造 Server）。读它的是 GET /executors 与结果端点的预览上限，
+	// 未注入时不报错：登记表在开关关闭时也是非 nil 的空表，"没装配"是默认状态。
 	executors *executor.Registry
+	// artifacts 是执行输出的文件存储；nil 表示这次部署没有产物文件可读
+	// （executors.enabled=false，或测试直接构造 Server）。
+	// GET /jobs/:id/result 缺它时返回 503，因为"读不到正文"与"正文是空的"必须区分开。
+	artifacts *executor.ArtifactStore
 	// history 是事件总线的内存订阅者，为详情页时间线与 Dashboard 提供最近事件
 	history *EventHistory
 	// console 是嵌入的前端产物根；nil 表示这次部署只提供 API（开发形态）。
@@ -73,9 +78,15 @@ func WithGroupStore(store core.GroupStore) Option {
 
 // WithExecutorRegistry 注入执行器档位登记表。传 nil 与不注入等价：
 // 登记表在开关关闭时也是非 nil 的空表，所以"没装配"只有测试直接构造 Server 那一种情况。
-// 端点尚未实现（TASK-E07），这里先只把依赖接进来，避免那时再改一次装配。
+// 读取方是 GET /executors 与结果端点的预览上限，两者都把 nil 当默认状态处理，不返回 503。
 func WithExecutorRegistry(reg *executor.Registry) Option {
 	return func(s *Server) { s.executors = reg }
+}
+
+// WithArtifacts 注入执行输出的文件存储。传 nil 与不注入等价：
+// /jobs/:id/result 会明确返回 503，而不是回一份"看起来是空输出"的结果。
+func WithArtifacts(store *executor.ArtifactStore) Option {
+	return func(s *Server) { s.artifacts = store }
 }
 
 // NewServer 创建API服务器。sec 为零值时不鉴权、接受任意跨域来源；
@@ -206,7 +217,15 @@ func (s *Server) setupRoutes() {
 			jobs.POST("/:id/force-pause", s.RequireRole(core.RoleAdmin), s.ForcePauseJob)
 			jobs.GET("/:id/events", reader, s.GetJobEvents)
 			jobs.POST("/batch-ops", operator, s.BatchJobOps)
+
+			// 执行输出正文。判档在先、依赖检查在后：未认证的连接不该从状态码里
+			// 读出"这次部署装没装产物存储"。
+			jobs.GET("/:id/result", reader, s.requireArtifacts(), s.GetJobResult)
 		}
+
+		// 执行器档位列表。未注入登记表时它回 {"enabled":false,"profiles":[]}：
+		// 执行器默认关闭，那是默认状态而不是错误状态，所以这里没有 503 守卫。
+		api.GET("/executors", reader, s.ListExecutors)
 
 		// 全局最近事件：Dashboard 刷新后补历史用
 		api.GET("/events", reader, s.ListRecentEvents)
