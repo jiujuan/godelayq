@@ -287,8 +287,12 @@ core 的调度器一行未改：超时与取消的分类靠 `ExitError.Is` 接�
 
 - Unix 上的真实进程行为：本机是 Windows，`sh -c` 分支与 SIGKILL/SIGTERM 的信号名解析
   只写了默认实现，`signalOf` 在 `!windows` 上仍返回空串。需要 Linux/CI 实跑（既有登记项）。
+  **2026-09-30 由 TASK-E10 收口**：E10 在 WSL2 Ubuntu（go1.24.13 linux/amd64）实跑过本卡的
+  executor 全包与 §5 的六条终止用例，并修掉本卡两条依赖机器速度的断言
+  （`DurationMs` 非零——`echo hello` 在 Linux 上不足 1 毫秒，见 E10 第 10 节第 8 条）。
 - 整棵进程树的终止：本卡只杀直接子进程。超时用例在 Windows 上是靠 `WaitDelay` 才让
   Handler 返回的（`cmd /c ping` 的孙进程仍活着），这条正是 E10/E11 要消掉的现象。
+  **Unix 侧已由 E10 消掉**（进程组写法 + 宽限期，孙进程实测消失）；Windows 侧留给 E11。
 - 取消路径经 REST 的实际效果（`handleInterrupted` 不消耗重试）只有单测覆盖；
   冒烟没提交长任务再 `POST /jobs/:id/cancel`。
 - 优雅关闭期间在途执行的表现（E10 §3.5 的时长关系）。
