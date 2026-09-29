@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"sort"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -63,16 +64,17 @@ func TestRegister_AllProfiles(t *testing.T) {
 		return cmd
 	}
 
-	registry, err := NewRegistry(configAllowing(workspace, []string{executable, missingProgram},
+	cfg := configAllowing(workspace, []string{executable, missingProgram},
 		named("alpha", executable),
 		named("beta", executable),
 		named("zeta", missingProgram), // 探测失败：仍然要注册
-	), quietLogger())
+	)
+	registry, err := NewRegistry(cfg, quietLogger())
 	require.NoError(t, err)
 
 	registrar := newFakeRegistrar()
 	var logs bytes.Buffer
-	result, err := Register(registrar, registry, slog.New(slog.NewTextHandler(&logs, nil)))
+	result, err := Register(registrar, registry, cfg, nil, slog.New(slog.NewTextHandler(&logs, nil)))
 	require.NoError(t, err)
 
 	assert.Equal(t, Registration{Total: 3, Registered: 3, Unavailable: 1}, result)
@@ -94,15 +96,16 @@ func TestRegister_AllProfiles(t *testing.T) {
 func TestRegister_KeyConflict(t *testing.T) {
 	workspace := t.TempDir()
 
-	registry, err := NewRegistry(configAllowing(workspace, []string{selfExecutable(t)},
+	cfg := configAllowing(workspace, []string{selfExecutable(t)},
 		namedScript(t, workspace, "alpha"),
 		namedScript(t, workspace, "beta"),
-	), nil)
+	)
+	registry, err := NewRegistry(cfg, nil)
 	require.NoError(t, err)
 
 	// 模拟代码里已经占用过这个键的处理函数
 	registrar := newFakeRegistrar("exec.beta")
-	result, err := Register(registrar, registry, nil)
+	result, err := Register(registrar, registry, cfg, nil, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "exec.beta")
@@ -124,7 +127,7 @@ func TestRegister_EmptyRegistry(t *testing.T) {
 
 	var logs bytes.Buffer
 	registrar := newFakeRegistrar()
-	result, err := Register(registrar, registry, slog.New(slog.NewTextHandler(&logs, nil)))
+	result, err := Register(registrar, registry, cfg, nil, slog.New(slog.NewTextHandler(&logs, nil)))
 	require.NoError(t, err)
 
 	assert.Equal(t, Registration{}, result)
@@ -134,13 +137,14 @@ func TestRegister_EmptyRegistry(t *testing.T) {
 }
 
 func TestRegister_LogsWarnWithoutProfiles(t *testing.T) {
-	registry, err := NewRegistry(configWith(t.TempDir()), nil)
+	cfg := configWith(t.TempDir())
+	registry, err := NewRegistry(cfg, nil)
 	require.NoError(t, err)
 	require.True(t, registry.Enabled())
 	require.Empty(t, registry.Keys())
 
 	var logs bytes.Buffer
-	result, err := Register(newFakeRegistrar(), registry, slog.New(slog.NewTextHandler(&logs, nil)))
+	result, err := Register(newFakeRegistrar(), registry, cfg, nil, slog.New(slog.NewTextHandler(&logs, nil)))
 	require.NoError(t, err)
 
 	assert.Equal(t, Registration{}, result)
@@ -149,30 +153,28 @@ func TestRegister_LogsWarnWithoutProfiles(t *testing.T) {
 	assert.Contains(t, output, "executors are enabled but no profile is declared")
 }
 
-func TestStubHandler_ReturnsNotImplemented(t *testing.T) {
-	workspace := t.TempDir()
-	profile := profileFrom(t, configAllowing(workspace, []string{selfExecutable(t)},
-		namedScript(t, workspace, "nightly")), 0)
+// TestRegister_HandlerRunsTheProfile 确认注册链路已从占位实现切到真实执行器（卡片 §5.11）。
+//
+// 断言方式是跑一次并检查摘要与产物文件：错误文本里有没有 "not implemented" 只能证明
+// 占位实现还在，证明不了真实执行可用。
+func TestRegister_HandlerRunsTheProfile(t *testing.T) {
+	cfg := configWith(t.TempDir(), shellCommand(t, "echo registered"))
+	registry, err := NewRegistry(cfg, quietLogger())
+	require.NoError(t, err)
 
-	var logs bytes.Buffer
-	restore := slog.Default()
-	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
-	t.Cleanup(func() { slog.SetDefault(restore) })
+	store := artifactStoreFor(t, core.DefaultExecMaxOutputBytes, 0, nil)
+	registrar := newFakeRegistrar()
+	_, err = Register(registrar, registry, cfg, store, quietLogger())
+	require.NoError(t, err)
 
-	handler := profile.StubHandler()
+	handler, ok := registrar.handlers["exec.runner_case"]
+	require.True(t, ok)
 
-	err := handler(context.Background(), &core.Job{ID: "job-1"})
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "exec.nightly")
-	assert.Contains(t, err.Error(), "not implemented yet")
+	job := &core.Job{ID: "job-registered", Name: "exec.runner_case", Attempts: 1}
+	require.NoError(t, handler(context.Background(), job))
 
-	output := logs.String()
-	assert.Contains(t, output, "executor stub invoked")
-	assert.Contains(t, output, "job_id=job-1")
-	assert.Contains(t, output, "handler_key=exec.nightly")
-
-	// 已取消的上下文不改变结论：占位实现不做任何等待，也返回同样的错误
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	assert.ErrorContains(t, handler(ctx, &core.Job{ID: "job-2"}), "not implemented yet")
+	require.NotNil(t, job.Exec, "真实执行器要留下执行摘要")
+	assert.Equal(t, "runner_case", job.Exec.Profile)
+	assert.Equal(t, "registered", strings.TrimSpace(job.Exec.Preview))
+	assert.True(t, store.Exists(job.ID, job.Attempts))
 }

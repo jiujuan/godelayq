@@ -208,7 +208,7 @@ func run(deps runtimeDeps) error {
 	if err != nil {
 		return err
 	}
-	if err := registerHandlers(server, scheduler, executors, deps.logger); err != nil {
+	if err := registerHandlers(server, scheduler, executors, cfg, artifacts, deps.logger); err != nil {
 		return err
 	}
 
@@ -258,7 +258,11 @@ func liveJobIDs(store core.Store) func() (map[string]bool, error) {
 // 示例走 api.Server、档位走调度器，是因为 api.Server 只转发写入、不转发查询，
 // 而注册档位需要"先确认键没被占用再写入"，查重与写入必须落在同一张注册表上。
 // 两者在真实进程里本来就是同一张表：api.Server.RegisterJobHandler 就是调度器的转发。
-func registerHandlers(server serverAPI, scheduler schedulerAPI, reg *executor.Registry, logger *slog.Logger) error {
+//
+// cfg 与 artifacts 一起传给注册：档位的处理函数从这一步起是真实执行器，
+// 它要按 executors 一节求生效超时，也要有产物存储可写。
+func registerHandlers(server serverAPI, scheduler schedulerAPI, reg *executor.Registry,
+	cfg core.Config, artifacts *executor.ArtifactStore, logger *slog.Logger) error {
 	server.RegisterJobHandler("payment_check", handlePaymentCheck)
 	server.RegisterJobHandler("email_send", handleEmailSend)
 	server.RegisterJobHandler("data_sync", handleDataSync)
@@ -267,7 +271,13 @@ func registerHandlers(server serverAPI, scheduler schedulerAPI, reg *executor.Re
 	if reg == nil {
 		return nil
 	}
-	_, err := executor.Register(scheduler, reg, logger)
+	if cfg.Executors.Enabled && artifacts == nil {
+		// 档位的处理函数从这里起会真的起进程，没有产物存储就等于每次执行都没有输出可查。
+		// 装配少传一个参数属于编程错误：停在这儿比等到任务逐个报"没地方写输出"好排查。
+		// 判断依据是运行配置而非登记表开关：真正决定要不要存储的是这一次启动开没开执行器。
+		return fmt.Errorf("executors are enabled but no artifact store was provided")
+	}
+	_, err := executor.Register(scheduler, reg, cfg, artifacts, logger)
 	return err
 }
 

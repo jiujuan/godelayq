@@ -27,6 +27,10 @@ type Registration struct {
 
 // Register 把登记表里的每个档位注册成 exec.<name> 处理函数。
 //
+// cfg 是整份配置（内部归一化后取 executors 一节给执行器用），artifacts 是输出落盘的存储：
+// 打开执行器时装配方一定要传一个可用的进来，传 nil 只会让每次执行在起进程之前失败——
+// 那种失败在日志里看起来像"脚本坏了"，其实是装配漏了参数。
+//
 // 键冲突一律返回错误而不是覆盖：档位与代码里注册的处理函数同名，说明这台机器的
 // 配置和代码对不上，静默覆盖会让其中一方悄悄失效，运维在现场查不到痕迹。
 // 检查在写入之前全部做完，因此冲突时不会留下部分注册结果——注册表要么完整要么没动过。
@@ -35,13 +39,14 @@ type Registration struct {
 // 而静默消失会让 /job-types 里凭空少一个名字。
 //
 // 登记表为空时不写任何东西也不记注册日志；此时若开关是打开的，另记一条 warn。
-func Register(registrar Registrar, reg *Registry, logger *slog.Logger) (Registration, error) {
+func Register(registrar Registrar, reg *Registry, cfg core.Config, artifacts *ArtifactStore, logger *slog.Logger) (Registration, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
 
 	keys := reg.Keys()
 	result := Registration{Total: len(keys)}
+	executors := cfg.Normalized().Executors
 
 	// 空表直接返回：开关关闭时这是正常状态，不该在每次启动留一行注册日志。
 	if result.Total == 0 {
@@ -66,7 +71,9 @@ func Register(registrar Registrar, reg *Registry, logger *slog.Logger) (Registra
 		if !ok {
 			continue
 		}
-		registrar.RegisterHandler(key, profile.StubHandler())
+		// Runner 是真实的执行主体：校验 payload、拼 argv、起进程、把输出写进产物文件。
+		// http 档位也走同一个入口，它在 Runner.Handler 里明确报告"执行分支归 TASK-E15"。
+		registrar.RegisterHandler(key, NewRunner(profile, artifacts, executors, logger).Handler())
 		result.Registered++
 		if probe, ok := reg.ProbeOf(key); ok && !probe.Available {
 			result.Unavailable++

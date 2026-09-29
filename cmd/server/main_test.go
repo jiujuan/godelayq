@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"godelayq/core"
 	"godelayq/executor"
 )
@@ -21,21 +23,40 @@ func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
 
-// disabledRegistry 造一个开关关闭时空着的登记表，等价于"这次部署没有执行器"。
-func disabledRegistry(t *testing.T) *executor.Registry {
+// tempArtifactStore 把产物写进临时目录，供注册链路构造真实执行器（TASK-E09）。
+// 打开执行器却不给产物存储时 registerHandlers 会直接报装配错误，
+// 所以凡是用启用状态的登记表跑一遍的用例都要带上一份。
+func tempArtifactStore(t *testing.T, cfg core.Config) *executor.ArtifactStore {
 	t.Helper()
 
-	reg, err := executor.NewRegistry(core.DefaultConfig(), quietLogger())
+	store, err := executor.NewArtifactStore(executor.ArtifactOptions{
+		Dir:      filepath.Join(t.TempDir(), "exec"),
+		MaxBytes: cfg.Executors.Output.MaxBytes,
+	}, quietLogger())
+	if err != nil {
+		t.Fatalf("build artifact store: %v", err)
+	}
+	return store
+}
+
+// disabledRegistry 造一个开关关闭时空着的登记表，等价于"这次部署没有执行器"。
+// 连同配置一起返回：注册档位要按 executors 一节求生效超时，测试里两份都得是同一套取值。
+func disabledRegistry(t *testing.T) (core.Config, *executor.Registry) {
+	t.Helper()
+
+	cfg := core.DefaultConfig()
+	reg, err := executor.NewRegistry(cfg, quietLogger())
 	if err != nil {
 		t.Fatalf("build disabled registry: %v", err)
 	}
-	return reg
+	return cfg, reg
 }
 
 // scriptRegistry 造一个启用状态的登记表，每个名字一条脚本档位。
 // runtime 用当前测试程序自身：它一定存在且在 PATH 里，因此探测结论为可用，
 // 断言不必依赖目标机器装了 node 或 php。
-func scriptRegistry(t *testing.T, names ...string) *executor.Registry {
+// 返回值带一份配置：注册链路要用它求生效超时（TASK-E09 之后档位处理函数是真实执行器）。
+func scriptRegistry(t *testing.T, names ...string) (core.Config, *executor.Registry) {
 	t.Helper()
 
 	executable, err := os.Executable()
@@ -70,13 +91,14 @@ func scriptRegistry(t *testing.T, names ...string) *executor.Registry {
 	if err != nil {
 		t.Fatalf("build executor registry: %v", err)
 	}
-	return reg
+	return cfg, reg
 }
 
 func TestRegisterHandlers_RegistersAllSupportedJobTypes(t *testing.T) {
 	server, scheduler := newRegisteredPair()
 
-	if err := registerHandlers(server, scheduler, disabledRegistry(t), quietLogger()); err != nil {
+	cfg, registry := disabledRegistry(t)
+	if err := registerHandlers(server, scheduler, registry, cfg, nil, quietLogger()); err != nil {
 		t.Fatalf("expected registerHandlers to succeed, got %v", err)
 	}
 
@@ -95,7 +117,8 @@ func TestRegisterHandlers_RegistersAllSupportedJobTypes(t *testing.T) {
 func TestRegisterHandlers_WithProfiles(t *testing.T) {
 	server, scheduler := newRegisteredPair()
 
-	if err := registerHandlers(server, scheduler, scriptRegistry(t, "a", "b"), quietLogger()); err != nil {
+	cfg, registry := scriptRegistry(t, "a", "b")
+	if err := registerHandlers(server, scheduler, registry, cfg, tempArtifactStore(t, cfg), quietLogger()); err != nil {
 		t.Fatalf("expected registerHandlers to succeed, got %v", err)
 	}
 
@@ -115,12 +138,30 @@ func TestRegisterHandlers_WithProfiles(t *testing.T) {
 	}
 }
 
+// TestRegisterHandlers_MissingArtifactStoreFails 钉住"打开执行器却没传产物存储"的结论：
+// 档位的处理函数是真实执行器，没有输出落盘的地方就注定每次执行都查不到结果。
+// 装配少传一个参数属于编程错误，要在注册阶段停住，而不是让任务逐个失败。
+func TestRegisterHandlers_MissingArtifactStoreFails(t *testing.T) {
+	server, scheduler := newRegisteredPair()
+	cfg, registry := scriptRegistry(t, "a")
+
+	err := registerHandlers(server, scheduler, registry, cfg, nil, quietLogger())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "artifact store")
+
+	// 停在装配期：档位键一个都没进来，不会留下"注册了一半"的表
+	for _, key := range scheduler.registeredKeys() {
+		assert.NotEqual(t, "exec.a", key)
+	}
+}
+
 func TestRegisterHandlers_ConflictFails(t *testing.T) {
 	server, scheduler := newRegisteredPair()
 	// 占用档位将要使用的键，模拟配置与代码对不上的情况
 	scheduler.RegisterHandler("exec.a", func(context.Context, *core.Job) error { return nil })
 
-	err := registerHandlers(server, scheduler, scriptRegistry(t, "a", "b"), quietLogger())
+	cfg, registry := scriptRegistry(t, "a", "b")
+	err := registerHandlers(server, scheduler, registry, cfg, tempArtifactStore(t, cfg), quietLogger())
 	if err == nil {
 		t.Fatal("expected a conflict error")
 	}

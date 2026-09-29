@@ -24,7 +24,8 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 	server := newFakeServer()
 	server.onRegister = scheduler.RegisterHandler
 	var logs strings.Builder
-	executors := scriptRegistry(t, "smoke")
+	// 这条用例的运行配置没开执行器，登记表只是被传进来的物件，用不到它那份配置
+	_, executors := scriptRegistry(t, "smoke")
 	registryCalls := 0
 
 	cfg := core.Config{}
