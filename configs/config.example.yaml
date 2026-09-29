@@ -122,15 +122,20 @@ executors:
     ttl: 168h
   # 档位列表：能执行什么完全由这里决定，不提供自由命令行，也不接受任务里内联源码。
   # 与 server.auth.users 同理，这里故意不写 []（解开示例即可启用，写 [] 再挂列表项会让 YAML 报错）。
-  # 本节的正式结构在 executor 包中定义，当前只有顶层 commands 键被识别，
-  # 档位内部的键名拼错此时不会被配置校验发现。字段与校验规则见设计文档 §5。
+  # 键名拼错会被配置解码直接拒绝；字段取值与组合规则由 executor.LoadProfiles 在启动时校验，
+  # 任一条不过即启动失败并指出档位名。字段含义与校验规则见设计文档 §5。
   commands:
   #  - name: nightly_report          # 注册后的任务类型名是 exec.nightly_report
   #    kind: script                  # script | binary | http
-  #    runtime: node
-  #    script: scripts/report.mjs    # 相对 workspace，文件必须已存在
+  #    runtime: node                 # 必须在上面的 runtime_allow 里
+  #    script: scripts/report.mjs    # 相对 workspace，且必须解析在 workspace 内
   #    args:
   #      - { name: day, required: true, pattern: '^(yesterday|today)$' }
-  #    args_render: ["--day={day}"]
+  #      - { name: token, secret: true }        # 值不进响应与错误信息
+  #    args_render: ["--day={day}"]  # 只能引用 args 里声明过的名字
+  #    cwd: "."                      # 相对 workspace 的工作目录
+  #    env: { REPORT_HOME: /srv/report }         # 固定注入，payload 不能覆盖
+  #    env_allow: [TRACE_ID]                     # payload 可注入的键名白名单
   #    timeout: 10m
   #    max_parallel: 1
+  #    retry_on_exit: [75]           # 这些退出码才允许重试，其它非 0 视为重试无意义

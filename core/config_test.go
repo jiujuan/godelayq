@@ -578,10 +578,10 @@ executors:
 	assert.Equal(t, "/var/lib/godelayq/exec", cfg.Executors.Output.Dir)
 	assert.Equal(t, 48*time.Hour, cfg.Executors.Output.TTL)
 
-	// 档位内容在 TASK-E02 之前按原样收下（宽松类型），这里只钉住"能被读出来"
+	// 档位现在是有类型的结构：只断言"能被读出来"，字段级校验在 executor.LoadProfiles
 	require.Len(t, cfg.Executors.Commands, 1)
-	assert.Equal(t, []map[string]any{
-		{"name": "nightly_report", "kind": "script", "runtime": "node"},
+	assert.Equal(t, []ExecutorCommand{
+		{Name: "nightly_report", Kind: "script", Runtime: "node"},
 	}, cfg.Executors.Commands)
 }
 
@@ -614,10 +614,9 @@ func TestLoadConfig_RejectsUnknownExecutorsKeys(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parse config failed")
 
-	// 已知限制（有意保留到 TASK-E02）：档位内部用宽松类型接收，键名拼错此时发现不了。
-	// 这条特征化测试的作用是在 E02 换成正式结构时失败，提醒连同注释一起改掉。
-	cfg, err := LoadConfig(writeConfigFile(t, "executors:\n  commands:\n    - nmae: nightly\n"))
-	require.NoError(t, err)
-	require.Len(t, cfg.Executors.Commands, 1)
-	assert.Equal(t, "nightly", cfg.Executors.Commands[0]["nmae"])
+	// TASK-E02 之后档位内部也是有类型的结构：拼错的键名同样被 UnmarshalExact 拒绝，
+	// 不再存在"档位写错但配置加载通过"的窗口。
+	_, err = LoadConfig(writeConfigFile(t, "executors:\n  commands:\n    - nmae: nightly\n"))
+	require.Error(t, err, "档位内部的未知键也必须报错")
+	assert.Contains(t, err.Error(), "nmae")
 }

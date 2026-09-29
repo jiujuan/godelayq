@@ -242,10 +242,98 @@ type ExecutorsConfig struct {
 	// Output 执行输出的截断与保留策略
 	Output ExecutorOutputConfig `mapstructure:"output"`
 
-	// Commands 档位列表。正式结构在 executor 包（TASK-E02）定义，
-	// 这里先用宽松类型打通配置解码；代价是档位内部的键名拼错此时不会被发现
-	// （UnmarshalExact 只保证本节顶层键合法）。
-	Commands []map[string]any `mapstructure:"commands"`
+	// Commands 档位列表：能执行什么完全由这里决定。
+	// 校验规则在 executor.LoadProfiles（启动时执行，任一条不过即启动失败），
+	// 这里只保证键名与类型——UnmarshalExact 会拒绝档位内部的拼错键名。
+	Commands []ExecutorCommand `mapstructure:"commands"`
+}
+
+// ExecutorCommand 一个可执行档位，注册后的任务类型名是 "exec." + Name。
+// 按 Kind 使用不同字段子集，未用的字段应当留空：executor.LoadProfiles 会拒绝填错的组合。
+type ExecutorCommand struct {
+	// Name 档位名，只允许字母、数字、下划线与连字符，长度 ≤64
+	Name string `mapstructure:"name"`
+	// Kind 执行方式：script（解释器 + workspace 内脚本）| binary（workspace 内产物或 PATH 程序）| http
+	Kind string `mapstructure:"kind"`
+
+	// Runtime 解释器名（bash/sh/cmd/pwsh/node/php/python/java 之一，受 executors.runtime_allow 约束），仅 script 档位使用
+	Runtime string `mapstructure:"runtime"`
+	// Script workspace 内的脚本相对路径，仅 script 档位使用
+	Script string `mapstructure:"script"`
+	// Program 二进制档位的可执行文件：workspace 内相对路径，或 runtime_allow 里的程序名
+	Program string `mapstructure:"program"`
+	// FixedArgs 二进制档位写死的参数前缀（payload 无法改写），例如 ["-jar", "app/app.jar"]
+	FixedArgs []string `mapstructure:"fixed_args"`
+
+	// Args 允许 payload 提供的具名参数；未声明的键一律拒绝
+	Args []ExecutorArg `mapstructure:"args"`
+	// ArgsRender 参数渲染模板，每项形如 "--day={day}"，占位符只能引用 Args 里声明过的名字
+	ArgsRender []string `mapstructure:"args_render"`
+	// Positional 位置参数规则；不声明就不接受位置参数
+	Positional *ExecutorPositional `mapstructure:"positional"`
+
+	// Cwd 工作目录，相对 workspace；留空表示 workspace 本身
+	Cwd string `mapstructure:"cwd"`
+	// Env 注入子进程的固定变量，payload 不能覆盖
+	Env map[string]string `mapstructure:"env"`
+	// EnvAllow 允许 payload 额外注入的变量键名白名单
+	EnvAllow []string `mapstructure:"env_allow"`
+
+	// Timeout 单次执行超时，留空用 executors.default_timeout；超过 executors.max_timeout 报错
+	Timeout time.Duration `mapstructure:"timeout"`
+	// MaxParallel 同一档位同时执行的任务数上限，0 表示 1
+	MaxParallel int `mapstructure:"max_parallel"`
+	// RetryOnExit 这些退出码允许重试；其它非 0 退出码按"重试也不会变好"处理
+	RetryOnExit []int `mapstructure:"retry_on_exit"`
+
+	// ---- 以下仅 http 档位使用 ----
+
+	// Method HTTP 方法，大写：GET|POST|PUT|PATCH|DELETE
+	Method string `mapstructure:"method"`
+	// URLTemplate 目标 URL，可含 {name} 占位符（占位符名必须在 Args 里声明）
+	URLTemplate string `mapstructure:"url_template"`
+	// AllowedHosts 允许访问的主机白名单，元素是主机名、host:port 或 "*.域名"
+	AllowedHosts []string `mapstructure:"allowed_hosts"`
+	// Headers 固定请求头
+	Headers map[string][]string `mapstructure:"headers"`
+	// HeaderAllow 允许 payload 覆盖的请求头键名
+	HeaderAllow []string `mapstructure:"header_allow"`
+	// Body 请求体来源：json（payload.body 必须是对象/数组）| raw（任意 JSON 值）| none（忽略 body）
+	Body string `mapstructure:"body"`
+	// ExpectStatus 视为成功的状态码；留空表示只接受 2xx
+	ExpectStatus []int `mapstructure:"expect_status"`
+	// CaptureResponse 是否把响应体写进产物文件
+	CaptureResponse bool `mapstructure:"capture_response"`
+	// MaxBodyBytes 响应体读取上限，0 表示用 executors.output.max_bytes
+	MaxBodyBytes int `mapstructure:"max_body_bytes"`
+	// MaxRedirects 只允许 0：跟随重定向会让 allowed_hosts 失去意义
+	MaxRedirects int `mapstructure:"max_redirects"`
+	// DenyPrivate 是否禁止解析到回环/内网/链路本地地址；留空表示禁止
+	DenyPrivate *bool `mapstructure:"deny_private_ranges"`
+}
+
+// ExecutorArg 档位声明的一个具名参数。
+type ExecutorArg struct {
+	// Name 参数名，小写字母、数字与下划线
+	Name string `mapstructure:"name"`
+	// Required payload 必须提供该参数
+	Required bool `mapstructure:"required"`
+	// Default 未提供时使用的值；与 Required 同时给出属于配置矛盾
+	Default string `mapstructure:"default"`
+	// Pattern 值的正则约束；留空由 executor 侧套用默认安全字符集
+	Pattern string `mapstructure:"pattern"`
+	// Secret 值属于敏感信息：HTTP 响应里掩码，且不出现在错误信息中
+	Secret bool `mapstructure:"secret"`
+	// AllowDash 允许值以 "-" 开头。默认不允许：值以 "-" 开头可能被程序解释成选项
+	AllowDash bool `mapstructure:"allow_dash"`
+}
+
+// ExecutorPositional 位置参数的数量与取值约束。
+type ExecutorPositional struct {
+	// Max 位置参数个数上限，1..16
+	Max int `mapstructure:"max"`
+	// Pattern 每个位置值的正则约束；留空由 executor 侧套用默认安全字符集
+	Pattern string `mapstructure:"pattern"`
 }
 
 // ExecutorOutputConfig 执行输出（stdout/stderr）的落盘与预览参数。
