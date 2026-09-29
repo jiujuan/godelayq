@@ -81,7 +81,7 @@ go test ./executor -race -v
 
 - 不做版本探测（字段留空，理由写进注释）。
 - 不做网络连通性检查（E15 的执行期错误处理负责）。
-- - 不做注册到调度器（E04）。
+- 不做注册到调度器（E04）。
 - 不加 HTTP 端点（E07 一起做）。
 
 ## 9. 风险与回滚
@@ -89,3 +89,53 @@ go test ./executor -race -v
 - 风险：`exec.LookPath` 在 Windows 上会按 `PATHEXT` 匹配，测试里用 `os.Executable()` 当"存在的程序"是安全的，但不要用 `"node"` 这种依赖环境的值。
 - 风险：把不可用档位保留在注册表里，会让 `GET /job-types` 出现当前跑不了的名字。这是有意的（前端据此显示不可用状态），E04 要在注册日志里说明，E13 的响应必须带 `runtime_ok`，否则运维会以为系统坏了。
 - 回滚：新增文件，`git revert` 即可。
+
+## 10. 实现记录（2026-09-29）
+
+改动文件：新增 `executor/probe.go`、`executor/probe_test.go`、`executor/registry.go`、`executor/registry_test.go`；
+本卡片修正了 §8 的一处笔误（多打的一个 `-`）。
+
+### 与卡片的偏离与补充
+
+1. **`exec.LookPath` 收进包级变量 `lookPath`**。测试需要一个"一定存在且可执行"的程序来验证正反两条分支，
+   用当前测试程序自身的路径（`os.Executable()`，绝对路径也走 LookPath，语义一致）最可靠；
+   留成变量也让后面任何要模拟 PATH 的测试不用改生产代码。
+2. **脚本不要求执行位、产物要求**（卡片只写"检查存在性与是否可执行"）。
+   脚本是被解释器读取的（`node app.mjs` 不需要 app.mjs 可执行），要求执行位会误伤一批合法配置；
+   产物文件是要直接执行的，所以 Unix 看执行位、Windows 看扩展名集合 `.exe/.com/.bat/.cmd`。
+   两侧各有用例（`TestProbe_ScriptIsAcceptedWithoutExecuteBit`、`TestProbe_BinaryNotExecutable`）。
+3. **不可用原因里只写相对 workspace 的路径**。卡片只要求原因能原样显示，
+   而 E16 要求不把服务器目录结构透给接口；在这里就不带绝对路径，比在 HTTP 层再遮蔽可靠
+   （`TestProbe_ReasonNeverLeaksWorkspacePath` 直接断言原因里不含 workspace 绝对路径）。
+4. **`Registry` 比卡片多四个访问器**：`Enabled()`、`RequiredRole()`、`LoaderAllowed()`、`ProbeOf(key)`。
+   前三条分别被 E07、E16、E17 引用，`ProbeOf` 是 E07 输出 `runtime_ok` + 原因所需的；
+   放在登记表的归属卡里实现，避免三张卡各自回来补方法。
+5. **`enabled=false` 时不加载也不探测**（卡片只说返回空登记表）。
+   这意味着关闭状态下配置里的档位错误不会暴露，与"enabled=false 时本节取值全部不生效"一致；
+   `TestNewRegistry_EmptyWhenDisabled` 里放了一条越界路径的档位来钉住这个行为。
+6. **卡片 §7 的手工验证此刻做不到**：服务端进程要到 E04 才会调用 `NewRegistry`，
+   所以"启动后日志里看到 warn"这条只能以两种方式替代——
+   `TestNewRegistry_FromConfigFile`（真实 YAML → `core.LoadConfig` → `NewRegistry`，混合可用与不可用档位），
+   以及一次临时冒烟程序（见下）。E04 完成后应当回到这条手工验证再走一遍。
+
+### 验证结果
+
+- 单元测试：`go test ./executor -race -count=1` 通过；探测 13 个用例、登记表 8 个用例，全部不依赖目标机器装了
+  node/php（用测试程序自身路径与一个必然不存在的名字 `godelayq-test-runtime-xyz`）。
+- `go build ./...`、`go vet ./...`、`go test ./... -race` 全绿；
+  `GOOS=linux/darwin/windows` 三平台 `go build ./...` 通过，`GOOS=linux` 与 `GOOS=windows` 下 `go vet ./executor` 通过。
+- 真实进程冒烟（临时程序 + 本机真实 PATH，跑完已删除）：六条档位一次加载，
+  `node` 与 `bash` 在本机确实存在 → 判可用；`godelayq-no-such-runtime` →
+  `runtime "godelayq-no-such-runtime" not found in PATH`；缺失脚本 → `script file "scripts/absent.sh" does not exist`；
+  `bin/tool.exe` 可用、`bin/absent.exe` 报文件缺失；http 档位可用且 `Path` 为空；
+  warn 恰好 3 行、每行含 `profile`/`handler_key`/`kind`/`reason`；`Keys()` 按注册键字典序输出。
+  另一份把脚本写成 `../../escape.sh` 的配置 → `NewRegistry` 返回
+  `executors.commands[0] "report_present": script "../../escape.sh" must not climb out of executors.workspace`。
+- 服务端行为未变的确认：`GODELAYQ_EXECUTORS_ENABLED=true` 启动服务端二进制，
+  正常 listening、无 error 级日志（此时校验与探测都还没接进装配，属 E04）。
+
+### 留给 E04 的接口形状
+
+`NewRegistry(cfg, logger)` 返回 `(*Registry, error)`；`logger` 传 nil 时用 `slog.Default()`
+（照 `core/load.go` 的 `LoaderOptions.Logger` 体例）；档位配置非法时返回 `nil, err`，
+装配方据此终止启动。"开了开关但一个档位都没有"的 warn 留给 E04 记，本卡不重复输出。
