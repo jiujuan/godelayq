@@ -11,14 +11,24 @@ import (
 	"godelayq/core"
 )
 
-// outputWaitDelay 是"进程已结束（或被杀掉）但输出管道还开着"时的兜底等待时长。
+// killGrace 是"先礼后兵"里礼的那一段：向进程组发 SIGTERM 之后，留给脚本自己收尾的时间。
+//
+// 取值 2 秒的理由（卡片 §3.5 要求二选一并记录结论，这里选的是"调小两个常量"那条）：
+// 够一个正常脚本刷完缓冲、关掉临时文件，又不至于把关停流程拖到运维等不及；
+// 另一条路（WaitDelay 取 min(2*killGrace, 剩余关闭时间)）要 Handler 知道进程还剩多少关闭预算，
+// 而那份预算并不存在——core 的 Scheduler.Stop 取消在途任务后是无期限等 worker 的
+// （cmd/server 的 shutdown_timeout 只管 HTTP 服务的优雅关闭），拿不到"剩余时间"就无从取 min。
+const killGrace = 2 * time.Second
+
+// processWaitDelay 是取消之后等待输出管道关闭的上限。
 //
 // 档位脚本 fork 出去的进程会继承 stdout/stderr 的写端：直接子进程退出了，
 // os/exec 的拷贝协程还在等一个再也没人写的 EOF。没有这条上限，Handler 会一直不返回，
 // 表现为"任务 timed out 了但 worker 名额没还回来"，比杀掉进程更难排查。
-// 取值要明显小于最短的合理执行超时，又不能短到在正常收尾时抢跑：5 秒是这两者之间的折中，
-// 与 TASK-E10 讨论的 killGrace/优雅关闭时长的关系在那一卡一并定稿。
-const outputWaitDelay = 5 * time.Second
+//
+// 与 killGrace 相加是 Handler 最晚返回的时长（约 6 秒）；E19 的部署文档要把
+// scheduler.shutdown_timeout 的推荐值写到 10s 以上，否则关停会先于收尾被运维打断。
+const processWaitDelay = 4 * time.Second
 
 // Runner 是一个档位的执行主体：把 payload 变成一次真实的进程执行，
 // 把输出落到产物文件，把结论写进 job.Exec。
@@ -180,9 +190,11 @@ func (r *Runner) execute(ctx context.Context, timeout time.Duration, argv []stri
 	cmd.Env = BuildEnv(r.cfg, p, sub)
 	cmd.Stdout = writer.Stdout()
 	cmd.Stderr = writer.Stderr()
-	// 取消时只结束直接子进程；整棵进程树的终止见 TASK-E10（Unix）与 TASK-E11（Windows）。
-	cmd.Cancel = func() error { return cmd.Process.Kill() }
-	cmd.WaitDelay = outputWaitDelay
+	// 平台差异只留在这里的三行里（卡片 §6/DoD 的口径）：
+	// Unix 让子进程自成进程组，取消时整组结束；Windows 的对应实现归 TASK-E11。
+	cmd.SysProcAttr = sysProcAttr()
+	cmd.Cancel = func() error { return killTree(cmd, killGrace) }
+	cmd.WaitDelay = processWaitDelay
 
 	started := time.Now()
 	runErr := cmd.Run()

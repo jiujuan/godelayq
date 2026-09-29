@@ -61,9 +61,9 @@ func loopBody(t *testing.T, lines int, line string) string {
 
 // slowCommand 造一条"运行 seconds 秒"的档位，并返回它的程序名（要加进 runtime_allow）。
 //
-// 等待者必须是直接子进程本身，不能套在 cmd/sh 里面：取消或超时时我们杀掉的是那层 shell，
+// 等待者必须是直接子进程本身，不能套在 cmd/sh 里面：在 Windows 上我们杀的只是那层 shell，
 // 真正还在计时的孙进程活着，还会继续占住工作目录（用例结束时清理临时目录就会失败）。
-// 整棵进程树的终止归 TASK-E10（Unix）与 TASK-E11（Windows），本卡的默认实现只杀直接子进程。
+// Windows 侧的整树终止归 TASK-E11；Unix 上进程组能整组结束，见 proc_unix.go。
 func slowCommand(t *testing.T, seconds int) (core.ExecutorCommand, string) {
 	t.Helper()
 
@@ -213,9 +213,23 @@ func TestRunner_SuccessPreview(t *testing.T) {
 	assert.NotZero(t, job.Exec.OutBytes, "一行输出的字节数要记进摘要")
 	assert.Equal(t, "hello", strings.TrimSpace(job.Exec.Preview))
 	assert.Equal(t, core.ArtifactAvailable, job.Exec.Artifact)
-	assert.NotZero(t, job.Exec.DurationMs, "耗时落到毫秒；仍是 0 说明这次执行没有真的等待进程")
 	assert.False(t, job.Exec.Truncated)
 	assert.Equal(t, int64(len(fixture.stream("job-hello", 1, "out"))), job.Exec.OutBytes)
+}
+
+// TestRunner_DurationIsRecorded 单独验耗时这条字段：
+// 一条 `echo hello` 在 Linux 上可以在 1 毫秒内跑完，所以"必须大于 0"那种断言
+// 换台机器就会失败（本卡第一次在 Linux 上实跑就是这样撞上的）。
+// 要验的是"计时的跨度真的覆盖进程运行期间"，那就用一个跑得动的命令来量。
+func TestRunner_DurationIsRecorded(t *testing.T) {
+	fixture := slowFixture(t, 1, nil)
+
+	job, err := fixture.run(context.Background(), "job-duration", "")
+	require.NoError(t, err)
+
+	require.NotNil(t, job.Exec)
+	assert.GreaterOrEqual(t, job.Exec.DurationMs, int64(700), "一秒的命令只记下几十毫秒说明计时没有覆盖进程运行期间")
+	assert.Less(t, job.Exec.DurationMs, int64(20000), "耗时统计不该把产物写入与清理也算进去")
 }
 
 // TestRunner_LargeOutputComplete 是卡片 §5.3 的那条：子进程输出 2MB 并立刻退出。
@@ -349,9 +363,11 @@ func TestRunner_ProgramMissing(t *testing.T) {
 	require.NotNil(t, job.Exec, "起进程失败同样要留下可解释的摘要")
 	assert.Equal(t, string(KindBinary), job.Exec.Kind)
 	assert.Equal(t, "missing_binary", job.Exec.Profile)
-	assert.NotZero(t, job.Exec.DurationMs)
 	assert.Zero(t, job.Exec.ExitCode)
 	assert.True(t, job.Exec.Permanent)
+	// 产物文件已经建好（Open 在起进程之前），所以这条路径的 Artifact 仍是 available：
+	// 两个流都是空的合法文件，读侧会给出 size_bytes=0，而不是"没有产物"。
+	assert.Equal(t, core.ArtifactAvailable, job.Exec.Artifact)
 }
 
 func TestRunner_Timeout(t *testing.T) {

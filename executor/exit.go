@@ -25,9 +25,9 @@ type ExitError struct {
 	// 没跑起来的进程没有退出码，这里保持 0：宁可留空，也不编一个 1 或 -1 让人以为程序真的这样退出过。
 	ExitCode int
 
-	// Signal 是终止进程的信号名（如 SIGKILL）。
-	// 取值来自平台实现 signalOf：默认实现返回空串（Windows 没有信号概念，
-	// Unix 上从退出状态里解析实际信号是 TASK-E10 的改动）。
+	// Signal 是终止进程的信号名（如 SIGKILL），正常退出为空。
+	// 取值来自平台实现 signalOf：Unix 上从退出状态里解析出实际信号（proc_unix.go），
+	// Windows 的退出状态里没有这个概念，那边恒返回空串（proc_windows.go）。
 	Signal string
 
 	// TimedOut 表示这次执行是被超时结束的
