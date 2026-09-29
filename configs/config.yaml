@@ -16,8 +16,8 @@ server:
     # 生产环境用环境变量注入：GODELAYQ_SERVER_AUTH_TOKEN=...
     token: ""
     jwt:
-      # HS256 签名密钥，至少 32 字节；禁止把明文密钥提交进本文件，
-      # 请用环境变量注入：GODELAYQ_SERVER_AUTH_JWT_SECRET=...
+      # HS256 签名密钥，至少 32 字节，用 `go run ./cmd/gensecret` 生成；
+      # 只能写进环境变量 GODELAYQ_SERVER_AUTH_JWT_SECRET，明文禁止写入本配置。
       # 轮换密钥会让全部已签发令牌立即失效（所有人需重新登录）。
       secret: ""
       access_ttl: 15m   # 访问令牌有效期；0 表示用代码默认值 15m
@@ -26,7 +26,9 @@ server:
     # 增删账号需改本文件并重启进程。
     # 密码只存 bcrypt 哈希，用 `go run ./cmd/hashpassword` 生成；明文禁止写入配置。
     # role 取 viewer|operator|admin|ops，权限矩阵见 docs/design/web-console-design.md §5.7.3
-    users: []
+    # 这里故意不写 []：解开下面的示例即可启用。写成 `users: []` 再挂列表项，
+    # 空序列与块式序列会撞在一起，YAML 只给一句 "did not find expected key"。
+    users:
     #  - name: admin01
     #    password_bcrypt: "$2a$10$..."
     #    role: admin
