@@ -7,6 +7,38 @@ import (
 	"os"
 	"os/exec"
 	"strconv"
+
+	"godelayq/core"
+)
+
+// failureClass 是一次失败的类别。它存在的唯一理由是把"重试有没有意义"收敛到一处判定
+// （classifyExit，对应卡片 §3.5 那张表），构造点不再各写各的布尔。
+type failureClass int
+
+const (
+	// failureInvalidSubmission 提交内容非法：参数越界、payload 结构错、命令行拼不出来。
+	// 重跑用的还是同一份 payload，结论不会变。
+	failureInvalidSubmission failureClass = iota
+
+	// failureProfileUnavailable 档位不可用：程序找不到、档位类型与本执行器不符。
+	failureProfileUnavailable
+
+	// failureNotAllowed 环境不允许：产物文件建不出来、目录不可写、进程因权限起不来。
+	// 这一类里"改好环境之后重试就有意义"的情形由运维处理，不由调度器重跑负责。
+	failureNotAllowed
+
+	// failureTimeout 执行超时。外部条件（机器忙、下游慢）居多，重跑有意义。
+	failureTimeout
+
+	// failurePermitWait 等档位并发许可等满了超时。同上，可重试。
+	failurePermitWait
+
+	// failureInterrupted 被取消或优雅关闭打断。调度器走 handleInterrupted，
+	// 既不记失败也不消耗重试，所以这一类不参与重试判定。
+	failureInterrupted
+
+	// failureExitCode 进程自己以某个退出码结束（含 WaitDelay 强关管道之后拿到的退出码）。
+	failureExitCode
 )
 
 // ExitError 是一次执行的失败结论。
@@ -94,24 +126,58 @@ func (e *ExitError) Unwrap() error { return e.Detail }
 // Permanent 是 core 侧重试判定要读的接口方法（设计文档 §6.3）。
 func (e *ExitError) Permanent() bool { return !e.Retryable }
 
-// 这两条断言在编译期固定住对外承诺的形状：core 靠接口认"永久失败"，
+// 这两条断言在编译期固定住对外承诺的形状：core 靠 core.PermanentError 认"永久失败"，
 // 方法签名一改，重试判定会静默退化成"所有失败都可重试"。
 var (
-	_ error                         = (*ExitError)(nil)
-	_ interface{ Permanent() bool } = (*ExitError)(nil)
+	_ error               = (*ExitError)(nil)
+	_ core.PermanentError = (*ExitError)(nil)
 )
 
-// classifyExit 决定"进程以这个退出码结束算不算可重试"。
+// summaryPermanent 给出任务摘要里该写的 permanent（core.ExecMeta.Permanent）。
 //
-// 默认不重试：非 0 退出多半是脚本自身或参数的问题，重跑只会把同样的错误再产生一遍，
-// 还可能把副作用（写数据、发请求）重复执行一次。要重试哪些退出码，由档位的 retry_on_exit 显式列出。
-func classifyExit(p *Profile, exitCode int) bool {
-	if exitCode == 0 {
-		// 0 不会走到失败分支；挡在这里是因为 retry_on_exit 里写了 0 时，
-		// "成功但被判成需要重试"会无从解释。
+// 判定口径与调度器完全一致——读的也是 core.PermanentError，这里不重复一遍规则。
+// 只多一条处理：取消与优雅关闭打断不算任务失败（调度器走 handleInterrupted，
+// 既不记失败也不消耗重试），所以那种路径的摘要里不留"重试没有意义"的判断，
+// 免得一条被用户自己取消的任务在接口上看起来像永久失败。
+func summaryPermanent(err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) {
 		return false
 	}
-	for _, code := range p.RetryOnExit {
+
+	var permanent core.PermanentError
+	return errors.As(err, &permanent) && permanent.Permanent()
+}
+
+// classifyExit 是卡片 §3.5 那张表的代码形式：给定失败类别与退出码，回答"重试有没有意义"。
+//
+// 全部执行路径的重试标记都从这里出（TASK-E12 §3.5），各分支不再手写布尔：
+// 漏写一处，"要不要重试"就取决于代码写到哪儿了，而重复执行的后果是外部副作用。
+//
+// 两条可重试的形：超时（含等不到并发许可）与档位显式声明过的退出码。
+// 默认不重试：非 0 退出多半是脚本自身或参数的问题，重跑只会把同样的错误再产生一遍，
+// 还可能把副作用（写数据、发请求）重复执行一次。要重试哪些退出码，由 retry_on_exit 显式列出。
+//
+// failureInterrupted 不在这张表里给出结论：取消与关停打断由调度器走 handleInterrupted，
+// 根本不读重试标记（表里那行"不适用"就是这个意思），这里的 Retryable 留假，
+// 免得同时读两个标记的代码把取消当成一次可重试的失败。
+func classifyExit(class failureClass, exitCode int, retryOnExit []int) bool {
+	switch class {
+	case failureTimeout, failurePermitWait:
+		return true
+	case failureExitCode:
+		return exitCodeIn(retryOnExit, exitCode)
+	default:
+		return false
+	}
+}
+
+// exitCodeIn 判断退出码是否被档位显式列入可重试。
+// 0 不在这里放行：那是成功，走不到失败判定；retry_on_exit 里写了 0 也无从生效。
+func exitCodeIn(retryOnExit []int, exitCode int) bool {
+	if exitCode == 0 {
+		return false
+	}
+	for _, code := range retryOnExit {
 		if code == exitCode {
 			return true
 		}
@@ -119,7 +185,26 @@ func classifyExit(p *Profile, exitCode int) bool {
 	return false
 }
 
-// classifyFailure 把 cmd.Run 的返回结果归到五种情形之一，填好重试标记。
+// newFailure 按类别造一条失败结论：TimedOut/Cancelled/Retryable 三个标记由类别决定，
+// 调用方只负责给类别、退出码、类别文本与底层错误。
+//
+// 与退出码无关的构造点（提交非法、档位不可用、超时、许可等不到、被打断）exitCode 传 0：
+// 那个位置的 0 意思是"没有退出码可言"，不是"进程以 0 退出"。
+// reason 为空的退出码分支不需要额外文本：退出码本身就是结论（见 ExitError.Error）。
+func newFailure(p *Profile, class failureClass, exitCode int, reason string, detail error) *ExitError {
+	failure := &ExitError{
+		Profile:   p.Name,
+		ExitCode:  exitCode,
+		Reason:    reason,
+		Detail:    detail,
+		TimedOut:  class == failureTimeout || class == failurePermitWait,
+		Cancelled: class == failureInterrupted,
+	}
+	failure.Retryable = classifyExit(class, exitCode, p.RetryOnExit)
+	return failure
+}
+
+// classifyFailure 把 cmd.Run 的返回结果归到情形之一，并按类别填好重试标记。
 //
 // 判断顺序有讲究：上下文结束（超时/取消）优先于退出码——进程被我们杀掉了，
 // 它退出时的状态是 killing 的结果，不是脚本自己的结论。
@@ -131,42 +216,38 @@ func classifyFailure(p *Profile, runErr error, state *os.ProcessState, ctxErr er
 		return nil
 	}
 
-	failure := &ExitError{Profile: p.Name, Detail: runErr}
+	exitCode := 0
+	signal := ""
 	if state != nil {
-		failure.ExitCode = state.ExitCode()
-		failure.Signal = signalOf(state)
+		exitCode = state.ExitCode()
+		signal = signalOf(state)
 	}
 
+	var failure *ExitError
 	switch {
 	case ctxErr != nil:
-		// 超时按设计文档 §5.5 走重试；取消不算任务失败（调度器走中断分支，不消耗重试次数），
-		// 所以它的 Retryable 留假：同时读两个标记的代码不会把取消当成一次可重试的失败。
-		failure.TimedOut = errors.Is(ctxErr, context.DeadlineExceeded)
-		failure.Cancelled = !failure.TimedOut
-		failure.Retryable = failure.TimedOut
-		failure.Reason = "cancelled"
-		if failure.TimedOut {
-			failure.Reason = "timed out"
+		if errors.Is(ctxErr, context.DeadlineExceeded) {
+			failure = newFailure(p, failureTimeout, exitCode, "timed out", runErr)
+		} else {
+			failure = newFailure(p, failureInterrupted, exitCode, "cancelled", runErr)
 		}
 
 	case errors.Is(runErr, exec.ErrWaitDelay):
 		// 进程已经结束（或被杀掉），但它派生的进程继承了输出管道的写端，
-		// 拷贝协程只能靠 WaitDelay 强行关掉。
-		// 退出码为 0 时也不重试：重跑会把脚本的副作用再做一遍，而问题只在"输出没收全"上。
-		failure.Reason = "output stayed open past the wait limit"
-		failure.Retryable = classifyExit(p, failure.ExitCode)
+		// 拷贝协程只能靠 WaitDelay 强行关掉。退出码仍按 retry_on_exit 判：
+		// 这条路径的进程结论是真实的，缺的只是尾部输出。
+		failure = newFailure(p, failureExitCode, exitCode, "output stayed open past the wait limit", runErr)
 
 	case isExitStatus(runErr):
-		failure.Retryable = classifyExit(p, failure.ExitCode)
+		failure = newFailure(p, failureExitCode, exitCode, "", runErr)
 
 	default:
 		// 走到这里的是 Start 阶段的失败：程序不存在、不是可执行文件、权限不足。
 		// 进程从未运行，退出码与信号都没有意义，一律留零值。
-		failure.ExitCode = 0
-		failure.Signal = ""
-		failure.Reason = "cannot start the process"
+		failure = newFailure(p, failureProfileUnavailable, 0, "cannot start the process", runErr)
 	}
 
+	failure.Signal = signal
 	return failure
 }
 

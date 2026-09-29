@@ -101,32 +101,37 @@ func (r *Runner) Handler() core.Handler {
 	p := r.profile
 	key := p.HandlerKey()
 
-	return func(ctx context.Context, job *core.Job) error {
+	return func(ctx context.Context, job *core.Job) (err error) {
 		result := NewResult(p)
 
 		// 摘要在每条返回路径上都要落进 job.Exec：接口与事件读的就是它，
 		// "没跑起来"的执行同样需要一条能解释的结论，而不是留下 nil 让人猜。
+		//
+		// permanent 也从这里出（TASK-E12）：调度器按返回的错误决定要不要重试，
+		// 接口与事件读的是摘要，两处必须同源。各分支自己写这个布尔的话，
+		// "摘要说会重试、实际不再重试"这种自相矛盾迟早会出现在某条早退路径上。
 		defer func() {
+			result.Meta.Permanent = summaryPermanent(err)
 			job.Exec = &result.Meta
 			r.logRun(key, job, result.Meta)
 		}()
 
 		if p.Kind == KindHTTP {
-			return &ExitError{Profile: p.Name,
-				Reason: "http profiles are executed by the http executor, which lands in TASK-E15"}
+			return newFailure(p, failureProfileUnavailable, 0,
+				"http profiles are executed by the http executor, which lands in TASK-E15", nil)
 		}
 		if r.artifacts == nil {
-			return &ExitError{Profile: p.Name,
-				Reason: "no artifact store is configured, execution output has nowhere to go"}
+			return newFailure(p, failureNotAllowed, 0,
+				"no artifact store is configured, execution output has nowhere to go", nil)
 		}
 
 		sub, err := ValidateSubmission(p, job.Payload)
 		if err != nil {
-			return &ExitError{Profile: p.Name, Reason: "invalid submission", Detail: err}
+			return newFailure(p, failureInvalidSubmission, 0, "invalid submission", err)
 		}
 		argv, err := p.Render(sub)
 		if err != nil {
-			return &ExitError{Profile: p.Name, Reason: "cannot build the command line", Detail: err}
+			return newFailure(p, failureInvalidSubmission, 0, "cannot build the command line", err)
 		}
 
 		timeout := p.timeoutWithin(r.cfg, sub.TimeoutValue)
@@ -138,10 +143,15 @@ func (r *Runner) Handler() core.Handler {
 		writer, err := r.artifacts.Open(job.ID, job.Attempts)
 		if err != nil {
 			// 没地方写输出就不执行：脚本跑完却拿不到结论，比不跑更糟
-			return &ExitError{Profile: p.Name, Reason: "cannot create the output files", Detail: err}
+			return newFailure(p, failureNotAllowed, 0, "cannot create the output files", err)
 		}
 
 		runErr := r.execute(ctx, timeout, argv, sub, writer, result)
+
+		// permanent 在这里就先落一次：产物目录里的 meta.json 与任务快照读同一份结论，
+		// 而写文件发生在返回之前，等不到外层那条 defer。defer 里还会按同样的函数再算一遍，
+		// 两处都出自 summaryPermanent，不存在两个地方各写各的规则。
+		result.Meta.Permanent = summaryPermanent(runErr)
 
 		// 先关文件再读尾部：io.Writer 形态的输出由 os/exec 的拷贝协程写入，
 		// cmd.Run 返回时它们已经等过（WaitDelay 兜底），关闭即把缓冲刷到磁盘。
@@ -212,7 +222,6 @@ func (r *Runner) execute(ctx context.Context, timeout time.Duration, argv []stri
 		// 一次成功的执行会被记成失败。
 		return nil
 	}
-	result.Meta.Permanent = failure.Permanent()
 	return failure
 }
 
@@ -271,29 +280,22 @@ func (r *Runner) acquirePermit(ctx context.Context, limit time.Duration) bool {
 }
 
 // permitFailure 区分"等许可时被取消"与"等满超时仍没许可"。
+//
+// 两条路径的类别都由 newFailure 负责，重试标记因此与进程执行路径出自同一个判定函数
+// （TASK-E12 §3.5：等不到许可是可重试的，被打断不是）。
 func (r *Runner) permitFailure(ctx context.Context, limit time.Duration) error {
 	p := r.profile
 	if ctxErr := ctx.Err(); ctxErr != nil {
-		timedOut := errors.Is(ctxErr, context.DeadlineExceeded)
-		return &ExitError{
-			Profile:   p.Name,
-			Reason:    "cancelled",
-			Cancelled: !timedOut,
-			TimedOut:  timedOut,
-			Retryable: timedOut,
-			Detail:    ctxErr,
+		if errors.Is(ctxErr, context.DeadlineExceeded) {
+			return newFailure(p, failureTimeout, 0, "timed out", ctxErr)
 		}
+		return newFailure(p, failureInterrupted, 0, "cancelled", ctxErr)
 	}
 
 	// 等不到许可也记成超时：调度器据此把它归到"超时"这一类，重试与告警口径一致。
-	return &ExitError{
-		Profile:   p.Name,
-		Reason:    "concurrency limit",
-		TimedOut:  true,
-		Retryable: true,
-		Detail: fmt.Errorf("profile %q runs at most %d job(s) at a time and none finished within %v",
-			p.Name, p.MaxParallel, limit),
-	}
+	return newFailure(p, failurePermitWait, 0, "concurrency limit",
+		fmt.Errorf("profile %q runs at most %d job(s) at a time and none finished within %v",
+			p.Name, p.MaxParallel, limit))
 }
 
 func (r *Runner) releasePermit() {
