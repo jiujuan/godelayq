@@ -163,6 +163,11 @@ git show HEAD --stat        # 确认只改了 core/job.go、api/dto.go、executo
   无摘要时不出现 `exec` 键、配置上限、默认上限、副本语义。
 - `go build ./...`、`go vet ./...`、`go test ./... -race -count=1` 全绿；
   `GOOS=linux/darwin` 交叉编译与 `-tags dashboard` 构建通过；改动文件按 LF 副本跑 `gofmt -l` 无输出。
+- DoD 第 1 条（"漏改任意一处会失败"）用突变验证过搬运的两处读侧/写侧：临时删掉 `ToSnapshot` 的 `Exec: j.Exec`
+  一行、以及 `FromSnapshot` 的 `j.Exec = s.Exec` 一行，`go test ./core` 均如期变红，
+  且失败信息分别指向被改的那一处（`TestJob_ExecSurvivesSnapshotRoundTrip` 的两条断言分别写着
+  "ToSnapshot 应带上执行摘要"与"FromSnapshot 应还原执行摘要"），随后已还原并复跑全绿。
+  另外两处（`CloneForRetry`、Cron 重排）的用例断言就是"`Exec` 必须为 nil"，多带一个字段即失败，未再单独突变。
 - 真实进程冒烟（二进制、配置、workspace、数据文件全在系统临时目录，跑完已删除；仓库 `data/` 未被写入）：
   数据文件里手工放四条记录——一条升级前的老数据（无 `exec` 键、还带一个未知键 `future_key`）、
   两条带摘要（ASCII 预览 1500 字节、中文预览 3603 字节）、一条 17 字节的短预览；
