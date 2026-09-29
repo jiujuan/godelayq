@@ -8,6 +8,7 @@
 import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import {
   Activity,
+  BookOpen,
   ClipboardList,
   FolderOpen,
   LayoutDashboard,
@@ -61,6 +62,13 @@ const routes: RouteRecordRaw[] = [
     name: 'groups',
     component: () => import('../views/GroupsView.vue'),
     meta: { title: '分组', icon: FolderOpen },
+  },
+  {
+    path: '/template',
+    name: 'job-template',
+    component: () => import('../views/TemplateView.vue'),
+    // 纯文档页，viewer 就该能看怎么写任务
+    meta: { title: '任务模板', icon: BookOpen },
   },
   {
     path: '/monitor',
