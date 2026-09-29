@@ -21,11 +21,18 @@ type schedulerAPI interface {
 	Start()
 	Stop()
 	RegisterHandler(jobType string, handler core.Handler)
+	// RegisterHandlerClass 是执行器档位的注册入口：档位任务属于 JobClassExec，
+	// 与普通任务分池执行（TASK-E13）。代码中示例处理函数继续走 RegisterHandler。
+	RegisterHandlerClass(jobType string, handler core.Handler, class core.JobClass)
 	// LookupHandler 是注册档位前的查重入口：执行器写的是调度器里那张注册表，
-	// 只靠 api.Server.RegisterJobHandler 这一个写入口看不到已注册的键。
+	// 只靠 RegisterJobHandler 这一个写入口看不到已注册的键。
 	LookupHandler(jobType string) (core.Handler, bool)
 	SetConcurrency(n int)
 	SetQueueCapacity(n int)
+	// SetExecConcurrency/SetExecQueueCapacity 把执行器池的规模交给调度器（TASK-E13）。
+	// 执行器没打开时传 0：调度器连队列和协程都不建，进程与拆池之前完全一致。
+	SetExecConcurrency(n int)
+	SetExecQueueCapacity(n int)
 	// SetEventPreviewLimit 把输出预览的字节上限交给调度器：完成/失败事件由 core 发布，
 	// 尺寸限制必须在发事件的一方生效，而不能只在接口侧裁剪。
 	SetEventPreviewLimit(n int)
@@ -167,6 +174,16 @@ func run(deps runtimeDeps) error {
 	}, nil)
 	scheduler.SetConcurrency(cfg.Scheduler.Workers)
 	scheduler.SetQueueCapacity(cfg.Scheduler.QueueCapacity)
+	// 执行器池的规模只在打开执行器时才建：cfg.Executors.Concurrency 在 Normalized 里
+	// 已经补齐默认值（显式写 0 会被配置校验拒绝），没打开时这一对调用传 0，
+	// 调度器因此不建通道也不起协程，未使用执行器的进程与本卡之前一字不差。
+	if cfg.Executors.Enabled {
+		scheduler.SetExecConcurrency(cfg.Executors.Concurrency)
+		scheduler.SetExecQueueCapacity(cfg.Executors.QueueCapacity)
+	} else {
+		scheduler.SetExecConcurrency(0)
+		scheduler.SetExecQueueCapacity(0)
+	}
 	// 事件里输出预览的字节上限：取值已在 Normalized 里补齐，非法值的兜底由调度器负责。
 	scheduler.SetEventPreviewLimit(cfg.Executors.Output.InlinePreview)
 

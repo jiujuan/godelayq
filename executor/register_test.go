@@ -24,10 +24,14 @@ var _ Registrar = (*core.Scheduler)(nil)
 
 type fakeRegistrar struct {
 	handlers map[string]core.Handler
+	classes  map[string]core.JobClass
 }
 
 func newFakeRegistrar(keys ...string) *fakeRegistrar {
-	f := &fakeRegistrar{handlers: make(map[string]core.Handler)}
+	f := &fakeRegistrar{
+		handlers: make(map[string]core.Handler),
+		classes:  make(map[string]core.JobClass),
+	}
 	for _, key := range keys {
 		f.handlers[key] = func(context.Context, *core.Job) error { return nil }
 	}
@@ -35,7 +39,14 @@ func newFakeRegistrar(keys ...string) *fakeRegistrar {
 }
 
 func (f *fakeRegistrar) RegisterHandler(jobType string, handler core.Handler) {
+	f.RegisterHandlerClass(jobType, handler, core.JobClassDefault)
+}
+
+// RegisterHandlerClass 把类别一起记下来：E13 的分池接线靠这个值，
+// 注册链路只调用 RegisterHandler 的话，档位就会退回共享池。
+func (f *fakeRegistrar) RegisterHandlerClass(jobType string, handler core.Handler, class core.JobClass) {
 	f.handlers[jobType] = handler
+	f.classes[jobType] = class
 }
 
 func (f *fakeRegistrar) LookupHandler(jobType string) (core.Handler, bool) {
@@ -84,6 +95,9 @@ func TestRegister_AllProfiles(t *testing.T) {
 		handler, ok := registrar.handlers[key]
 		require.True(t, ok, "%s 应该已注册", key)
 		require.NotNil(t, handler)
+		// 探测不可用的档位同样登记为 exec 类：它归执行器池管，
+		// 落到共享池会让普通任务和一次注定失败的执行抢名额（TASK-E13 §3.2）。
+		assert.Equal(t, core.JobClassExec, registrar.classes[key], "%s 的执行类别", key)
 	}
 
 	output := logs.String()

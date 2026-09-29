@@ -9,8 +9,13 @@ import (
 
 // Registrar 是注册档位所需的调度器能力：写入处理函数、查询某个键是否已被占用。
 // *core.Scheduler 与 *api.Server 的组合都满足它，装配方传哪一个由它自己决定。
+//
+// RegisterHandlerClass 是执行器唯一需要的注册入口：档位任务属于 JobClassExec，
+// 与普通任务分池执行（TASK-E13）。只有 RegisterHandler 的组合（例如把注册表换成
+// 测试替身）仍然可用，只是所有档位会落进共享池。
 type Registrar interface {
 	RegisterHandler(jobType string, handler core.Handler)
+	RegisterHandlerClass(jobType string, handler core.Handler, class core.JobClass)
 	LookupHandler(jobType string) (core.Handler, bool)
 }
 
@@ -73,7 +78,8 @@ func Register(registrar Registrar, reg *Registry, cfg core.Config, artifacts *Ar
 		}
 		// Runner 是真实的执行主体：校验 payload、拼 argv、起进程、把输出写进产物文件。
 		// http 档位也走同一个入口，它在 Runner.Handler 里明确报告"执行分支归 TASK-E15"。
-		registrar.RegisterHandler(key, NewRunner(profile, artifacts, executors, logger).Handler())
+		registrar.RegisterHandlerClass(key, NewRunner(profile, artifacts, executors, logger).Handler(),
+			core.JobClassExec)
 		result.Registered++
 		if probe, ok := reg.ProbeOf(key); ok && !probe.Available {
 			result.Unavailable++

@@ -124,6 +124,16 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 	if scheduler.previewLimit != core.DefaultExecInlinePreview {
 		t.Fatalf("expected the preview limit to reach the scheduler, got %d", scheduler.previewLimit)
 	}
+	// 没开执行器时两个规模都必须是 0：传默认值会让调度器凭空建出一条队列和一组协程，
+	// 而这台部署从来没有档位（TASK-E13 §3.7）。
+	if scheduler.execConcurrency != 0 || scheduler.execQueueCapacity != 0 {
+		t.Fatalf("expected no executor pool, got concurrency=%d queue=%d",
+			scheduler.execConcurrency, scheduler.execQueueCapacity)
+	}
+	// 档位必须以 JobClassExec 注册，否则它会退回共享池，分池隔离等于没做。
+	if got := scheduler.classes["exec.smoke"]; got != core.JobClassExec {
+		t.Fatalf("expected the profile class to be %d, got %d", core.JobClassExec, got)
+	}
 
 	if scheduler.startCalls != 1 {
 		t.Fatalf("expected scheduler start once, got %d", scheduler.startCalls)
@@ -328,6 +338,48 @@ func TestRun_LogsErrorWhenAuthDisabled(t *testing.T) {
 	// 开了开关却没声明档位，是同一条链路上另一个常见错法，也要留在日志里
 	if !strings.Contains(output, "executors are enabled but no profile is declared") {
 		t.Fatalf("expected the empty-profile warning, got %q", output)
+	}
+}
+
+// TestRun_ExecPoolSizingReachesScheduler 钉住配置里两个执行器池取值到调度器的接线：
+// 打开执行器后，调度器要按配置建池。数字对不上等于档位规模被静默丢弃，
+// 运维在 /admin/runtime 上看到的 worker 数与配置文件就成了两套说法。
+func TestRun_ExecPoolSizingReachesScheduler(t *testing.T) {
+	store := newStubStore()
+	scheduler := newSpyScheduler()
+	server := newFakeServer()
+	artifactDir := t.TempDir()
+
+	cfg := core.DefaultConfig()
+	cfg.Executors.Enabled = true
+	cfg.Executors.Concurrency = 5
+	cfg.Executors.QueueCapacity = 9
+	cfg.Executors.Output.Dir = filepath.Join(artifactDir, "exec")
+
+	err := run(runtimeDeps{
+		config:              cfg,
+		newStore:            func() (core.Store, error) { return store, nil },
+		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
+		newExecutorRegistry: executor.NewRegistry,
+		newArtifactStore:    artifactStoreFromConfig,
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+			return server, nil
+		},
+		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
+			go func() {
+				ch <- syscall.SIGTERM
+			}()
+		},
+		timeout: 20 * time.Millisecond,
+		logger:  slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	if err != nil {
+		t.Fatalf("expected run to succeed, got %v", err)
+	}
+	if scheduler.execConcurrency != 5 || scheduler.execQueueCapacity != 9 {
+		t.Fatalf("expected the configured pool size to reach the scheduler, got concurrency=%d queue=%d",
+			scheduler.execConcurrency, scheduler.execQueueCapacity)
 	}
 }
 
@@ -580,14 +632,20 @@ type spyScheduler struct {
 	startCalls    int
 	stopCalls     int
 	registered    map[string]core.Handler
+	classes       map[string]core.JobClass
 	concurrency   int
 	queueCapacity int
-	previewLimit  int
+	// execConcurrency 与 execQueueCapacity 记录执行器池的装配结果：
+	// 没打开执行器时必须都是 0，否则进程凭空多出一组协程。
+	execConcurrency   int
+	execQueueCapacity int
+	previewLimit      int
 }
 
 func newSpyScheduler() *spyScheduler {
 	return &spyScheduler{
 		registered: make(map[string]core.Handler),
+		classes:    make(map[string]core.JobClass),
 	}
 }
 
@@ -609,6 +667,18 @@ func (s *spyScheduler) SetEventPreviewLimit(n int) {
 	s.previewLimit = n
 }
 
+func (s *spyScheduler) SetExecConcurrency(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.execConcurrency = n
+}
+
+func (s *spyScheduler) SetExecQueueCapacity(n int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.execQueueCapacity = n
+}
+
 func (s *spyScheduler) Start() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -622,9 +692,16 @@ func (s *spyScheduler) Stop() {
 }
 
 func (s *spyScheduler) RegisterHandler(jobType string, handler core.Handler) {
+	s.RegisterHandlerClass(jobType, handler, core.JobClassDefault)
+}
+
+// RegisterHandlerClass 把类别一起记下：档位必须以 JobClassExec 进来，
+// 否则装配链路退化成共享池，E13 的隔离就不成立了。
+func (s *spyScheduler) RegisterHandlerClass(jobType string, handler core.Handler, class core.JobClass) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.registered[jobType] = handler
+	s.classes[jobType] = class
 }
 
 func (s *spyScheduler) LookupHandler(jobType string) (core.Handler, bool) {
