@@ -20,10 +20,32 @@ import (
 	"godelayq/core"
 )
 
-// grandchildScript 生成"起一个后台 sleep、把它的 PID 写进 workspace 里的文件、然后等它"的脚本。
-// 这正是本卡要消掉的那类脚本：只杀直接子进程的话，那个 sleep 会活到最后。
-func grandchildScript(pidFile string, seconds int) string {
-	return "sleep " + strconv.Itoa(seconds) + " & echo $! > " + pidFile + "; wait"
+// grandchildPIDFile 是脚本写下孙进程 PID 的文件名，落在档位的工作目录里。
+const grandchildPIDFile = "grandchild.pid"
+
+// grandchildCommand 造一条"直接子进程再派生长命孙进程"的档位（§3.4 的平台夹具之一）。
+// 这正是本卡要消掉的那类命令：只杀直接子进程的话，那个后台 sleep 会活到最后。
+func grandchildCommand(t *testing.T, seconds int) core.ExecutorCommand {
+	t.Helper()
+
+	return shellCommand(t, "sleep "+strconv.Itoa(seconds)+" & echo $! > "+grandchildPIDFile+"; wait")
+}
+
+// pipeHeldBody 造一条"直接子进程先退出、孙进程还在跑"的命令串。
+// 后台 sleep 继承了 stdout 的写端，所以 EOF 要等它也结束才会出现。
+func pipeHeldBody(seconds int) string {
+	return "sleep " + strconv.Itoa(seconds) + " & echo started"
+}
+
+// watchGrandchild 返回一个"取本次执行派生的孙进程 PID"的函数。
+// Unix 侧靠脚本自己写下的 PID 文件，因此返回的函数会一直等到文件出现；
+// Windows 侧按进程树找同名辅助进程（proc_windows_test.go），两边签名一致。
+func watchGrandchild(t *testing.T, workspace string) func() int {
+	t.Helper()
+
+	return func() int {
+		return readRecordedPID(t, workspace, grandchildPIDFile)
+	}
 }
 
 // processAlive 判断进程还在不在。发 0 号信号只做存在性检查；
@@ -64,9 +86,9 @@ func readRecordedPID(t *testing.T, workspace, file string) int {
 	return pid
 }
 
-// sleeperPIDs 返回当前名为 sleep 的进程集合（/proc/<pid>/stat 的第二个字段是命令名）。
-// 第三.5 条用例用它统计"残留的 sleep 有没有被清干净"。
-func sleeperPIDs(t *testing.T) map[int]bool {
+// helperPIDs 返回当前名为 sleep 的进程集合（/proc/<pid>/stat 的第二个字段是命令名）。
+// Windows 侧的同名函数统计 ping.exe；两处都用于"有没有残留"和"本次新起了哪些"的判断。
+func helperPIDs(t *testing.T) map[int]bool {
 	t.Helper()
 
 	entries, err := os.ReadDir("/proc")
@@ -99,7 +121,8 @@ func sleeperPIDs(t *testing.T) map[int]bool {
 // TestKillTree_GrandchildDies 是本卡的核心用例（§5.1）：
 // 脚本 fork 出去的后台进程必须跟着一起结束，不能留下"任务显示没在跑、机器上还有进程"。
 func TestKillTree_GrandchildDies(t *testing.T) {
-	fixture := newRunnerFixture(t, shellCommand(t, grandchildScript("grandchild.pid", 300)), nil)
+	fixture := newRunnerFixture(t, grandchildCommand(t, 300), nil)
+	watch := watchGrandchild(t, fixture.profile.Workspace)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
@@ -116,7 +139,7 @@ func TestKillTree_GrandchildDies(t *testing.T) {
 		}
 	})
 
-	pid := readRecordedPID(t, fixture.profile.Workspace, "grandchild.pid")
+	pid := watch()
 	require.True(t, processAlive(pid), "前提：孙进程此刻还在跑")
 
 	cancel()
@@ -127,16 +150,17 @@ func TestKillTree_GrandchildDies(t *testing.T) {
 
 // TestKillTree_TimeoutPath 走超时那条路径（§5.2）：结果与取消一致，但标记要落在超时上。
 func TestKillTree_TimeoutPath(t *testing.T) {
-	command := shellCommand(t, grandchildScript("timeout.pid", 300))
+	command := grandchildCommand(t, 300)
 	command.Timeout = time.Second
 	fixture := newRunnerFixture(t, command, nil)
+	watch := watchGrandchild(t, fixture.profile.Workspace)
 
 	started := time.Now()
 	_, err := fixture.run(context.Background(), "job-kill-timeout", "")
 	elapsed := time.Since(started)
 	failure := asExitError(t, err)
 
-	pid := readRecordedPID(t, fixture.profile.Workspace, "timeout.pid")
+	pid := watch()
 
 	assert.True(t, failure.TimedOut)
 	assert.True(t, errors.Is(err, context.DeadlineExceeded))
@@ -158,7 +182,7 @@ func TestKillTree_NoOrphanAfterCancelStress(t *testing.T) {
 	command.MaxParallel = jobs
 	fixture := newRunnerFixture(t, command, nil)
 
-	before := sleeperPIDs(t)
+	before := helperPIDs(t)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
@@ -178,7 +202,7 @@ func TestKillTree_NoOrphanAfterCancelStress(t *testing.T) {
 	wg.Wait()
 
 	require.Eventually(t, func() bool {
-		for pid := range sleeperPIDs(t) {
+		for pid := range helperPIDs(t) {
 			if !before[pid] {
 				return false
 			}
@@ -191,7 +215,7 @@ func TestKillTree_NoOrphanAfterCancelStress(t *testing.T) {
 // 孙进程继承了 stdout 的写端，直接子进程先退出，此时没人再写、也没人关管道。
 // 没有 cmd.WaitDelay 的话 Wait 会一直等 EOF，Handler 永不返回。
 func TestWaitDelay_PipeHeldByGrandchild(t *testing.T) {
-	fixture := newRunnerFixture(t, shellCommand(t, "sleep 5 & echo started"), nil)
+	fixture := newRunnerFixture(t, shellCommand(t, pipeHeldBody(5)), nil)
 
 	started := time.Now()
 	_, err := fixture.run(context.Background(), "job-pipe-held", "")
@@ -265,7 +289,7 @@ func TestGracefulShutdown_NotStalled(t *testing.T) {
 
 	// 先记下机器上本来就有的 sleep 进程：别的用例（比如管道兜底那条）可能还留着几个，
 	// 这条用例只对"本次新起的进程有没有被清掉"下结论。
-	before := sleeperPIDs(t)
+	before := helperPIDs(t)
 
 	require.NoError(t, scheduler.Schedule(&core.Job{
 		ID:        "job-shutdown",
@@ -287,7 +311,7 @@ func TestGracefulShutdown_NotStalled(t *testing.T) {
 		"关停花了 %v，说明取消没有在宽限期内结束进程树", elapsed)
 
 	require.Eventually(t, func() bool {
-		for pid := range sleeperPIDs(t) {
+		for pid := range helperPIDs(t) {
 			if !before[pid] {
 				return false
 			}
