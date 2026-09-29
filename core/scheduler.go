@@ -1108,6 +1108,8 @@ func (s *Scheduler) handleSuccess(job *Job) {
 				Status:     StatusPending,
 				CreatedAt:  job.CreatedAt,
 				UpdatedAt:  time.Now(),
+				// 不写 Exec：下一轮是一次新的执行，带上一次的退出码会让详情页在跑完之前显示旧结论。
+				// 这里是显式字段列表，漏写即是置 nil，与 CloneForRetry 的口径一致。
 			}
 			s.Schedule(newJob)
 			return

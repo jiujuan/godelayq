@@ -481,6 +481,38 @@ func TestScheduler_HandleSuccess_Repeat(t *testing.T) {
 	}
 }
 
+// TestScheduler_HandleSuccess_RepeatDropsPreviousExec 钉住执行摘要的第四处搬运：
+// Cron 重排出来的下一轮是一次新的执行，带着上一轮的退出码与输出预览，
+// 会让详情页在新的一轮跑完之前显示旧结论。
+func TestScheduler_HandleSuccess_RepeatDropsPreviousExec(t *testing.T) {
+	store := newMockStore()
+	scheduler := NewScheduler(store, nil, nil)
+
+	job := &Job{
+		ID:       "repeat-exec-test",
+		Name:     "exec.nightly_report",
+		Handler:  func(ctx context.Context, job *Job) error { return nil },
+		CronExpr: "*/5 * * * *",
+		IsRepeat: true,
+		Exec:     &ExecMeta{Kind: "script", Profile: "nightly_report", ExitCode: 1, DurationMs: 20},
+	}
+
+	scheduler.handleSuccess(job)
+
+	item := scheduler.heap.Peek()
+	if item == nil {
+		t.Fatal("Expected the cron job to be rescheduled")
+	}
+	nextJob := item.(*Job)
+	if nextJob.Exec != nil {
+		t.Errorf("Cron 下一轮不应带上一次的执行摘要，实际 %+v", *nextJob.Exec)
+	}
+	// 本轮的结论仍挂在原对象上：收尾日志与事件读的是它
+	if job.Exec == nil {
+		t.Error("重排不应清空本轮任务的摘要")
+	}
+}
+
 func TestScheduler_HandleFailure_WithRetries(t *testing.T) {
 	store := newMockStore()
 	retryPolicy := &mockRetryPolicy{delay: 10 * time.Millisecond}

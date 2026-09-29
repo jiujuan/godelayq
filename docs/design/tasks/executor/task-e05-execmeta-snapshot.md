@@ -111,3 +111,79 @@ git show HEAD --stat        # 确认只改了 core/job.go、api/dto.go、executo
 - 风险：在 `Job` 上加 `Exec` 字段意味着处理函数可以改任务对象。目前执行器任务由单个 worker 协程持有，安全；但如果有别的代码在任务执行期间读 `Job`（例如列表接口从堆里取），就会读到中间态。实现时确认读路径只走 `store.LoadAll` 的快照（`api/handlers.go` 的 `ListJobs` 已是这样），并在 `Exec` 字段的注释里写明"仅执行协程可写"。
 - 风险：`Preview` 被 DTO 透传后，事件缓冲里若也带 `Preview`（E07 会做），单条事件会变大。要求事件里的预览字节数上限由 `executors.output.inline_preview` 控制，且默认值小（2KB）。
 - 回滚：新增字段是加法，回滚只需 revert 本卡提交；已经写入 `exec` 键的 `jobs.json` 在旧代码下也能读（未知键在快照解码时被忽略，实现时验证这一点并记进测试注释）。
+
+## 10. 实现记录（2026-09-30）
+
+改动文件：`core/job.go`（`ExecMeta` + `Job.Exec` + `JobSnapshot.Exec` + 三处搬运）、
+`core/scheduler.go`（只加注释，见第 3 条）、`executor/result.go`（新增）、
+`executor/registry.go`（新增 `InlinePreview()`）、`api/dto.go` 与 `api/handlers.go`（响应透传）；
+测试新增或扩充 `core/job_test.go`、`core/store_test.go`、`core/scheduler_test.go`、
+`executor/result_test.go`、`executor/registry_test.go`、`api/dto_test.go`。
+
+### 与卡片的偏离与补充
+
+1. **`Result` 的方法语义在卡片之外补全**（卡片只写"置 Truncated"、"取尾部 limit 字节"）：
+   - `Truncate(maxBytes)` 保留开头、丢掉结尾，并把裁剪后的长度记进 `OutBytes` / `ErrBytes`。
+     保留开头与 E06 写入器"到达上限即停止写入"的产物文件内容一致；
+     字节数取采集到的量，这样接口上 `out_bytes` 说的就是"产物里有几个字节"，
+     "还有更多没采到"由 `Truncated` 表达，两个信息不混在一个字段里。
+   - `maxBytes <= 0` 表示不裁剪、只记账（有用例钉住，避免以后把 0 理解成"清空输出"）。
+   - `SetPreview(limit)` 的取流规则：stdout 非空用 stdout，否则用 stderr——脚本失败时
+     往往只有 stderr 有内容，列表与事件里那一行摘要要靠它说明失败原因。`limit <= 0` 置空。
+2. **新增导出函数 `executor.TrimPreview(text, limit)`**：接口在把摘要透出去之前要用同一条
+   裁剪规则再算一次，两边各写一份迟早会得出不同长度的预览。`Result.SetPreview` 也走这个实现。
+3. **第四处搬运确认**：`core/scheduler.go` 的 `handleSuccess` 在 Cron 重排时用显式字段列表构造新任务，
+   不写 `Exec` 即为 `nil`，代码上不需要改动；卡片要求"实现时先确认是否复用同一对象"——
+   结论是新建对象，因此只在字面量旁写了原因注释，并补 `TestScheduler_HandleSuccess_RepeatDropsPreviousExec`
+   钉住这条语义（漏改的判定从"读注释"变成"跑测试"）。
+4. **`api/handlers.go` 的映射函数是方法 `(*Server).toJobResponse`**，新增两个私有辅助
+   `execForResponse`（超上限时返回副本并裁尾部）与 `execPreviewLimit`（上限来源）。
+   裁剪必须返回副本：`ToSnapshot` 复制的是指针，同一个 `ExecMeta` 同时被任务对象与存储里的快照引用，
+   就地裁剪会改到别处读到的内容。用例 `TestExecForResponse_KeepsShortPreviewAndSharedObject`
+   同时钉住"未超上限不复制"和"超了才复制"。
+5. **`Registry` 多一个访问器 `InlinePreview()`**（E03 §10 第 4 条的先例：访问器在归属卡补齐）。
+   `executors.enabled=false` 时它同样有取值，因为裁剪的是已经写在快照里的文本，
+   与"这台机器现在能不能执行"无关；没注入登记表的 `Server`（测试里直接构造）退回
+   `core.DefaultExecInlinePreview`。
+6. **E04 记录的"登记表字段暂无读取方"从本卡起结束**：`Server.executors` 现在被 `execPreviewLimit` 读。
+   `requireExecutorRegistry()` 的 503 守卫仍然推迟到 E07（本卡没有新增端点）。
+7. **回滚路径的实测口径**：Go 的 JSON 解码忽略未知键，所以带 `exec` 键的 `jobs.json` 在旧代码下照样读
+   （`TestJobSnapshot_OmitsExecWhenAbsent` 的反向用例）；但要注意反向的另一半——
+   本项目的 `flushLocked` 是整文件重写，任何未知键在**新代码写盘时**会被丢弃（冒烟里用一条带
+   `future_key` 的老记录实测确认）。这是升级前就有的行为，本卡没有改动，记录在这里以免被误认为是新增风险。
+
+### 验证结果
+
+- 单元测试新增 20 个用例（core 7 + executor 8 + api 5）：
+  core 覆盖往返两种字段组合、`CloneForRetry` 丢摘要、Cron 重排丢摘要、`omitempty` 键位、
+  无摘要时不写 `exec` 键、旧数据文件读取与"老记录旁写入摘要后重开"（同一个用例）、
+  500 条 2KB 预览的尺寸守卫；另在既有的"旧快照解码"用例里补了一条 `Exec` 必须为 nil 的断言。
+  executor 覆盖 `NewResult` 预填、字符边界裁剪、取流规则、截断标记与记账、`TrimPreview`，
+  并把 `InlinePreview` 的三种配置并进登记表既有的访问器用例。api 覆盖透传、
+  无摘要时不出现 `exec` 键、配置上限、默认上限、副本语义。
+- `go build ./...`、`go vet ./...`、`go test ./... -race -count=1` 全绿；
+  `GOOS=linux/darwin` 交叉编译与 `-tags dashboard` 构建通过；改动文件按 LF 副本跑 `gofmt -l` 无输出。
+- 真实进程冒烟（二进制、配置、workspace、数据文件全在系统临时目录，跑完已删除；仓库 `data/` 未被写入）：
+  数据文件里手工放四条记录——一条升级前的老数据（无 `exec` 键、还带一个未知键 `future_key`）、
+  两条带摘要（ASCII 预览 1500 字节、中文预览 3603 字节）、一条 17 字节的短预览；
+  配置 `executors.enabled: false` 且 `executors.output.inline_preview: 256`。
+  - `GET /api/v1/jobs` → 四条都在；老记录响应里**没有** `exec` 键（前端据此区分"不是执行器任务"），
+    17 字节预览原样透出，1500 与 3603 字节的预览分别被裁到 256（纯 ASCII 正好 256）与 255
+    （中文按字符边界跳过 1 个 continuation 字节，`utf-8` 解码不报错、尾部 `END` 保留）。
+  - `GET /api/v1/jobs/job_exec_bad` → 200，`exit_code` / `signal` / `duration_ms` / `truncated` /
+    `permanent` / `artifact` / `err_bytes` 逐项与写入时一致；`GET /api/v1/job-types` 仍是原有四个名字。
+  - `POST /api/v1/jobs` 新建一个普通任务（触发整文件重写）后复查数据文件：
+    三条 `exec` 摘要逐字段完好（含 1500 字节预览原文），未知键 `future_key` 如既有行为被丢弃。
+  - 全程日志 0 条 `level=ERROR`；`enabled: false` 时日志里 `executor` 关键字 0 次（E04 的口径继续成立）。
+  - 冒烟中一次 `POST /api/v1/jobs` 用 `exec.nightly_report` 得到 400：`enabled=false` 时档位不注册，
+    因此任务类型未知——这是 E04 已定的行为，不是本卡的写入问题。
+
+### 留给后续卡片的接口形状
+
+- E06：写入器负责"边写边裁"，写完调用 `Result.Truncate(maxBytes)` 记账、`SetPreview(inlinePreview)` 生成摘要尾部，
+  并按 `Meta.Artifact` 写 `available`；`Preview` 的长度上限由 E06 传入，不要在执行侧再抄一份常量。
+- E07：`GET /jobs/:id/result` 读产物文件；`ExecMeta.Artifact=purged` 时降级为只读摘要。
+  同批补 `requireExecutorRegistry()`。
+- E12：`Meta.Permanent` 由错误分类写入，`handleFailure` 的重试判定读它（core 侧不依赖 executor）。
+- E16：响应里的 `Preview` 已经过上限裁剪；secret 参数的值不能出现在 `Preview` 里，
+  这是执行侧生成预览时的责任（E08/E09 处理）。

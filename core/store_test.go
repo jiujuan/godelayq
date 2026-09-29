@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -655,4 +656,111 @@ func TestJSONFileStore_MultipleDeletes(t *testing.T) {
 	assert.Len(t, store.data, 2, "Should have 2 jobs remaining")
 	assert.Contains(t, store.data, "job-2")
 	assert.Contains(t, store.data, "job-4")
+}
+
+// TestJSONFileStore_LegacySnapshotWithoutExec 读一份升级前写的数据文件：
+// 记录里没有 exec 键，还带一个当前结构体不认识的 future_key。
+// 解码必须照常成功、Exec 为 nil；随后写入带摘要的快照再读回，老记录不受影响。
+// 这条是"无需迁移脚本即可上线"的证据，也是回滚路径（旧代码读带 exec 的文件）的镜像。
+func TestJSONFileStore_LegacySnapshotWithoutExec(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "jobs.json")
+
+	legacy := []byte(`{"job_old_1":{"id":"job_old_1","name":"payment_check","payload":"e30=",` +
+		`"trigger_at":"2024-01-02T15:30:00+08:00","cron_expr":"","is_repeat":false,` +
+		`"timeout":0,"max_retries":3,"retry_count":1,"retry_delay":60000000000,` +
+		`"status":0,"created_at":"2024-01-02T15:20:00+08:00","updated_at":"2024-01-02T15:20:00+08:00",` +
+		`"attempts":1,"future_key":123}}`)
+	require.NoError(t, os.WriteFile(storePath, legacy, 0o644))
+
+	store, err := NewJSONFileStore(storePath)
+	require.NoError(t, err)
+
+	items, err := store.LoadAll()
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	assert.Equal(t, "payment_check", items[0].Name)
+	assert.Equal(t, 3, items[0].MaxRetries, "老记录自身字段要完整读回")
+	assert.Nil(t, items[0].Exec, "没有 exec 键的旧数据应解出 nil，而不是空摘要")
+
+	// 在老记录旁边写入一条带摘要的终态记录，然后重开一次存储读回
+	legacySnap := items[0]
+	require.NoError(t, store.Update(legacySnap))
+	require.NoError(t, store.Save(&Job{
+		ID:        "job_exec_1",
+		Name:      "exec.nightly_report",
+		Status:    StatusSuccess,
+		UpdatedAt: time.Now(),
+		Exec:      &ExecMeta{Kind: "script", Profile: "nightly_report", DurationMs: 900, OutBytes: 20, ExitCode: 0, Preview: "done"},
+	}))
+	require.NoError(t, store.Close())
+
+	reopened, err := NewJSONFileStore(storePath)
+	require.NoError(t, err)
+	defer reopened.Close()
+
+	all, err := reopened.LoadAll()
+	require.NoError(t, err)
+	require.Len(t, all, 2)
+
+	byID := make(map[string]JobSnapshot, len(all))
+	for _, snap := range all {
+		byID[snap.ID] = snap
+	}
+	assert.Nil(t, byID["job_old_1"].Exec, "重写之后老记录仍然不该有摘要")
+	require.NotNil(t, byID["job_exec_1"].Exec)
+	assert.Equal(t, int64(900), byID["job_exec_1"].Exec.DurationMs)
+	assert.Equal(t, "done", byID["job_exec_1"].Exec.Preview)
+}
+
+// TestJSONFileStore_KeepsExecOutOfHotPathSize 是给"完整输出不进快照"这条决策上的量化守卫：
+// 500 条终态记录各带 2KB 预览，文件仍应在几 MB 量级。
+// 谁以后把 stdout 正文塞进快照，这条会先失败——那正是整文件重写扛不住的写法。
+func TestJSONFileStore_KeepsExecOutOfHotPathSize(t *testing.T) {
+	storePath := filepath.Join(t.TempDir(), "bulk.json")
+
+	store, err := NewJSONFileStoreWithOptions(storePath, StoreOptions{
+		Interval:     time.Hour,
+		HistoryLimit: 1000,
+	})
+	require.NoError(t, err)
+
+	preview := strings.Repeat("输出尾部预览", 114) // 约 2KB 的 UTF-8 文本，与 inline_preview 默认值同量级
+	require.Equal(t, 2052, len(preview))
+
+	for i := 0; i < 500; i++ {
+		require.NoError(t, store.Save(&Job{
+			ID:        "job-" + strconv.Itoa(i),
+			Name:      "exec.nightly_report",
+			Status:    StatusSuccess,
+			TriggerAt: time.Now(),
+			UpdatedAt: time.Now(),
+			Exec: &ExecMeta{
+				Kind:       "script",
+				Profile:    "nightly_report",
+				DurationMs: int64(i),
+				OutBytes:   int64(len(preview)),
+				Preview:    preview,
+			},
+		}))
+	}
+
+	require.NoError(t, store.Close())
+
+	info, err := os.Stat(storePath)
+	require.NoError(t, err)
+	assert.Less(t, info.Size(), int64(5<<20), "500 条 2KB 预览不该把 jobs.json 推到 5MB 以上")
+	assert.Greater(t, info.Size(), int64(500*len(preview)/2), "断言不能是空跑的：预览确实落进了文件")
+
+	// 读回抽查一条，证明限制是"小"而不是"写坏了"
+	reopened, err := NewJSONFileStore(storePath)
+	require.NoError(t, err)
+	defer reopened.Close()
+
+	items, err := reopened.LoadAll()
+	require.NoError(t, err)
+	require.Len(t, items, 500)
+	for _, snap := range items {
+		require.NotNil(t, snap.Exec)
+		assert.Equal(t, len(preview), len(snap.Exec.Preview))
+	}
 }

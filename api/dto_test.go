@@ -2,11 +2,14 @@ package api
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"godelayq/core"
+	"godelayq/executor"
 )
 
 func TestCreateJobRequest_JSONMarshaling(t *testing.T) {
@@ -453,4 +456,100 @@ func TestCreateJobRequest_AllTimeFormats(t *testing.T) {
 			assert.Equal(t, req.Name, decoded.Name)
 		})
 	}
+}
+
+// execFixture 是一条已经跑完的执行器任务：摘要字段填满，便于逐字段比对透传结果。
+func execFixture() *core.ExecMeta {
+	return &core.ExecMeta{
+		Kind:       "script",
+		Profile:    "nightly_report",
+		ExitCode:   1,
+		Signal:     "SIGTERM",
+		HTTPStatus: 0,
+		DurationMs: 4200,
+		OutBytes:   2048,
+		ErrBytes:   512,
+		Truncated:  true,
+		Permanent:  false,
+		Preview:    "Traceback (most recent call last): ...",
+		Artifact:   "available",
+	}
+}
+
+func execJob() *core.Job {
+	return &core.Job{
+		ID:     "job_exec_1",
+		Name:   "exec.nightly_report",
+		Status: core.StatusFailed,
+		Exec:   execFixture(),
+	}
+}
+
+func TestJobResponse_CarriesExec(t *testing.T) {
+	server := &Server{}
+
+	resp := server.toJobResponse(execJob())
+
+	require.NotNil(t, resp.Exec, "执行摘要必须透传给接口，否则详情页看不到退出码")
+	assert.Equal(t, *execFixture(), *resp.Exec)
+
+	encoded, err := json.Marshal(resp)
+	require.NoError(t, err)
+	assert.Contains(t, string(encoded), `"exit_code":1`)
+	assert.Contains(t, string(encoded), `"profile":"nightly_report"`)
+}
+
+func TestJobResponse_OmitsExecWhenAbsent(t *testing.T) {
+	server := &Server{}
+
+	resp := server.toJobResponse(&core.Job{ID: "job_plain", Name: "payment_check", Status: core.StatusSuccess})
+
+	assert.Nil(t, resp.Exec)
+	encoded, err := json.Marshal(resp)
+	require.NoError(t, err)
+	// 普通任务的响应里不该出现一个空的 exec 键：前端要靠"没有这个键"区分两者
+	assert.NotContains(t, string(encoded), `"exec"`)
+}
+
+func TestExecForResponse_CapsPreviewWithConfiguredLimit(t *testing.T) {
+	cfg := core.DefaultConfig()
+	cfg.Executors.Output.InlinePreview = 32
+	registry, err := executor.NewRegistry(cfg, nil)
+	require.NoError(t, err)
+
+	server := &Server{executors: registry}
+	meta := &core.ExecMeta{Kind: "script", Profile: "p", Preview: strings.Repeat("x", 5000)}
+
+	resp := server.execForResponse(meta)
+
+	require.NotNil(t, resp)
+	assert.Len(t, resp.Preview, 32, "超过配置上限的预览要被裁到上限")
+	assert.Equal(t, strings.Repeat("x", 32), resp.Preview)
+}
+
+func TestExecForResponse_UsesDefaultLimitWithoutRegistry(t *testing.T) {
+	server := &Server{}
+	meta := &core.ExecMeta{Kind: "script", Profile: "p", Preview: strings.Repeat("y", core.DefaultExecInlinePreview+100)}
+
+	resp := server.execForResponse(meta)
+
+	assert.Len(t, resp.Preview, core.DefaultExecInlinePreview)
+}
+
+func TestExecForResponse_KeepsShortPreviewAndSharedObject(t *testing.T) {
+	// 预览没超上限时返回的是同一个对象（省一次复制）；超上限时必须返回副本，
+	// 因为存储里的快照与任务对象指的是同一份摘要，就地裁剪会改到别处读到的内容。
+	server := &Server{}
+
+	short := &core.ExecMeta{Kind: "script", Profile: "p", Preview: "done"}
+	assert.Same(t, short, server.execForResponse(short))
+
+	big := &core.ExecMeta{Kind: "script", Profile: "p", Preview: strings.Repeat("z", core.DefaultExecInlinePreview*2)}
+	trimmed := server.execForResponse(big)
+
+	assert.NotSame(t, big, trimmed)
+	assert.Len(t, trimmed.Preview, core.DefaultExecInlinePreview)
+	assert.Len(t, big.Preview, core.DefaultExecInlinePreview*2, "原对象不能被改动")
+	assert.Equal(t, big.Kind, trimmed.Kind)
+	assert.Equal(t, big.Profile, trimmed.Profile)
 }

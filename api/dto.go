@@ -3,6 +3,8 @@ package api
 import (
 	"encoding/json"
 	"time"
+
+	"godelayq/core"
 )
 
 // CreateJobRequest 创建任务请求
@@ -74,6 +76,11 @@ type JobResponse struct {
 	Timeout    string `json:"timeout,omitempty" example:"30s"` // 单次执行超时，空表示不限制
 	IsRepeat   bool   `json:"is_repeat" example:"false"`
 	CronExpr   string `json:"cron_expr,omitempty"`
+
+	// Exec 是执行器任务的结果摘要（退出码 / HTTP 状态 / 时长 / 输出预览）。
+	// 非执行器任务与"还没执行完"的任务都不写这个键，前端据此区分两者。
+	// 完整输出不在响应里，走 GET /jobs/:id/result（TASK-E07）。
+	Exec *core.ExecMeta `json:"exec,omitempty"`
 
 	// 时间戳
 	CreatedAt time.Time `json:"created_at" format:"date-time"`

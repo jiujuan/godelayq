@@ -458,6 +458,9 @@ func TestJobSnapshot_LegacyJSONStillDecodes(t *testing.T) {
 	if JobStatus(snapshot.Status) != StatusPending {
 		t.Errorf("旧数据 status=0 应仍是 pending，实际 %s", JobStatus(snapshot.Status))
 	}
+	if snapshot.Exec != nil {
+		t.Errorf("旧数据没有 exec 键，应解出 nil，实际 %+v", snapshot.Exec)
+	}
 
 	// 反向也要成立：未分组的任务落盘时不写 group 键，保持文件与旧版本一致
 	encoded, err := json.Marshal((&Job{ID: "job_new_1", Name: "email_send", Status: StatusPending}).ToSnapshot())
@@ -466,5 +469,130 @@ func TestJobSnapshot_LegacyJSONStillDecodes(t *testing.T) {
 	}
 	if bytes.Contains(encoded, []byte(`"group"`)) {
 		t.Errorf("未分组不应写出 group 键，实际 %s", encoded)
+	}
+}
+
+// fullExecMeta 是一份每个字段都有值的执行摘要，供搬运测试逐字段比对。
+func fullExecMeta() *ExecMeta {
+	return &ExecMeta{
+		Kind:       "script",
+		Profile:    "nightly_report",
+		ExitCode:   3,
+		Signal:     "SIGTERM",
+		HTTPStatus: 502,
+		DurationMs: 1500,
+		OutBytes:   2048,
+		ErrBytes:   512,
+		Truncated:  true,
+		Permanent:  true,
+		Preview:    "tail of the output",
+		Artifact:   "available",
+	}
+}
+
+func TestJob_ExecSurvivesSnapshotRoundTrip(t *testing.T) {
+	minimal := &ExecMeta{Kind: "http", Profile: "ping_home", DurationMs: 12}
+
+	tests := []struct {
+		name string
+		meta *ExecMeta
+	}{
+		{name: "全部字段有值", meta: fullExecMeta()},
+		{name: "只有必填字段", meta: minimal},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			job := &Job{ID: "job_exec_1", Name: "exec.nightly_report", Exec: tc.meta}
+
+			snapshot := job.ToSnapshot()
+			if snapshot.Exec != tc.meta {
+				t.Error("ToSnapshot 应带上执行摘要（复制指针即可，不该丢）")
+			}
+
+			// 绕一圈真实的 JSON：字段名写错、标签漏写 omitempty 都只在这里才暴露
+			encoded, err := json.Marshal(snapshot)
+			if err != nil {
+				t.Fatalf("快照编码失败: %v", err)
+			}
+			var decoded JobSnapshot
+			if err := json.Unmarshal(encoded, &decoded); err != nil {
+				t.Fatalf("快照解码失败: %v", err)
+			}
+
+			restored := &Job{}
+			restored.FromSnapshot(decoded)
+			if restored.Exec == nil {
+				t.Fatalf("FromSnapshot 应还原执行摘要，实际为 nil（encoded=%s）", encoded)
+			}
+			if *restored.Exec != *tc.meta {
+				t.Errorf("执行摘要逐字段应相等，实际 %+v", *restored.Exec)
+			}
+		})
+	}
+}
+
+func TestJob_CloneForRetry_DropsExec(t *testing.T) {
+	original := &Job{
+		ID:         "job_exec_retry",
+		Name:       "exec.nightly_report",
+		MaxRetries: 3,
+		RetryCount: 1,
+		Exec:       fullExecMeta(),
+	}
+
+	clone := original.CloneForRetry(time.Now().Add(time.Minute))
+
+	// 重试副本代表一次新的执行：留着旧结论会让 /jobs/:id 在新一轮跑完前显示上一次的退出码
+	if clone.Exec != nil {
+		t.Errorf("CloneForRetry 不应带上一次的执行摘要，实际 %+v", *clone.Exec)
+	}
+	if clone.RetryCount != original.RetryCount+1 {
+		t.Errorf("重试次数应递增，实际 %d", clone.RetryCount)
+	}
+	if original.Exec == nil {
+		t.Error("克隆副本不该改动原任务摘要，它还要作为本次失败的原因落盘")
+	}
+}
+
+func TestExecMeta_OmitEmptyKeys(t *testing.T) {
+	// 只填"没有 omitempty 的四个必填字段"，其余留零值
+	encoded, err := json.Marshal(&ExecMeta{Kind: "script", Profile: "nightly_report"})
+	if err != nil {
+		t.Fatalf("编码失败: %v", err)
+	}
+	text := string(encoded)
+
+	for _, key := range []string{`"exit_code"`, `"signal"`, `"http_status"`, `"truncated"`, `"permanent"`, `"preview"`, `"artifact"`} {
+		if bytes.Contains(encoded, []byte(key)) {
+			t.Errorf("零值字段 %s 应被省略，jobs.json 会被它撑大，实际 %s", key, text)
+		}
+	}
+	// duration_ms / out_bytes / err_bytes 没写 omitempty：它们为 0 也要落盘，
+	// 因为"跑了 0 毫秒"与"没有这个字段"在排障时是两件事。
+	for _, key := range []string{`"kind"`, `"profile"`, `"duration_ms"`, `"out_bytes"`, `"err_bytes"`} {
+		if !bytes.Contains(encoded, []byte(key)) {
+			t.Errorf("必填字段 %s 应始终写出，实际 %s", key, text)
+		}
+	}
+}
+
+func TestJobSnapshot_OmitsExecWhenAbsent(t *testing.T) {
+	// 绝大多数任务不是执行器任务：它们落盘时必须与升级前的字节结构一致，
+	// 凭空多出 "exec":null 会让每份 jobs.json 都变大一点，也让旧代码读到陌生键。
+	encoded, err := json.Marshal((&Job{ID: "job_plain", Name: "payment_check", Status: StatusPending}).ToSnapshot())
+	if err != nil {
+		t.Fatalf("编码失败: %v", err)
+	}
+	if bytes.Contains(encoded, []byte(`"exec"`)) {
+		t.Errorf("没有执行摘要时不应写出 exec 键，实际 %s", encoded)
+	}
+
+	// 反向：未知键在快照解码时被忽略，所以带着 exec 键的文件在旧代码里也能读（回滚路径）
+	withUnknown := []byte(`{"id":"job_1","name":"payment_check","payload":null,"trigger_at":"2024-01-02T15:30:00Z",` +
+		`"exec":{"kind":"script","profile":"x","duration_ms":1,"out_bytes":2,"err_bytes":3},"status":0}`)
+	var snapshot JobSnapshot
+	if err := json.Unmarshal(withUnknown, &snapshot); err != nil {
+		t.Errorf("带 exec 的快照解码失败: %v", err)
 	}
 }

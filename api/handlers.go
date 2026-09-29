@@ -9,6 +9,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"godelayq/core"
+	"godelayq/executor"
 )
 
 // defaultListJobsLimit 是 GET /jobs 未显式给 limit 时返回的最大条数，
@@ -580,6 +581,10 @@ func (s *Server) toJobResponse(job *core.Job) JobResponse {
 		resp.Timeout = job.Timeout.String()
 	}
 
+	if job.Exec != nil {
+		resp.Exec = s.execForResponse(job.Exec)
+	}
+
 	// 计算剩余时间
 	if job.Status == core.StatusPending {
 		d := time.Until(job.TriggerAt)
@@ -591,4 +596,29 @@ func (s *Server) toJobResponse(job *core.Job) JobResponse {
 	}
 
 	return resp
+}
+
+// execForResponse 按配置上限再裁一次输出预览。
+//
+// 摘要生成时已经裁过，这里是重复检查：预览可能来自一份旧数据文件（当时配的是更大的值），
+// 而列表接口一次返回上百条，每条几十 KB 的文本会把响应撑到不可用。
+// 超过上限时返回副本——同一个 ExecMeta 可能同时被存储里的快照引用，改它会改到别处读到的内容。
+func (s *Server) execForResponse(meta *core.ExecMeta) *core.ExecMeta {
+	limit := s.execPreviewLimit()
+	if limit <= 0 || len(meta.Preview) <= limit {
+		return meta
+	}
+
+	trimmed := *meta
+	trimmed.Preview = executor.TrimPreview(meta.Preview, limit)
+	return &trimmed
+}
+
+// execPreviewLimit 返回输出预览的字节上限。
+// 没注入登记表时取配置默认值：测试里直接构造的 Server 也要给出可预期的裁剪长度。
+func (s *Server) execPreviewLimit() int {
+	if s.executors != nil {
+		return s.executors.InlinePreview()
+	}
+	return core.DefaultExecInlinePreview
 }

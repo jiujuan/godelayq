@@ -163,12 +163,27 @@ func TestRegistry_AccessorsReflectConfig(t *testing.T) {
 	assert.Equal(t, "ops", registry.RequiredRole())
 	assert.True(t, registry.LoaderAllowed())
 
+	// 预览上限同样来自配置：接口在透传摘要之前要用它再裁一次
+	cfg.Executors.Output.InlinePreview = 4096
+	registry, err = NewRegistry(cfg, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 4096, registry.InlinePreview())
+
 	// 未显式配置时取默认值，而不是零值字符串
 	defaulted, err := NewRegistry(configAllowing(workspace, []string{selfExecutable(t)},
 		namedScript(t, workspace, "two")), nil)
 	require.NoError(t, err)
 	assert.Equal(t, core.DefaultExecRequiredRole, defaulted.RequiredRole())
 	assert.False(t, defaulted.LoaderAllowed())
+	assert.Equal(t, core.DefaultExecInlinePreview, defaulted.InlinePreview())
+
+	// 开关关闭时这个上限仍然有取值：它约束的是已经写在快照里的文本，与能不能执行无关
+	off := configWith(workspace)
+	off.Executors.Enabled = false
+	off.Executors.Output.InlinePreview = 64
+	disabled, err := NewRegistry(off, nil)
+	require.NoError(t, err)
+	assert.Equal(t, 64, disabled.InlinePreview())
 }
 
 // TestNewRegistry_FromConfigFile 是本卡的手工确认的可执行版本：

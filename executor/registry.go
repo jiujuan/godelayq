@@ -24,6 +24,7 @@ type Registry struct {
 	enabled       bool
 	requiredRole  string
 	loaderAllowed bool
+	inlinePreview int
 	entries       map[string]*entry
 	keys          []string // 已按注册键字典序排好，接口输出要稳定
 }
@@ -42,6 +43,9 @@ func NewRegistry(cfg core.Config, logger *slog.Logger) (*Registry, error) {
 		enabled:       normalized.Executors.Enabled,
 		requiredRole:  normalized.Executors.RequiredRole,
 		loaderAllowed: normalized.Executors.LoaderAllow,
+		// 预览上限在开关关闭时也有取值：接口用它裁剪一条已经存在快照里的输出预览，
+		// 与"这台机器现在能不能执行"无关。
+		inlinePreview: normalized.Executors.Output.InlinePreview,
 		entries:       make(map[string]*entry),
 	}
 	if !registry.enabled {
@@ -84,6 +88,10 @@ func (r *Registry) RequiredRole() string { return r.requiredRole }
 // LoaderAllowed 返回是否允许目录任务加载器接受 exec. 前缀的任务文件。
 // 自行接入 core.DirectoryLoader 的程序用它读取这个决定，避免配置项没有实际读取方（见 TASK-E17）。
 func (r *Registry) LoaderAllowed() bool { return r.loaderAllowed }
+
+// InlinePreview 返回输出预览的字节上限（executors.output.inline_preview）。
+// 接口在把摘要透出去之前用它再裁一次：摘要一旦落盘，写它的那个配置值可能已经改小。
+func (r *Registry) InlinePreview() int { return r.inlinePreview }
 
 // Keys 返回全部注册键，按字典序。返回的是副本，调用方改动不影响登记表。
 func (r *Registry) Keys() []string {
