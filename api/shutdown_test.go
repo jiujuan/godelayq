@@ -46,8 +46,13 @@ func TestServerStopClosesListener(t *testing.T) {
 
 	require.NoError(t, srv.Stop(context.Background()))
 
-	client := &http.Client{Timeout: 500 * time.Millisecond}
-	_, err = client.Get(baseURL + "/api/v1/health")
+	// 这条断言说的是"不再接受新连接"，所以必须真的发起一次新连接：
+	// 默认的 http.DefaultTransport 会复用上面那次请求留下的保活连接，
+	// 复用上的话请求在客户端就发出去了，服务端有没有在监听反而看不到
+	// （Linux 上就是这样读到 nil 错误，Windows 上则因为连接被服务端关掉又重试才碰巧通过）。
+	transport := &http.Transport{DisableKeepAlives: true}
+	defer transport.CloseIdleConnections()
+	_, err = (&http.Client{Timeout: 500 * time.Millisecond, Transport: transport}).Get(baseURL + "/api/v1/health")
 	assert.Error(t, err, "server must refuse connections after Stop")
 }
 
