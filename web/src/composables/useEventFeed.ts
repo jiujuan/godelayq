@@ -1,7 +1,11 @@
 /* 全局事件流：后端缓冲回填 + 前端实时缓冲的归并（§4.5、§4.7 的 events 键）。
  *
  * 刷新页面不该让刚发生的事凭空消失：GET /events 补一次历史，此后由 WS append。
- * 两边都来自同一个内存环形缓冲（api/history.go），所以归并只需要去重，不存在两份真相。 */
+ * 首屏那批读的是持久化事件库还是内存缓冲由响应的 note 说明（装没装配事件库决定），
+ * 但两路的内容同源——都是总线发布过的那一份，所以归并只需要去重，不存在两份真相。
+ * 去重键用的是事件自带的 timestamp：只有"同一条事件既被 WS 推过又出现在首屏"时才用上，
+ * 而库里读回来的时间戳精确到微秒（写入时截断），与 WS 那份不严格相等，
+ * 这种重叠是刷新与推送抢同一瞬间的产物，不是常态。 */
 import { useQuery } from '@tanstack/vue-query'
 import { computed, type ComputedRef } from 'vue'
 import { fetchRecentEvents } from '../api/events'

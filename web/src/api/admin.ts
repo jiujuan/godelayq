@@ -16,7 +16,8 @@ export function unsuspendScheduler(): Promise<{ suspended: boolean }> {
   return request<{ suspended: boolean }>('/admin/scheduler/unsuspend', { method: 'POST' })
 }
 
-/** 清空事件内存缓冲：各详情页时间线从当前时刻重新开始，任务历史不受影响 */
+/** 清空的是事件内存缓冲：未装配持久化事件库时详情页时间线从当前时刻重新开始；
+ * 装配了库时时间线读库，清空只影响这份缓冲，任务历史与库里的事件都不动 */
 export function clearEventHistory(): Promise<{ cleared: number }> {
   return request<{ cleared: number }>('/admin/events', { method: 'DELETE' })
 }

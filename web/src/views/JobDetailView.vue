@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /* 任务详情：基本信息 + payload 只读 + 运行时间线 + 与列表同一套操作规则。
  *
- * 时间线首屏来自 GET /jobs/:id/events（后端内存缓冲），此后由 WS 事件续上，
- * 所以它是"当前进程这一世"的历史：进程重启后从头计，页面直接引用后端给的 note 说明。 */
+ * 时间线首屏来自 GET /jobs/:id/events，此后由 WS 事件续上。首屏那批读的是持久化事件库
+ * 还是进程内存缓冲，由响应的 note 字段说明，页面只引用它——所以"能看到多久的历史"
+ * 随这次部署的观测层配置而变，别在这里写死成某一种。 */
 import { computed, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useQuery, useQueryClient } from '@tanstack/vue-query'

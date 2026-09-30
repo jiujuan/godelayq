@@ -1,10 +1,11 @@
 /* 详情页运行时间线（§4.6 JobDetailView）。
  *
- * 首屏取 GET /jobs/:id/events（后端内存缓冲，时间升序），此后由 WS 事件续上。
+ * 首屏取 GET /jobs/:id/events（时间升序；读的是持久化事件库还是内存缓冲由响应的 note 说明），
+ * 此后由 WS 事件续上。
  * 实时部分读的是 realtime store 的 200 条全局环形缓冲，而不是给它再开一个监听位：
  * 监听位只有一个且已被"事件 → Query 失效"管线占用，多处注册会互相覆盖，
  * 而缓冲里本来就带着这条时间线需要的全部字段。
- * 代价是高频任务的旧事件可能被缓冲挤出——首屏那 100 条已经在手上，不会因此丢历史。
+ * 代价是高频任务的旧事件可能被缓冲挤出——首屏那批已经在手上，不会因此丢历史。
  */
 import { useQuery } from '@tanstack/vue-query'
 import { computed, toValue, type MaybeRefOrGetter } from 'vue'
@@ -59,7 +60,7 @@ export function useJobEvents(jobId: MaybeRefOrGetter<string>) {
 
   return {
     timeline,
-    // note 来自后端（"in-memory buffer, cleared on restart"），UI 引用它而不是另写一句
+    // note 由后端给出，说明这批事件读的是哪一份数据；UI 引用它而不是复述某一句文本
     note: computed(() => query.data.value?.note ?? ''),
     isLoading: computed(() => query.isPending.value),
     error: computed(() => query.error.value ?? null),

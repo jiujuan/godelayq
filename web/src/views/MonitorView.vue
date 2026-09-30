@@ -66,7 +66,7 @@ function clearFilters(): void {
 
 // 订阅帧只在变化时发；两个维度都清空就等于恢复全量。
 // 同时把首屏那次回填作废：过滤期间服务端根本没推这些事件，
-// 不重取一次后端缓冲的话，"清除筛选"会让人以为事件凭空消失了（实测踩过）。
+// 不重取一次首屏的话，"清除筛选"会让人以为事件凭空消失了（实测踩过）。
 watch([pickedEvents, pickedJobTypes], ([eventTypes, jobTypes]) => {
   realtime.setFilter({ jobTypes, eventTypes })
   void queryClient.invalidateQueries({ queryKey: queryKeys.eventsRecent })
