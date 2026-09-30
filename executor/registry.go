@@ -3,6 +3,7 @@ package executor
 import (
 	"log/slog"
 	"sort"
+	"time"
 
 	"godelayq/core"
 )
@@ -25,8 +26,12 @@ type Registry struct {
 	requiredRole  string
 	loaderAllowed bool
 	inlinePreview int
-	entries       map[string]*entry
-	keys          []string // 已按注册键字典序排好，接口输出要稳定
+	// executors 是归一化之后的那一节配置，只用于算生效超时：
+	// 接口在提交期要把"任务实际会按多长的超时落盘"算出来（TASK-E16 §3.2），
+	// 而这条合成规则的执行侧版本在 Profile.timeoutWithin，两处必须同一个入口。
+	executors core.ExecutorsConfig
+	entries   map[string]*entry
+	keys      []string // 已按注册键字典序排好，接口输出要稳定
 }
 
 // NewRegistry 加载并探测全部档位。
@@ -46,6 +51,7 @@ func NewRegistry(cfg core.Config, logger *slog.Logger) (*Registry, error) {
 		// 预览上限在开关关闭时也有取值：接口用它裁剪一条已经存在快照里的输出预览，
 		// 与"这台机器现在能不能执行"无关。
 		inlinePreview: normalized.Executors.Output.InlinePreview,
+		executors:     normalized.Executors,
 		entries:       make(map[string]*entry),
 	}
 	if !registry.enabled {
@@ -92,6 +98,16 @@ func (r *Registry) LoaderAllowed() bool { return r.loaderAllowed }
 // InlinePreview 返回输出预览的字节上限（executors.output.inline_preview）。
 // 接口在把摘要透出去之前用它再裁一次：摘要一旦落盘，写它的那个配置值可能已经改小。
 func (r *Registry) InlinePreview() int { return r.inlinePreview }
+
+// EffectiveTimeout 返回这个档位在一次提交里实际生效的超时（TASK-E16 §3.2 第 1 条）。
+//
+// requested 是 payload 的 timeout 取值（没有填就是 0）。规则与执行侧完全同一条：
+// 都走 Profile.timeoutWithin，入参是登记表里那份归一化过的配置。
+// 接口之所以要在提交期算一次：任务详情显示的超时必须是真正会生效的那一个，
+// 否则"详情写 5m、实际 30s 就断"这种落差会一直留在工单里。
+func (r *Registry) EffectiveTimeout(p *Profile, requested time.Duration) time.Duration {
+	return p.timeoutWithin(r.executors, requested)
+}
 
 // Keys 返回全部注册键，按字典序。返回的是副本，调用方改动不影响登记表。
 func (r *Registry) Keys() []string {
