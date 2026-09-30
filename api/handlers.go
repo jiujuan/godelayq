@@ -62,6 +62,7 @@ func (s *Server) CreateJob(c *gin.Context) {
 		return
 	}
 
+	stashAuditJobID(c, job.ID)
 	c.JSON(201, s.toJobResponse(job))
 }
 
@@ -533,6 +534,9 @@ func (s *Server) ListJobTypes(c *gin.Context) {
 // BatchCreateJobs POST /api/v1/jobs/batch
 // 逐条独立处理：某条失败不影响其他条入队，失败原因按原始下标返回。
 func (s *Server) BatchCreateJobs(c *gin.Context) {
+	// 台账一行的归属先声明：批量里的逐条结论不进这一行（见 api/audit.go 的 markAuditBatch）
+	markAuditBatch(c)
+
 	var reqs []CreateJobRequest
 	if err := c.ShouldBindJSON(&reqs); err != nil {
 		c.JSON(400, ErrorResponse{

@@ -524,6 +524,9 @@ func (s *Server) gateExecutorSubmissionRole(c *gin.Context, profile *executor.Pr
 	if !s.allowRole(c, role) {
 		principal, _ := PrincipalFrom(c)
 		s.logAccessRejection(principal, "executor job submission", role)
+		// 台账的结论与上面那行日志同处、同源：不放进 logAccessRejection 是因为它同时被
+		// 路由档位与结果端点共用，而那些拒绝不该带执行器列（本卡 §3.5 的取舍见 §10）。
+		stashAuditExecutor(c, auditExecRoleDenied, role.String(), profile)
 		return &ErrorResponse{
 			Code:    http.StatusForbidden,
 			Message: "insufficient role",
@@ -557,6 +560,7 @@ func (s *Server) gateExecutorSubmission(c *gin.Context, job *core.Job,
 	if reason, available := s.executors.Available(name); !available {
 		// 与"类型未注册"分开写：那条说这个名字不存在，这条说名字对但这台机器现在跑不了
 		// （脚本没部署、程序不在 PATH 里）。运维需要的是后一种的改正方向。
+		stashAuditExecutor(c, auditExecProfileUnavailable, auditReasonProfile, profile)
 		return &ErrorResponse{
 			Code:    http.StatusBadRequest,
 			Message: "executor profile is not available on this server",
@@ -565,6 +569,7 @@ func (s *Server) gateExecutorSubmission(c *gin.Context, job *core.Job,
 	}
 
 	if requestedTimeout > profile.Timeout {
+		stashAuditExecutor(c, auditExecTimeoutRejected, auditReasonTimeout, profile)
 		return &ErrorResponse{
 			Code:    http.StatusBadRequest,
 			Message: "invalid timeout",
@@ -575,6 +580,8 @@ func (s *Server) gateExecutorSubmission(c *gin.Context, job *core.Job,
 
 	sub, err := executor.ValidateSubmission(profile, job.Payload)
 	if err != nil {
+		// 错误原文只进响应与日志，不进台账：里面可能出现参数取值（设计文档 D7）
+		stashAuditExecutor(c, auditExecPayloadRejected, auditReasonPayload, profile)
 		return &ErrorResponse{
 			Code:    http.StatusBadRequest,
 			Message: "invalid executor payload",
@@ -585,6 +592,7 @@ func (s *Server) gateExecutorSubmission(c *gin.Context, job *core.Job,
 	// 生效超时在这里算一次并写进任务：执行侧用的是同一个合成函数（Registry.EffectiveTimeout），
 	// 所以任务详情显示的就是实际会断的那一个，不会出现"显示 5m、30s 就超时"。
 	job.Timeout = s.executors.EffectiveTimeout(profile, sub.TimeoutValue)
+	stashAuditExecutor(c, auditExecAccepted, auditReasonAccepted, profile)
 	return nil
 }
 
