@@ -80,6 +80,10 @@ type JobResponse struct {
 	Timeout    string `json:"timeout,omitempty" example:"30s"` // 单次执行超时，空表示不限制
 	IsRepeat   bool   `json:"is_repeat" example:"false"`
 	CronExpr   string `json:"cron_expr,omitempty"`
+	// Attempts 是已经启动过的执行次数（含重试）。它同时是 GET /jobs/:id/result 里
+	// attempt 可取的范围（1..attempts），前端的"第几次尝试"下拉因此不必自己去数事件
+	// （TASK-E18 §3.2 第 3 条）。重试副本何时带上这个计数见 docs/design/tasks/executor/task-e15-http-executor.md 第 10 节。
+	Attempts int `json:"attempts" example:"1"`
 
 	// Exec 是执行器任务的结果摘要（退出码 / HTTP 状态 / 时长 / 输出预览）。
 	// 非执行器任务与"还没执行完"的任务都不写这个键，前端据此区分两者。

@@ -631,6 +631,7 @@ func (s *Server) toJobResponse(job *core.Job) JobResponse {
 		Payload:    s.payloadForResponse(job.Name, job.Payload),
 		RetryCount: job.RetryCount,
 		MaxRetries: job.MaxRetries,
+		Attempts:   job.Attempts,
 		IsRepeat:   job.IsRepeat,
 		CronExpr:   job.CronExpr,
 		CreatedAt:  job.CreatedAt,
