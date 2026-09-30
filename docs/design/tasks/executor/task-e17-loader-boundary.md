@@ -152,7 +152,7 @@ Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
 | 命令 | 结果 |
 | --- | --- |
 | `go build ./... && go vet ./...` | 通过 |
-| `go test ./... -race -count=1` | api 112.1s、cmd/server 5.4s、core 12.6s、executor 22.1s 全 ok |
+| `go test ./... -race -count=1` | api 112.1s、cmd/server 5.4s、core 12.6s、executor 22.1s 全 ok（这张表记的是改动定稿后的那次跑动。之后又跑了两次全仓：一次 api 包整包失败、其余三包 ok，一次四包全 ok（api 101.1s）；失败的那条用例与本卡无关，见"未验证与遗留"最后一条） |
 | `go test ./core -run 'Loader' -race -v` | §5.1…§5.5 六条新用例全 PASS |
 | 既有用例 | `core/load_test.go`、`core/load_watcher_test.go`、`core/load_format_test.go` 断言一字未改，全绿（§5.6 的回归要求） |
 | `GOOS=linux GOARCH=amd64`、`GOOS=darwin GOARCH=arm64` 的 `go build` | 通过 |
@@ -204,3 +204,8 @@ Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
   这一点已写进配置注释与 E19 的部署文档清单，别让读者以为打开它服务端就会接受目录里的
   执行器任务。
 - `docs/deployment.md` 与 `docs/api.md` 的同步归 E19，已把要写的两条补进该卡 §3.2。
+- 收尾时有一条与本卡无关的偶发观察：`api` 包的 `TestAdminRuntime_ExposesExecPool`（E13 的用例）
+  连续两次失败（一次全仓 `-race`，同轮 `cmd/server`、`core`、`executor` 三包 ok；紧跟着一次 `api` 包单独跑），
+  之后的复跑全部通过：该用例单跑、`-count=30`、`-count=200` 各一轮，`api` 包整包五次，全仓再跑一次。
+  本机没能再复现，因此没有改动这条用例，只在 E19 §5.1 登记成待观察项（含复跑命令与该用例缺的等待条件）。
+  本卡只改 `core` 的加载器路径，没有碰调度循环与池统计。
