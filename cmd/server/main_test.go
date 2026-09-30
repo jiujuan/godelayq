@@ -335,7 +335,8 @@ func TestDefaultRuntimeDeps(t *testing.T) {
 	deps := defaultRuntimeDeps(core.DefaultConfig(), slog.Default())
 
 	if deps.newStore == nil || deps.newScheduler == nil || deps.newExecutorRegistry == nil ||
-		deps.newArtifactStore == nil || deps.newServer == nil || deps.notifySignals == nil {
+		deps.newArtifactStore == nil || deps.newObservabilityDB == nil ||
+		deps.newServer == nil || deps.notifySignals == nil {
 		t.Fatal("expected all runtime dependencies to be set")
 	}
 	if deps.timeout != core.DefaultConfig().Scheduler.ShutdownTimeout {

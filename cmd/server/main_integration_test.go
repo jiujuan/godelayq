@@ -16,6 +16,7 @@ import (
 
 	"godelayq/core"
 	"godelayq/executor"
+	"godelayq/store/sqlite"
 )
 
 func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
@@ -76,6 +77,7 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 			t.Fatal("artifact store must not be built while executors are disabled")
 			return nil, nil
 		},
+		newObservabilityDB: unopenedObservabilityDB(t),
 		newServer: func(gotScheduler schedulerAPI, gotStore core.Store, port string, gotExecutors *executor.Registry, gotArtifacts *executor.ArtifactStore) (serverAPI, error) {
 			if gotScheduler != scheduler {
 				t.Fatalf("expected server to receive scheduler stub, got %T", gotScheduler)
@@ -196,6 +198,7 @@ func TestRun_ServerStartFailureStopsScheduler(t *testing.T) {
 		},
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
+		newObservabilityDB:  unopenedObservabilityDB(t),
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return server, nil
 		},
@@ -235,6 +238,7 @@ func TestRun_StoreCreationFailure(t *testing.T) {
 			t.Fatal("artifact store should not be built when store creation fails")
 			return nil, nil
 		},
+		newObservabilityDB: unopenedObservabilityDB(t),
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			t.Fatal("server should not be created when store creation fails")
 			return nil, nil
@@ -266,6 +270,7 @@ func TestRun_ExecutorRegistryError(t *testing.T) {
 			t.Fatal("artifact store should not be built when the registry fails")
 			return nil, nil
 		},
+		newObservabilityDB: unopenedObservabilityDB(t),
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			t.Fatal("server should not be created when the registry fails")
 			return nil, nil
@@ -308,6 +313,7 @@ func TestRun_LogsErrorWhenAuthDisabled(t *testing.T) {
 		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
 		newExecutorRegistry: executor.NewRegistry,
 		newArtifactStore:    artifactStoreFromConfig,
+		newObservabilityDB:  unopenedObservabilityDB(t),
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return server, nil
 		},
@@ -375,6 +381,7 @@ func runWithExecutorConfig(t *testing.T, tune func(*core.Config)) (*spyScheduler
 		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
 		newExecutorRegistry: func(core.Config, *slog.Logger) (*executor.Registry, error) { return executors, nil },
 		newArtifactStore:    artifactStoreFromConfig,
+		newObservabilityDB:  unopenedObservabilityDB(t),
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return server, nil
 		},
@@ -475,6 +482,7 @@ func TestRun_ExecPoolSizingReachesScheduler(t *testing.T) {
 		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
 		newExecutorRegistry: executor.NewRegistry,
 		newArtifactStore:    artifactStoreFromConfig,
+		newObservabilityDB:  unopenedObservabilityDB(t),
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return server, nil
 		},
@@ -547,6 +555,7 @@ func TestRun_ArtifactStoreErrorStopsStartup(t *testing.T) {
 		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
 		newExecutorRegistry: executor.NewRegistry,
 		newArtifactStore:    staticArtifactStore(nil, wantErr),
+		newObservabilityDB:  unopenedObservabilityDB(t),
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			t.Fatal("server should not be created when the artifact store fails")
 			return nil, nil
@@ -593,6 +602,7 @@ func TestRun_ArtifactCleanerStopsWithRun(t *testing.T) {
 			stores = append(stores, artifacts)
 			return artifacts, nil
 		},
+		newObservabilityDB: unopenedObservabilityDB(t),
 		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry, gotArtifacts *executor.ArtifactStore) (serverAPI, error) {
 			// 接口拿到的必须就是 run 里那一份：换成新建的存储会读不到刚写出的产物
 			if len(stores) != 1 || gotArtifacts != stores[0] {
@@ -619,6 +629,305 @@ func TestRun_ArtifactCleanerStopsWithRun(t *testing.T) {
 		t.Fatalf("expected the artifact dir to exist: %v", err)
 	}
 	// run 能返回本身就说明清理协程已经退出：协程没停的话，收尾的 <-cleanerStopped 会一直阻塞
+}
+
+// unopenedObservabilityDB 是给"配置没开观测层"的用例用的闭包：一旦被调用就让测试失败。
+// 写法与产物存储那条（executors 关闭时不该建存储）一致，守的是"默认关闭 = 不创建任何文件"。
+func unopenedObservabilityDB(t *testing.T) func(core.Config, *slog.Logger) (observabilityDB, error) {
+	return func(core.Config, *slog.Logger) (observabilityDB, error) {
+		t.Fatal("observability database must not be opened while observability.enabled is false")
+		return nil, nil
+	}
+}
+
+// observabilityStub 是观测库句柄的替身。真实 *sqlite.DB 的关闭时机在测试里没有旁路可看，
+// 而"观测层先关、存储后关"正是本卡要钉住的顺序（设计文档 §7.3），所以 run 拿的是接口。
+type observabilityStub struct {
+	path       string
+	journal    string
+	stats      sqlite.Stats
+	statsErr   error
+	closeErr   error
+	statsCalls int
+	closeCalls int
+	// order 非空时把关闭动作记进共享的顺序表（与 stubStore.order 同一张表）。
+	order *[]string
+}
+
+func (s *observabilityStub) Path() string { return s.path }
+
+func (s *observabilityStub) JournalMode() string {
+	if s.journal != "" {
+		return s.journal
+	}
+	return "wal"
+}
+
+func (s *observabilityStub) Stats() (sqlite.Stats, error) {
+	s.statsCalls++
+	return s.stats, s.statsErr
+}
+
+func (s *observabilityStub) Close() error {
+	s.closeCalls++
+	if s.order != nil {
+		*s.order = append(*s.order, "observability")
+	}
+	return s.closeErr
+}
+
+// runWithObservability 用一份观测层配置跑一次完整装配（不起真服务），返回替身观测库、
+// 替身存储与启动日志。三条观测层装配用例只差在配置与闭包返回值上，共用这一份骨架。
+func runWithObservability(t *testing.T, tune func(*core.Config), newDB func(core.Config, *slog.Logger) (observabilityDB, error)) (*observabilityStub, *stubStore, []string, string) {
+	t.Helper()
+
+	var order []string
+	store := &stubStore{order: &order}
+	scheduler := newSpyScheduler()
+	server := newFakeServer()
+	var logs strings.Builder
+
+	cfg := core.DefaultConfig()
+	if tune != nil {
+		tune(&cfg)
+	}
+
+	stub := &observabilityStub{path: cfg.Observability.Path, order: &order,
+		stats: sqlite.Stats{SchemaVersion: 1}}
+	// 闭包由用例决定返回替身还是报错；返回替身时把用例给的错误与路径一并接上
+	closure := newDB
+	if closure == nil {
+		closure = func(core.Config, *slog.Logger) (observabilityDB, error) { return stub, nil }
+	}
+
+	err := run(runtimeDeps{
+		config:              cfg,
+		newStore:            func() (core.Store, error) { return store, nil },
+		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
+		newExecutorRegistry: staticExecutorRegistry(nil, nil),
+		newArtifactStore:    staticArtifactStore(nil, nil),
+		newObservabilityDB:  closure,
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+			return server, nil
+		},
+		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
+			go func() {
+				ch <- syscall.SIGTERM
+			}()
+		},
+		timeout: 20 * time.Millisecond,
+		logger:  newCaptureLogger(&logs),
+	})
+	if err != nil {
+		t.Fatalf("expected run to succeed, got %v", err)
+	}
+	return stub, store, append([]string(nil), order...), logs.String()
+}
+
+// TestRun_ObservabilityDisabledOpensNothing 是本卡的第一条 DoD：
+// 默认配置（observability.enabled=false）下闭包一次都不调用，配置的路径上也不出现文件。
+// 只看"没报错"不够——静默打开一个库同样会被当成"这次部署启用了观测层"。
+func TestRun_ObservabilityDisabledOpensNothing(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "observe.sqlite")
+
+	var logs strings.Builder
+	store := newStubStore()
+	calls := 0
+	err := run(runtimeDeps{
+		config: func() core.Config {
+			cfg := core.DefaultConfig()
+			cfg.Observability.Path = path // 总开关保持默认的 false
+			return cfg
+		}(),
+		newStore:            func() (core.Store, error) { return store, nil },
+		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
+		newExecutorRegistry: staticExecutorRegistry(nil, nil),
+		newArtifactStore:    staticArtifactStore(nil, nil),
+		newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
+			calls++
+			return nil, nil
+		},
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+			return newFakeServer(), nil
+		},
+		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
+			go func() {
+				ch <- syscall.SIGTERM
+			}()
+		},
+		timeout: 20 * time.Millisecond,
+		logger:  newCaptureLogger(&logs),
+	})
+	if err != nil {
+		t.Fatalf("expected run to succeed, got %v", err)
+	}
+
+	if calls != 0 {
+		t.Fatalf("expected the observability closure not to be called, got %d calls", calls)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("expected no database file at %s, stat said %v", path, err)
+	}
+	// 目录本身也不该被顺手建出来：run 用的是 t.TempDir()，所以只看日志与文件
+	if output := logs.String(); strings.Contains(output, "observability enabled") {
+		t.Fatalf("the disabled path must not log an enabled observability layer, got %q", output)
+	}
+	if store.closeCalls != 1 {
+		t.Fatalf("expected the store to still be closed once, got %d", store.closeCalls)
+	}
+}
+
+// TestRun_ObservabilityOpenFailureStopsStartup 固定住"建不起库就别启动"：
+// 带着三张永远为空的表上线，比启动失败更难被发现（设计文档 §11）。
+func TestRun_ObservabilityOpenFailureStopsStartup(t *testing.T) {
+	store := newStubStore()
+	scheduler := newSpyScheduler()
+	wantErr := errors.New("sqlite: unable to open database file: permission denied")
+
+	cfg := core.DefaultConfig()
+	cfg.Observability.Enabled = true
+	cfg.Observability.Path = filepath.Join(t.TempDir(), "observe.sqlite")
+
+	err := run(runtimeDeps{
+		config:              cfg,
+		newStore:            func() (core.Store, error) { return store, nil },
+		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
+		newExecutorRegistry: staticExecutorRegistry(nil, nil),
+		newArtifactStore:    staticArtifactStore(nil, nil),
+		newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
+			return nil, wantErr
+		},
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+			t.Fatal("the server should not be created when the observability database fails")
+			return nil, nil
+		},
+		notifySignals: func(chan<- os.Signal, ...os.Signal) {},
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected the observability error, got %v", err)
+	}
+	if scheduler.startCalls != 0 {
+		t.Fatalf("expected the scheduler not to start, got %d", scheduler.startCalls)
+	}
+	// 早退路径也必须收尾存储：它与观测层无关，但 defer 不能因为插入 return 而失效
+	if store.closeCalls != 1 {
+		t.Fatalf("expected the store to be closed once, got %d", store.closeCalls)
+	}
+}
+
+// TestRun_ObservabilityStatsFailureStopsStartup 钉住 Open 成功但库读不出版本时的处置：
+// 这种库文件多半被外部改坏或权限不对，此时报"不可用"比留下一个空台账有用。
+func TestRun_ObservabilityStatsFailureStopsStartup(t *testing.T) {
+	store := newStubStore()
+	cfg := core.DefaultConfig()
+	cfg.Observability.Enabled = true
+	path := filepath.Join(t.TempDir(), "observe.sqlite")
+	cfg.Observability.Path = path
+
+	stub := &observabilityStub{path: path, statsErr: errors.New("database disk image is malformed")}
+	err := run(runtimeDeps{
+		config:              cfg,
+		newStore:            func() (core.Store, error) { return store, nil },
+		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
+		newExecutorRegistry: staticExecutorRegistry(nil, nil),
+		newArtifactStore:    staticArtifactStore(nil, nil),
+		newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
+			return stub, nil
+		},
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+			t.Fatal("the server should not be created when the observability database is unusable")
+			return nil, nil
+		},
+		notifySignals: func(chan<- os.Signal, ...os.Signal) {},
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	if err == nil || !strings.Contains(err.Error(), path) {
+		t.Fatalf("expected the error to name the unusable database path, got %v", err)
+	}
+	if store.closeCalls != 1 {
+		t.Fatalf("expected the store to be closed once, got %d", store.closeCalls)
+	}
+	// Stats 失败后句柄仍要关掉：不然这份库文件的连接就一直留在进程里
+	if stub.closeCalls != 1 {
+		t.Fatalf("expected the failed database handle to be closed, got %d", stub.closeCalls)
+	}
+}
+
+// TestRun_ObservabilityClosedBeforeStore 是本卡唯一能用断言表达的关闭顺序（设计文档 §7.3）：
+// 观测层的 defer 晚于 store.Close 的 defer 声明，因此先执行。顺序颠倒时，
+// S03 起的事件写入器会在已关闭的任务存储之上再读一次快照。
+func TestRun_ObservabilityClosedBeforeStore(t *testing.T) {
+	stub, store, order, logs := runWithObservability(t, func(cfg *core.Config) {
+		cfg.Observability.Enabled = true
+		cfg.Observability.Path = filepath.Join(t.TempDir(), "observe.sqlite")
+	}, nil)
+
+	if stub.closeCalls != 1 {
+		t.Fatalf("expected the observability handle to be closed once, got %d", stub.closeCalls)
+	}
+	if store.closeCalls != 1 {
+		t.Fatalf("expected the store to be closed once, got %d", store.closeCalls)
+	}
+	// 这一条才是本卡的顺序断言：观测层先关、任务存储后关。
+	// 只断言"两个都关过"是不够的——反过来的顺序同样能通过，而那时 S03 的事件写入器
+	// 会在已关闭的存储上再读一次快照。
+	if len(order) != 2 || order[0] != "observability" || order[1] != "store" {
+		t.Fatalf("expected the close order [observability, store], got %v", order)
+	}
+
+	// 关观测层时报的 Stats 调用次数固定为 1（启动日志那一行），关闭本身不再查
+	if stub.statsCalls != 1 {
+		t.Fatalf("expected the startup log to read the schema version once, got %d", stub.statsCalls)
+	}
+
+	output := logs
+	if !strings.Contains(output, `msg="observability enabled"`) {
+		t.Fatalf("expected the observability startup line, got %q", output)
+	}
+	if !strings.Contains(output, "schema_version=1") || !strings.Contains(output, "journal_mode=wal") {
+		t.Fatalf("the startup line must carry the schema version and the effective journal mode, got %q", output)
+	}
+}
+
+// TestRun_ObservabilityEnabledOpensAndClosesForReal 用真实的 sqlite.Open 走一遍装配：
+// 闭包的映射（cfg.Observability → store/sqlite）与 defer 的关闭都是被执行过的那条路径，
+// 替身断言不了这条。库文件建出来、启动日志有那一行、run 返回后连接确实已关。
+func TestRun_ObservabilityEnabledOpensAndClosesForReal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "data", "observe.sqlite")
+
+	var opened observabilityDB
+	stub, _, _, logs := runWithObservability(t, func(cfg *core.Config) {
+		cfg.Observability.Enabled = true
+		cfg.Observability.Path = path
+	}, func(cfg core.Config, logger *slog.Logger) (observabilityDB, error) {
+		db, err := sqlite.Open(cfg.Observability, logger)
+		if err != nil {
+			return nil, err
+		}
+		opened = db
+		return db, nil
+	})
+
+	if opened == nil {
+		t.Fatal("expected the real database handle to reach run")
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("expected the database file at the configured path: %v", err)
+	}
+	if stub.closeCalls != 0 {
+		t.Fatalf("the real handle is not a stub, closeCalls should stay 0, got %d", stub.closeCalls)
+	}
+	// run 返回即观测层已关：关掉之后 Stats 必须报错，而不是还能读出行数
+	if _, err := opened.Stats(); err == nil {
+		t.Fatal("expected the database to be closed when run returns")
+	}
+	if !strings.Contains(logs, `msg="observability enabled"`) || !strings.Contains(logs, path) {
+		t.Fatalf("expected the startup line to name the path, got %q", logs)
+	}
 }
 
 // TestLiveJobIDs 检查"存储里的 ID 集合"包装：内容一致，存储报错时原样透出
@@ -655,6 +964,7 @@ func TestRun_ServerStopErrorIsLoggedAndIgnored(t *testing.T) {
 		},
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
+		newObservabilityDB:  unopenedObservabilityDB(t),
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return server, nil
 		},
@@ -688,6 +998,7 @@ func TestRun_UsesDefaultTimeoutAndLoggerWhenUnset(t *testing.T) {
 		},
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
+		newObservabilityDB:  unopenedObservabilityDB(t),
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return server, nil
 		},
@@ -725,6 +1036,7 @@ func TestRun_ServerFactoryError(t *testing.T) {
 		},
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
+		newObservabilityDB:  unopenedObservabilityDB(t),
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			return nil, wantErr
 		},
@@ -905,11 +1217,13 @@ func (s *fakeServer) Stop(ctx context.Context) error {
 // stubStore 记录 Close 次数：早退路径（登记表建不起来、服务起不来）也必须收尾，
 // 这条断言固定住"存储一定被关掉"，防止装配代码插入 return 时漏掉 defer。
 // snapshots / loadErr 让读路径（产物清理要的"任务还活着"集合）可被测试编排。
+// order 非空时把关闭动作记进共享的顺序表，供"观测层早于存储"那条断言使用。
 type stubStore struct {
 	mu         sync.Mutex
 	closeCalls int
 	snapshots  []core.JobSnapshot
 	loadErr    error
+	order      *[]string
 }
 
 func newStubStore() *stubStore {
@@ -945,6 +1259,9 @@ func (s *stubStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.closeCalls++
+	if s.order != nil {
+		*s.order = append(*s.order, "store")
+	}
 	return nil
 }
 

@@ -15,6 +15,7 @@ import (
 	"godelayq/api"
 	"godelayq/core"
 	"godelayq/executor"
+	"godelayq/store/sqlite"
 	"godelayq/web"
 )
 
@@ -50,6 +51,19 @@ type serverAPI interface {
 	Stop(ctx context.Context) error
 }
 
+// observabilityDB 是 run 对观测库句子的要求：报路径与实际生效的 PRAGMA、报迁移版本、干净关闭。
+//
+// 接口定义在消费方是本仓库的既有惯例（schedulerAPI、serverAPI 同样如此），这里还多一条理由：
+// 关闭顺序（观测层早于 store.Close）只有在句柄可替换时才断言得出来，
+// 真实 *sqlite.DB 的关闭时机在测试里没有别的观察办法。
+// 本卡只用到这三个方法，S03 起要把事件写入器接进装配时再扩，不提前摆空参数。
+type observabilityDB interface {
+	Path() string
+	JournalMode() string
+	Stats() (sqlite.Stats, error)
+	Close() error
+}
+
 type signalNotifier func(chan<- os.Signal, ...os.Signal)
 
 type runtimeDeps struct {
@@ -62,10 +76,14 @@ type runtimeDeps struct {
 	// newArtifactStore 建输出产物的文件存储与清理协程，只在 executors.enabled=true 时调用。
 	// 与登记表一样列入依赖完整性检查：少了它输出会静默无处安放。
 	newArtifactStore func(core.Config, *slog.Logger) (*executor.ArtifactStore, error)
-	newServer        func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore) (serverAPI, error)
-	notifySignals    signalNotifier
-	timeout          time.Duration
-	logger           *slog.Logger
+	// newObservabilityDB 打开 SQLite 观测库（建目录、建表、应用迁移），只在
+	// observability.enabled=true 时调用。它同样列入依赖完整性检查：少装配一个闭包的后果是
+	// "三张表永远是空的"，看起来正常、实际没记，必须在启动期就报错。
+	newObservabilityDB func(core.Config, *slog.Logger) (observabilityDB, error)
+	newServer          func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore) (serverAPI, error)
+	notifySignals      signalNotifier
+	timeout            time.Duration
+	logger             *slog.Logger
 }
 
 // defaultRuntimeDeps 把配置注入各构造闭包，run() 本身不再关心具体取值来源
@@ -90,6 +108,15 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				MaxBytes: cfg.Executors.Output.MaxBytes,
 				TTL:      cfg.Executors.Output.TTL,
 			}, logger)
+		},
+		newObservabilityDB: func(cfg core.Config, logger *slog.Logger) (observabilityDB, error) {
+			db, err := sqlite.Open(cfg.Observability, logger)
+			if err != nil {
+				// 这里必须返回 nil 而不是那个类型化的空句柄：
+				// 装了 *sqlite.DB(nil) 的接口值不等于 nil，调用方的判空会失效。
+				return nil, err
+			}
+			return db, nil
 		},
 		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore) (serverAPI, error) {
 			coreScheduler, ok := scheduler.(*core.Scheduler)
@@ -152,7 +179,8 @@ func main() {
 
 func run(deps runtimeDeps) error {
 	if deps.newStore == nil || deps.newScheduler == nil || deps.newExecutorRegistry == nil ||
-		deps.newArtifactStore == nil || deps.newServer == nil || deps.notifySignals == nil {
+		deps.newArtifactStore == nil || deps.newObservabilityDB == nil || deps.newServer == nil ||
+		deps.notifySignals == nil {
 		return fmt.Errorf("runtime dependencies are incomplete")
 	}
 
@@ -225,6 +253,43 @@ func run(deps runtimeDeps) error {
 			stopCleanup()
 			<-cleanerStopped
 		}()
+	}
+
+	// 观测层（运行事件、产物索引、写操作审计三张表）只在总开关打开时装配。
+	//
+	// defer 的顺序有讲究：这里的 defer 晚于上面 store.Close 的 defer 声明，因此实际执行顺序
+	// 是先关观测层、后关存储（设计文档 §7.3）。反过来就会在已关闭的任务存储之上再读一次快照，
+	// S03 起这条链上还要先撤掉事件总线的订阅。
+	//
+	// 句柄没有存到 if 外面：本卡它除了关闭之外没有读取方，而 Go 不允许声明用不上的变量。
+	// S03 注入事件写入器时再把它取出来，关闭顺序仍由这一行的 defer 保证。
+	if cfg.Observability.Enabled {
+		db, err := deps.newObservabilityDB(cfg, deps.logger)
+		if err != nil {
+			// 建不起库等于什么都记不住，与档位配置非法、产物目录建不起来同一口径：
+			// 不让进程带着"这次部署其实一行历史都不会留下"的状态上线。
+			return err
+		}
+		// 收尾立刻挂上，再读迁移版本：Stats 失败也要把这份句柄关掉，
+		// 否则早退路径留下一条没人认领的连接。
+		defer func() {
+			if err := db.Close(); err != nil {
+				deps.logger.Error("failed to close observability database", "error", err)
+			}
+		}()
+
+		stats, err := db.Stats()
+		if err != nil {
+			// Open 已经成功却读不出迁移版本，说明这份库文件本身有问题（权限、被外部改坏）。
+			// 报出来比让三张表安静地空着强。
+			return fmt.Errorf("observability database %s is unusable: %w", db.Path(), err)
+		}
+		// journal_mode 记的是实际生效值：网络文件系统上 WAL 会静默退回 delete，
+		// 只看配置文件里的写法看不出降级已经发生（本卡 §9 风险 2）。
+		deps.logger.Info("observability enabled",
+			"path", db.Path(),
+			"schema_version", stats.SchemaVersion,
+			"journal_mode", db.JournalMode())
 	}
 
 	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts)
