@@ -18,6 +18,7 @@
 - 📊 **数据处理**：定时报表生成、数据同步、日志清理
 - 🔄 **工作流引擎**：状态机流转、审批超时提醒(* 暂时没实现)
 - ⏰ **定时任务**：Cron 表达式支持的周期性任务
+- 🛠️ **运维自动化**：定时清理、报表脚本、部署钩子——由配置声明的执行器档位执行，见核心特性第 3 条
 
 
 ## 架构设计
@@ -61,6 +62,20 @@
 └─────────────────┘  └─────────────────┘    └─────────────────────┘
 │                  │                          │
 └──────────────────┴──────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────┐
+│                Executor Layer (执行层，executors.enabled)        │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  │
+│  │    Registry     │  │ Runner / HTTP   │  │ Result&Artifact │  │
+│  │ (档位登记表)     │  │ (进程/HTTP 执行) │  │ (摘要与产物文件)  │  │
+│  │                 │  │                 │  │                 │  │
+│  │  • 配置声明      │  │  • 白名单命令行   │  │  • 退出码/状态码 │  │
+│  │  • 可用性探测    │  │  • 超时与整树终止 │  │  • TTL/孤儿清理 │  │
+│  │  • 参数校验      │  │  • 输出落盘      │  │  • 尾部预览      │  │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘  │
+│  独立执行池（与 scheduler.workers 分池），任务类别由调度器识别        │
+└─────────────────────────────────────────────────────────────────┘
 │
 ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -144,6 +159,7 @@ godelayq/
 │   ├── handlers_lifecycle.go # 暂停/强制暂停/恢复 + batch-ops 批量操作
 │   ├── handlers_groups.go    # 分组注册表 CRUD（改名连带改写任务标签）
 │   ├── handlers_events.go    # 任务时间线与全局最近事件
+│   ├── handlers_executors.go # 档位清单、执行输出读取、提交期判定与凭据掩码
 │   ├── handlers_admin.go     # ops 档：运行时诊断、调度总开关、清缓冲
 │   ├── history.go            # 事件内存环形缓冲（订阅事件总线，重启即清空）
 │   ├── authenticator.go      # 账号校验与 JWT 签发/验签
@@ -155,6 +171,22 @@ godelayq/
 │   ├── websocket.go          # gorilla/websocket 适配器
 │   ├── sse.go                # Server-Sent Events
 │   └── *_test.go             # 契约、鉴权、关闭与流式测试
+│
+├── executor/                 # 执行层（把配置里的档位变成可注册的执行任务；默认不启用）
+│   ├── profile.go            # 档位加载与校验：workspace 边界、解释器白名单、参数与超时声明
+│   ├── registry.go           # "档位 + 可用性"的只读登记表（配置项 executors.* 的唯一读取方）
+│   ├── register.go           # 把档位注册进调度器（Registrar 由调用方提供，不依赖具体实现）
+│   ├── probe.go              # 可用性探测：程序在不在 PATH、脚本在不在，不启动任何进程
+│   ├── args.go               # payload 解码、参数校验与命令行/URL 渲染（没有 shell，也没有内联源码）
+│   ├── env.go                # 子进程环境重建：固定注入 + env_allow 白名单，排除 GODELAYQ_ 前缀
+│   ├── proc.go               # 进程档位（script / binary）的执行主体：起进程、收输出、判超时
+│   ├── proc_unix.go          # Unix 侧进程组信号与终止
+│   ├── proc_windows.go       # Windows 侧整树终止（taskkill /T /F）与差异说明
+│   ├── exit.go               # 退出码 / 信号 / HTTP 状态到失败原因的归类（含"重试无意义"判定）
+│   ├── http.go               # HTTP 档位：拨号层禁内网与元数据地址、请求渲染、响应与头的落盘
+│   ├── result.go             # 一次执行的内存形态：结论摘要 + 两条输出流 + 预览裁剪
+│   ├── artifact.go           # 产物文件存储（a<n>.out / a<n>.err / meta.json）与 TTL、孤儿清理
+│   └── *_test.go             # 与上述文件一一对应的单元测试（含真实进程与跨平台夹具）
 │
 ├── examples/                 # 独立可运行示例
 │   ├── demo1/                # 编程式提交与崩溃恢复
@@ -218,6 +250,10 @@ godelayq/
 
 - **多种触发方式**：延迟执行（Duration）、定时执行（Time）、周期执行（Cron，5 或 6 段）
 - **三种提交入口**：REST API、任务文件目录、代码内直接 `Schedule`
+- **执行器档位（默认关闭）**：`executors.commands` 里声明的档位注册成 `exec.<档位名>` 任务类型，
+  到点直接跑脚本、跑已编译产物或发一个 HTTP 请求，不需要改代码；能执行什么完全由这份白名单决定，
+  **不提供自由命令行，也不接受任务里内联源码**。参数声明（必填、正则、`secret`）、可用性探测、
+  独立执行池与输出产物存储都在 `executor/` 包里；开关与部署前提见 [部署文档](./docs/deployment.md) 的"开启执行器"。
 - **上下文传递**：Handler 收到带 cancellation 与 timeout 的 `context.Context`
 - **标识**：任务 ID 为 UUIDv7（毫秒时间戳前缀 + 随机后缀，可按字典序粗略排序）
 
@@ -373,6 +409,24 @@ store:
 logging:
   level: info                 # debug|info|warn|error
   format: text                # text|json（输出固定为标准输出）
+executors:
+  enabled: false              # 总开关；打开等于把"能提交任务"扩成"能执行命令"，必须先配鉴权
+  required_role: admin        # 提交 exec.* 任务与读取其含凭据档位的产物正文所需的最低角色
+  workspace: ./exec-workspace # 脚本与产物的根目录，档位路径不得越出它
+  runtime_allow: [bash, sh, cmd, pwsh, node, php, python, java]
+  env_allow: [PATH, LANG, LC_ALL, TZ, HOME]  # GODELAYQ_ 前缀的键启动即拒（服务凭据在进程环境里）
+  concurrency: 4              # 执行器专用池的协程数，与 scheduler.workers 分池
+  queue_capacity: 0           # 执行器队列容量；0 表示与本节 concurrency 相等
+  default_timeout: 5m         # 档位没写 timeout 时的单次执行超时
+  max_timeout: 30m            # 超时上限：档位或任务请求超过它直接被拒
+  restore_policy: pause       # 崩溃后正在跑的执行器任务：pause 等人确认 / replay 重跑
+  loader_allow: false         # 目录加载器是否接受 exec.* 任务文件（服务端不启用加载器，详见部署文档）
+  output:
+    inline_preview: 2048      # 事件与任务详情里带的尾部预览字节数
+    max_bytes: 262144         # 单条流的落盘上限，达到即标记截断
+    dir: ./data/exec          # 产物目录，与 store.path 分开放，便于单独设权限与清理
+    ttl: 168h                 # 产物保留时长；0 表示只做起动时的孤儿清理
+  commands: []                # 档位列表：脚本 / 已编译产物 / HTTP 三种，字段见模板注释与设计文档 §5
 ```
 
 配置 `server.auth.token` 或 `server.auth.users` 任一后，除两个登录入口
@@ -401,5 +455,5 @@ logging:
 - [部署文档](./docs/deployment.md)
 - [核心模块设计分析](./docs/core-scheduler-heap-event-load-analysis.md)
 - [Web 控制台设计文档](./docs/design/web-console-design.md)（`web/` 的技术选型、页面与后端改造方案，含里程碑进度）
-- [执行器设计文档](./docs/design/executor-design.md)（shell/脚本/HTTP 执行层的白名单档位、结果通道与权限模型；**设计定稿，尚未实现**）
+- [执行器设计文档](./docs/design/executor-design.md)（shell/脚本/HTTP 执行层的白名单档位、结果通道与权限模型；**已实现（M0–M5），与实现的偏差在该文正文的 ⚠️ 标注里**）
   - 实施拆分：[执行器任务卡 TASK-E01 … E19](./docs/design/tasks/executor/README.md)
