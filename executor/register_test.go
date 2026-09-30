@@ -192,3 +192,30 @@ func TestRegister_HandlerRunsTheProfile(t *testing.T) {
 	assert.Equal(t, "registered", strings.TrimSpace(job.Exec.Preview))
 	assert.True(t, store.Exists(job.ID, job.Attempts))
 }
+
+// TestRegister_WarnsWhenAddressPolicyDisabled 钉住 TASK-E15 §9 要求的启动期 warn：
+// 关掉地址防线的档位必须在启动日志里留一行。E02 只挡住最危险的那半种写法
+// （deny_private_ranges:false 配通配主机名），写成具体内网主机的档位是能启动的。
+func TestRegister_WarnsWhenAddressPolicyDisabled(t *testing.T) {
+	relaxed := httpGetCommand("https://api.internal:8443/ping", "api.internal:8443")
+	relaxed.Name = "dev_callback"
+	relaxed.DenyPrivate = boolPtr(false)
+
+	guarded := httpGetCommand("https://api.internal:8443/ping", "api.internal:8443")
+	guarded.Name = "prod_callback"
+
+	cfg := configWith(t.TempDir(), relaxed, guarded)
+	registry, err := NewRegistry(cfg, quietLogger())
+	require.NoError(t, err)
+
+	var logs bytes.Buffer
+	result, err := Register(newFakeRegistrar(), registry, cfg, nil, slog.New(slog.NewTextHandler(&logs, nil)))
+	require.NoError(t, err)
+	assert.Equal(t, 2, result.Registered)
+
+	output := logs.String()
+	assert.Contains(t, output, "level=WARN", "关掉防线的档位要留一条 warn")
+	assert.Contains(t, output, "executor http profiles accept private and loopback addresses")
+	assert.Contains(t, output, "profiles=exec.dev_callback", "只列关掉防线的那条档位")
+	assert.NotContains(t, output, "exec.prod_callback", "开着防线的档位不该出现在这行里")
+}

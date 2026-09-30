@@ -3,6 +3,7 @@ package executor
 import (
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"godelayq/core"
 )
@@ -76,9 +77,10 @@ func Register(registrar Registrar, reg *Registry, cfg core.Config, artifacts *Ar
 		if !ok {
 			continue
 		}
-		// Runner 是真实的执行主体：校验 payload、拼 argv、起进程、把输出写进产物文件。
-		// http 档位也走同一个入口，它在 Runner.Handler 里明确报告"执行分支归 TASK-E15"。
-		registrar.RegisterHandlerClass(key, NewRunner(profile, artifacts, executors, logger).Handler(),
+		// 按 kind 分流：进程档位由 Runner 起进程，http 档位由 HTTPRunner 发请求（TASK-E15）。
+		// 两条都是真实的执行主体，共用校验、许可、产物与失败分类那一套；
+		// 分流只在这一处，Runner 自己不再解释 http 档位（它会按"档位类型不符"报永久失败）。
+		registrar.RegisterHandlerClass(key, handlerFor(profile, artifacts, executors, logger).Handler(),
 			core.JobClassExec)
 		result.Registered++
 		if probe, ok := reg.ProbeOf(key); ok && !probe.Available {
@@ -91,5 +93,55 @@ func Register(registrar Registrar, reg *Registry, cfg core.Config, artifacts *Ar
 		"registered", result.Registered,
 		"unavailable", result.Unavailable)
 
+	warnRelaxedAddressPolicy(reg, keys, logger)
+
 	return result, nil
+}
+
+// warnRelaxedAddressPolicy 给"关掉了地址防线"的 http 档位记一条启动期 warn（TASK-E15 §9）。
+//
+// 为什么这一条要在启动时说出来而不是等执行时报错：`deny_private_ranges: false` 是一次
+// 明确的配置选择，E02 只能挡住它最危险的那半种写法（通配主机名），
+// 写成具体内网主机名的档位会顺利通过校验并且从此每次都能连到那台机器。
+// 让它在启动日志里留一行，部署方 review 配置时才有机会发现这条档位上了生产机。
+func warnRelaxedAddressPolicy(reg *Registry, keys []string, logger *slog.Logger) {
+	var relaxed []string
+	for _, key := range keys {
+		profile, ok := reg.Lookup(key)
+		if !ok || profile.Kind != KindHTTP || profile.DenyPrivate {
+			continue
+		}
+		relaxed = append(relaxed, key)
+	}
+	if len(relaxed) == 0 {
+		return
+	}
+
+	logger.Warn("executor http profiles accept private and loopback addresses",
+		"profiles", strings.Join(relaxed, ","),
+		"reason", "deny_private_ranges is false",
+		"hint", "intended for reaching a service on the same development machine; remove it from production configs")
+}
+
+// profileHandler 是两种执行主体共同的最小形状：交出一个能给调度器的处理函数。
+// 用接口而不是 switch 里两份注册代码：分流只应该发生在一处（见 handlerFor）。
+type profileHandler interface {
+	Handler() core.Handler
+}
+
+// handlerFor 按档位的 kind 选执行主体：http 走 HTTPRunner，其余走进程执行器 Runner。
+//
+// 两条路共用 payload 校验、档位并发许可、产物存储与失败分类那一张表，
+// 差别只在"起一个进程"还是"发一个请求"。
+func handlerFor(p *Profile, artifacts *ArtifactStore, cfg core.ExecutorsConfig, logger *slog.Logger) profileHandler {
+	if p.Kind == KindHTTP {
+		runner, err := NewHTTPRunner(p, artifacts, cfg, logger)
+		if err == nil {
+			return runner
+		}
+		// NewHTTPRunner 只在 kind 不符时报错，而这一支刚判过它是 http：属于走不到的分支。
+		// 真走到了就退回进程执行器，由它在执行时说明"档位类型与本执行器不符"——
+		// 注册阶段 panic 会让整个进程起不来，而这条档位本身没写错。
+	}
+	return NewRunner(p, artifacts, cfg, logger)
 }
