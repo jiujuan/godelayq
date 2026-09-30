@@ -95,13 +95,13 @@
 
 ## 6. 完成标准（DoD）
 
-- [ ] `observability.enabled: false`（默认）时不构造订阅者、总线订阅数与改动前一致、库里没有文件。
-- [ ] `enabled: true` + `events.enabled: false` 时建表但不写入、不订阅（用一条用例把"不订阅"固定下来）。
-- [ ] `Publish` 的非阻塞契约没有被削弱：§5 第 5 条用例证明队列打满时发布方照常返回。
-- [ ] 事件在进程重启后仍在库里（手工步骤见 §7）。
-- [ ] `Close` 之后不再有写入，且 `Close` 幂等。
-- [ ] 装配顺序满足"在 `scheduler.Start()` 之前构造订阅者"，注释里写明漏掉会丢哪一段事件。
-- [ ] `core/` 与 `api/` 一行未改（DoD 第 7 条：本卡只加写入方）。
+- [x] `observability.enabled: false`（默认）时不构造订阅者、总线订阅数与改动前一致、库里没有文件。（`TestRun_ObservabilityDisabledOpensNothing`：`newObservabilityDB` 调用数为 0、配置路径上没有文件、日志没有 `observability enabled`；订阅数没有直接计数，由 `newEventLog` 同样不被调用这条路径保证）
+- [x] `enabled: true` + `events.enabled: false` 时建表但不写入、不订阅（`TestRun_EventLogDisabledOpensNoWriter` 里构造函数一被调用就 `t.Fatal`，启动日志写的是 `events_writer=false`；建表本身是 `sqlite.Open` 的迁移，与本卡无关，S02 已有用例）。
+- [x] `Publish` 的非阻塞契约没有被削弱：§5 第 5 条用例证明队列打满时发布方照常返回。（`TestEventLog_DoesNotBlockPublisher`：容量 4、发 400 条，发布总耗时上界 5 秒，且队列长度始终不超过 4）
+- [x] 事件在进程重启后仍在库里（手工步骤见 §7）。（§10.4：两轮任务六行，`seq` 1→6 连续，强制结束后重开文件内容不变）
+- [x] `Close` 之后不再有写入，且 `Close` 幂等。（`TestEventLog_CloseUnsubscribes`；幂等由 `closeOnce` 保证，重复调用返回第一次结果）
+- [x] 装配顺序满足"在 `scheduler.Start()` 之前构造订阅者"，注释里写明漏掉会丢哪一段事件。（`cmd/server/main.go` 装配块上方注释 + `TestRun_EventLogClosureIsMandatoryWhenEnabled`、`TestRun_ObservabilityClosedBeforeStore`）
+- [x] `core/` 与 `api/` 一行未改（DoD 第 7 条：本卡只加写入方）。（`git diff -- core api` 为空）
 
 ## 7. 验收方式
 
@@ -132,3 +132,86 @@ go test ./store/sqlite -run EventLog -v
 - 回滚：`events.enabled: false` 即可完全停止写入（表留着但不读不写）；整体回滚是删 `store/sqlite/events.go` + revert `cmd/server` 的装配提交。
 
 ## 10. 实现记录（执行时补写）
+
+完成日期：2026-10-01。新增 `store/sqlite/events.go`、`store/sqlite/events_test.go`，改 `cmd/server/main.go` 与两个 `cmd/server` 测试文件，另在 `store/sqlite/batch.go` 加了一个包内可见的 `queued()`。`core/` 与 `api/` 内容一行未改。
+
+### 10.1 落地的接口
+
+```go
+// store/sqlite/events.go
+type EventLogOptions struct{ FlushInterval, QueueCapacity, RetentionCount, RetentionAge, Now }
+func NewEventLog(bus *core.EventBus, db *DB, opts EventLogOptions, logger *slog.Logger) (*EventLog, error)
+func (e *EventLog) Flush() error
+func (e *EventLog) Close() error
+func (e *EventLog) Dropped() int64
+func (e *EventLog) Count() (int64, error)
+```
+
+链路：`SubscribeAll()` → 转发协程 `mapEvent` → `batcher[eventRecord].append`（非阻塞）→ `writeBatch`（一个事务里多条参数化 INSERT + 淘汰）→ 提交。转发协程内没有任何 SQL。
+
+### 10.2 与本卡写法的差异
+
+1. **`runtimeDeps.newEventLog` 的签名**（本卡 §3.7 写的是 `func(*core.EventBus, *sqlite.DB, ...) (*sqlite.EventLog, error)`）。实际是 `func(bus *core.EventBus, db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (eventLogAPI, error)`，默认闭包内部把 `db` 断言回 `*sqlite.DB`，断言失败返回错误。理由是沿用 S02 已定的消费侧窄接口口径（设计文档 §9.6）：`cmd/server` 的用例要能拿替身句柄验装配与关停顺序，否则只能全用真库。`sqlite.NewEventLog` 本身的签名与本卡一致，仍是 `*DB`。
+2. **按时间淘汰的语句**（本卡 §3.6 给的是 `DELETE FROM job_events WHERE ? > 0 AND ts_us < ?`）。实际改成 Go 侧先判断 `retentionAge <= 0` 就整条跳过，只执行 `DELETE FROM job_events WHERE ts_us < ?`。行为一致，差别是 `retention_age: 0` 时不再每批发一条恒真值为假的语句。按条数淘汰那条语句与本卡逐字一致。
+3. **注入的 `Now` 只补空时间戳**。本卡 §3.4 的说明是"`ts_us` 来自 `event.Timestamp.UnixMicro()`，注入的 `Now` 也经这条路径生效"。实现取的是：事件带时间戳就用它，`event.Timestamp.IsZero()` 才取 `Now()`；另外 `Now` 还用于按时间淘汰的截止点。这样真实事件保留自己的发生时间，而测试与第三方发布的空时间戳事件不会在库里落成 0。
+4. **`RetentionCount <= 0` 回落到默认值而不是不限量**（本卡未明说）。零值配置、以及 `Normalized()` 之后仍为 0 的路径都会落到 `core.DefaultObserveEventRetentionCount`，避免一个漏配把表推成无界增长；`RetentionAge < 0` 按 0 处理。用 `TestEventLog_DefaultsForNonPositiveOptions` 固定。
+5. **空批不产生事务的观察办法**。本卡 §5.10 建议用 `Stats()` 或 `seq` 连续性断言，但 `seq` 由 `AUTOINCREMENT` 给出，一次空事务在库里不留任何痕迹，读不出来。因此在 `EventLog` 上加了包内可见的 `writeRounds atomic.Int64`，用例断言连续五次 `Flush()` 之后它是 0。
+6. **`batcher[T].queued()`**。S02 的 `batch.go` 多了一个包内私有方法，返回队列里未落盘的条数。用途是把 `events_test.go` 里"睡一会儿再看结果"换成"等到条数对上"（`waitQueued`），将来把队列占用透出到运维端点时读同一个数。
+7. **用例命名**。本卡 §5.12 要的 `TestRun_EventLogClosedBeforeDB` 实现为把既有的 `TestRun_ObservabilityClosedBeforeStore` 扩成三个元素的顺序表（`event_log` → `observe_db` → `store`），断言的是同一条结论；`TestRun_EventLogDisabledOpensNoWriter` 按原名实现。另外补了 `TestRun_EventLogOpenFailureStopsStartup`、`TestRun_EventLogClosureIsMandatoryWhenEnabled`、`TestRun_ObservabilityEnabledOpensAndClosesForReal`（真 `sqlite.Open` + 生产闭包，走一遍类型断言那条路径，并重新打开文件确认两行仍在）。
+8. **§5 的 11 条包内用例全部实现，另有 4 条补充**（`TestEventLog_MapEvent`、`TestEventLog_RetentionAgeZeroKeepsEverything`、`TestEventLog_DefaultsForNonPositiveOptions`、`TestEventLog_WriteFailureIsRetriedOnce`），共 15 条。
+9. **`eventLogAPI` 不含 `Flush`**。装配侧只需要 `Close()` 与 `Dropped()`：落盘由写入器自己的周期负责，关停时它自己会把剩余批次写完，`run` 里没有单独 Flush 的时机。留着一个没人调的方法只会让人以为关停链路里有一次显式落盘。
+
+### 10.3 验证证据
+
+```
+go build ./...                                     通过
+go vet ./...                                       通过
+go test ./... -race                                全绿（api / cmd/server / core / executor / store/sqlite）
+go test ./store/sqlite -run "EventLog|NewEventLog" -v -race   15/15 PASS
+go test ./cmd/server -run "Observability|EventLog" -v -race    8/8 PASS
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...  通过
+GOOS=windows GOARCH=386 CGO_ENABLED=0 go build ./...  通过
+go build -tags dashboard ./... && go vet -tags dashboard ./...  通过
+grep -rln "modernc.org/sqlite" --include=*.go .       只有 store/sqlite/db.go、store/sqlite/doc.go
+git diff -- core api                                 空（内容未改）
+```
+
+`gofmt` 用去 CR 的临时副本跑，`cmd/server/main.go`、`store/sqlite/events_test.go` 有格式修正后写回；其余文件无变化。
+
+每个提交另外用 `git archive <sha> | tar -x` 在新目录里重建中间态再验一次（`go build ./...`、`go vet ./...`、`go test ./store/sqlite ./cmd/server`）。第一轮就这样暴露出 §10.5 那条用例问题：仓库里带 `-race` 跑得过，副本里不带 `-race`、多包并发跑不过。
+
+### 10.4 手工验收（本卡 §7）
+
+在 `%TEMP%\s03-smoke` 里放独立二进制与独立配置（`configs/config.example.yaml` 的副本），全部路径走 `GODELAYQ_*` 环境变量覆盖，不碰仓库的 `configs/config.yaml` 与 `data/`：
+
+```
+GODELAYQ_SERVER_PORT=8137  GODELAYQ_SCHEDULER_WORKERS=2
+GODELAYQ_OBSERVABILITY_ENABLED=true  GODELAYQ_OBSERVABILITY_PATH=<临时目录>/observe.sqlite
+GODELAYQ_OBSERVABILITY_FLUSH_INTERVAL=50ms  GODELAYQ_SERVER_AUTH_TOKEN=<本机随机串>
+```
+
+- 第一轮启动日志：`msg="observability enabled" path=... schema_version=1 journal_mode=wal events_writer=true`。
+- `POST /api/v1/jobs`（`payment_check`，`delay: 3s`）等它跑完，`sqlite3` 读回：
+
+  ```
+  1|job.scheduled|01a0f382-…c03|0
+  2|job.started  |01a0f382-…c03|1
+  3|job.completed|01a0f382-…c03|2
+  ```
+
+- 停进程（本机只能强制结束，见 10.5）、再启动，提交第二条任务（`email_send`，`delay: 3s`）：`seq` 从 4 续到 6，第一轮那三行内容、顺序都没变；`PRAGMA integrity_check` 返回 `ok`。
+- `metadata` 列在真库里是 `{"is_repeat":false,"trigger_at":"2026-10-01T02:10:02.816594+08:00"}`、`{"attempt":0}`、`{"duration_ms":2002}` 这样的原文；`data` 列在这两条任务上都是空（NULL），因为都成功了、没有错误负载。
+
+### 10.5 验证中发现并修掉的缺陷
+
+**`TestEventLog_DroppedIsCounted` 的前提是错的**（第一版按本卡 §5.6 写成"发 2×容量条，断言 `Dropped() == 发布数 - 落库数`"）。总线给每个订阅者的通道同样是非阻塞投递（`core/event.go` 的 `select/default`），订阅通道缓冲 100，一次性发 400 条时**先在总线那一层就丢掉一截**，那些事件根本到不了写入器，也就不会计进 `Dropped()`。等式只在"总线一条没丢"时成立，而这取决于转发协程当次被调度的快慢：本机跑过、在全新检出的副本里 `go test ./...`（无 `-race`、多包并发）跑出 `expected 396 dropped, got 279`。
+
+处置：发布条数改为正好等于一个订阅缓冲（100 条），这样总线不会丢，写入器的账就是确定的 4 条落库 + 96 条丢弃；用例注释写明"这条断言守的是写入器的账，不是总线的账"。反向验证过：`-count=20` 连跑 20/20 通过，副本里无 `-race` 连跑三轮通过。
+
+
+### 10.6 未覆盖与已知边界
+
+- **优雅停服这一步在本机做不到**：Windows 下无法从外部给控制台进程发 SIGTERM（`taskkill` 不带 `/F` 对该进程无效），所以手工验收的停止是强制结束。这意味着"重启后历史仍在"是用最硬的停法验的（那三行当时已经在 WAL 里），而"干净关闭会检查点 WAL""关闭顺序是先写入库→观测库→任务存储"两条仍只由 Go 用例覆盖（`TestCloseCheckpointsWAL`、`TestRun_ObservabilityClosedBeforeStore`），没有真进程响应可引。
+- **`data` 列的失败原文没有真跑过**：手工那两条任务都成功。`{"error":…}` 那段的原文入库由 `TestEventLog_PreservesDataAndMetadata` 覆盖。
+- **恢复阶段那批 `job.scheduled` 是否进库没有手工证据**：装配顺序的注释与 `TestRun_EventLogClosureIsMandatoryWhenEnabled`、`TestRun_ObservabilityEnabledOpensAndClosesForReal` 守住了"写入器在 `Start` 之前挂上"，但用例走的是替身调度器，没有真的从 `jobs.json` 恢复一条任务再读库。留待 S04 有读端点后一并补。
+
