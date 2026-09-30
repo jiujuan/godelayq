@@ -84,6 +84,31 @@ type eventLogAPI interface {
 
 type signalNotifier func(chan<- os.Signal, ...os.Signal)
 
+// auditLogAPI 是 run 对台账写入器的要求，与 eventLogAPI 同一取向：
+//   - 关停面（Close / Dropped）：把剩余行落盘、把丢弃数记进关停日志；
+//   - 读写两面（Append / Query）：原样交给 api.WithAuditLog。
+//
+// 这里的 Append 让 run 也持有写面，是因为服务与中间件用的是同一个句柄：
+// 台账的写入方就是查询方，分成两个闭包注入只会出现"一边写了另一边读不到"。
+type auditLogAPI interface {
+	Close() error
+	Dropped() int64
+	Append(api.AuditEntry) error
+	Query(api.AuditFilter) ([]api.AuditEntry, int, error)
+}
+
+// observabilityAPI 是装配好的观测层写入器集合，作为 newServer 的最后一个参数交给服务。
+// 整体为 nil 表示这次部署没装观测层；单个字段为 nil 表示那一个子开关关着。
+//
+// 合成一个参数而不是每加一个写入器就多一位：S04 用第六位传事件读取方，S06 再加就是第七位，
+// 下一个观测层写入器就是第八位，而每一位都要重排 23 处 newServer 字面量。
+// 合起来之后参数的语义也从"事件读取方"变成"这次部署装配了哪些观测层记录器"，
+// 关闭顺序仍然在 run 自己手里（它拿的是同一批句柄）。
+type observabilityAPI struct {
+	events eventLogAPI
+	audit  auditLogAPI
+}
+
 type runtimeDeps struct {
 	config       core.Config
 	newStore     func() (core.Store, error)
@@ -108,10 +133,16 @@ type runtimeDeps struct {
 	// 它列入依赖完整性检查的条件与上面这条相同：少了这个闭包的部署会一边写文件一边不记索引，
 	// 列表端点于是永远空着，与未启用索引看不出区别。
 	newArtifactIndex func(db observabilityDB, cfg core.ObservabilityConfig, rootDir string, logger *slog.Logger) (executor.ArtifactIndexer, error)
-	newServer        func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore, events eventLogAPI) (serverAPI, error)
-	notifySignals    signalNotifier
-	timeout          time.Duration
-	logger           *slog.Logger
+	// newAuditLog 把每个写操作登记成 write_audit 的一行，只在
+	// observability.enabled && observability.audit.enabled 时调用。
+	// 列入依赖完整性检查的条件与事件写入器相同：少了它这张表永远是空的，
+	// 而 /admin/audit 看起来"没有符合条件的记录"，与真的没有分不清。
+	newAuditLog func(db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (auditLogAPI, error)
+	newServer   func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry,
+		artifacts *executor.ArtifactStore, obs *observabilityAPI) (serverAPI, error)
+	notifySignals signalNotifier
+	timeout       time.Duration
+	logger        *slog.Logger
 }
 
 // defaultRuntimeDeps 把配置注入各构造闭包，run() 本身不再关心具体取值来源
@@ -172,7 +203,22 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				RootDir: rootDir,
 			}, logger)
 		},
-		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore, events eventLogAPI) (serverAPI, error) {
+		newAuditLog: func(db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (auditLogAPI, error) {
+			handle, ok := db.(*sqlite.DB)
+			if !ok {
+				// 与 newEventLog、newArtifactIndex 同一处置：台账要真连接，
+				// 接了假句柄就报错，而不是让这张表安静地空着。
+				return nil, fmt.Errorf("audit log needs the real observability handle, got %T", db)
+			}
+			return sqlite.NewAuditLog(handle, sqlite.AuditLogOptions{
+				FlushInterval:  cfg.FlushInterval,
+				QueueCapacity:  cfg.QueueCapacity,
+				RetentionCount: cfg.Audit.RetentionCount,
+				RetentionAge:   cfg.Audit.RetentionAge,
+			}, logger)
+		},
+		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry,
+			artifacts *executor.ArtifactStore, obs *observabilityAPI) (serverAPI, error) {
 			coreScheduler, ok := scheduler.(*core.Scheduler)
 			if !ok {
 				return nil, fmt.Errorf("default server requires *core.Scheduler, got %T", scheduler)
@@ -198,10 +244,16 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				// 写成无条件调用而不是两份装配，是为了让单二进制的差异只留在 web 包那一处。
 				api.WithConsole(web.Dist),
 			}
-			// 事件读取方按装没装配分岔：观测层或事件子开关关闭时这里是 nil，
-			// 两个事件端点继续读内存缓冲（未启用时的默认行为必须一字不变）。
-			if events != nil {
-				opts = append(opts, api.WithEventLog(events))
+			// 观测层的两面都按装没装配分岔：总开关或对应子开关关闭时那一面是 nil，
+			// 事件端点继续读内存缓冲、审计中间件继续只记日志（未启用时的默认行为必须一字不变）。
+			if obs != nil {
+				if obs.events != nil {
+					opts = append(opts, api.WithEventLog(obs.events))
+				}
+				if obs.audit != nil {
+					// 读写两面是同一个句柄：台账的写入方就是查询方
+					opts = append(opts, api.WithAuditLog(obs.audit, obs.audit))
+				}
 			}
 			return api.NewServer(coreScheduler, store, port, security, logger, opts...), nil
 		},
@@ -252,6 +304,12 @@ func run(deps runtimeDeps) error {
 	}
 	if deps.config.Observability.Enabled && deps.config.Observability.Artifacts.Enabled &&
 		deps.config.Executors.Enabled && deps.newArtifactIndex == nil {
+		return fmt.Errorf("runtime dependencies are incomplete")
+	}
+	// 台账的必需条件与事件写入器同形（总开关 + 自己的子开关），不带执行器那一条：
+	// 写操作在任何部署里都可能发生。
+	if deps.config.Observability.Enabled && deps.config.Observability.Audit.Enabled &&
+		deps.newAuditLog == nil {
 		return fmt.Errorf("runtime dependencies are incomplete")
 	}
 
@@ -326,6 +384,8 @@ func run(deps runtimeDeps) error {
 	var events eventLogAPI
 	// 产物索引同样声明在外面：挂给它的是产物存储（SetIndex），而日志要知道这次到底挂没挂。
 	var artifactIndex executor.ArtifactIndexer
+	// 台账也声明在外面：它既要在观测层那段里创建与关停，又要作为观测层参数交给服务。
+	var audit auditLogAPI
 
 	// 观测层（运行事件、产物索引、写操作审计三张表）只在总开关打开时装配。
 	//
@@ -393,6 +453,25 @@ func run(deps runtimeDeps) error {
 			artifacts.SetIndex(artifactIndex)
 		}
 
+		// 写操作台账：中间件装在 api 侧，行由这里创建的写入器落盘。
+		// 未启用审计子开关时不创建，中间件因此退回"只记一行结构化日志"那条路径（本卡 §3.2）。
+		if cfg.Observability.Audit.Enabled {
+			audit, err = deps.newAuditLog(db, cfg.Observability, deps.logger)
+			if err != nil {
+				return fmt.Errorf("observability audit writer: %w", err)
+			}
+			// 与事件写入器同一位置：晚于 db.Close 声明，因此先执行——剩余行先落盘再关连接。
+			defer func() {
+				if err := audit.Close(); err != nil {
+					deps.logger.Error("failed to close observability audit writer", "error", err)
+				}
+				if dropped := audit.Dropped(); dropped > 0 {
+					deps.logger.Warn("observability audit writer dropped records",
+						"dropped", dropped, "path", db.Path())
+				}
+			}()
+		}
+
 		// journal_mode 记的是实际生效值：网络文件系统上 WAL 会静默退回 delete，
 		// 只看配置文件里的写法看不出降级已经发生（本卡 §9 风险 2）。
 		deps.logger.Info("observability enabled",
@@ -400,7 +479,8 @@ func run(deps runtimeDeps) error {
 			"schema_version", stats.SchemaVersion,
 			"journal_mode", db.JournalMode(),
 			"events_writer", events != nil,
-			"artifact_index", artifactIndex != nil)
+			"artifact_index", artifactIndex != nil,
+			"audit_writer", audit != nil)
 	}
 
 	// 产物清理协程在观测层挂好之后起：Start 的第一轮扫描是"孤儿清理 + TTL 清理 + 索引对账"，
@@ -419,7 +499,14 @@ func run(deps runtimeDeps) error {
 		}()
 	}
 
-	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts, events)
+	// 观测层的两个写入器合成一个参数交给服务：都没装配时传 nil，
+	// 服务里两条注入都不发生（未启用观测层的部署行为与本卡之前一致）。
+	var obs *observabilityAPI
+	if events != nil || audit != nil {
+		obs = &observabilityAPI{events: events, audit: audit}
+	}
+
+	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts, obs)
 	if err != nil {
 		return err
 	}
