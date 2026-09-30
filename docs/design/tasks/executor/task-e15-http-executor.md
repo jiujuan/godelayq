@@ -214,7 +214,7 @@ Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
 | 命令 | 结果 |
 | --- | --- |
 | `go build ./... && go vet ./...` | 通过 |
-| `go test ./... -race -count=1` | api 84.6s、cmd/server 5.5s、core 12.5s、executor 22.0s 全 ok |
+| `go test ./... -race -count=1` | api 87.9s、cmd/server 5.5s、core 12.0s、executor 22.6s 全 ok（提交拆分后在临时 worktree 里逐个提交点复验，数字取那一次） |
 | `go test ./executor -run HTTP -race -count=3` | 15 条用例三轮全 PASS（拨号与 TLS 用例对时序敏感，按 DoD 要求重复跑） |
 | `GOOS=linux GOARCH=amd64`、`GOOS=darwin GOARCH=arm64` 的 `go build` + `go vet` | 通过 |
 | `go build -tags dashboard ./...` | 通过 |
