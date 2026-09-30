@@ -162,6 +162,7 @@ loader, err := core.NewDirectoryLoader(scheduler, core.LoaderOptions{
     PostLoadAction: core.ArchiveAfterLoad,
     ArchiveDir:     "./jobs/archive",
     ErrorDir:       "./jobs/errors",   // 校验/解析失败的文件留档到这里
+    AllowExecJobs:  false,             // 默认拒绝 exec.* 任务文件，见下一段
     EnableWatcher:  true,              // 实时监控新文件
     Logger:         logger,            // 可选，nil 用 slog.Default()
 })
@@ -177,6 +178,18 @@ defer loader.Stop()
 
 任务文件里的 `name` 必须在调度器的注册表里存在（`scheduler.RegisterHandler(name, ...)`），
 否则任务入堆后执行时会被判为失败（`no handler registered`）。
+
+例外是执行器档位：`name` 以 `exec.` 开头的任务文件**默认被加载器拒绝**，即使档位已经注册成功。
+这条路径上没有身份凭据，"能往这个目录写文件"如果不拒绝就等于"能在这台机器上执行档位声明的命令"。
+被拒绝的文件不会进堆、也不会调用任何 Handler，去向是一行 warn + 错误目录副本 + 按 `PostLoadAction` 处理：
+
+```
+level=WARN msg="executor job file rejected by the loader" path=job_queue\exec_try.json job_name=exec.echo reason="executor jobs are not accepted from the loader" hint="set LoaderOptions.AllowExecJobs only when writing into this directory is meant to grant execution"
+```
+
+要放开只能由程序显式设置 `LoaderOptions.AllowExecJobs`（配置项 `executors.loader_allow` 只由
+`Registry.LoaderAllowed()` 读取，调用方把结果填给加载器；服务端二进制不启用目录加载器，
+也就没有这条链）。前提与后果见 [部署文档](./deployment.md) 的"开启执行器"第 12 条。
 `LoaderOptions.HandlerMap` 可以在加载时直接绑定 Handler，但执行侧回查用的仍是注册表，
 两者键值都以 `name`（或任务 `type`）为准。
 
