@@ -299,6 +299,13 @@ type ExecMeta struct {
   重新加到 1，所以重试链的文件名始终是 `a1.*`，后一次执行会覆盖前一次的产物，`?attempt=2` 读不到东西
   （`Job.Attempts` 的既有缺陷，已登记在 §11 第 7 条，未修）。也就是说"按 attempt 分文件才看得到重试链各自的输出"
   这句在实现里不成立，`docs/api.md` 与 `GET /jobs/:id` 的 `attempts` 字段都按现状写明。
+- 产物索引（TASK-S05 追加）：每次执行的两侧字节数、截断与状态另登记一份在观测库的 `artifact_index` 表里，
+  由 `GET /jobs/:id/artifacts` 透出（`docs/api.md`）。定位是**加速器而不是账本**：文件仍是权威，索引写失败
+  只记一条日志、不改执行结果，快照里 `exec.artifact` 的取值语义照旧，那张表只是它的第二份记录。
+  写侧在两个 Runner 各一处（`executor/proc.go`、`executor/http.go`），删侧跟着 `Purge*` 的实际删除成功
+  （先删目录、再删行），另有启动对账把"有行、目录已不在"标成 purged。
+  上面那条"重试始终写 `a1.*`"的现状在这里同样成立：同一个 attempt 被二次登记是**覆盖**，
+  所以重试过的任务在列表里仍是一行，看不到两条尝试。
 - ⚠️ 清扫：实现是 `ArtifactStore.Start`（`executor/artifact.go`）——**启动时同步跑一轮完整扫描**（孤儿目录 +
   TTL 过期），之后每 `purgeInterval`（24 小时）只按 TTL 过期删除，不再重跑孤儿扫描；孤儿清理只做一次的理由写在
   `PurgeOrphans` 的注释里（运行期"存储与堆里都没有"的 ID 可能正在执行，删不得）。"每日跑一次 + 启动跑一次"
