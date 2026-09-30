@@ -91,6 +91,16 @@ POST /api/v1/auth/login
 
 完整矩阵见 `docs/design/web-console-design.md` §5.7.3。
 
+开启执行器后还有两条由配置决定的门槛，不放在上面那张表里（理由：它们可以按部署改，写死进代码就会与配置各说各话）：
+
+| 能力 | 门槛 | 说明 |
+| --- | --- | --- |
+| 提交执行器任务（`exec.*`） | `executors.required_role`，默认 `admin` | `viewer` 先被 `POST /jobs` 的 operator 门槛挡下；`machine` 与 operator 同档，默认配置下不能提交；`ops` 高于 `admin`，始终可提交 |
+| 读取含 `secret` 参数档位的产物正文 | 同一个 `executors.required_role` | `GET /jobs/:id/result` 的路由门槛是 `reader`，档位声明了 `secret` 时在处理器里升到这档 |
+
+15 组组合（三种 `required_role` × 五种身份）的逐条断言在 `api/executors_submission_test.go` 的
+`TestCreateJob_ExecutorRequiredRole`，结论与现场记录见 `docs/design/tasks/executor/task-e16-submission-role-and-mask.md` §5.1。
+
 ### 凭据通道
 
 四种等价传法，**按此优先级取其一**：
@@ -185,14 +195,14 @@ Content-Type: application/json
 
 | 字段           | 类型     | 必填 | 说明                                                  |
 | ------------ | ------ | -- | --------------------------------------------------- |
-| name         | string | ✅  | 任务类型名称，需提前注册 Handler                                |
+| name         | string | ✅  | 任务类型名称：代码里注册的 Handler，或 `executors.commands` 声明的执行器档位（`exec.<档位名>`）                                |
 | delay        | string | 条件 | 相对延迟，如 "10m", "1h30s"（与 trigger\_at/cron\_expr 三选一） |
 | trigger\_at  | string | 条件 | 绝对时间，ISO 8601 格式                                    |
 | cron\_expr   | string | 条件 | Cron 表达式，如 "0 \*/5 \* \* \* \*"                     |
-| payload      | object | ❌  | 任务数据，JSON 对象，会透传给 Handler                           |
+| payload      | object | ❌  | 任务数据，JSON 对象，会透传给 Handler；执行器任务的顶层键是固定的，见[执行器 API](#执行器-api)                           |
 | group        | string | ❌  | 分组标签，`[A-Za-z0-9_-]{1,64}`；不要求该分组已在 `/groups` 注册   |
 | is\_repeat   | bool   | ❌  | 是否重复执行（Cron 任务需设为 true）                             |
-| timeout      | string | ❌  | 单次执行超时，如 "30s"；为空不限制。Handler 需检查 ctx 才能被按时中止      |
+| timeout      | string | ❌  | 单次执行超时，如 "30s"；为空不限制。Handler 需检查 ctx 才能被按时中止；执行器任务以 `payload.timeout` 为准      |
 | max\_retries | int    | ❌  | 最大重试次数。**省略即 0（不重试）**，想要重试必须显式给值                |
 | retry\_delay | string | ❌  | 基础重试间隔，默认 "1m"                                      |
 
@@ -351,6 +361,16 @@ Content-Type: application/json
 暂停中的任务同样不能用它改分组（不在堆里 → 409）；给暂停或已结束的任务移组，
 用下面的批量操作端点。
 
+执行器任务在这里多四条约束。判定顺序是"任务不存在 404 → 改了名字 400 → 档位不够 403 → 不是 pending 409"，
+前两条在状态检查之前判，所以档位不够的身份不会从 409 里读出这条任务是否已经跑完：
+
+- `name` 只允许传回任务原本的名字，不同值即 400（`job name cannot be changed`，`details` 里写明当前名字
+  与要改成的那个）；这条对所有任务生效，把普通任务改成 `exec.` 前缀同样被拒。
+- 改 `payload` 会重跑提交期那一整套判定，因此执行器章节里那四种拒绝都可能在这里出现。
+- 档位声明为 `secret` 的参数在读取接口是 `***`，PUT 不会把它回填成原值；照原样保存会把 `***` 当成新的
+  取值写进任务，要改参数就把它改成真实取值再提交。
+- 改顶层 `timeout` 对执行器任务不起作用：生效超时每次从 payload 与档位重新求出，请求字段会被覆盖。
+
 ### 6. 取消任务
 
 ```json
@@ -486,6 +506,404 @@ Content-Type: application/json
 校验规则与单条 `POST /jobs` 完全一致（同一套解析逻辑），包括 `delay`/`trigger_at`/`cron_expr`
 优先级、`timeout` 格式非法即拒绝、以及未注册的 `name` 视为错误。
 
+## 执行器 API
+
+执行器把"任务类型"从代码里注册的 Handler 扩展到配置文件里声明的**档位**（profile）：一条档位写清楚
+用什么程序、跑哪个脚本、发哪个 HTTP 请求、允许哪些参数。注册之后它的任务类型名就是 `exec.<档位名>`。
+
+能执行什么完全由 `executors.commands` 决定：**没有自由命令行**，任务里也不能内联源码、不能要求现场编译。
+档位改动要重启进程。开关、白名单与部署前提见 [部署文档](./deployment.md) 的"开启执行器"一节。
+
+### 与 `/job-types` 的关系
+
+执行器打开（`executors.enabled: true`）并注册成功时，档位名与内置 Handler 名一起出现在
+`GET /api/v1/job-types` 里（按字典序）：
+
+```json
+{
+  "types": ["data_sync", "email_send", "exec.fail3", "exec.long60", "exec.nap",
+            "exec.not_deployed", "exec.show_token", "payment_check", "report_generate"]
+}
+```
+
+关闭时这个列表只剩代码里注册的那几个。探测不通过的档位（脚本没部署、程序不在 PATH）
+**仍然注册**，因此也会出现在这里；提交它会被拒，见下面的"提交期被拒的四种响应"。
+
+### 档位清单：`GET /api/v1/executors`
+
+```json
+GET /api/v1/executors
+```
+
+档位声明是公开信息（不含脚本内容与参数取值），`viewer` 及以上可读；执行器关闭时这不是错误，
+返回 `enabled: false` 与空列表。真实响应（本机六个档位里挑四个，含一个不可用的与一个 HTTP 的）：
+
+```json
+{
+  "enabled": true,
+  "required_role": "admin",
+  "max_timeout": "5m0s",
+  "profiles": [
+    {
+      "key": "exec.fail3",
+      "name": "fail3",
+      "kind": "script",
+      "runtime_ok": true,
+      "reason": "",
+      "timeout": "30s",
+      "max_parallel": 1,
+      "args": [
+        { "name": "day", "required": true, "default": "", "pattern": "^[a-z0-9-]{1,32}$", "secret": false }
+      ],
+      "env_allow": [],
+      "has_secret_args": false,
+      "preferred_result_direction": "tail"
+    },
+    {
+      "key": "exec.not_deployed",
+      "name": "not_deployed",
+      "kind": "script",
+      "runtime_ok": false,
+      "reason": "script file \"scripts/not-deployed.sh\" does not exist",
+      "timeout": "30s",
+      "max_parallel": 1,
+      "args": [],
+      "env_allow": [],
+      "has_secret_args": false,
+      "preferred_result_direction": "tail"
+    },
+    {
+      "key": "exec.show_token",
+      "name": "show_token",
+      "kind": "script",
+      "runtime_ok": true,
+      "reason": "",
+      "timeout": "30s",
+      "max_parallel": 1,
+      "args": [
+        { "name": "token", "required": true, "default": "", "pattern": "^[A-Za-z0-9._:/=,-]{1,256}$", "secret": true }
+      ],
+      "env_allow": [],
+      "has_secret_args": true,
+      "preferred_result_direction": "tail"
+    },
+    {
+      "key": "exec.local_health",
+      "name": "local_health",
+      "kind": "http",
+      "runtime_ok": true,
+      "reason": "",
+      "timeout": "10s",
+      "max_parallel": 1,
+      "args": [],
+      "env_allow": [],
+      "has_secret_args": false,
+      "preferred_result_direction": "head",
+      "method": "GET",
+      "body_mode": "none",
+      "url": "http://127.0.0.1:18090/api/v1/health"
+    }
+  ]
+}
+```
+
+字段口径：
+
+| 字段 | 说明 |
+| --- | --- |
+| `enabled` | `executors.enabled` 的当前值 |
+| `required_role` | 提交 `exec.*` 任务所需的最低角色；**执行器关闭时是 `null`**（那时"要什么档位"这个问题不成立） |
+| `max_timeout` | `executors.max_timeout`，payload 里 `timeout` 的上限；只在 `enabled: true` 时出现，关闭时整个键省略 |
+| `profiles[].key` | 提交任务时 `name` 要写的值（`exec.<档位名>`） |
+| `kind` | `script` / `binary` / `http` |
+| `runtime_ok` | **这台机器现在能不能跑**：解释器或程序在不在 PATH、脚本文件在不在。false 时提交被拒 |
+| `reason` | `runtime_ok: false` 的原因原文；可用时是空串 |
+| `timeout` | 档位声明的单次执行超时 |
+| `max_parallel` | 同一档位最多同时跑几个（配置里写 0 已在加载时归一为 1） |
+| `args[]` | 具名参数声明：`required`、`default`、`pattern`（配置留空时给的是实际生效的那份默认安全字符集）、`secret` |
+| `positional` | 对象 `{max, pattern}`；档位没声明位置参数时**整个键不出现** |
+| `env_allow` | payload 可以注入的环境变量**键名**白名单（取值不外露）；空表给 `[]` |
+| `has_secret_args` | 档位是否声明了至少一个 `secret` 参数。true 时 payload 与输出预览会掩码，读取产物正文的门槛也升到 `required_role` |
+| `preferred_result_direction` | 读这个档位输出时的建议起点：`head` 或 `tail`（`http` 给 `head`，进程档位给 `tail`），与下面 `/result` 的 `from` 参数同一套词 |
+| `method` / `body_mode` / `url` / `header_allow` | 只出现在 `http` 档位上。`body_mode` 是 `json` / `raw` / `none` 之一（配置里没写 `body` 的档位在这里归一成 `none`）；`url` 给的是模板原文（含 `{占位符}`），不是渲染后的地址；`header_allow` 是 payload 可覆盖的请求头名，**空表时整个键省略**（与 `env_allow` 的口径不同，别当成"没返回"） |
+
+### 提交执行器任务：`POST /jobs`
+
+任务对象与普通任务同一个端点、同一批字段，只有 `payload` 换成固定结构。顶层键**只能用下面这几个**，
+多写一个键整条请求被拒：
+
+| 键 | 适用档位 | 说明 |
+| --- | --- | --- |
+| `args` | 脚本 / 产物 | 具名参数的取值，键名必须是档位 `args[].name` 声明过的那些 |
+| `args._positional` | 脚本 / 产物 | 位置参数，字符串数组；数量上限与字符集见响应的 `positional` |
+| `env` | 脚本 / 产物 | 追加的环境变量，键名必须在 `env_allow` 里 |
+| `params` | HTTP | URL 模板里 `{占位符}` 的取值（占位符同样声明在档位的 `args` 里） |
+| `headers` | HTTP | 覆盖的请求头，名字必须在 `header_allow` 里；`Host`、`Content-Length`、`Transfer-Encoding` 由执行器决定，出现在这里就是错误 |
+| `body` | HTTP | 请求体，只有档位 `body_mode` 是 `json` 或 `raw` 才能给 |
+| `timeout` | 全部 | 本次执行的超时；超过 `max_timeout` 的值被夹到上限，超过档位 `timeout` 的值直接被拒 |
+
+**脚本档位**（`kind: script`，请求与 201 响应都是本机实测）：
+
+```json
+POST /api/v1/jobs
+{
+  "name": "exec.fail3",
+  "delay": "3s",
+  "payload": { "args": { "day": "mon" }, "timeout": "30s" }
+}
+```
+
+```json
+201 Created
+{
+  "id": "01a0f1f7-77bc-7209-bee8-daf1506f288e",
+  "name": "exec.fail3",
+  "status": "pending",
+  "trigger_at": "2026-09-30T18:58:55.7876014+08:00",
+  "payload": { "args": { "day": "mon" }, "timeout": "30s" },
+  "retry_count": 0,
+  "max_retries": 0,
+  "is_repeat": false,
+  "attempts": 0,
+  "created_at": "2026-09-30T18:58:52.7876973+08:00",
+  "updated_at": "2026-09-30T18:58:52.7876973+08:00",
+  "next_run_in": "3s"
+}
+```
+
+**产物档位带位置参数**（`kind: binary`）：
+
+```json
+{
+  "name": "exec.etl_full",
+  "delay": "10m",
+  "payload": { "args": { "window": "20261001", "_positional": ["part-01", "part-02"] } }
+}
+```
+
+**HTTP 档位**（`kind: http`）：
+
+```json
+{
+  "name": "exec.rebuild_index",
+  "delay": "1m",
+  "payload": {
+    "params": { "tenant": "acme" },
+    "headers": { "X-Trace-Id": "t-1" },
+    "body": { "force": true }
+  }
+}
+```
+
+两条容易写错的地方：
+
+- 请求体顶层的 `timeout`（任务字段）与 `payload.timeout` 不是一回事。执行器任务以 `payload.timeout` 为准：
+  它被求成生效超时并写进任务；顶层 `timeout` 只做上限检查（超过档位 `timeout` 直接 400），检查完就被覆盖。
+- 脚本与产物档位的命令行是 `[程序, 脚本路径, 固定参数, 渲染出的参数]` 拼出来的，
+  **中间没有 shell**。参数值里的空格与 `;`、`&&`、`|` 都只是普通字符，不会被当成命令语法解释。
+  Windows 上 `cmd`、`pwsh` 要带 `/c`、`-File` 之类开关才会去执行文件，而脚本档位没有放开关的位置，
+  可用写法见 [部署文档](./deployment.md) 的 Windows 限制一节。
+
+### 提交期被拒的四种响应
+
+四条文案各不相同，`details` 给的是判定依据原文（不含参数取值，除非取值本身违规）。都是本机实测响应：
+
+| 情况 | HTTP | 响应原文 |
+| --- | --- | --- |
+| 身份低于 `required_role` | 403 | `{"code":403,"message":"insufficient role","details":"job type \"exec.fail3\" is an executor profile; submitting it requires role admin (executors.required_role)"}` |
+| 参数格式不符 | 400 | `{"code":400,"message":"invalid executor payload","details":"args.day: value \"BAD DAY!\" does not match pattern ^[a-z0-9-]{1,32}$"}` |
+| payload 有档位不接受的键 | 400 | `{"code":400,"message":"invalid executor payload","details":"payload key \"cmd\" is not accepted by profile \"fail3\" (allowed keys: args, env, timeout)"}` |
+| 档位在这台机器跑不了 | 400 | `{"code":400,"message":"executor profile is not available on this server","details":"script file \"scripts/not-deployed.sh\" does not exist"}` |
+| 顶层 `timeout` 超档位上限 | 400 | `{"code":400,"message":"invalid timeout","details":"timeout 9m0s exceeds the 30s allowed by profile \"fail3\""}` |
+
+`viewer` 连建任务这一步都进不去（`POST /jobs` 路由本身要 operator），拿到的是不带 `details` 的
+`{"code":403,"message":"insufficient role"}`。静态 token 的身份是 `machine`，与 operator 同档，
+所以默认配置（`required_role: admin`）下**脚本凭据不能提交执行器任务**。
+
+批量创建逐条独立：档位不够的那一条在 `errors[]` 里给 403，整批仍是 207。
+
+```json
+207 Multi-Status
+{
+  "succeeded": 1,
+  "failed": 1,
+  "items": [
+    { "id": "01a0f206-5465-7a1a-9931-ac08706909b7", "name": "payment_check", "status": "pending" }
+  ],
+  "errors": [
+    {
+      "index": 1,
+      "code": 403,
+      "message": "insufficient role",
+      "details": "job type \"exec.fail3\" is an executor profile; submitting it requires role admin (executors.required_role)"
+    }
+  ]
+}
+```
+
+### 读取执行输出：`GET /jobs/:id/result`
+
+摘要在任务对象里就有，**正文要单独读**：它来自磁盘上的产物文件，响应带 `Cache-Control: no-store`，
+不随详情页一起取。
+
+查询参数：
+
+| 参数 | 取值 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `stream` | `out` / `err` | `out` | 读哪一路。`http` 档位的 `out` 是响应体，`err` 是请求与响应的头（**不是 stderr**） |
+| `from` | `head` / `tail` | `tail` | 从文件头还是尾读。建议起点看 `GET /executors` 的 `preferred_result_direction` |
+| `attempt` | 整数 | 最近一次 | 允许范围是 `1..attempts`；越界 400 |
+| `max_bytes` | 正整数 | 预览上限的 4 倍（`executors.output.inline_preview × 4`） | 单次请求的硬上限是 8 MiB，超过直接 400；再大的请求值也只会夹到 `executors.output.max_bytes`（文件不可能比它更大） |
+
+```json
+GET /api/v1/jobs/01a0f1f7-77bc-7209-bee8-daf1506f288e/result?stream=err&from=tail
+```
+
+```json
+200 OK
+{
+  "job_id": "01a0f1f7-77bc-7209-bee8-daf1506f288e",
+  "attempt": 1,
+  "stream": "err",
+  "found": true,
+  "size_bytes": 51,
+  "returned_bytes": 51,
+  "truncated": false,
+  "meta": { "kind": "script", "profile": "fail3", "exit_code": 3, "duration_ms": 34,
+            "out_bytes": 22, "err_bytes": 51, "permanent": true,
+            "preview": "stderr: missing input file\nstderr: cannot continue\n", "artifact": "available" },
+  "content": "stderr: missing input file\nstderr: cannot continue\n"
+}
+```
+
+`meta` 来自任务快照，`content` 来自产物文件，两者来源不同。产物文件被保留策略清掉之后（本机实测：
+同一个任务在 TTL 清理之后再读一次），摘要照旧给出，只是 `found: false`、`content` 为空，
+同时把快照里的 `meta.artifact` 回写成 `purged`（每个任务每次尝试最多回写一次；之后 `GET /jobs/:id`
+里的 `exec.artifact` 同样是 `purged`）：
+
+```json
+200 OK
+{
+  "job_id": "01a0f1f7-77bc-7209-bee8-daf1506f288e",
+  "attempt": 1,
+  "stream": "err",
+  "found": false,
+  "size_bytes": 0,
+  "returned_bytes": 0,
+  "truncated": false,
+  "meta": { "kind": "script", "profile": "fail3", "exit_code": 3, "duration_ms": 34,
+            "out_bytes": 22, "err_bytes": 51, "permanent": true,
+            "preview": "stderr: missing input file\nstderr: cannot continue\n", "artifact": "purged" },
+  "content": ""
+}
+```
+
+"文件不在"不等于"输出是空的"，也不等于"任务没跑过"：这三件事由状态码、`meta` 是否为 `null` 与 `found` 共同区分。
+
+失败返回（都是本机实测原文）：
+
+| HTTP | 触发条件 | 响应原文 |
+| --- | --- | --- |
+| 400 | 参数取值非法 | `{"code":400,"message":"invalid attempt","details":"got \"9\": attempt 9 is out of range, this job has 1 attempt(s)"}`；`stream`、`from`、`max_bytes` 同形（`invalid stream` / `invalid from` / `invalid max_bytes`） |
+| 403 | 档位声明了 `secret` 参数，而身份低于 `required_role` | `{"code":403,"message":"insufficient role","details":"profile \"show_token\" declares secret arguments; reading its execution output requires role admin"}` |
+| 404 | 任务不存在 | `{"code":404,"message":"job not found"}` |
+| 404 | 任务存在但没有执行结论（普通任务，或还没执行完） | `{"code":404,"message":"no execution result for this job"}` |
+| 503 | 部署没装配产物存储 | `{"code":503,"message":"execution output storage is not configured","details":"start the server with api.WithArtifacts to enable /api/v1/jobs/:id/result"}` |
+
+档位没声明 `secret` 参数时，这个端点的门槛就是 `reader`（`viewer` 及以上）。
+
+### 任务对象里的 `exec` 与 `attempts`
+
+执行器任务进入终态后带一个 `exec` 对象（普通任务没有这个键，读取方不要假设它一定存在）：
+
+| 字段 | 说明 |
+| --- | --- |
+| `kind` | `script` / `binary` / `http` |
+| `profile` | 档位名（不含 `exec.` 前缀） |
+| `exit_code` | 进程档位的退出码。与 `http_status` **互斥**：`http` 档位只写后者，状态码永远不会进 `exit_code` |
+| `http_status` | HTTP 档位响应的状态码 |
+| `signal` | 被信号中止时的信号名（Windows 上不产生） |
+| `duration_ms` | 本次执行的墙钟耗时 |
+| `out_bytes` / `err_bytes` | **落盘字节数**，不是输出的全长：超过 `executors.output.max_bytes` 的部分不会写进文件，此时 `truncated: true`。`capture_response: false` 的 HTTP 档位 `out_bytes` 为 0 |
+| `permanent` | 只在"重试无意义"时为 `true`（参数不合法、命令不存在、4xx、地址被策略拒掉等）；缺省即假 |
+| `preview` | 尾部预览，长度上限 `executors.output.inline_preview`；含 `secret` 参数的档位里命中的值被替换成 `***` |
+| `artifact` | `available` / `purged`：产物文件在不在。`purged` 由读取端点在发现文件已缺失时回写 |
+
+`attempts` 是所有任务都有的字段：已经启动过的执行次数，同时决定 `/result` 里 `attempt` 的允许范围。
+**已知现状**：重试副本不携带这个计数，所以重试过的任务这里仍然是 `1`，产物文件名也还是 `a1.out`，
+后一次执行覆盖前一次。要按尝试分别读输出，得先修那条计数（登记在 TASK-E15 卡的遗留事项里）。
+
+### 事件里的执行结论
+
+`job.completed` 与 `job.failed` 的 `data` 在有执行结论时是一个对象，`result` 就是上面那份 `exec` 摘要
+（失败时另有 `error` 一句人话）：
+
+```json
+{
+  "type": "job.failed",
+  "job_id": "01a0f1f7-77bc-7209-bee8-daf1506f288e",
+  "job_name": "exec.fail3",
+  "status": "failed",
+  "data": {
+    "error": "profile \"fail3\": exit status 3",
+    "result": { "kind": "script", "profile": "fail3", "exit_code": 3, "duration_ms": 34,
+                "out_bytes": 22, "err_bytes": 51, "permanent": true,
+                "preview": "stderr: missing input file\nstderr: cannot continue\n", "artifact": "available" }
+  },
+  "metadata": { "retry_count": 0, "max_retries": 0, "timeout": false, "permanent": true }
+}
+```
+
+`job.failed` 的 `metadata` 里 `retry_count`、`max_retries`、`timeout`（这次是否因超时中止）是既有字段；
+`permanent` 只在"重试无意义"时出现，取值恒为 `true`（不写 `false`，为了让既有事件的 JSON 形状一字不变）。
+`job.completed` 的 `metadata` 只有 `duration_ms`；`job.started` 带 `attempt`（见上文 `attempts` 的现状）。
+
+被崩溃恢复置为 `paused` 的执行器任务，`job.paused` 事件带来源标记：
+
+```json
+{
+  "type": "job.paused",
+  "metadata": { "reason": "restore_after_crash", "forced": true,
+                "attempts": 1, "trigger_at": "2026-09-30T19:04:34.4905316+08:00" }
+}
+```
+
+`reason: "restore_after_crash"` 表示这条暂停来自重启时的崩溃恢复，不是人在控制台点的；没有 `reason`
+的才是用户操作。这条标记必须写在事件里：事件历史在进程内存里，重启之后崩溃前那几轮 `job.started`
+已经不在，时间线上只剩这一条 `job.paused`。
+
+### 敏感参数（`secret`）出现在哪些地方
+
+档位把某个参数声明成 `secret` 之后，读取接口按值掩码，命中的位置是这些：
+
+- 任务对象的六处出口（创建、列表、详情、更新、重试、批量创建）里的 `payload`：掩的是 `args`、`params`、
+  `headers`、`env` 四个字段里命中参数名的**取值**；`body` 不掩（档位没有声明"body 里哪个键是凭据"的能力，
+  要传凭据就走请求头：把它声明成 `secret` 参数并放进 `header_allow`）。
+- 同一批出口与事件里的 `exec.preview`：按值替换，例如 `orders/***`，不是整段抹掉。
+- `/result` 响应里的 `meta.preview`。
+
+实测一对（同一个任务，输入框里的原值与读回来的样子）：
+
+```json
+{ "payload": { "args": { "token": "***" } },
+  "exec": { "preview": "received: --token=***\n" } }
+```
+
+两点要说清：
+
+- **掩码只发生在读取接口这一层。** `jobs.json` 里的 `payload`、产物文件正文与 `meta.json` 仍是提交时的原文，
+  所以这两个位置的权限要按凭据文件的等级设（见部署文档）。
+- 正文不掩，因为输出是脚本或对端打印出来的，框架层管不住它把值写回正文。因此含 `secret` 参数的档位被放行
+  读取时，响应多一个固定说明字段：
+
+```json
+{
+  "redaction_note": "output is produced by the script or the remote endpoint and may contain the values of secret arguments"
+}
+```
+
+这句话是提醒读的人"正文里可能有凭据"，不是"内容已防护"的声明。
+
 ## 分组管理 API
 
 分组的元数据存在 `store.groups_path`（默认 `./data/groups.json`）。
@@ -599,6 +1017,9 @@ GET /events?limit=100           # viewer 及以上，跨任务的全局最近事
 没有记录时返回空列表而不是 404：详情页时间线本来就可能在等第一个事件。
 事件与实时通道的关系：这里补的是"打开页面之前"的历史，之后的增量仍由 WS/SSE 推送。
 
+执行器任务的 `job.completed` / `job.failed` 在 `data` 里多带一份执行结论、`job.failed` 的 `metadata`
+多一个 `permanent`，字段口径见[执行器 API](#执行器-api)的"事件里的执行结论"。
+
 ## 运维 API（ops）
 
 只有 `ops` 档可用（`admin` 也不行）。未启用鉴权时所有请求都是匿名的 ops 档，
@@ -622,7 +1043,11 @@ GET /admin/runtime
     "running": 3,
     "heap_size": 15,
     "suspended": false,
-    "force_pause_pending": 0
+    "force_pause_pending": 0,
+    "exec_workers": 2,
+    "exec_running": 2,
+    "exec_queue_length": 2,
+    "exec_queue_capacity": 2
   },
   "event_history": {
     "jobs": 42,
@@ -635,6 +1060,11 @@ GET /admin/runtime
 ```
 
 只读，不含任务内容与凭据。`queue_length`/`running` 是瞬时值，用来看趋势不是用来审计的。
+
+执行器打开时 `scheduler` 里多四个 `exec_` 前缀的字段：执行器专用池的 worker 数、正在跑几个、队列长度与容量，
+与同一对象里的 `workers`/`running`/`queue_length`/`queue_capacity`（普通池）分账。档位任务走独立队列，
+队列满时任务留在堆与存储里等空位，普通任务的准时性不受它影响。`exec_running` 只算执行器池，
+因此它不等于 `GET /stats` 的 `running`（后者是两池之和）。执行器关闭时这四个字段是零值。
 
 ### 调度总开关
 
@@ -686,7 +1116,7 @@ GET /stats
 | 字段 | 来源 | 说明 |
 | --- | --- | --- |
 | pending / paused / completed / failed | 存储快照按状态计数 | completed/failed 依赖终态留痕，关闭留痕后恒 0 |
-| running | 进程内实时执行数 | 已进入 Handler、尚未返回的任务数 |
+| running | 进程内实时执行数 | 已进入 Handler、尚未返回的任务数；**执行器任务与普通任务共用这一个计数（两池之和）**，分池的数字在 `GET /admin/runtime` 里读 |
 | heap_size | 调度堆长度 | 仍在堆里等待的任务数 |
 | uptime | 进程启动至今 | 计数器不跨重启，completed/failed 随存储恢复而继续累计 |
 | scheduling_suspended | 调度总开关的当前值 | 与 `GET /admin/runtime` 的 `scheduler.suspended` 同源 |
@@ -735,6 +1165,17 @@ GET /job-types
 按字典序返回；`POST /jobs` 与 `POST /jobs/batch` 只接受其中出现过的 `name`，
 否则返回 400 `unknown job type`。注册表由进程启动时代码注册（见 `cmd/server`），
 不能通过 HTTP 动态增删。
+
+开启执行器时，配置里 `executors.commands` 声明的档位也在这一份注册表里，因此同样出现在 `types` 里；
+探测不通过的档位也在（提交它会被拒）。上面的响应是执行器关闭时的样子，打开时形如：
+
+```json
+{
+  "types": ["data_sync", "email_send", "exec.fail3", "exec.nap", "payment_check", "report_generate"]
+}
+```
+
+档位随进程启动从配置注册，改档位要重启；不存在"通过接口新增档位"这条路（见[执行器 API](#执行器-api)）。
 
 ## WebSocket 实时通信
 
