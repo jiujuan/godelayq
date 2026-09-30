@@ -152,7 +152,7 @@ Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
 | 命令 | 结果 |
 | --- | --- |
 | `go build ./... && go vet ./...` | 通过 |
-| `go test ./... -race -count=1` | api 112.1s、cmd/server 5.4s、core 12.6s、executor 22.1s 全 ok（这张表记的是改动定稿后的那次跑动。之后又跑了两次全仓：一次 api 包整包失败、其余三包 ok，一次四包全 ok（api 101.1s）；失败的那条用例与本卡无关，见"未验证与遗留"最后一条） |
+| `go test ./... -race -count=1` | api 112.1s、cmd/server 5.4s、core 12.6s、executor 22.1s 全 ok（这张表记的是改动定稿后的那次跑动。之后又跑了两次全仓：一次 api 包整包失败、其余三包 ok，一次四包全 ok（api 101.1s）；修完那条用例后再跑一次全仓，四包仍全 ok（api 49.1s、cmd/server 5.4s、core 11.9s、executor 20.8s）。失败的那条用例不是本卡引入的，原因与修法见"未验证与遗留"最后一条） |
 | `go test ./core -run 'Loader' -race -v` | §5.1…§5.5 六条新用例全 PASS |
 | 既有用例 | `core/load_test.go`、`core/load_watcher_test.go`、`core/load_format_test.go` 断言一字未改，全绿（§5.6 的回归要求） |
 | `GOOS=linux GOARCH=amd64`、`GOOS=darwin GOARCH=arm64` 的 `go build` | 通过 |
