@@ -100,6 +100,28 @@ const buffer = computed(() => {
     { label: '单任务窗口', value: history.per_job_capacity },
   ]
 })
+
+/**
+ * 执行器池四格（TASK-E18 §3.4 第 3 条）。
+ *
+ * workers=0 表示这次部署没建执行池（执行器关闭，或开关开着但并发被配成 0），
+ * 那种情况下显示四个 0 会被读成"池子空着、随时能用"，所以换成一句"未启用执行器"。
+ * 数字取自 GET /admin/runtime 的 scheduler 段，与上面"运行时占用"里的 running 是两套计数：
+ * 那边的 running 只算普通池（TASK-E13 的口径）。
+ */
+const execPool = computed(() => {
+  const current = scheduler.value
+  if (!current) return null
+  return {
+    enabled: current.exec_workers > 0,
+    rows: [
+      { label: '执行器 worker', value: current.exec_workers },
+      { label: '执行器执行中', value: current.exec_running },
+      { label: '执行器队列中', value: current.exec_queue_length },
+      { label: '执行器队列容量', value: current.exec_queue_capacity },
+    ],
+  }
+})
 </script>
 
 <template>
@@ -200,6 +222,28 @@ const buffer = computed(() => {
         <p class="mt-3 text-xs leading-relaxed text-[var(--color-text-muted)]">
           缓冲是内存里的，进程重启即清空；它是详情页时间线的数据源，不是审计日志。
           清空后各详情页从当前时刻重新开始，任务本身的历史记录不受影响。
+        </p>
+      </section>
+
+      <section class="rounded-[var(--radius-card)] border border-[var(--color-border)] bg-white p-4 lg:col-span-2">
+        <h2 class="mb-3 text-sm font-semibold">执行器池</h2>
+
+        <p v-if="execPool && !execPool.enabled" class="text-sm text-[var(--color-text-muted)]">
+          未启用执行器：这次部署没有执行池，档位任务不会进队列。
+          要开就在配置里把 <code>executors.enabled</code> 置真并声明档位，然后重启进程。
+        </p>
+
+        <dl v-else-if="execPool" class="grid grid-cols-2 gap-x-4 gap-y-2.5 text-sm md:grid-cols-4">
+          <div v-for="item in execPool.rows" :key="item.label" class="flex flex-col">
+            <dt class="text-xs text-[var(--color-text-muted)]">{{ item.label }}</dt>
+            <dd class="tabular-nums">{{ item.value }}</dd>
+          </div>
+        </dl>
+
+        <p v-if="execPool?.enabled" class="mt-3 text-xs leading-relaxed text-[var(--color-text-muted)]">
+          这四个数只算执行器池，与上面"运行时占用"里的"执行中"是两个池各自的计数：
+          档位任务走独立 worker，队列满时任务留在堆与存储里等空位，普通任务的准时性不受它影响（TASK-E13）。
+          <template v-if="runtime"> <code>/stats</code> 的 running 才是两池之和。</template>
         </p>
       </section>
     </div>

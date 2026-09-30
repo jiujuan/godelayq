@@ -16,7 +16,7 @@ import {
   type LucideIcon,
 } from 'lucide-vue-next'
 import UiBadge from '../ui/UiBadge.vue'
-import { formatDateTime } from '../../display'
+import { eventExec, execSummary, formatDateTime } from '../../display'
 import type { JobEvent } from '../../api/types'
 
 type Tone = 'primary' | 'success' | 'warning' | 'danger' | 'neutral'
@@ -57,17 +57,34 @@ const nodes = computed(() =>
     if (meta.was_paused === true) bits.push('原本处于暂停')
     if (typeof meta.next_retry_at === 'string') bits.push(`下次重试 ${formatDateTime(meta.next_retry_at)}`)
 
+    // 执行结论（TASK-E18 §3.4 第 1 条）：job.completed / job.failed 的 data 里带 result 时补一行短摘要。
+    // 只写结论与耗时，不写输出预览：预览按字节上限也可能有几百字符，一行摘要放不下，
+    // 完整内容在详情页的执行结果区块里看。
+    const summary = eventExec(event)
+    if (summary) bits.push(execSummary(summary))
+
     // 不认识的键照样露出来，只是按原样写：隐藏未知字段等于丢线索
     for (const [key, value] of Object.entries(meta)) {
       if (!HANDLED_KEYS.has(key) && value !== undefined && value !== null) bits.push(`${key}=${String(value)}`)
     }
 
-    // 失败事件的错误正文在 data 里，不在 metadata
-    const detail = typeof event.data === 'string' ? event.data : ''
+    // 事件的 data 有两种形状：早年的取消/无 handler 那几条是纯字符串，
+    // 有执行结论之后是 {error, result} 这样的对象。两种都要认，
+    // 否则对象形的错误正文会在页面上直接消失。
+    const detail = eventDetail(event)
 
     return { event, icon: shape.icon, tone: shape.tone, label: shape.label, bits, detail }
   }),
 )
+
+function eventDetail(event: JobEvent): string {
+  if (typeof event.data === 'string') return event.data
+  if (event.data && typeof event.data === 'object') {
+    const error = (event.data as { error?: unknown }).error
+    if (typeof error === 'string') return error
+  }
+  return ''
+}
 </script>
 
 <template>
@@ -86,7 +103,7 @@ const nodes = computed(() =>
             {{ formatDateTime(node.event.timestamp) }}
           </span>
         </div>
-        <p v-if="node.bits.length > 0" class="mt-1 text-xs text-[var(--color-text-muted)]">
+        <p v-if="node.bits.length > 0" class="mt-1 break-words text-xs text-[var(--color-text-muted)]">
           {{ node.bits.join(' · ') }}
         </p>
         <p v-if="node.detail" class="mt-1 break-all text-xs text-[var(--color-status-failed)]">
