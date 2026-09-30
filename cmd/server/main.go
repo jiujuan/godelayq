@@ -101,11 +101,17 @@ type runtimeDeps struct {
 	// newEventLog 给事件总线挂上第二个订阅者并把 job.* 事件写进 job_events，
 	// 只在 observability.enabled 与 observability.events.enabled 同时为真时调用。
 	// 它同样列入依赖完整性检查（按上一条的组合条件）：少了它事件表永远是空的。
-	newEventLog   func(bus *core.EventBus, db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (eventLogAPI, error)
-	newServer     func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore, events eventLogAPI) (serverAPI, error)
-	notifySignals signalNotifier
-	timeout       time.Duration
-	logger        *slog.Logger
+	newEventLog func(bus *core.EventBus, db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (eventLogAPI, error)
+	// newArtifactIndex 给产物存储挂上输出索引，只在
+	// observability.enabled && observability.artifacts.enabled && executors.enabled
+	// 三者同时成立时调用（关着执行器时根本没有产物可索引，此时建索引等于在库里留一张空表）。
+	// 它列入依赖完整性检查的条件与上面这条相同：少了这个闭包的部署会一边写文件一边不记索引，
+	// 列表端点于是永远空着，与未启用索引看不出区别。
+	newArtifactIndex func(db observabilityDB, cfg core.ObservabilityConfig, rootDir string, logger *slog.Logger) (executor.ArtifactIndexer, error)
+	newServer        func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore, events eventLogAPI) (serverAPI, error)
+	notifySignals    signalNotifier
+	timeout          time.Duration
+	logger           *slog.Logger
 }
 
 // defaultRuntimeDeps 把配置注入各构造闭包，run() 本身不再关心具体取值来源
@@ -153,6 +159,17 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				QueueCapacity:  cfg.QueueCapacity,
 				RetentionCount: cfg.Events.RetentionCount,
 				RetentionAge:   cfg.Events.RetentionAge,
+			}, logger)
+		},
+		newArtifactIndex: func(db observabilityDB, cfg core.ObservabilityConfig, rootDir string, logger *slog.Logger) (executor.ArtifactIndexer, error) {
+			handle, ok := db.(*sqlite.DB)
+			if !ok {
+				// 与 newEventLog 同一处置：索引要真连接，接了假句柄就报错，
+				// 而不是让这张表安静地空着。
+				return nil, fmt.Errorf("artifact index needs the real observability handle, got %T", db)
+			}
+			return sqlite.NewArtifactIndex(handle, sqlite.ArtifactIndexOptions{
+				RootDir: rootDir,
 			}, logger)
 		},
 		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore, events eventLogAPI) (serverAPI, error) {
@@ -233,6 +250,10 @@ func run(deps runtimeDeps) error {
 	if deps.config.Observability.Enabled && deps.config.Observability.Events.Enabled && deps.newEventLog == nil {
 		return fmt.Errorf("runtime dependencies are incomplete")
 	}
+	if deps.config.Observability.Enabled && deps.config.Observability.Artifacts.Enabled &&
+		deps.config.Executors.Enabled && deps.newArtifactIndex == nil {
+		return fmt.Errorf("runtime dependencies are incomplete")
+	}
 
 	cfg := deps.config.Normalized()
 	if deps.timeout <= 0 {
@@ -296,18 +317,15 @@ func run(deps runtimeDeps) error {
 			// 目录建不起来等于输出无处可写，与档位配置非法同级：不让进程带着"结果一定会丢"启动。
 			return err
 		}
-		cleanupCtx, stopCleanup := context.WithCancel(context.Background())
-		cleanerStopped := artifacts.Start(cleanupCtx, liveJobIDs(store))
-		// 先停清理协程再关存储（后声明的先执行）：否则协程可能在存储已关闭后再去读一次任务集合。
-		defer func() {
-			stopCleanup()
-			<-cleanerStopped
-		}()
+		// 清理协程到观测层挂好之后再起：Start 的第一轮扫描里要做索引对账
+		// （见下面观测层那段），提前起就看不到索引。
 	}
 
 	// 事件写入器在观测层装配那段里创建，声明放在外面：它同时是 api.Server 的事件读取方，
 	// 而 newServer 在观测层之后调用。未启用时保持 nil，两个事件端点因此走内存缓冲。
 	var events eventLogAPI
+	// 产物索引同样声明在外面：挂给它的是产物存储（SetIndex），而日志要知道这次到底挂没挂。
+	var artifactIndex executor.ArtifactIndexer
 
 	// 观测层（运行事件、产物索引、写操作审计三张表）只在总开关打开时装配。
 	//
@@ -361,13 +379,44 @@ func run(deps runtimeDeps) error {
 			}()
 		}
 
+		// 产物索引挂在产物存储上：写侧（两个执行器）与读侧（列表端点）拿的是同一份可选依赖，
+		// 所以这里只挂一次，不往 api 的注入参数里再加一位。
+		//
+		// 三个开关缺一不可：观测层总开关关着就没有这张表；事件之外单独关产物子开关时
+		// 文件照写、索引不记，此时列表端点明确 503；executors.enabled=false 时压根没有产物，
+		// 建索引等于在库里留一张空表。
+		if cfg.Observability.Artifacts.Enabled && artifacts != nil {
+			artifactIndex, err = deps.newArtifactIndex(db, cfg.Observability, artifacts.Dir(), deps.logger)
+			if err != nil {
+				return fmt.Errorf("observability artifact index: %w", err)
+			}
+			artifacts.SetIndex(artifactIndex)
+		}
+
 		// journal_mode 记的是实际生效值：网络文件系统上 WAL 会静默退回 delete，
 		// 只看配置文件里的写法看不出降级已经发生（本卡 §9 风险 2）。
 		deps.logger.Info("observability enabled",
 			"path", db.Path(),
 			"schema_version", stats.SchemaVersion,
 			"journal_mode", db.JournalMode(),
-			"events_writer", events != nil)
+			"events_writer", events != nil,
+			"artifact_index", artifactIndex != nil)
+	}
+
+	// 产物清理协程在观测层挂好之后起：Start 的第一轮扫描是"孤儿清理 + TTL 清理 + 索引对账"，
+	// 对账要读索引，起早了那份索引还不在。
+	//
+	// 这里的 defer 比观测层那两个 defer 后声明，因此关停顺序是：先停清理协程，
+	// 再撤事件订阅、关观测库、最后关任务存储。反过来就会让清理协程在索引连接已关之后
+	// 去删它该删的行。
+	if artifacts != nil {
+		cleanupCtx, stopCleanup := context.WithCancel(context.Background())
+		cleanerStopped := artifacts.Start(cleanupCtx, liveJobIDs(store))
+		// 先停清理协程再关存储（后声明的先执行）：否则协程可能在存储已关闭后再去读一次任务集合。
+		defer func() {
+			stopCleanup()
+			<-cleanerStopped
+		}()
 	}
 
 	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts, events)

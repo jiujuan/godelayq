@@ -1201,7 +1201,224 @@ func TestRun_NoServerReaderWhenEventsDisabled(t *testing.T) {
 	}
 }
 
-// TestLiveJobIDs 检查"存储里的 ID 集合"包装：内容一致，存储报错时原样透出
+// artifactIndexStub 是产物索引的替身：装配用例只回答"闭包返回的那一个实例有没有挂到产物存储上"。
+// 索引真正的读写行为在 store/sqlite 与 executor 两侧各有用例。
+type artifactIndexStub struct{}
+
+func (s *artifactIndexStub) Record(executor.IndexRecord) error { return nil }
+func (s *artifactIndexStub) MarkPurged(string, int) error      { return nil }
+func (s *artifactIndexStub) MarkAllPurged(string) error        { return nil }
+func (s *artifactIndexStub) DeleteByJob(string) error          { return nil }
+func (s *artifactIndexStub) List(string) ([]executor.IndexRecord, error) {
+	return nil, nil
+}
+func (s *artifactIndexStub) Exists(string, int) (bool, error) { return false, nil }
+
+// artifactIndexRun 是一次装配能看到的结果：交给服务的产物存储、newServer 被调了几次、启动日志。
+type artifactIndexRun struct {
+	store       *executor.ArtifactStore
+	serverCalls int
+	logs        string
+}
+
+// runWithArtifactIndexFlags 按三个开关的任意组合跑一次完整装配（不起真服务）。
+// newIndex 传 nil 就是"这份装配没有索引闭包"，正是依赖完整性检查要拦的那种。
+// 事件子开关一律关着，并且给事件闭包放了个会失败的钩子：产物索引不该顺手把事件写入器也拉起来。
+func runWithArtifactIndexFlags(t *testing.T, tune func(*core.Config),
+	newIndex func(observabilityDB, core.ObservabilityConfig, string, *slog.Logger) (executor.ArtifactIndexer, error),
+) (artifactIndexRun, error) {
+	t.Helper()
+
+	dir := t.TempDir()
+	cfg := core.DefaultConfig()
+	cfg.Executors.Output.Dir = filepath.Join(dir, "exec")
+	cfg.Observability.Path = filepath.Join(dir, "observe.sqlite")
+	cfg.Observability.Events.Enabled = false
+	if tune != nil {
+		tune(&cfg)
+	}
+
+	var result artifactIndexRun
+	var logs strings.Builder
+	logger := newCaptureLogger(&logs)
+
+	deps := runtimeDeps{
+		config:              cfg,
+		newStore:            func() (core.Store, error) { return newStubStore(), nil },
+		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
+		newExecutorRegistry: staticExecutorRegistry(nil, nil),
+		newArtifactStore: func(core.Config, *slog.Logger) (*executor.ArtifactStore, error) {
+			// 照 defaultRuntimeDeps 建真存储：索引挂在它身上，只有拿到同一个实例才看得见
+			return artifactStoreFromConfig(cfg, logger)
+		},
+		newObservabilityDB: unopenedObservabilityDB(t),
+		newEventLog: func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error) {
+			t.Fatal("the artifact index must not drag the event writer along")
+			return nil, nil
+		},
+		newArtifactIndex: newIndex,
+		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry,
+			artifacts *executor.ArtifactStore, _ eventLogAPI) (serverAPI, error) {
+			result.serverCalls++
+			result.store = artifacts
+			return newFakeServer(), nil
+		},
+		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
+			go func() {
+				ch <- syscall.SIGTERM
+			}()
+		},
+		timeout: 20 * time.Millisecond,
+		logger:  logger,
+	}
+	if cfg.Observability.Enabled {
+		deps.newObservabilityDB = func(core.Config, *slog.Logger) (observabilityDB, error) {
+			return &observabilityStub{stats: sqlite.Stats{SchemaVersion: 1}}, nil
+		}
+	}
+
+	err := run(deps)
+	result.logs = logs.String()
+	return result, err
+}
+
+// TestRun_ArtifactIndexIsSetOnStore 钉住索引的交接：闭包只在三开关齐备时被调用一次，
+// 拿到的是产物存储的根目录，返回的实例确实挂在了交给服务的那一份存储上。
+//
+// 这里比的是实例同一性而不是"挂没挂"：写侧（两个执行器）与读侧（列表端点）拿的必须是
+// 同一份可选依赖，接错成另一份存储时列表端点会永远看不见刚写下的产物。
+func TestRun_ArtifactIndexIsSetOnStore(t *testing.T) {
+	var gotRoot string
+	var calls int
+	stub := &artifactIndexStub{}
+
+	result, err := runWithArtifactIndexFlags(t, func(cfg *core.Config) {
+		cfg.Executors.Enabled = true
+		cfg.Observability.Enabled = true
+		cfg.Observability.Artifacts.Enabled = true
+	}, func(_ observabilityDB, _ core.ObservabilityConfig, rootDir string, _ *slog.Logger) (executor.ArtifactIndexer, error) {
+		calls++
+		gotRoot = rootDir
+		return stub, nil
+	})
+	if err != nil {
+		t.Fatalf("expected run to succeed, got %v", err)
+	}
+
+	if calls != 1 {
+		t.Fatalf("expected the index closure to be called once, got %d", calls)
+	}
+	if result.store == nil {
+		t.Fatal("expected an artifact store while executors are enabled")
+	}
+	if gotRoot != result.store.Dir() {
+		t.Fatalf("expected the artifact root %q, got %q", result.store.Dir(), gotRoot)
+	}
+	if result.store.Index() != executor.ArtifactIndexer(stub) {
+		t.Fatal("the store got a different index than the assembled one")
+	}
+	if !strings.Contains(result.logs, "artifact_index=true") {
+		t.Fatalf("expected the startup log to say the index is on, got %s", result.logs)
+	}
+}
+
+// TestRun_ArtifactIndexOffByEachSwitch 是上一条的反面：三个开关任一关闭都不建索引，
+// 而产物路径照常工作（"没装索引时端点怎么回答"由 api 的 503 用例负责）。
+func TestRun_ArtifactIndexOffByEachSwitch(t *testing.T) {
+	cases := []struct {
+		name string
+		tune func(*core.Config)
+	}{
+		{"executors off", func(cfg *core.Config) {
+			cfg.Observability.Enabled = true
+			cfg.Observability.Artifacts.Enabled = true
+		}},
+		{"observability off", func(cfg *core.Config) {
+			cfg.Executors.Enabled = true
+			cfg.Observability.Artifacts.Enabled = true
+		}},
+		{"artifacts off", func(cfg *core.Config) {
+			cfg.Executors.Enabled = true
+			cfg.Observability.Enabled = true
+			cfg.Observability.Artifacts.Enabled = false
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			result, err := runWithArtifactIndexFlags(t, tc.tune,
+				func(observabilityDB, core.ObservabilityConfig, string, *slog.Logger) (executor.ArtifactIndexer, error) {
+					calls++
+					return &artifactIndexStub{}, nil
+				})
+			if err != nil {
+				t.Fatalf("expected run to succeed, got %v", err)
+			}
+			if calls != 0 {
+				t.Fatalf("the index closure must not run while %s", tc.name)
+			}
+			if result.store != nil && result.store.Index() != nil {
+				t.Fatal("an artifact store must not carry an index here")
+			}
+			if result.serverCalls != 1 {
+				t.Fatalf("expected the server to be built once, got %d", result.serverCalls)
+			}
+			if strings.Contains(result.logs, "artifact_index=true") {
+				t.Fatalf("startup log must not claim the index is on: %s", result.logs)
+			}
+		})
+	}
+}
+
+// TestRun_ArtifactIndexClosureIsMandatoryWhenEnabled 与事件写入器那条同口径：
+// 三开关齐备却没有闭包，后果是"一边写文件一边不记索引"，与未启用看不出区别，必须启动期报错。
+func TestRun_ArtifactIndexClosureIsMandatoryWhenEnabled(t *testing.T) {
+	result, err := runWithArtifactIndexFlags(t, func(cfg *core.Config) {
+		cfg.Executors.Enabled = true
+		cfg.Observability.Enabled = true
+		cfg.Observability.Artifacts.Enabled = true
+	}, nil)
+	if err == nil || !strings.Contains(err.Error(), "runtime dependencies are incomplete") {
+		t.Fatalf("expected a missing index closure to be reported, got %v", err)
+	}
+	if result.serverCalls != 0 {
+		t.Fatalf("the server must not be built, got %d calls", result.serverCalls)
+	}
+
+	// 同样的配置只关产物子开关：不构造索引是预期行为，不该因此报错
+	_, err = runWithArtifactIndexFlags(t, func(cfg *core.Config) {
+		cfg.Executors.Enabled = true
+		cfg.Observability.Enabled = true
+		cfg.Observability.Artifacts.Enabled = false
+	}, nil)
+	if err != nil {
+		t.Fatalf("expected run to work without the closure while artifacts are off, got %v", err)
+	}
+}
+
+// TestRun_ArtifactIndexOpenFailureStopsStartup 与事件写入器、观测库那条同口径：
+// 建不起索引就不起服务，而不是让列表端点永远空着。
+func TestRun_ArtifactIndexOpenFailureStopsStartup(t *testing.T) {
+	wantErr := errors.New("artifact index table is missing")
+	result, err := runWithArtifactIndexFlags(t, func(cfg *core.Config) {
+		cfg.Executors.Enabled = true
+		cfg.Observability.Enabled = true
+		cfg.Observability.Artifacts.Enabled = true
+	}, func(observabilityDB, core.ObservabilityConfig, string, *slog.Logger) (executor.ArtifactIndexer, error) {
+		return nil, wantErr
+	})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected the index build error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "observability artifact index") {
+		t.Fatalf("expected the error to name the assembly step, got %v", err)
+	}
+	if result.serverCalls != 0 {
+		t.Fatalf("the server must not be built, got %d calls", result.serverCalls)
+	}
+}
+
 // TestLiveJobIDs 检查"存储里的 ID 集合"包装：内容一致，存储报错时原样透出
 // （PurgeOrphans 依赖这个错误决定跳过本轮删除）。
 func TestLiveJobIDs(t *testing.T) {
