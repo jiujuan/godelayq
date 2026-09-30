@@ -151,15 +151,21 @@ go test ./api -run 'Executor|MaskPayload|Secret' -v
    `exec.` 前缀同样被拒（冒烟 D5），因为换名字就等于换执行体。
 7. **PUT 的重校验走同一个 `gateExecutorSubmission`**，所以它同样包含档位判定与可用性判定
    （§3.2 只写"重跑同一套校验"）。operator 改不动执行器任务的 payload（冒烟 D1 拿 403）。
-8. **PUT 的状态检查在档位判定之前**：已结束的任务先拿到 409
-   `only pending jobs can be updated`。冒烟 D 组第一轮全部命中 409，改用 `delay: 30m`
-   的待执行任务才走到 403/400。如果希望档位不够的身份一律先看到 403，需要把判定提到状态
-   检查之前；本卡没有改，登记在"未验证与遗留"。
+8. **PUT 的判定顺序是"身份 → 请求合法性 → 任务状态"**：处理器在 `UpdatePending` 之前先读一次
+   快照（`snapshotOf`），依次给出 404（任务不存在）、400（改了名字）、403（执行器任务但档位不够），
+   之后才轮到 `core` 的 409（不是 pending）。理由与 §3.3 第 2 条把 `resultGuard` 放在参数解析之前
+   是同一条：状态码不该把"这条执行器任务跑完了没有"透露给本来就没权限的身份。
+   第一轮冒烟不是这个顺序（D 组全部命中 409，改用 `delay: 30m` 的待执行任务才走到 403/400），
+   复查时按上面这条改了实现，用例 `TestUpdateJob_ExecutorGuards/判档与改名排在状态检查之前`
+   与冒烟 D7 是现在的现场。代价是 PUT 多读一次存储（PUT 是低频操作，且 `GetJob` 本来就是整份读）。
 9. **掩码覆盖的 payload 字段是 `args`、`params`、`headers`、`env` 四个**（§3.3 第 1 条只列了
    args/headers/env）：`params` 是 http 档位的参数入口，漏掉它等于 http 档位的凭据不掩。
-10. **`body` 字段不掩码**：请求体是提交者自己给的业务数据，档位没有"这个 body 键是凭据"的
-    声明能力，整段掩掉会让普通档位的详情页读不出自己提交过什么。要不要按档位加一条
-    "body 整体视为 secret"的开关，留给用户定（登记在"未验证与遗留"）。
+10. **`body` 字段不掩码，这是结论不是漏项**：请求体是提交者给的业务数据，档位没有"body 里
+    哪个键是凭据"的声明能力，整段掩掉会让普通档位的详情页读不出自己提交过什么。
+    要给 http 档位传凭据的正确写法是走请求头：把参数声明成 `secret`，再在 payload 的 `headers`
+    里用同名键（要出现在档位的 `header_allow` 里）——`headers` 在 §3.3 的掩码字段集合内，
+    因此它的值既不会出现在读取响应里，也会在预览被对端回显时按值掩掉（`MaskSecretText` 读的
+    四个字段是 `args`/`params`/`headers`/`env`）。已把这条写进 E19 的接口文档清单。
 11. **`headers` 与 `env` 的键按归一化名字与 secret 参数名比较**（小写、连字符折成下划线）：
     档位参数写 `api_key`、payload 头写 `API-KEY` 算同一个凭据。反过来档位参数叫 `token`、
     payload 头叫 `X-Token` 不算同一个——名字不同的两个键在配置里就是两件事，框架不做前缀猜测。
@@ -232,6 +238,36 @@ handler 写出的预览本来就不含参数值——这条只有真实档位与
 同属磁盘上的产物。§9 第一条的风险照旧成立——把值换个写法再打印（例如 base64）就掩不住，
 这一层只覆盖"原样回显"这一种最常见形态，不能写成已防护。
 
+### 复查补记（同日，两条待确认口径收口）
+
+第 8 条与第 10 条登记的两条待确认按默认结论办了：
+
+1. **PUT 的判定顺序改成"身份 → 请求合法性 → 任务状态"**。实现上是把提交档位的判定从
+   `gateExecutorSubmission` 里拆出 `gateExecutorSubmissionRole`，让 `UpdateJob` 在
+   `scheduler.UpdatePending` 之前先读一次快照（`snapshotOf`）并按 404 → 400（改名）→ 403（档位）
+   的顺序判完，再轮到 `core` 的 409。理由与 `resultGuard` 放在参数解析之前同一条：
+   状态码不该把"这条执行器任务跑完了没有"透露给本来没权限的身份。
+   代价是 PUT 多读一次存储，PUT 是低频操作且 `GetJob` 本来就是整份读，可以接受。
+   新现场（单元测试 `TestUpdateJob_ExecutorGuards/判档与改名排在状态检查之前`，冒烟 D7 七条）：
+
+   | 请求 | 结果 |
+   | --- | --- |
+   | 已到 success 的 exec 任务 + operator 改 payload | 403 `insufficient role`（改之前是 409） |
+   | 同一条任务换 admin | 409 `only pending jobs can be updated`（状态仍然最后判） |
+   | 已到终态的普通任务 + 传不同 name | 400 `job name cannot be changed`（改之前是 409） |
+   | 已到终态的普通任务 + 只改 payload | 409 |
+   | 不存在的任务 | 404 |
+
+2. **`body` 不掩码定为结论**，并把"要给 http 档位传凭据就走请求头"的写法写进第 10 条与
+   E19 的接口文档清单：`secret` 参数 + `header_allow` 里的同名键，`headers` 在掩码字段集合内，
+   值既不进读取响应，也会在预览被对端回显时按值掩掉。
+
+顺带修了冒烟驱动自己的一处假通过：C4 那条"磁盘快照仍是原文"原本是 `SECRET_VALUE in 文件全文`，
+而 JSON 存储把 `payload` 按 base64 写，明文本来就不会以裸字符串出现在文件里；
+上一轮之所以通过，是文件里还留着改动之前那批任务的明文预览。现在 C4 解码 `payload` 再比
+（结论：磁盘上确实是原文），另加 C4b 检查磁盘上的 `exec.preview` 已经是掩码
+（执行侧写摘要时替换的结果）。清空 `data/` 之后整组重跑，45 条断言全部相符。
+
 ### 验证结果
 
 Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
@@ -241,6 +277,9 @@ Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
 | `go build ./... && go vet ./...` | 通过 |
 | `go test ./... -race -count=1` | api 100.9s、cmd/server 5.3s、core 12.7s、executor 21.4s 全 ok |
 | `go test ./executor ./api -race -count=1`（预览掩码落地后那一轮） | executor 21.9s、api 102.4s 全 ok |
+| `go test ./api ./core ./cmd/server -race -count=1`（复查改完 PUT 判定顺序之后） | api 124.5s、core 12.5s、cmd/server 5.5s 全 ok |
+| `go test ./... -race -count=1`（全仓，两次） | api 57.3s / 57.7s、executor 21.1s、core 11.8s、cmd/server 5.5s 全 ok |
+| `go test ./api ./executor -race -count=2` | api 111.5s、executor 41.3s 全 ok |
 | `GOOS=linux GOARCH=amd64`、`GOOS=darwin GOARCH=arm64` 的 `go build` | 通过 |
 | `go build -tags dashboard ./...` | 通过 |
 | §7 的 `go test ./api -run 'Executor \| MaskPayload \| Secret' -v` | 全 PASS（新增用例名含 `Executor`、`Mask`、`Secret`、`WarnOnce`） |
@@ -268,6 +307,7 @@ Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
 
 ### 冒烟（Windows 真实服务端 + REST）
 
+除说明另有写明的段落外，冒烟断言 45 条、不符 0 条。
 配置在临时目录：`executors.required_role: admin`（最后一段改成 `operator` 再跑一遍）、
 三个账号 `worker01`(operator)/`rooter01`(admin)/`keeper01`(ops) 加一个静态 token，
 `runtime_allow: [bash]`，三条档位：`hook_secret`（http，`token` 是必填 secret 参数）、
@@ -346,9 +386,8 @@ level=WARN msg="access denied" who=worker01 have=operator need="execution output
 
 - **`viewer` 身份在冒烟里没有账号**（配置只建了 operator/admin/ops 三个账号）：
   15 组矩阵在单元测试里覆盖了 viewer，结论是它在路由层就被挡住（建任务本身要 operator）。
-- **PUT 对已终态任务先给 409 而不是 403**（第 8 条）：要不要把档位判定提到状态检查之前，
-  让档位不够的身份一律先看到 403，登记待确认。
-- **`body` 字段是否整体视为凭据**（第 10 条）：登记待确认。
+- （复查后收口两条）PUT 的判定顺序按第 8 条改成"身份 → 请求合法性 → 状态"；
+  `body` 不掩码按第 10 条定下来，并给出"凭据走请求头"的写法。两条都已进代码与用例。
 - **旧数据文件里已落盘的明文**：payload 与旧任务的预览都在磁盘上；响应层现在会掩，
   但文件本身仍是原文（§3.3 第 3 条的口径，清理靠换数据文件或重跑任务）。
 - **WS/SSE 实时推送没有单独观测**：事件文本与 `GET /events` 取的是同一份摘要，

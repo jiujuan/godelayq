@@ -64,14 +64,16 @@
    - `PUT /jobs/:id` 现在能出现 `name` 字段，但只允许传回任务原本的名字：不同值 400
      `job name cannot be changed`（这一条对所有任务生效，普通任务改成 `exec.` 前缀同样被拒）；
      改 payload 会重跑提交期那一整套判定，因此四种拒绝都可能在这里出现。
-     已结束的任务先拿 409 `only pending jobs can be updated`，档位判定在状态检查之后。
+     判定顺序是"任务不存在 404 → 改了名字 400 → 档位不够 403 → 不是 pending 409"，
+     前两条在状态检查之前判，所以档位不够的身份不会从 409 里读出这条任务跑完了没有。
    - `GET /executors` 的 `required_role` 在执行器关闭时是 `null`；`has_secret_args` 只看档位
      有没有声明 secret 参数，不看某一次提交有没有真的带值。
    - 含 secret 参数的档位被掩码的位置要一次写清，别只写"payload 会掩码"：任务对象的六处出口
      （创建、列表、详情、更新、重试、批量）里的 `payload` 与 `exec.preview`，以及 `/result`
      响应里的 `meta.preview`。`payload` 掩的是 `args`/`params`/`headers`/`env` 四个字段里
-     命中 secret 参数名的取值，`body` 不掩；`exec.preview` 是按值替换（`orders/***`），
-     不是整段抹掉。磁盘上的 `jobs.json`、产物文件与 `meta.json` 都仍是原文。
+     命中 secret 参数名的取值，`body` 不掩（档位没有声明"body 里哪个键是凭据"的能力，
+     要传凭据就走请求头：`secret` 参数 + `header_allow` 里的同名键）；`exec.preview` 是按值替换
+     （`orders/***`），不是整段抹掉。磁盘上的 `jobs.json`、产物文件与 `meta.json` 都仍是原文。
    - `/result` 被档位挡住时 details 说的是档位的声明，不是任务内容；放行时响应多一个
      `redaction_note` 字段，取值是固定一句英文，文档里给出原文并说明它是提醒而不是"已防护"。
 
