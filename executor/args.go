@@ -126,6 +126,9 @@ func ValidateSubmission(p *Profile, payload []byte) (*Submission, error) {
 		if err := fillValues(p, rawParams, sub.Params, "params"); err != nil {
 			return nil, err
 		}
+		if err := checkURLParamValues(p, sub.Params); err != nil {
+			return nil, err
+		}
 		if err := checkSubmissionHeaders(p, sub.Headers); err != nil {
 			return nil, err
 		}
@@ -361,6 +364,12 @@ func checkSubmissionHeaders(p *Profile, headers map[string]string) error {
 		if key != strings.TrimSpace(key) || key == "" || strings.ContainsAny(key, ": ") {
 			return fmt.Errorf("headers.%q: not a valid header name", key)
 		}
+		// 这三个头由 net/http 与实际目标地址决定，交给 payload 等于把"目标主机可以改写"
+		// 这条路重新打开——E15 的 allowed_hosts 与拨号层检查都以请求的 URL 为准。
+		// 显式拒绝而不是"反正 net/http 会忽略"：静默忽略会让人以为覆盖成功了。
+		if forbiddenHTTPRequestHeader(key) {
+			return fmt.Errorf("headers.%s: this header is set by the executor, not by the payload", key)
+		}
 		if containsControl(value) || containsControl(key) {
 			return fmt.Errorf("headers.%s: name and value must not contain control characters", key)
 		}
@@ -374,6 +383,49 @@ func checkSubmissionHeaders(p *Profile, headers map[string]string) error {
 		if !allowed {
 			return fmt.Errorf("headers.%s: not in the profile's header_allow (%s)",
 				key, strings.Join(p.HeaderAllow, ", "))
+		}
+	}
+	return nil
+}
+
+// forbiddenHTTPRequestHeader 判断请求头是否属于"由执行器决定、payload 不得设置"的那几个。
+//
+// Host 决定实际访问的主机（本卡两层检查的前提就是它不可控）；
+// Content-Length 与 Transfer-Encoding 决定分帧方式，让调用方指定会出现长度与体不一致的连接错误。
+func forbiddenHTTPRequestHeader(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "host", "content-length", "transfer-encoding":
+		return true
+	default:
+		return false
+	}
+}
+
+// urlParamForbidden 是 URL 占位符值里不许出现的字符（TASK-E15 §3.2）。
+//
+// E08 的默认字符集（executor.DefaultArgPattern）允许 `:` `/` `=` `,`——那对脚本参数是正常的
+// （路径、URL 片段），但同一个值填进 url_template 就能改掉 URL 结构：
+// `/` 多出一段路径，`?` `#` 把后面的内容变成查询串或片段，`@` 换掉主机，
+// `%` 让下游把后续字符当成转义序列再解一次（值里 `%2F` 到对端就成了 `/`，等于绕开本规则）。
+// 所以 http 档位的占位符值走这一份更严的字符集，脚本档位不受影响。
+// 空白与控制字符一并拒绝；`\` 也拒（Windows 路径习惯写进 URL 只会造成歧义）。
+const urlParamForbidden = `/ ?#@:%\` + "\t\r\n" + "\\"
+
+// checkURLParamValues 逐个检查 URL 占位符的值。
+//
+// 按档位声明的参数顺序遍历而不是遍历那张 map：map 的顺序每次不同，
+// 同一次提交两次报出不同的键会让运维以为问题在变。
+// 错误信息里只出现参数名，不出现值：参数可以是 secret（口令进 URL 路径是常见写法），
+// 而这条校验的失败文本会进接口响应与任务事件。
+func checkURLParamValues(p *Profile, params map[string]string) error {
+	for _, spec := range p.Args {
+		value, ok := params[spec.Name]
+		if !ok {
+			continue
+		}
+		if strings.ContainsAny(value, urlParamForbidden) {
+			return fmt.Errorf("params.%s: the value cannot be used in a URL path segment (it must not contain space or any of %q)",
+				spec.Name, urlParamForbidden)
 		}
 	}
 	return nil

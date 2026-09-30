@@ -746,6 +746,13 @@ func checkURLTemplate(raw string, allowedHosts []string, args []ArgSpec, index i
 	if err != nil {
 		return profileError(index, name, "url_template is not a valid URL: %v", err)
 	}
+	// 占位符只支持出现在路径段（TASK-E15 §3.2）。查询段的取值规则不一样：
+	// 路径段里值不能含 `/ ? #`，而查询串本来就要用 `=` `&` 这类分隔符，
+	// 一套字符集管两种位置迟早出错。写在配置阶段报错，比在执行阶段猜意图清楚。
+	if cut := strings.IndexAny(raw, "?#"); cut >= 0 && placeholderPattern.MatchString(raw[cut:]) {
+		return profileError(index, name,
+			"url_template placeholders are only supported in the path segment, not in the query or fragment")
+	}
 	if parsed.Host == "" {
 		return profileError(index, name, "url_template %q has no host", raw)
 	}
