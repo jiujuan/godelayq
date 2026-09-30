@@ -1180,6 +1180,131 @@ DELETE /admin/events
 返回 `{"cleared": 118}`（被清掉的条数）。之后各详情页时间线从当前时刻重新开始，
 任务本身与存储记录不受影响。
 
+### 写操作台账：`GET /api/v1/admin/audit`
+
+```json
+GET /admin/audit?limit=20&actor=admin01&verdict=denied
+```
+
+读的是 SQLite 观测库的 `write_audit` 表：**每个写请求（POST/PUT/DELETE）一行**，
+记录谁、以什么身份、对哪个端点做了什么、成没成、耗时多久。
+读端点（GET）与 WebSocket/SSE 握手不进台账，否则会被前端轮询写满。
+
+前置条件是 `observability.enabled` 与 `observability.audit.enabled` 同时为真
+（设计文档 §6.3、任务卡 TASK-S06）。任一为假时本端点返回 503：
+
+```json
+{
+  "code": 503,
+  "message": "write audit log is not configured",
+  "details": "start the server with observability.enabled and observability.audit.enabled to enable /api/v1/admin/audit"
+}
+```
+
+503 而不是 404：开关没打开的部署里，路由存在这一点本身就该说清楚。
+台账写入器未装配时写请求仍会落一行结构化日志（`msg="write operation audited"`），
+所以关掉开关不是丢掉审计，是退回只查日志。
+
+查询参数（全部可选，组合时按 AND 处理）：
+
+| 参数 | 取值 | 说明 |
+| --- | --- | --- |
+| `limit` | 非负整数，默认 50，上限 500 | 一页行数；`0` 按默认 50 处理，超过 500 是 400 而不是被截断 |
+| `offset` | 非负整数，默认 0 | 跳过行数，配合 `total` 翻页 |
+| `actor` | 账号名，≤128 字符 | 精确匹配；匿名请求这列是空串，`actor=` 匹配不到它们 |
+| `action` | 下方动作词表之一 | 拼错或不在表内一律 400 |
+| `verdict` | 下方结论词表之一 | 同上 |
+| `since` / `until` | RFC3339 时间 | 两端都含；按写入时间比较 |
+
+`limit=abc`、`limit=-5`、`?verdict=nonsense` 这类都是 400，`details` 会给出该参数的合法取值：
+
+```json
+{
+  "code": 400,
+  "message": "invalid verdict",
+  "details": "got \"nonsense\": expected one of ok, bad_request, denied, not_found, conflict, partial, throttled, error, other"
+}
+```
+
+读库失败是 500（`failed to load audit records`），不会静默返回一份看起来完整的空结果。
+
+响应体：
+
+```json
+{
+  "count": 2,
+  "total": 41,
+  "limit": 2,
+  "offset": 0,
+  "items": [
+    {
+      "time": "2026-10-01T05:34:06.888916+08:00",
+      "actor": "admin01",
+      "actor_kind": "user",
+      "role": "admin",
+      "action": "job.create",
+      "method": "POST",
+      "route": "/api/v1/jobs",
+      "status": 201,
+      "latency_us": 0,
+      "verdict": "ok",
+      "exec_verdict": "accepted",
+      "handler_key": "exec.hello",
+      "profile": "hello",
+      "job_id": "01a0f43d-3428-7dfa-8fc0-4a93a626436f",
+      "remote_ip": "127.0.0.1",
+      "user_agent": "curl/8.17.0"
+    },
+    {
+      "time": "2026-10-01T05:34:06.825442+08:00",
+      "actor": "operator01",
+      "actor_kind": "user",
+      "role": "operator",
+      "action": "job.create",
+      "method": "POST",
+      "route": "/api/v1/jobs",
+      "status": 403,
+      "latency_us": 0,
+      "verdict": "denied",
+      "exec_verdict": "role_denied",
+      "exec_reason_code": "admin",
+      "handler_key": "exec.hello",
+      "profile": "hello",
+      "remote_ip": "127.0.0.1",
+      "user_agent": "curl/8.17.0"
+    }
+  ]
+}
+```
+
+- **顺序是最新在前**（表内 `seq` 降序），与事件端点的升序相反：台账的用法是"刚发生了什么"。
+  空结果是 `items: []` 而不是 `null`。`total` 是匹配过滤条件的总行数，`count` 是本次返回的行数。
+- `route` 存的是 gin 的**路由模板**（`/api/v1/jobs/:id`），不是原始 URL——任务 ID 属于请求内容。
+- `actor_kind` 是 `user`（控制台账号）、`machine`（静态 token）、`anonymous`（免鉴权部署）。
+  静态 token 折算 operator 档，因此它读不到本端点（要 ops）。`actor` 对 `machine` 与匿名请求都是空串，
+  区分它们看 `actor_kind`。
+- `verdict` 由状态码派生：`ok`（2xx）、`bad_request`（400）、`denied`（401/403）、`not_found`（404）、
+  `conflict`（409）、`partial`（207）、`throttled`（429）、`error`（其余 5xx）、`other`（兜底）。
+  401 算 `denied`：一次失败的登录尝试正是要看的行。
+  两个批量端点（`job.batch_create`/`job.batch_op`）的 `action` 行一律是 `partial`——
+  批量端点即使全部成功也返回 207，逐条结果在响应体里，台账一行不表达"哪几条失败"。
+- `action` 是封闭动作词，与"方法 + 路由模板"一一对应：`auth.login`、`auth.refresh`、`auth.logout`、
+  `auth.ws_ticket`、`job.create`、`job.update`、`job.cancel`、`job.retry`、`job.pause`、`job.resume`、
+  `job.force_pause`、`job.batch_create`、`job.batch_op`、`group.create`、`group.update`、`group.delete`、
+  `admin.scheduler_suspend`、`admin.scheduler_unsuspend`、`admin.events_clear`。
+  未匹配到路由的请求记 `unmatched`（404 的乱撞路径），匹配到路由但表里没配动作记 `other`——
+  加了写路由忘了配表时台账不会静默少行。
+- `exec_verdict`/`exec_reason_code`/`handler_key`/`profile` 只在执行器任务的提交期出现
+  （`POST /jobs` 与 `PUT /jobs/:id`）。`exec_verdict` 是 `accepted`|`role_denied`|`profile_unavailable`|
+  `payload_rejected`|`timeout_rejected`；`exec_reason_code` 只存结论码，其中 `role_denied` 那行存的是
+  要求达到的档位名（如 `admin`）。**参数取值、请求体、校验错误原文都不进表**（设计文档 D7）：
+  人类可读的说明继续走 slog 与响应体。
+- `job_id` 只在提交动作里填（新建任务时由服务端生成），批量请求那一行的 `job_id` 留空。
+- `latency_us` 是微秒整数。开发机上的单调时钟粒度可能粗到让快请求显示 0——它是量级参考，不是精确计时。
+
+保留策略在配置里（`observability.audit.retention_count` 默认 50 万条、`retention_age` 默认 2160 小时），
+本端点只读不删：给它一个清空按钮会让"谁删了台账"这件事没有出处。
+
 ## 统计与监控 API
 
 ### 获取统计信息

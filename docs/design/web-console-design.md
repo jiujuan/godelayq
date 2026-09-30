@@ -604,7 +604,9 @@ GET    /api/v1/admin/runtime       ops          worker/队列/堆/in-flight/缓�
 POST   /api/v1/admin/scheduler/suspend   ops    调度总开关（§5.2 Suspend）
 POST   /api/v1/admin/scheduler/unsuspend ops
 DELETE /api/v1/admin/events        ops          清空事件环形缓冲，返回 {cleared:n}
-# 写操作审计本期只输出结构化日志（§5.7.6）；/admin/audit 查询端点留二期
+# 写操作台账：结构化日志（§5.7.6）+ SQLite write_audit 表与查询端点，见
+# docs/design/sqlite-observability-design.md §6.3 与任务卡 TASK-S06
+GET    /api/v1/admin/audit         ops          写操作台账查询（§5.7.6），未装配观测库时 503
 ```
 
 实现落点：生命周期与批量在 `api/handlers_lifecycle.go`，分组在 `api/handlers_groups.go`，
@@ -797,9 +799,22 @@ server:
 
 #### 5.7.6 审计日志
 
-`api` 层对**写操作**（POST/PUT/DELETE，含 pause/force-pause/groups/admin/*）记录一行
-结构化日志：`who(name) role= action= method path status= latency=`。落现有 logger
-（`core/scheduler.go` 已用 slog 风格），不引入新存储。持久化后可查询属二期。
+`api` 层对**写操作**（POST/PUT/DELETE，含 pause/force-pause/groups/admin/*）记一笔台账，
+两条出口：
+
+- **结构化日志**（本节原始方案，仍然是关闭观测层时的唯一出口）：一行
+  `msg="write operation audited"`，字段与表列同名（`who`/`role`/`action`/`method`/`route`/
+  `status`/`latency_us`/`verdict`，执行器任务再多 `exec_verdict`/`exec_reason`/`profile`/`handler_key`）。
+  由 `api/audit.go` 的中间件产出，未装配写入器时走这条。
+- **持久化与查询**（`docs/design/sqlite-observability-design.md` §6.3 的 `write_audit` 表，
+  由 `docs/design/tasks/sqlite/task-s06-write-audit-and-endpoint.md` 落地）：同一份内容写进
+  SQLite 观测库，`GET /api/v1/admin/audit` 按账号/动作/结论/时间区间查询，两端都取 ops 档。
+  开关是 `observability.enabled` 与 `observability.audit.enabled`，任一为假时端点返回 503、
+  台账退回只落日志。
+
+两条都不记请求体、参数取值与校验错误原文（设计文档 D7）；`route` 记路由模板而非原始 URL。
+访问日志 `requestLogger` 那行（`msg="http request"`）继续存在且覆盖读请求，
+它说的是"这个请求被怎么处理"，台账说的是"谁改动了什么"，两行的字段与用途不同。
 
 ---
 
