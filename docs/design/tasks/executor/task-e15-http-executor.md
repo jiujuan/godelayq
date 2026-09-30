@@ -113,3 +113,163 @@ go test ./... -race
 - 风险：允许 `deny_private_ranges: false` 为本地回环调试保留一个例外配置，等于关掉这道防线。要求：显式设 false 时 E02 校验必须同时要求 `allowed_hosts` 全为具体主机名（E02 第 3.4 已含此规则），并在启动时记一条 warn；文档（E19）里写明这只允许在开发机使用。
 - 风险：`Preview` 取响应体尾部，对 JSON 错误响应可能只看到半截。可接受（完整内容在产物文件里），但 `/result` 的默认 `from` 对本 kind 应偏向 `head`；本卡在代码里留一个 `preferredStreamDirection` 提示并在 E18 使用，避免前端各自猜。
 - 回滚：`http.go` 独立文件；`Register` 的分流改动是一处 `switch`，回滚后 `http` 档位在 E02 校验阶段就会因为"kind 未实现"被拒（要求 E02 在校验时把 `kind:http` 当已支持处理，因此回滚后要同步把 kind 判定改回来——记录在提交信息里）。
+
+## 10. 实现记录（2026-09-30）
+
+落地文件：新增 `executor/http.go`（`HTTPRunner`、`NewHTTPRunner`、`Handler`、请求构造与地址渲染、
+响应处理与产物写入、拨号层地址判定、`PreferredResultDirection`）与新增 `executor/http_test.go`
+（15 条用例：§5.1…§5.11 各一条，另加连接层失败、`capture_response:false`、
+错误档位分流与输出起点提示四条）；
+改动 `executor/exit.go`（三个 http 失败类别、`httpStatusRetryable`、`newStatusFailure`）、
+`executor/args.go`（`urlParamForbidden`、`checkURLParamValues`，以及 `checkSubmissionHeaders`
+拒掉由执行器决定的三个请求头）、`executor/profile.go`（`checkURLTemplate` 拒绝出现在 `?` 或 `#`
+之后的占位符）、`executor/proc.go`（并发许可的三个方法改成包内函数、KindHTTP 守卫文本）、
+`executor/register.go`（按 kind 分流的 `handlerFor`、`warnRelaxedAddressPolicy`）与
+`executor/register_test.go`、`executor/proc_test.go`。
+
+**没有新增配置键**：§3 用到的每一项都已在 E01 定义、E02 校验，本卡只是让它们真的起作用。
+
+### 与卡片的偏离与补充
+
+1. **`NewHTTPRunner` 多一个 `*ArtifactStore` 参数**（§3.1 的签名里没有）。响应体与头信息要落到
+   E06 的产物文件，存储必须传进来；传 `nil` 时执行直接判失败并说明"没有产物存储，响应没处可写"，
+   与 `Runner` 同一条口径（这条判在 `Handler` 第一行，请求不会发出）。
+2. **§3.3 的两个候选取"自己解析、按解析出的 IP 建连"，TLS 走 `DialTLSContext` 而不是
+   `Transport.TLSClientConfig`**。原因写在 `dialTLSContext` 的注释里：按 IP 建连之后标准库从
+   URL 主机名推 TLS 的 `ServerName`，主机名本身就是 IP 时推出来是空的，证书校验会对着一个空目标做。
+   自己握手时把档位声明的主机名交给 `tls.Config.ServerName`：域名走 SNI，IP 字面量不发 SNI
+   并按证书的 IP 主题备用名校验。`tls.Config` 只设 `ServerName` 与 `RootCAs` 两个字段，
+   代码里不存在 `InsecureSkipVerify` 的写法（DoD 第三条）。
+3. **§5.2 的重绑定用例做成了反向**（第一次答案给回环、第二次给私网），断言改成两条：
+   `lookups==1`（解析只发生一次，第二份 DNS 答案没有机会被用到）与"防线开/关两次对照"
+   （同一条档位关掉防线能连上本地服务、开着防线在建连前拒掉且对端零命中）。
+   按卡片原文（第一次公网）写会让用例去拨一个可路由地址，测试因此变慢且结果取决于机器网络。
+4. **§3.3 第 2 步的网段判断全部用 `net.IP` 的既有方法，只有一段例外**：RFC 6598 的
+   `100.64.0.0/10` 标准库没有对应方法，卡片又明确把它列进拒绝清单，于是显式写了一个 `net.IPNet`
+   （`sharedAddressSpace`）。DoD 第二条据此读作"除这一段之外没有手写网段表"。
+   IPv4 映射地址（`::ffff:127.0.0.1`）在 §5.1 的用例里单独一条：`net.IP` 的方法会先折成 IPv4 再判。
+5. **`ExecMeta.OutBytes` 记的是落盘字节数，不是响应全长**（§3.4 要求二选一并写注释）。
+   超限判定用 `io.LimitReader(body, max+1)`，读到的比上限多一个字节即 `truncated=true`，
+   写进产物的是前 `max` 字节。没有新增"响应全长"字段。
+6. **预览不走 `Result.SetPreview`**（§3.4 让它填 `Preview`）：那个方法按"脚本失败时最有用的信息在
+   stderr"的规则优先取 stderr，而 http 档位的 `.err` 写的是头信息，照那条规则预览会变成一串头名。
+   改由 `fillBodyPreview` 用 `core.TrimExecPreview` 裁响应体尾部，裁剪口径与进程档位、事件侧、
+   接口侧仍是同一个函数。`capture_response: false` 时不写预览。
+7. **产物 `.err` 里不写请求体内容，只写字节数**（§3.4 只要求"请求与响应的头"）。
+   请求体可能就是明文口令或业务数据，整份抄进一份给人排查用的记录里不是本卡能默认的事。
+8. **`.err` 的请求行用打码后的地址**：声明为 `secret` 的参数值在请求行里写成 `<secret>`
+   （`maskSecrets` 替换的是转义之后的值，因此不需要第二条渲染路径）。§3.2 只要求固定头打码，
+   这一层是多做的。**响应体里回显的参数值没有打码**——那属于 E16：
+   它的 §3.3 第 2 条与 §9 已经把"输出内容由对端产生、可能包含敏感值"列为自己的口径，
+   处理方式是 `/result` 收严档位加 `redaction_note`，冒烟 B 组最后一条现场就是这个样子。
+9. **超时只有一个来源**（§3.5）：`client.Timeout` 不设，档位与 payload 算出的生效超时在 `Handler` 里
+   用 `context.WithTimeout` 套一次，拨号、握手、读体全挂在这一个上下文上。
+   请求构造用的是 `http.NewRequest` + `execute` 里的 `request.WithContext(ctx)`，
+   与 §3.5 写的 `http.NewRequestWithContext` 是同一机制：构造请求时还没有本次执行的上下文，
+   那层超时是算完生效超时之后才产生的。
+10. **"GET/DELETE 带请求体"在执行期拒**（§3.2 要求报错，没规定在哪一层）：E02 允许 GET 档位声明
+    `body: json`（它只要求非 GET/DELETE 必须声明 body 来源），所以这一条落在 `newRequest`，
+    判在拼完请求体之后、建连之前。冒烟 B 组第四条确认对端零命中。
+11. **重试分类与 E12 共用同一张表**（§3.4、DoD 第四条）：`classifyExit` 新增
+    `failureHTTPStatus`、`failureAddressRefused`、`failureTransport` 三个类别，`code` 这个参数的含义
+    随类别切换（进程路径是退出码，http 路径是状态码）。
+    状态码不进 `newFailure` 的 `exitCode` 位置——那个值会写进摘要的 `exit_code`，
+    把 502 记成"进程退出码 502"是一条假信息，因此另造 `newStatusFailure`，摘要里只填 `http_status`。
+12. **策略拒绝与连接失败分两类**：`errAddressRefused` 哨兵把"被网络策略拦下"从"连不上"里分出来，
+    前者算永久失败（策略不会自己变，重试只是白占执行名额），后者整类可重试（§3.4）。
+    `*url.Error` 一律先剥掉再落日志与产物：它的文本含完整 URL，而路径段里可能就是参数值。
+13. **不设代理**：`Transport.Proxy` 显式留 `nil` 而不是继承 `ProxyFromEnvironment`。
+    环境变量里的代理会另起一条到代理服务器的连接，而那条连接不在本卡的地址判断之内。
+    §8 把"代理配置"列在范围外，这里的取值是"明确不开"。同时不强制 HTTP/2、保留 keep-alive。
+14. **§4 第 4 步的分流写法**：`Register` 用 `handlerFor(profile, ...)` 按 kind 选执行主体，
+    两条路共用一个 `profileHandler` 接口，注册代码只有一处。`Runner` 里那条 KindHTTP 守卫保留为
+    兜底，文本从"归 TASK-E15"改成说明性的 `http profiles are executed by the http executor`，
+    E09 期那条用例的断言同步改了这一个字符串。
+15. **§9 第三条的 `PreferredResultDirection` 已经在代码里**（http 返回 `head`、其余返回 `tail`），
+    但本期没有接进 `GET /api/v1/executors` 的响应：多一个字段就是改接口契约，
+    归 E18 与前端一起定。已登记到 E18 卡与 E19 卡。
+    因此本卡的用例只断言函数本身，接口上暂时读不到它。
+16. **§9 第二条要求的启动 warn 已实现**：`warnRelaxedAddressPolicy` 在注册完成之后按档位列出
+    `deny_private_ranges: false` 的 http 档位（`profiles=exec.a,exec.b`），配一条用例
+    `TestRegister_WarnsWhenAddressPolicyDisabled`。E02 那条"这种取值下不许写通配主机"的规则
+    只挡住一半写法，具体内网主机名的配置是能启动的，所以需要这一行。
+17. **E07/E08 登记的两条 http 专属守卫在本卡补上**：`urlParamForbidden`（占位符值不得含
+    `/ ? # @ : %` 与空白、反斜杠，见 `checkURLParamValues`）与 `checkURLTemplate` 拒绝出现在
+    `?` 或 `#` 之后的占位符。§3.2 那句"占位符出现在查询段的用法本期不支持，配置里写了就报错"由此成立。
+18. **并发许可从 `Runner` 的方法改成包内函数**（`acquirePermit`/`permitFailure`/`releasePermit`）：
+    两条执行路径要用同一个"同一档位同时执行几个"的名额语义，留在 `Runner` 上就得复制一份。
+19. **档位并发默认值、许可等待时长、产物命名与 `meta.json` 全部复用进程路径那一份实现**，
+    http 侧没有另开一套。
+20. **冒烟跑出来的一个缺陷已当场修掉**：首轮 B 组第一条的产物里固定请求头写成
+    `x-source: godelayq-smoke`（小写）。原因是配置解码会把映射键折成小写（E08 记录过同一个现象），
+    而 `cloneHeaders` 原来把键名原样放进 `http.Header` 这个 map，于是线路上与产物里都是小写；
+    payload 那一路走的是 `Set`，同一个档位出现两种头名写法。改成 `Add` 之后两处都按 HTTP 惯例归一，
+    `TestHTTP_SecretHeaderNotLogged` 加了一条"小写声明的头要以归一形式落盘"的断言，
+    并重跑一次 B 组第一条确认线路上的对端也收到 `X-Source`。
+
+### 验证结果
+
+Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
+
+| 命令 | 结果 |
+| --- | --- |
+| `go build ./... && go vet ./...` | 通过 |
+| `go test ./... -race -count=1` | api 84.6s、cmd/server 5.5s、core 12.5s、executor 22.0s 全 ok |
+| `go test ./executor -run HTTP -race -count=3` | 15 条用例三轮全 PASS（拨号与 TLS 用例对时序敏感，按 DoD 要求重复跑） |
+| `GOOS=linux GOARCH=amd64`、`GOOS=darwin GOARCH=arm64` 的 `go build` + `go vet` | 通过 |
+| `go build -tags dashboard ./...` | 通过 |
+| 既有用例 | `args_test.go`、`profile_test.go`、`exit_test.go`、`probe_test.go`、`api` 与 `cmd/server` 的断言一字未改，全绿；只有 `TestRunner_HttpProfileIsNotExecutedByProcessRunner` 改了断言的字符串（见第 14 条） |
+
+冒烟（Windows 真实服务端 + REST，独立配置在临时目录；对端是本机 `127.0.0.1:18099` 的一个
+Python `ThreadingHTTPServer`，它把每个到达的请求记进 `target.log`，"对端有没有收到"就数这一行；
+提任务用静态 token，`executors.required_role: operator`）：
+
+**A. 地址防线与状态码分类**
+
+| 档位取值 | 现象 |
+| --- | --- |
+| `callback_ok`：`deny_private_ranges: false` + `http://127.0.0.1:18099/ok` | success；`exec.http_status=200`、`out_bytes=51`、`preview` 是响应体；`/result?stream=out` 给出响应体，`?stream=err` 给出 `> GET ...`、`> request body bytes: 0`、`< 200 OK` 与两侧头 |
+| `callback_guarded`：同一 URL，`deny_private_ranges` 留默认（开） | failed、`permanent: true`、`http_status` 不写；对端 `target.log` 零新增行；`.err` 末尾 `! request failed: address refused by the profile's network policy: 127.0.0.1 (loopback address)`；服务端一条 `level=WARN msg="executor http target address refused" profile=callback_guarded host=127.0.0.1 address=127.0.0.1 reason="loopback address"` |
+| `callback_500`：对端返 500，`expect_status: [200]`，`max_retries=2` | 三次执行（`retry_count=2/2`），退避照 E12 递增；每次都记 `http_status=500` 与响应体尾部；最终 failed 且 `permanent` 不为真 |
+| `callback_404`：对端返 404，`max_retries=2` | 一次执行就落终态（`retry_count=0/2`）、`permanent: true`；对端只收到 1 个请求 |
+| `callback_redirect`：对端返 302 带 `Location: /ok` | failed、`http_status=302`、`permanent: true`；对端只收到 `/redirect`，`/ok` 没有因为跟重定向而被访问 |
+
+**B. 请求体、请求头与上限**
+
+| 用例 | 现象 |
+| --- | --- |
+| `callback_post`（`method: POST`、`body: json`、固定头 `X-Source`、`header_allow: [X-Trace-Id]`，payload 给 `body` 与 `headers`） | success；对端回显 `content_type=application/json`、`body_bytes=18`（与请求体字节数一致）；`.err` 里 `> Content-Type: application/json`、`> X-Source: godelayq-smoke`、`> X-Trace-Id: trace-smoke-2` |
+| 同一档位 payload 覆盖不在 `header_allow` 里的头 | 执行前拒绝、对端零命中；事件 `job.failed` 的 error 文本 `invalid submission: headers.X-Source: not in the profile's header_allow (X-Trace-Id)` |
+| 同一档位 payload 的 `body` 是裸字符串 | 执行前拒绝、对端零命中（`json` 模式只接受对象或数组） |
+| `callback_ok`（GET、`body: none`）payload 硬塞 `body` | 执行前拒绝、对端零命中 |
+| `callback_big`（`max_body_bytes: 1024`，对端返 6035 字节） | success、`out_bytes=1024`、`truncated: true`；`/result?stream=out` 长度是 1024 |
+| `callback_nocapture`（`capture_response: false`） | success、`out_bytes=0`、`preview` 空；`.err` 仍写两侧头 |
+| `callback_secret`（`args` 里 `token` 声明 `secret: true` + 固定 `Authorization` 头） | success；`.err` 请求行是 `> GET http://127.0.0.1:18099/orders/<secret>`、`> authorization: <redacted>`；日志与产物里没有固定头的值。响应体把参数值回显出来了（`{"order": "SUPERsecret123", ...}`），`preview` 因此带着它——见第 8 条，这条归 E16 |
+
+**C. 超时**
+
+`callback_slow`（档位 `timeout: 2s`，对端睡 10 秒）：1.998 秒返回，failed、
+`http_status` 不写、`permanent` 不为真（超时可重试），`.err` 末尾
+`! request failed: context deadline exceeded`。取消路径只在单元测试里覆盖
+（`TestHTTP_CancelAndTimeout/cancel`）：Git Bash 无法向 Windows 进程发 SIGTERM，
+手工构造"用户点取消"需要另开一个脚本在 2 秒内打到 `POST /jobs/:id/cancel`，
+本轮没有做（见"未验证"）。
+
+### 未验证与遗留
+
+- Linux/macOS 的真实运行与那一侧的 `-race`（WSL2 缺 gcc），与其他卡片同一条遗留。
+- 真实外网目标（§7 写的 `https://httpbin.org/...`）没有跑：冒烟一律用本机对端，
+  不依赖外部网络与证书链。
+- 手工取消路径未跑（见 C）。
+- 接口上读不到 `PreferredResultDirection`（第 15 条），归 E18。
+- 响应体回显 `secret` 参数值的掩码与 `/result` 收严档位，归 E16（第 8 条）。
+- 冒烟里看到一条与本卡无关的既有日志写法值得跟进：档位超时触发的执行在 `core` 的事件里记成
+  `msg="job timed out" timeout=0s`，那个 `timeout` 取的是任务自己的超时字段（本次为空），
+  不是真正生效的档位超时。属于 E09 之前的既有行为，登记待处理。
+- **重试的产物会被后一次覆盖**（A 组 `callback_500` 现场）：`core/job.go` 的 `CloneForRetry`
+  不把 `Attempts` 带给重试副本，于是三次执行的 `job.Attempts` 都是 1，
+  产物文件名一直是 `a1.out`/`a1.err`，后一次把前一次的内容盖掉，接口上 `?attempt=1` 只能读到
+  最后一次。E06 §2 写明"每次尝试必须按 attempt 分文件，否则第二次尝试会覆盖第一次"，
+  而 `TestArtifactWriter_PerAttemptFiles` 只证明存储能容纳 1/2/3 三个独立文件——
+  调度器这一侧从来没给出过 2 和 3。进程档位同样如此，不是本卡引入的行为，
+  改法在 `core`（要么带 `Attempts`，要么让重试副本用 `RetryCount+1` 编号），登记待处理。

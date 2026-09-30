@@ -33,6 +33,16 @@
 3. 每次尝试可切换：`attempt` 下拉（范围来自 `job.attempts`），默认最近一次。
 4. 重试链可读性：任务有多次尝试时，在结果区块上方列出"第 1 次 退出码 1 / 第 2 次 退出码 0"这样的一行摘要（数据来自事件时间线里的 `result`，不需要新端点）。
 
+   E15 落地后的两条补充（实施本卡前先读 `task-e15-http-executor.md` 第 10 节）：
+
+   - 第 2 项的默认读取方向已经有后端取值可用：`executor.PreferredResultDirection(profile)` 对 `http`
+     返回 `head`、其余返回 `tail`，但**它还没进 `GET /api/v1/executors` 的响应**。本卡要么加一个字段
+     把它透出（同时更新 `types.ts` 与 `docs/api.md`），要么在前端按 `kind` 自己判——两处都判就会漂移，
+     实施时二选一并在提交信息里写明选了哪个。
+   - 第 3 项的 `attempt` 下拉现在拿不到多次尝试：`core/job.go` 的 `CloneForRetry` 不把 `Attempts`
+     带给重试副本，重试的每一次执行都是 `attempt=1`，产物文件被后一次覆盖（E15 卡末尾登记为待处理）。
+     如果那条先被修掉，本项按卡片原文做；没修之前下拉只有一项，界面要能容忍这种情况。
+
 ### 3.3 新建表单
 
 1. `JobForm.vue`：`name` 的候选来自 `fetchJobTypes()`（既有）与 `fetchExecutors()`；选中 `exec.*` 时切换成"参数表单"模式：

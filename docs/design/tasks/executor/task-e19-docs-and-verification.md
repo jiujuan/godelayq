@@ -35,6 +35,20 @@
      时间线上只剩这条 `job.paused`——所以来源标记必须写在事件里，不能靠上下文推断。
 3. 全文检查现有措辞：凡是"任务类型需提前注册 Handler"的地方（例如参数表里 `name` 的说明），补一句"执行器档位由 `executors.commands` 声明"。
 
+   E15 落地后 `docs/api.md` 这一节要补的三条（写文档时按这些结论，别照卡片原文抄）：
+
+   - `POST /jobs` 的 `http` 档位 payload 示例只接受四个键：`params`、`headers`、`body`、`timeout`，
+     写成 `url`/`method`/`cmd` 之类一律按"提交内容非法"拒掉（E08 的那条未知键检查）。
+     `headers` 只能覆盖档位 `header_allow` 里声明过的键，`Host`、`Content-Length`、`Transfer-Encoding`
+     三个头由执行器决定，payload 里出现就是错误。
+   - `exec` 摘要里 `http_status` 与 `exit_code` 互斥：http 档位只填前者，
+     状态码永远不会写进 `exit_code`。`out_bytes` 记的是**落盘字节数**而不是响应全长，
+     响应体超过 `max_body_bytes` 时 `truncated: true`；`capture_response: false` 的档位
+     `out_bytes` 为 0、`preview` 为空，产物 `.err` 仍然写两侧头。
+   - `/result` 的 `stream` 对 http 档位含义换了：`out` 是响应体，`err` 是请求与响应的头（不是 stderr）。
+     默认读取方向对 http 应该取 `head`（响应体开头最有用），取值函数 `executor.PreferredResultDirection`
+     已在 E15 落地，是否透出成 `/executors` 的字段由 E18 定；本卡按 E18 的最终形状写文档。
+
 ### 3.2 `docs/deployment.md`
 
 新增"开启执行器"一节，逐条写清（每条都要有"为什么"）：
@@ -47,6 +61,17 @@
 6. Windows 的输出编码：控制台程序写出的文本是系统本地代码页（中文 Windows 是 GBK），产物文件按原样字节保存，因此接口与 `meta.json` 里的尾部预览会把非 UTF-8 字节显示成替换字符（E11 第 10 节第 11 条）。要么在文档里给出"用 `chcp 65001` 或在脚本里重定向编码"的口径，要么按档位声明代码页转码——本卡只做文档，转码需求若要实现就开新任务卡。
 7. Windows 的 `script` 档位限制：`cmd`、`pwsh` 这类解释器必须带 `/c`、`-File` 之类的开关才会执行文件，而 `script` 档位生成的命令行是 `[解释器, 脚本路径]`（E11 第 10 节第 9 条）。当前可用写法是 `kind: binary` + `fixed_args: [/c, 脚本名]`，文档要写明这条差异，并说明参数形状的改造归后续任务卡。
 8. `deny_private_ranges: false` 只允许在开发机使用；关闭后 HTTP 档位可以访问回环与内网。
+   E15 落地之后这一节可以照现场写：
+   - 这种取值在启动阶段是合法的（E02 只拒绝它配通配主机名的写法），因此注册完成之后会有一条
+     `level=WARN msg="executor http profiles accept private and loopback addresses" profiles=...`
+     把关掉防线的档位名列出来。生产部署看到这一行就是要去改配置。
+   - 被拒时的现场线索是一条同主题的 warn（含档位名、主机与被拒 IP，不含完整 URL），
+     产物 `.err` 末尾一行 `! request failed: address refused by the profile's network policy: ...`，
+     并且这类失败算永久失败、不消耗重试名额。
+   - HTTP 档位的产物文件里 `a<attempt>.out` 是**对端返回的响应体**，`a<attempt>.err` 是两侧头
+     （`Authorization`、`Cookie`、`Set-Cookie`、`X-Api-Key`、`Proxy-Authorization` 的值写成
+     `<redacted>`）。因此上面第 3 条的文件权限建议对 HTTP 同样成立，而且响应体里可能带着
+     回显出来的请求参数——`secret` 参数只在请求行与响应里打码，管不住对端把值写回正文。
 9. `restore_policy: pause` 的运维含义：崩溃后会出现一批 `paused` 的执行器任务，需要人工确认后恢复（E14），并给出确认与批量恢复的操作步骤（`POST /jobs/batch-ops`）。
    E14 已在本机实测过一遍，文档照这几个结论写：
    - 判据是存储里的 `running` 快照。`kill -9`/`taskkill /F` 这类强杀会留下 `running`，
