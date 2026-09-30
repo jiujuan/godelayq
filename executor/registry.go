@@ -112,6 +112,13 @@ func (r *Registry) EffectiveTimeout(p *Profile, requested time.Duration) time.Du
 	return p.timeoutWithin(r.executors, requested)
 }
 
+// MaxTimeout 返回单次执行超时的上限（executors.max_timeout，已归一化为取值）。
+//
+// 它是给提交表单算"可填区间"用的：档位默认值在每个档位的 timeout 字段里，
+// 上限是这一个全局值，超过它的请求在提交期就被拒（TASK-E16 §3.2 第 2 条），
+// 所以前端不该让人填出注定失败的取值。
+func (r *Registry) MaxTimeout() time.Duration { return r.executors.MaxTimeout }
+
 // Keys 返回全部注册键，按字典序。返回的是副本，调用方改动不影响登记表。
 func (r *Registry) Keys() []string {
 	keys := make([]string, len(r.keys))

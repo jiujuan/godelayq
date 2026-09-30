@@ -285,6 +285,13 @@ type ExecutorArgResponse struct {
 	Secret   bool   `json:"secret"`
 }
 
+// ExecutorPositionalResponse 是档位的位置参数规则（args 里保留键 _positional 的取值规则）。
+// 档位没声明位置参数时整个键不出现，前端不必区分"没有"与"上限 0"。
+type ExecutorPositionalResponse struct {
+	Max     int    `json:"max"`
+	Pattern string `json:"pattern"`
+}
+
 // ExecutorProfileResponse 是一个档位的对外形状。
 //
 // 刻意不含的东西：env 的固定值（那是配置里的凭据）、脚本与产物的绝对路径
@@ -299,13 +306,27 @@ type ExecutorProfileResponse struct {
 	Reason    string `json:"reason"`
 	Timeout   string `json:"timeout"`
 	// MaxParallel 是该档位同时最多跑几个。0 已在加载时归一为 1。
-	MaxParallel int                   `json:"max_parallel"`
-	Args        []ExecutorArgResponse `json:"args"`
-	EnvAllow    []string              `json:"env_allow"`
+	MaxParallel int                         `json:"max_parallel"`
+	Args        []ExecutorArgResponse       `json:"args"`
+	Positional  *ExecutorPositionalResponse `json:"positional,omitempty"`
+	EnvAllow    []string                    `json:"env_allow"`
 	// HasSecretArgs 表示这个档位声明了至少一个 secret 参数：
 	// 它的 payload 在读取接口里会被掩码，结果端点的读取门槛也升到提交档位（TASK-E16 §3.4）。
 	// 前端据此显示"这个档位的参数不会回显"，不必自己复制一份 args[].secret 的判断。
 	HasSecretArgs bool `json:"has_secret_args"`
+	// PreferredResultDirection 是读这个档位输出时的建议起点（head | tail），
+	// 取值来自 executor.PreferredResultDirection，与 GET /jobs/:id/result 的 from 参数同一套词。
+	// 放在响应里而不是让前端按 kind 判：http 的正文开头才是结论，进程档位的末尾才是结论，
+	// 这条规则改一次就要改两处（TASK-E18 §3.2 第 2 条要求二选一，这里选"后端给"）。
+	PreferredResultDirection string `json:"preferred_result_direction"`
+	// 下面三项只在 http 档位出现，给的是"表单能填什么"，不是"这次填了什么"。
+	// Method 是档位声明的请求方法。
+	Method string `json:"method,omitempty"`
+	// HeaderAllow 是 payload 可以覆盖的请求头名；档位自己的固定头不在这里，
+	// 那部分本来就是配置内容，不需要表单参与。
+	HeaderAllow []string `json:"header_allow,omitempty"`
+	// BodyMode 是档位接受的请求体形态：json | raw | none。none 时表单不该给 body 输入区。
+	BodyMode string `json:"body_mode,omitempty"`
 	// URL 只在 http 档位出现，给的是模板原文（含 {占位符}），不是渲染后的地址。
 	URL string `json:"url,omitempty"`
 }
@@ -318,6 +339,11 @@ type ListExecutorsResponse struct {
 	// 执行器关闭时是 null：那时没有任何档位可提交，"要什么档位"这个问题不成立，
 	// 给一个配置里的取值反而会让前端以为存在这道门槛。
 	RequiredRole *string `json:"required_role"`
+	// MaxTimeout 是 payload 的 timeout 能填的上限（executors.max_timeout，已归一化为取值），
+	// 只在 enabled=true 时给出。提交表单用它给"超时"输入框划区间：超过它的值在提交期就被拒
+	// （TASK-E16 §3.2 第 2 条），不该让人填出注定失败的取值；而"能不能提交执行器任务"这个问题
+	// 只在执行器开着的时候成立，所以关闭时不给这个键，前端也不会去显示一个没人用的区间。
+	MaxTimeout string `json:"max_timeout,omitempty"`
 }
 
 // ListExecutors GET /api/v1/executors
@@ -338,6 +364,7 @@ func (s *Server) ListExecutors(c *gin.Context) {
 	if response.Enabled {
 		role := s.executors.RequiredRole()
 		response.RequiredRole = &role
+		response.MaxTimeout = s.executors.MaxTimeout().String()
 	}
 	for _, profile := range s.executors.Profiles() {
 		reason, ok := s.executors.Available(profile.HandlerKey())
@@ -374,9 +401,29 @@ func toExecutorProfile(profile *executor.Profile, reason string, runtimeOK bool)
 		Args:          args,
 		EnvAllow:      envAllow,
 		HasSecretArgs: profile.HasSecretArgs(),
+		// 起点建议由执行器包给出（http 读开头、进程读末尾），前端只照它设置初始标签页，
+		// 于是"两处各判一次导致默认读取方向不一致"这种漂移没有机会出现（TASK-E18 §3.2 第 2 条）。
+		PreferredResultDirection: executor.PreferredResultDirection(profile),
+	}
+	if profile.Positional != nil {
+		item.Positional = &ExecutorPositionalResponse{
+			Max:     profile.Positional.Max,
+			Pattern: profile.Positional.PatternText,
+		}
 	}
 	if profile.Kind == executor.KindHTTP {
 		item.URL = profile.URLTemplate
+		item.Method = profile.Method
+		// BodyMode 给的是 json | raw | none 三个词之一：配置里的空写法在这里归一为 none，
+		// 因为执行侧对"没写 body"与"写了 none"的判断就是同一条（args.go 的 checkHTTPBody），
+		// 让前端再各判一次空串等于把这条规则抄两遍。
+		item.BodyMode = profile.Body
+		if item.BodyMode == "" {
+			item.BodyMode = "none"
+		}
+		// 与 env_allow 同一口径：空表给 []，前端不必区分"没声明"与"声明了但不允许任何头"。
+		item.HeaderAllow = make([]string, 0, len(profile.HeaderAllow))
+		item.HeaderAllow = append(item.HeaderAllow, profile.HeaderAllow...)
 	}
 	return item
 }
