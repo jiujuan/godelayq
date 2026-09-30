@@ -23,6 +23,20 @@
    - `GET /api/v1/jobs/:id/result` 的全部查询参数、默认值、四种失败返回（400/403/404/503）与响应示例。
    - `POST /jobs` 提交执行器任务的 payload 结构（三类各一份完整示例，含 Unix 与 Windows 差异说明）。
    - 事件 `job.completed` / `job.failed` 的 `data.result` 与 `metadata.permanent` 字段说明。
+
+   TASK-E18 落地后，`GET /api/v1/executors` 与 `JobResponse` 又多了几个键，控制台按它们生成表单和读输出，
+   文档必须写全（结论取自 `api/handlers_executors.go` 与 `api/dto.go`，不要照本卡推测）：
+
+   - 响应顶层：`max_timeout`（字符串 Go duration，只在 `enabled: true` 时出现，关闭时这个键整个省略）。
+   - 每个档位：`preferred_result_direction`（`head` 或 `tail`，来自 `executor.PreferredResultDirection`，
+     `http` 为 `head`、其余为 `tail`；它同时是 `GET /jobs/:id/result` 里 `from` 参数的取值写法）、
+     `positional`（对象 `{max, pattern}`，档位没声明 `positional` 时这个键不出现）、
+     `method`、`header_allow`、`body_mode`（后三项只出现在 `http` 档位上；配置里没写 `body` 的档位
+     在响应里归一成 `body_mode: "none"`，不是空串）。
+   - `JobResponse` 新增 `attempts`：与 `GET /jobs/:id/result` 允许的 `attempt` 范围同一口径
+     （`1..attempts`，`attempts` 为 0 时只允许 1）。要同时写明现状：重试副本不带这个计数，
+     重试过的任务仍然是 `attempts: 1`，也就是第 10 节遗留事项里那条 `CloneForRetry` 缺陷。
+
 2. 修订既有条目：
    - `GET /api/v1/stats` 的 `running` 含义（两池之和）与新增的 `paused` 说明保持现状。
    - `GET /api/v1/admin/runtime` 响应示例补四个 exec 字段。
@@ -175,6 +189,10 @@
 2. 交叉编译：`GOOS=linux`、`GOOS=darwin`、`GOOS=windows` 各 `go build ./...` 一次（平台文件多的包最容易在这里漏编译分支）。
 3. 配置守卫：`go test -run TestExampleConfigMatchesLocal ./core`；并确认本机 `configs/config.yaml`（不入库）与模板键集合一致。
 4. 前端：`cd web && npx vue-tsc --noEmit && npm run build`；随后 `go build -tags dashboard -o godelayq-console ./cmd/server` 能成功（`web/dist` 已存在）。
+   TASK-E18 那张手工走查清单（本目录 `task-e18-console-frontend.md` 第 5.2 节九条）只在 Windows 内嵌形态跑过一轮，
+   结果与未观测项记在该卡第 10 节。E19 在 Linux 上复走其中三条就够：档位可用与不可用的显示差异、
+   详情页输出的头尾读取与"加载更多"、`secret` 参数在详情页与输出预览里的掩码。
+   Windows 那轮没覆盖到的两项（`cancelled` 状态在列表里不出现、macOS 整树终止）不在前端范围内，按第 5 条与第 10 节处理。
 5. 端到端手工场景（在 Linux 与 Windows 各跑一次，逐条记录结果）：
    - 打开 `enabled`，配一个输出到 stderr 并以 3 退出的脚本档位；提交 → 观察 400/403（参数越界与低权限）→ 正常提交 → 事件里读到 `exit_code:3` → `/result` 读到输出。
    - 60 秒脚本中途 `POST /jobs/:id/cancel` → 任务转 cancelled、无残留进程（`ps` / `tasklist` 断言）。
