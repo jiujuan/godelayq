@@ -169,6 +169,9 @@ func (r *Runner) Handler() core.Handler {
 		result.Meta.ErrBytes = info.ErrBytes
 		result.Meta.Truncated = info.Truncated
 		result.Meta.Artifact = core.ArtifactAvailable
+		// 索引登记跟着产物文件走：info 就是刚关完的那份结论，与摘要同源。
+		// 写失败只记日志，执行结果不因索引而改变（设计文档 D8）。
+		r.artifacts.recordIndex(p.Kind, p.Name, info)
 		if closeErr != nil {
 			r.logger.Warn("executor output files did not close cleanly",
 				"job_id", job.ID, "handler_key", key, "error", closeErr)

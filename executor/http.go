@@ -188,6 +188,9 @@ func (r *HTTPRunner) Handler() core.Handler {
 		// 两条来源说的是同一件事（还有内容没采到），但只有前者能解释成"响应体超限"。
 		result.Meta.Truncated = result.Meta.Truncated || info.Truncated
 		result.Meta.Artifact = core.ArtifactAvailable
+		// 索引登记与进程执行器同一位置：info 是刚关完的那份结论，与摘要同源。
+		// 新增一种 Kind 就要在这里接上，否则那一档的产物在列表里整个看不见（见接口注释）。
+		r.artifacts.recordIndex(KindHTTP, p.Name, info)
 		if closeErr != nil {
 			r.logger.Warn("executor output files did not close cleanly",
 				"job_id", job.ID, "handler_key", key, "error", closeErr)

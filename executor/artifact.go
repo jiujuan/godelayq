@@ -33,6 +33,10 @@ type ArtifactStore struct {
 	// purgeOnce 让"孤儿清理只在启动时跑一次"这个决定在代码里可见：
 	// 反复跑会把 store.history_limit=-1（不留痕）的部署里刚跑完的任务产物当孤儿删掉。
 	purgeOnce sync.Once
+
+	// index 是产物索引，可选依赖：nil 表示不维护索引，读写清理路径与本字段存在之前一致。
+	// 只在装配期由 SetIndex 写一次（Start 与执行器注册之前），运行期只读，所以不加锁。
+	index ArtifactIndexer
 }
 
 // ArtifactOptions 是构造产物存储需要的取值，对应 executors.output 一节。
@@ -117,11 +121,14 @@ func (a *ArtifactStore) MaxBytes() int { return a.maxBytes }
 // TTL 返回保留时长，0 表示不按时间清理。
 func (a *ArtifactStore) TTL() time.Duration { return a.ttl }
 
-// checkArtifactJobID 拒绝任何可能被当成路径写法的任务 ID。
+// CheckArtifactJobID 拒绝任何可能被当成路径写法的任务 ID。产物索引（store/sqlite）
+// 在写库与按 ID 查询时用同一个判断，不另写一套规则。
 //
 // 现实里的 ID 是 UUIDv7 文本形式，只含小写十六进制与连字符；但目录名来自调用方
 // （自行接入的程序、测试、以及未来任何写入路径），所以这里不依赖"上游一定安全"：
 // 分隔符、点号（含 `..`）、绝对路径前缀与任何非 ASCII 都挡掉。
+func CheckArtifactJobID(jobID string) error { return checkArtifactJobID(jobID) }
+
 func checkArtifactJobID(jobID string) error {
 	if jobID == "" {
 		return errors.New("artifact: job id is empty")
@@ -542,6 +549,8 @@ func (a *ArtifactStore) PurgeExpired() (int, error) {
 		if err := os.RemoveAll(dir); err != nil {
 			return deleted, fmt.Errorf("artifact: remove expired %s: %w", dir, err)
 		}
+		// 先删目录再删行：顺序反过来中途失败会留下"索引说没有、文件还在"的状态
+		a.deleteIndexRows(filepath.Base(dir))
 		deleted++
 	}
 	if deleted > 0 {
@@ -582,6 +591,7 @@ func (a *ArtifactStore) PurgeOrphans(live func() (map[string]bool, error)) (int,
 		if err := os.RemoveAll(dir); err != nil {
 			return deleted, fmt.Errorf("artifact: remove orphan %s: %w", dir, err)
 		}
+		a.deleteIndexRows(filepath.Base(dir))
 		deleted++
 	}
 	if deleted > 0 {
@@ -659,6 +669,9 @@ func (a *ArtifactStore) runStartup(live func() (map[string]bool, error)) {
 			}
 		})
 		a.purgeExpiredChecked()
+		// 对账排在本轮扫描的最后：孤儿与过期目录都已经清完，剩下的"行在、目录不在"
+		// 才是真正需要标注的那一批（手工删掉的目录、上次运行留下的残留行）。
+		a.reconcileIndex()
 	})
 }
 
