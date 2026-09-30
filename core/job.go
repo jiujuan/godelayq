@@ -7,6 +7,23 @@ import (
 	"unicode/utf8"
 )
 
+// ExecPrefix 是执行器档位在调度器注册表里的键前缀：配置里 name: hello 的档位，
+// 注册键是 exec.hello，任务里提交的类型名也是它。
+//
+// 定义在 core 而不是 executor：目录加载器（core/load.go）要按这个前缀拒绝任务文件（TASK-E17），
+// 而 executor 依赖 core，常量放在 executor 会让 core 反向依赖执行器包。
+const ExecPrefix = "exec."
+
+// IsExecHandlerKey 判断一个任务类型名是不是执行器档位的注册键。
+//
+// 名字前后空白按去掉之后判断（与 formatToJob 对 name 的处理一致）：带空白的写法在注册表里
+// 查不到东西，但按"是不是执行器任务"判断时不该因此被当成普通任务放过去。
+// 只有前缀没有名字（就是 "exec." 本身）也算执行器键：这种名字说明配置写错了，
+// 而"看起来像执行器键"的东西一律按执行器键处理更安全。
+func IsExecHandlerKey(name string) bool {
+	return strings.HasPrefix(strings.TrimSpace(name), ExecPrefix)
+}
+
 // JobStatus 任务状态
 type JobStatus int
 

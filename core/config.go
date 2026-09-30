@@ -235,8 +235,11 @@ type ExecutorsConfig struct {
 	RestorePolicy string `mapstructure:"restore_policy"`
 
 	// LoaderAllow 是否允许目录任务加载器接受 exec. 前缀的任务文件，默认 false。
-	// 注意当前服务端二进制并不启用加载器（LoaderOptions 只在库使用与 examples/demo2 中出现），
-	// 因此本项约束的是自行接入 DirectoryLoader 的程序，见设计文档 §6.9。
+	//
+	// 结论（TASK-E17）：服务端二进制不启用加载器，所以这个取值在服务端没有行为差别。
+	// 它有一条明确的读取方——executor.Registry.LoaderAllowed()——供自行接入 core.DirectoryLoader
+	// 的程序把结果接到 LoaderOptions.AllowExecJobs 上；加载器自己只看那个字段，不回头读配置
+	// （core 读不到执行器登记表）。见 docs/design/executor-design.md §6.9。
 	LoaderAllow bool `mapstructure:"loader_allow"`
 
 	// Output 执行输出的截断与保留策略

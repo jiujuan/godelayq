@@ -2,6 +2,7 @@ package core
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -13,6 +14,9 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 )
+
+// execJobRejectReason 是加载器不接受执行器任务文件时写给日志与错误副本的原因（TASK-E17）。
+const execJobRejectReason = "executor jobs are not accepted from the loader"
 
 // FileJobFormat 任务文件JSON格式
 type FileJobFormat struct {
@@ -67,6 +71,15 @@ type LoaderOptions struct {
 
 	// 任务名到Handler的映射（用于自动绑定）
 	HandlerMap map[string]Handler
+
+	// AllowExecJobs 允许加载 exec. 前缀的任务文件，默认 false。
+	//
+	// 默认关的理由（TASK-E17）：任务文件走这条路径时没有任何凭据，"能往这个目录写文件"
+	// 就等于"能在本机执行档位声明的命令"。要把执行器任务交给目录投递，得由程序显式打开。
+	// 服务端二进制当前不启用目录加载器（docs/design/executor-design.md §6.9），所以这个字段
+	// 约束的是自行把 Scheduler 与 DirectoryLoader 接起来的程序；配置项 executors.loader_allow
+	// 的取值由 executor.Registry.LoaderAllowed() 读出，调用方可以把它原样接到这里。
+	AllowExecJobs bool
 
 	// Logger 加载过程的日志器，nil 表示 slog.Default()
 	Logger *slog.Logger
@@ -274,6 +287,12 @@ func (l *DirectoryLoader) LoadFile(filePath string) error {
 		return fmt.Errorf("parse json failed: %w", err)
 	}
 
+	// 执行器任务默认不从目录接受（TASK-E17 §3.2）：判在绑定 Handler 与入队之前，
+	// 那时还没有任何东西被执行。
+	if !l.options.AllowExecJobs && IsExecHandlerKey(format.Name) {
+		return l.rejectExecJob(filePath, format.Name)
+	}
+
 	// 转换为Job
 	job, err := l.formatToJob(&format)
 	if err != nil {
@@ -296,6 +315,35 @@ func (l *DirectoryLoader) LoadFile(filePath string) error {
 		"path", filePath, "job_id", job.ID, "job_name", job.Name, "trigger_at", job.TriggerAt)
 
 	// 后处理
+	return l.postProcess(filePath)
+}
+
+// rejectExecJob 是加载器对 exec. 前缀任务文件的拒绝路径（TASK-E17 §3.2）。
+//
+// 返回 nil 而不是 error：调用方（ScanAndLoad 与监控回调）会把 error 记成 error 级并再抄一份
+// 错误副本，而"这类文件我们不从目录接受"是有意的拒绝，不是故障。日志只留一行 warn。
+//
+// 两种情况都不把文件留在原地反复扫描：
+//   - 配了 ErrorDir：文件复制进错误目录（带一句原因）。删除策略下 handleErrorFile 会顺手
+//     删掉源文件，这时就不再走 postProcess，否则会对同一个不存在的文件删第二次。
+//   - 没配 ErrorDir：其余失败要报出来，但源文件仍按 PostLoadAction 处理
+//     （Keep 模式下记成"已处理"，下一轮不会重复拒绝同一个文件）。
+func (l *DirectoryLoader) rejectExecJob(filePath, name string) error {
+	l.logger.Warn("executor job file rejected by the loader",
+		"path", filePath, "job_name", name, "reason", execJobRejectReason,
+		"hint", "set LoaderOptions.AllowExecJobs only when writing into this directory is meant to grant execution")
+
+	if l.options.ErrorDir == "" {
+		return l.postProcess(filePath)
+	}
+
+	if err := l.handleErrorFile(filePath, errors.New(execJobRejectReason)); err != nil {
+		l.logger.Error("failed to stash the rejected job file", "path", filePath, "error", err)
+		return l.postProcess(filePath)
+	}
+	if l.options.PostLoadAction == DeleteAfterLoad {
+		return nil
+	}
 	return l.postProcess(filePath)
 }
 
