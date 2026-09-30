@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -596,4 +597,243 @@ func jobIDs(records []eventRecord) []string {
 		out[i] = record.jobID
 	}
 	return out
+}
+
+// --- 读侧（TASK-S04）：两个端点要拿到的形状 ---
+
+// TestEventLog_EventsRoundTrip 写进去的一批事件经 Events() 读回后逐字段等于原值。
+//
+// 时间戳的断言口径是"同一时刻、精度到微秒"：库里 ts_us 只存到微秒，纳秒部分在写入时就丢了，
+// 所以这里给原值带上纳秒，比较用微秒截断后的相等（本卡 §9 第一条风险的固定点）。
+// 顺带一条同样要写进接口文档的：time.UnixMicro 还原出来的是本地时区表示的同一时刻，
+// 因此 JSON 里的时区偏移与写入时不一定相同，比较时刻而不是文本。
+func TestEventLog_EventsRoundTrip(t *testing.T) {
+	log, _, bus := newTestEventLog(t, nil)
+
+	data := json.RawMessage(`{"error":"boom","stdout":"a\nb"}`)
+	original := core.Event{
+		Type:      core.EventJobFailed,
+		JobID:     "job-rt",
+		JobName:   "payment_check",
+		Status:    core.StatusFailed,
+		Timestamp: fixedTime.Add(123 * time.Nanosecond),
+		Data:      data,
+		Metadata: map[string]interface{}{
+			"retry_count": 2.0,
+			"permanent":   false,
+			"trigger_at":  "2026-10-01T12:00:00Z",
+		},
+	}
+	bus.Publish(original)
+	waitQueued(t, log, 1)
+	if err := log.Flush(); err != nil {
+		t.Fatalf("Flush failed: %v", err)
+	}
+
+	got, err := log.Events("job-rt", 0)
+	if err != nil {
+		t.Fatalf("Events failed: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(got))
+	}
+
+	read := got[0]
+	if read.Type != original.Type || read.JobID != original.JobID ||
+		read.JobName != original.JobName || read.Status != original.Status {
+		t.Fatalf("identity fields changed: %+v", read)
+	}
+	if string(read.Data) != string(data) {
+		t.Errorf("data must come back byte for byte, got %q", string(read.Data))
+	}
+	if !read.Timestamp.Truncate(time.Microsecond).Equal(original.Timestamp.Truncate(time.Microsecond)) {
+		t.Errorf("expected %v, got %v", original.Timestamp, read.Timestamp)
+	}
+	if read.Metadata["retry_count"] != 2.0 || read.Metadata["permanent"] != false ||
+		read.Metadata["trigger_at"] != "2026-10-01T12:00:00Z" {
+		t.Errorf("metadata decoded wrong: %#v", read.Metadata)
+	}
+}
+
+// TestEventLog_EventsAscending 库里 10 条同任务事件，limit=3 拿到的是最后 3 条且升序。
+// 降序查询 + 整体反转是读侧唯一的定序办法，这条把它钉住。
+func TestEventLog_EventsAscending(t *testing.T) {
+	log, _, bus := newTestEventLog(t, nil)
+
+	for i := 0; i < 10; i++ {
+		bus.Publish(core.Event{
+			Type: core.EventType(fmt.Sprintf("job.e%d", i)), JobID: "job-order",
+			Status: core.StatusRunning, Timestamp: fixedTime.Add(time.Duration(i) * time.Second),
+		})
+	}
+	waitQueued(t, log, 10)
+	if err := log.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	got, err := log.Events("job-order", 3)
+	if err != nil {
+		t.Fatalf("Events failed: %v", err)
+	}
+	want := []string{"job.e7", "job.e8", "job.e9"}
+	if len(got) != len(want) {
+		t.Fatalf("expected %d events, got %d", len(want), len(got))
+	}
+	for i, wantType := range want {
+		if string(got[i].Type) != wantType {
+			t.Errorf("position %d: expected %s, got %s", i, wantType, got[i].Type)
+		}
+	}
+
+	// limit 给得比库存还大时不报错，返回全部
+	all, err := log.Events("job-order", 50)
+	if err != nil {
+		t.Fatalf("Events with a larger limit failed: %v", err)
+	}
+	if len(all) != 10 {
+		t.Fatalf("expected the whole set, got %d", len(all))
+	}
+}
+
+// TestEventLog_EventsOrderWithinSameMicrosecond 同一微秒连发的两条按 seq 定序读回，
+// 而不是并列乱序：时间线把 scheduled 在 started 之前当作因果。
+func TestEventLog_EventsOrderWithinSameMicrosecond(t *testing.T) {
+	log, _, bus := newTestEventLog(t, nil)
+
+	bus.Publish(core.Event{Type: core.EventJobScheduled, JobID: "job-tie",
+		Status: core.StatusPending, Timestamp: fixedTime})
+	bus.Publish(core.Event{Type: core.EventJobStarted, JobID: "job-tie",
+		Status: core.StatusRunning, Timestamp: fixedTime})
+	waitQueued(t, log, 2)
+	if err := log.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	got, err := log.Events("job-tie", 0)
+	if err != nil {
+		t.Fatalf("Events failed: %v", err)
+	}
+	if len(got) != 2 || got[0].Type != core.EventJobScheduled || got[1].Type != core.EventJobStarted {
+		t.Fatalf("expected scheduled then started, got %+v", got)
+	}
+	if !got[0].Timestamp.Equal(got[1].Timestamp) {
+		t.Fatalf("the two events were meant to share a timestamp, got %v and %v",
+			got[0].Timestamp, got[1].Timestamp)
+	}
+}
+
+// TestEventLog_NilMetadata 写入时 Metadata 与 Data 都是 nil，读回必须是 nil 而不是空 map：
+// core.Event 的两个字段都带 omitempty，空值会让响应的 JSON 形状多出一对键。
+func TestEventLog_NilMetadata(t *testing.T) {
+	log, _, bus := newTestEventLog(t, nil)
+
+	bus.Publish(core.Event{Type: core.EventJobStarted, JobID: "job-nil",
+		Status: core.StatusRunning, Timestamp: fixedTime})
+	waitQueued(t, log, 1)
+	if err := log.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	got, err := log.Events("job-nil", 0)
+	if err != nil {
+		t.Fatalf("Events failed: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected 1 event, got %d", len(got))
+	}
+	if got[0].Metadata != nil {
+		t.Errorf("expected nil metadata, got %#v", got[0].Metadata)
+	}
+	if got[0].Data != nil {
+		t.Errorf("expected nil data, got %q", string(got[0].Data))
+	}
+
+	encoded, err := json.Marshal(got[0])
+	if err != nil {
+		t.Fatalf("marshaling the read event failed: %v", err)
+	}
+	if strings.Contains(string(encoded), `"metadata"`) || strings.Contains(string(encoded), `"data"`) {
+		t.Fatalf("an event without metadata or data must not carry those keys, got %s", encoded)
+	}
+}
+
+// TestEventLog_Recent 全局读取跨任务、按写入顺序升序，且与单任务读取共用一套还原逻辑。
+func TestEventLog_Recent(t *testing.T) {
+	log, _, bus := newTestEventLog(t, nil)
+
+	for _, id := range []string{"job-a", "job-b"} {
+		bus.Publish(core.Event{Type: core.EventJobScheduled, JobID: id,
+			Status: core.StatusPending, Timestamp: fixedTime})
+	}
+	waitQueued(t, log, 2)
+	bus.Publish(core.Event{Type: core.EventJobCompleted, JobID: "job-a",
+		Status: core.StatusSuccess, Timestamp: fixedTime.Add(time.Second)})
+	waitQueued(t, log, 3)
+	if err := log.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	all, err := log.Recent(0)
+	if err != nil {
+		t.Fatalf("Recent failed: %v", err)
+	}
+	if len(all) != 3 {
+		t.Fatalf("expected 3 events, got %d", len(all))
+	}
+
+	tail, err := log.Recent(2)
+	if err != nil {
+		t.Fatalf("Recent with a limit failed: %v", err)
+	}
+	if len(tail) != 2 || tail[0].JobID != "job-b" || tail[1].Type != core.EventJobCompleted {
+		t.Fatalf("expected the last two in write order, got %+v", tail)
+	}
+}
+
+// TestEventLog_EventsIsolateJobs 一个任务的时间线不该出现另一个任务的事件。
+func TestEventLog_EventsIsolateJobs(t *testing.T) {
+	log, _, bus := newTestEventLog(t, nil)
+
+	for _, id := range []string{"job-a", "job-b", "job-a"} {
+		bus.Publish(core.Event{Type: core.EventJobStarted, JobID: id,
+			Status: core.StatusRunning, Timestamp: fixedTime})
+	}
+	waitQueued(t, log, 3)
+	if err := log.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	got, err := log.Events("job-a", 0)
+	if err != nil {
+		t.Fatalf("Events failed: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected only job-a's two events, got %+v", got)
+	}
+	for _, event := range got {
+		if event.JobID != "job-a" {
+			t.Fatalf("the timeline leaked another job: %+v", event)
+		}
+	}
+}
+
+// TestEventLog_EventsAfterClose 读方法只依赖连接，不依赖订阅：写入器关停后仍可查，
+// 否则关停顺序里任何一个时点都会让端点突然 500。
+func TestEventLog_EventsAfterClose(t *testing.T) {
+	log, _, bus := newTestEventLog(t, nil)
+
+	bus.Publish(core.Event{Type: core.EventJobScheduled, JobID: "job-late",
+		Status: core.StatusPending, Timestamp: fixedTime})
+	waitQueued(t, log, 1)
+	if err := log.Close(); err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	got, err := log.Events("job-late", 0)
+	if err != nil {
+		t.Fatalf("Events after Close failed: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("expected the flushed event, got %+v", got)
+	}
 }

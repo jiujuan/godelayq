@@ -238,6 +238,110 @@ func (e *EventLog) prune(tx *sql.Tx) error {
 	return nil
 }
 
+// eventColumns 是两条读路径共用的列序，顺序与 scanEvent 一一对应。
+const eventColumns = `ts_us, type, job_id, job_name, status, data, metadata`
+
+// eventsReadLimitFallback 是 limit 传了零或负数时使用的行数上界。
+// 调用方里的读端点自带一个同值的响应上界（api/handlers_events.go 的 eventsQueryLimit）：
+// 这里兜底是为了让"忘记传 limit"退化成少读，而不是把整张表读进内存。
+const eventsReadLimitFallback = 1000
+
+// Events 按任务读回最近 limit 条事件，结果按写入顺序升序。
+//
+// 读的是 seq 而不是 ts_us：同一微秒内连发的 scheduled 与 started 只有 seq 分得出先后，
+// 而时间线把这两条的先后当作因果（设计文档 §6）。
+func (e *EventLog) Events(jobID string, limit int) ([]core.Event, error) {
+	return e.readEvents(
+		`SELECT `+eventColumns+` FROM job_events WHERE job_id = ? ORDER BY seq DESC LIMIT ?`,
+		limit, jobID)
+}
+
+// Recent 读回跨任务的最近 limit 条事件，结果按写入顺序升序。
+func (e *EventLog) Recent(limit int) ([]core.Event, error) {
+	return e.readEvents(
+		`SELECT `+eventColumns+` FROM job_events ORDER BY seq DESC LIMIT ?`,
+		limit)
+}
+
+// readEvents 执行一次降序查询，再把结果整体反转成升序。
+//
+// 降序 + 反转而不是升序 + 偏移：要拿的是"最后 N 条"，降序走 seq 索引只需读 N 行，
+// 升序取尾必须先跳过前面所有行。args 是 WHERE 的参数，limit 单独追加。
+func (e *EventLog) readEvents(query string, limit int, args ...any) ([]core.Event, error) {
+	if limit <= 0 {
+		limit = eventsReadLimitFallback
+	}
+	rows, err := e.db.sqlDB.Query(query, append(args, limit)...)
+	if err != nil {
+		return nil, fmt.Errorf("sqlite: query events: %w", err)
+	}
+	defer rows.Close()
+
+	// 端点把空列表序列化成了 "items": []，读侧也保持同一个形状：
+	// 返回 nil 切片会让 JSON 变成 null，前端两处都按数组处理。
+	items := make([]core.Event, 0, min(limit, 256))
+	for rows.Next() {
+		event, err := scanEvent(rows)
+		if err != nil {
+			return nil, fmt.Errorf("sqlite: scan event: %w", err)
+		}
+		items = append(items, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("sqlite: iterate events: %w", err)
+	}
+
+	// 库里按 seq 降序取回，反转为升序：调用方拿到的时间线方向与内存缓冲一致
+	for left, right := 0, len(items)-1; left < right; left, right = left+1, right-1 {
+		items[left], items[right] = items[right], items[left]
+	}
+	return items, nil
+}
+
+// rowScanner 是 *sql.Rows 的最小读面，让行还原能单独被测。
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanEvent 把一行还原成 core.Event。
+//
+// ts_us 只到微秒，还原出的 Time 丢了原来的纳秒部分与原始时区偏移（这里是本地时区）：
+// 两个时刻相同，精度界限见设计文档 §9 与本卡 §9 的第一条风险。
+// data 存的是发布方的 JSON 原文，这里不重新序列化，读侧拿到的字节与写入时一致。
+func scanEvent(row rowScanner) (core.Event, error) {
+	var (
+		timestampUS int64
+		typ         string
+		jobID       string
+		jobName     string
+		status      int
+		data        sql.NullString
+		metadata    sql.NullString
+	)
+	if err := row.Scan(&timestampUS, &typ, &jobID, &jobName, &status, &data, &metadata); err != nil {
+		return core.Event{}, err
+	}
+
+	event := core.Event{
+		Type:      core.EventType(typ),
+		JobID:     jobID,
+		JobName:   jobName,
+		Status:    core.JobStatus(status),
+		Timestamp: time.UnixMicro(timestampUS),
+	}
+	if data.Valid {
+		event.Data = json.RawMessage(data.String)
+	}
+	if metadata.Valid {
+		parsed := map[string]interface{}{}
+		if err := json.Unmarshal([]byte(metadata.String), &parsed); err != nil {
+			return core.Event{}, fmt.Errorf("metadata of job %s is not decodable: %w", jobID, err)
+		}
+		event.Metadata = parsed
+	}
+	return event, nil
+}
+
 // Flush 立即落盘当前批次，空批次不产生事务。供关停路径与测试使用。
 func (e *EventLog) Flush() error {
 	return e.batch.Flush()
