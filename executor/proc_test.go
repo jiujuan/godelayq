@@ -478,7 +478,10 @@ func TestRunner_HttpProfileIsNotExecutedByProcessRunner(t *testing.T) {
 	job, err := fixture.run(context.Background(), "job-http-profile", "")
 	failure := asExitError(t, err)
 
-	assert.Contains(t, failure.Reason, "TASK-E15", "错误要说明这条分支归哪一卡，而不是含糊的 not implemented")
+	// E15 之前这里的文本写着"执行分支归 TASK-E15"（占位实现）。现在 http 档位有了自己的
+	// 执行主体，这条断言钉的是分流没走偏：进程执行器拿到 http 档位时报"类型不符"，
+	// 而不是含糊的 not implemented，也不去起一个根本不存在的进程。
+	assert.Contains(t, failure.Reason, "http executor")
 	assert.True(t, failure.Permanent())
 	require.NotNil(t, job.Exec)
 	assert.Equal(t, string(KindHTTP), job.Exec.Kind)

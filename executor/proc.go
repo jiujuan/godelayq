@@ -117,8 +117,11 @@ func (r *Runner) Handler() core.Handler {
 		}()
 
 		if p.Kind == KindHTTP {
+			// 进程执行器只跑 script/binary：http 档位由 HTTPRunner 执行（TASK-E15）。
+			// 走到这里说明调用方绕过了 Register 的按 kind 分流，属于装配错误：
+			// 按永久失败返回，而不是去起一个根本不存在的进程。
 			return newFailure(p, failureProfileUnavailable, 0,
-				"http profiles are executed by the http executor, which lands in TASK-E15", nil)
+				"http profiles are executed by the http executor", nil)
 		}
 		if r.artifacts == nil {
 			return newFailure(p, failureNotAllowed, 0,
@@ -135,10 +138,10 @@ func (r *Runner) Handler() core.Handler {
 		}
 
 		timeout := p.timeoutWithin(r.cfg, sub.TimeoutValue)
-		if !r.acquirePermit(ctx, timeout) {
-			return r.permitFailure(ctx, timeout)
+		if !acquirePermit(ctx, r.permits, timeout) {
+			return permitFailure(p, ctx, timeout)
 		}
-		defer r.releasePermit()
+		defer releasePermit(r.permits)
 
 		writer, err := r.artifacts.Open(job.ID, job.Attempts)
 		if err != nil {
@@ -256,12 +259,16 @@ func (r *Runner) previewLimit() int {
 
 // acquirePermit 取档位并发许可，等待上限是本次执行的生效超时。
 //
+// 进程执行器与 HTTP 执行器共用这一份实现（参数是各自的 permits 通道）：
+// 两条通路要表达的只有"占一个名额 / 退一个名额"，规则一分叉就会出现
+// "同一档位下脚本与请求各自算一套并发"。
+//
 // 许可不是无限的资源：等不到就按超时失败，绝不无限等——挂在这里的协程既占着 worker 名额，
-// 又让调用方等不到任何答复。TASK-E13 会把执行任务与普通任务分池，本卡的等待时长上限
+// 又让调用方等不到任何答复。TASK-E13 会把执行任务与普通任务分池，本函数的等待时长上限
 // 是那时的前置事实。
-func (r *Runner) acquirePermit(ctx context.Context, limit time.Duration) bool {
+func acquirePermit(ctx context.Context, permits chan struct{}, limit time.Duration) bool {
 	select {
-	case r.permits <- struct{}{}:
+	case permits <- struct{}{}:
 		return true
 	default:
 	}
@@ -270,7 +277,7 @@ func (r *Runner) acquirePermit(ctx context.Context, limit time.Duration) bool {
 	defer timer.Stop()
 
 	select {
-	case r.permits <- struct{}{}:
+	case permits <- struct{}{}:
 		return true
 	case <-ctx.Done():
 		return false
@@ -283,8 +290,7 @@ func (r *Runner) acquirePermit(ctx context.Context, limit time.Duration) bool {
 //
 // 两条路径的类别都由 newFailure 负责，重试标记因此与进程执行路径出自同一个判定函数
 // （TASK-E12 §3.5：等不到许可是可重试的，被打断不是）。
-func (r *Runner) permitFailure(ctx context.Context, limit time.Duration) error {
-	p := r.profile
+func permitFailure(p *Profile, ctx context.Context, limit time.Duration) error {
 	if ctxErr := ctx.Err(); ctxErr != nil {
 		if errors.Is(ctxErr, context.DeadlineExceeded) {
 			return newFailure(p, failureTimeout, 0, "timed out", ctxErr)
@@ -295,11 +301,14 @@ func (r *Runner) permitFailure(ctx context.Context, limit time.Duration) error {
 	// 等不到许可也记成超时：调度器据此把它归到"超时"这一类，重试与告警口径一致。
 	return newFailure(p, failurePermitWait, 0, "concurrency limit",
 		fmt.Errorf("profile %q runs at most %d job(s) at a time and none finished within %v",
-			p.Name, p.MaxParallel, limit))
+			p.Name, permitCapacity(p.MaxParallel), limit))
 }
 
-func (r *Runner) releasePermit() {
-	<-r.permits
+// releasePermit 退回一个名额。调用方必须先持有许可（acquirePermit 返回 true），
+// 所以这里的接收永远不会阻塞；写成阻塞版本正是为了在违反前提时立刻暴露成死锁，
+// 而不是悄悄把一个没占名额的请求算成占过。
+func releasePermit(permits chan struct{}) {
+	<-permits
 }
 
 // logRun 记一次执行的收尾日志。字段集合就是设计文档 §7 允许的那些：
