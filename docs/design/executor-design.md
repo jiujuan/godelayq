@@ -1,8 +1,10 @@
 # 执行器：进程 / 脚本 / HTTP 任务的可插拔执行层设计
 
-> 状态：设计定稿，**尚未开工**（M0–M5 全部待实施）。
+> 状态：**已实现（M0–M5 全部落地）**，实现记录见 `tasks/executor/` 各卡的第 10 节。
 > 实施拆分：本设计的 §9 里程碑已拆成 19 张执行卡，见 `tasks/executor/`（索引在该目录的 `README.md`）。
 > 冲突处理：卡片里更新的实现细节（例如产物清理的具体策略、加载器的真实作用范围）以卡片为准，本文件是设计依据。
+> 偏差标注：照 `web-console-design.md` 的体例，落地与本文件写法不一致的段落以 ⚠️ 就地标注并写明现状与去处，
+> 避免读者把设计时的设想当成当前行为。面向使用者的结论一律写在 `docs/api.md` 与 `docs/deployment.md`。
 > 引用约定：照 `web-console-design.md` 的体例，本文件按**符号**锚定代码（如 `core/scheduler.go` 的 `dispatch`），不写行号——行号每加一个里程碑就会漂移，符号不会。
 > 前置阅读：`docs/design/web-console-design.md` §5.7（角色档位）、§5.6（事件缓冲）。
 
@@ -40,7 +42,30 @@
 | D8 | **提交 exec 任务默认要求 admin 档；文件投递默认拒绝** | `machine`（静态 token）档位等同 `operator`（`core/auth.go`），因此天然不达标——CI 里泄漏一个 token 不会变成命令执行。文件投递是另一条没有凭据的提交路径：注意服务端二进制今天并没有启用目录加载器（见 §6.9），这道边界是给自行接起 `DirectoryLoader` 的库使用者的 |
 | D9 | **参数与输出的读取档位收严** | payload 现在原样出现在任务响应里（`api/dto.go` 的 `JobResponse.Payload`），viewer 可读。profile 可声明 `secret_args`，这些键在响应里掩码；env 注入值**永不**经 API 返回；事件只带摘要不带 stdout 正文（事件会广播给所有 WS 订阅者并进内存缓冲） |
 
+**落地位置**（实现之后补写，方便按决策找代码）：
+
+- D5 ⚠️ 整树终止：`executor/proc_unix.go` 的 `killTree`（`SysProcAttr{Setpgid:true}` + 进程组 TERM→宽限→KILL）与
+  `executor/proc_windows.go` 的 `killTree`/`runTaskkill`。超时的生效值由 `executor/profile.go` 的 `effectiveTimeout`
+  合成（档位没写就用 `executors.default_timeout`，一律受 `max_timeout` 封顶）。**与原设计的差别**：超过
+  `max_timeout` 的请求在提交期被 `api/handlers.go` 的 `gateExecutorSubmission` 以 400 `invalid timeout` 拒掉，
+  而不是"静默夹到上限后照常入队"——让调用方在提交时看到上限，比执行到一半被中止更好排查（TASK-E16）。
+- D6 ⚠️ 崩溃不重放：`cmd/server/main.go` 的 `installRestoreGuard`/`pauseRunningExecOnRestore` 决定装不装守卫
+  （`enabled=false` 与 `restore_policy: replay` 都不装），改判动作在 `core/scheduler.go` 的 `SetRestoreGuard`
+  与 `holdRestored`。**与原设计的差别**：那段"需人工确认"的说明没有写进 `ExecMeta`，而是写在 `job.paused`
+  事件的 `metadata.reason = "restore_after_crash"`（同批带 `forced: true` 与 `attempts`）——崩溃前那几轮的
+  `job.started` 只存在于进程内存，重启即丢，来源标记只能落在事件里（TASK-E14）。
+- D7 ⚠️ 独立池：`core/scheduler.go` 的 `JobClass`/`RegisterHandlerClass`/`SetExecConcurrency` 与 `dispatch`
+  的双队列分流，字段名与 §6.5 一致。另有一条实现期加的能力原设计没写：档位级 `max_parallel`
+  （`executor/proc.go` 的 `acquirePermit`），它在一个档位的名额排满时让任务等待而不是开更多协程。
+- D9 ⚠️ 落地形态是**参数级**的 `args[].secret: true`（`core/config.go` 的 `ExecutorArg`），不是档位级
+  `secret_args` 名字列表；本文余下段落里的 `secret_args` 一律按这一条读。对外表现为
+  `GET /executors` 的 `has_secret_args`、任务对象六处出口的按值掩码与 `/result` 的档位收严
+  （`api/handlers_executors.go`，细节见 `docs/api.md`）。同一条里还有两处设计没写：
+  `args[].allow_dash`（默认不允许值以 `-` 开头，逐参数放开）与"`payload.body` 不参与掩码"
+  ——档位没有声明"body 里哪个键是凭据"的能力，要传凭据就走 secret 参数 + `header_allow` 里的同名键。
+
 ---
+
 
 ## 3. 现状盘点（规划时基线，已核实）
 
@@ -117,7 +142,13 @@
 1. 执行器键 = `exec.<profile.name>`，注册进既有注册表；`profile.name` 需符合 `core` 的命名规则，且禁止与已注册 Handler 同名（注册期冲突即启动失败，不静默覆盖）。
 2. **所有执行参数只在 payload 里**。`JobSnapshot.Payload` 已落盘，因此崩溃恢复天然可重放，快照结构除 §6.4 的摘要字段外不动。
 3. payload 的 `args`/`params` 只能出现 profile 声明过的键，多一个键就 400——白名单模式的全部意义在于此。
-4. `Job.Timeout` 在提交期归一化：`min(payload 或 job.timeout 或 default_timeout, max_timeout)`，落盘的就是生效值，别让运维去猜"没写超时到底是无限还是默认"。
+   ⚠️ 位置参数的实际写法是保留键 `args._positional`（字符串数组，`executor/args.go` 的 `positionalKey`），
+   上限与字符集来自档位的 `positional`；`/executors` 会把这一条透出成 `positional{max, pattern}` 给表单用。
+   http 档位的 payload 只认四个顶层键：`params`、`headers`、`body`、`timeout`，写成 `url`/`method`/`cmd` 按非法拒掉。
+4. ⚠️ `Job.Timeout` 的归一化与本文写法不同：请求里的值**超过档位 `timeout` 就是 400 `invalid timeout`**，
+   不做 `min(…, max_timeout)` 的静默夹取（TASK-E16 的决定，理由见 §2 D5）。生效值由
+   `executor.Registry.EffectiveTimeout` 算一次并写进任务，落盘快照与任务详情显示的就是实际会断的那一个。
+
 
 ### 5.2 kind: `script`（php / node / python / bash / sh / pwsh）
 
@@ -222,7 +253,7 @@ SSRF 防护必须在**拨号层**做，不是拼 URL 时做一次字符串判断
   `GET /jobs/:id/result` 在未注入时才 503（照 `requireGroupStore` 的先例）。
 - `cmd/server/main.go` 的 `registerHandlers` 改为"示例 Handler + 配置档位"两部分；`executors.enabled: false` 时一个 `exec.` 键都不注册，`GET /job-types` 与提交侧行为回到今天的样子。
 
-### 6.2 进程 runner（proc.go / proc_unix.go / proc_win.go）
+### 6.2 进程 runner（proc.go / proc_unix.go / proc_windows.go）
 
 - `exec.Cmd` + `Env` **重建**：只带 `executors.env_allow` 列出的键（默认 `PATH`/`LANG`/`LC_*`/`TZ`/`HOME`）加 profile 的 `env`。进程 env 里现在有 `GODELAYQ_SERVER_AUTH_JWT_SECRET`、静态 token（`core/config.go` 支持环境变量覆盖），全量继承等于把这些交给子进程。
 - 取消：`Cmd.Cancel` 自定义——Unix 用 `SysProcAttr{Setpgid: true}` + `syscall.Kill(-pid, SIGTERM)`，宽限后 `-pid` SIGKILL；Windows 一期用 `taskkill /PID <pid> /T /F`（不加依赖），并在文档写明它与"子进程新派生分支"之间存在竞态，Job Object（`JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）列 §9。
@@ -256,9 +287,22 @@ type ExecMeta struct {
 ```
 
 - 加法安全：`JobSnapshot` 是 JSON 对象，旧 `jobs.json` 缺 `exec` 键解出 nil；`ToSnapshot`/`FromSnapshot`/`CloneForRetry` 三处搬运要一起补（照 `Group` 字段的既有教训：一个字段四处搬）。
+  ⚠️ 落地时 `CloneForRetry` 这一处**故意不搬**：副本代表一次新的执行，留着旧结论会让 `GET /jobs/:id`
+  在新一轮还没跑完时就显示上一次的退出码与输出预览（TASK-E05 的结论）。搬运的是前两处。
+- ⚠️ 结构体实到多了两个字段：`Permanent`（这次失败不该重试，TASK-E12 的判定依据）；`Signal` 与设计的写法一致。
+  另外 `ExitCode` 与 `HTTPStatus` 互斥——http 档位永远不写 `exit_code`（TASK-E15）。
 - **不动 `JobStatus` 枚举**——它有 int 落盘错位的既有约束（`core/job.go` 注释），退出码之类的新维度一律走 `ExecMeta`。
-- 产物布局：`<output.dir>/<job_id>/a<attempts>.out`、`.err`、`.meta.json`。`CloneForRetry` 保留 ID 但 `Attempts` 递增，所以按 attempt 分文件才看得到重试链各自的输出。
-- 清扫：独立协程每日跑一次 + 启动时跑一次，按 `output.ttl` 过期删除；同时删除"ID 既不存储也不堆里"的孤儿目录。**不挂进 store 的 trim**——`core/store.go` 不该知道文件系统产物，且 `history_limit: -1` 的部署根本没有终态记录可对照。
+- ⚠️ 产物布局：`<output.dir>/<job_id>/a<attempt>.out`、`.err`、`a<attempt>.meta.json`（`executor/artifact.go`
+  的 `streamPath`/`metaFileName`；meta 先写临时文件再改名，读侧因此可以认为"存在的 meta.json 内容是完整的"）。
+  这一条与设计**不符**：`CloneForRetry` 不搬运 `Attempts`，计数在 `core/scheduler.go` 的 `executeJob` 里从副本的 0
+  重新加到 1，所以重试链的文件名始终是 `a1.*`，后一次执行会覆盖前一次的产物，`?attempt=2` 读不到东西
+  （`Job.Attempts` 的既有缺陷，已登记在 §11 第 7 条，未修）。也就是说"按 attempt 分文件才看得到重试链各自的输出"
+  这句在实现里不成立，`docs/api.md` 与 `GET /jobs/:id` 的 `attempts` 字段都按现状写明。
+- ⚠️ 清扫：实现是 `ArtifactStore.Start`（`executor/artifact.go`）——**启动时同步跑一轮完整扫描**（孤儿目录 +
+  TTL 过期），之后每 `purgeInterval`（24 小时）只按 TTL 过期删除，不再重跑孤儿扫描；孤儿清理只做一次的理由写在
+  `PurgeOrphans` 的注释里（运行期"存储与堆里都没有"的 ID 可能正在执行，删不得）。"每日跑一次 + 启动跑一次"
+  的设想因此偏成"启动完整、周期只按 TTL"。不挂进 store 的 trim 这条保持不变，理由同原设计。
+
 
 ### 6.5 并发隔离（D7）
 
@@ -309,6 +353,16 @@ executors:
 
 同步清单（缺一即测试红）：`core/config.go` 的 `Config`/`DefaultConfig`/`Normalized`/`Validate`、`configs/config.example.yaml`、本机 `configs/config.yaml`（`TestExampleConfigMatchesLocal` 守卫，见该文件头部注释的键对应约定）。
 
+⚠️ 三处取值规则与本节写法不同（`core/config.go` 的 `ExecutorsConfig` 注释与 `configs/config.example.yaml` 是权威）：
+
+- `default_timeout` 在 `enabled=true` 时必须是正值，`max_timeout` 超上限的档位与任务请求**直接 400 拒掉**（§2 D5）。
+- `concurrency` 与"0 = 用默认值"的既有约定**不同**：`enabled=true` 时显式写 0 会被拒，
+  要默认值就留空或删掉该项。这是为了让打开执行器的部署必须明确表态。
+- `output.max_bytes` 在 `enabled=true` 时有 1024 的下限；`output.ttl` 写 0 表示"不按时间清理，只做启动时的孤儿清理"。
+- 平台细节：Windows 的 `SystemRoot`、`COMSPEC`、`PATHEXT` 与 `PATH` 由执行器无条件透传（子进程启动的最小必需集），
+  不必也无法靠 `env_allow` 关掉；`GODELAYQ_` 前缀则无论写不写都被强制排除。
+
+
 环境变量覆盖不是自动的：`LoadConfig` 里是一张 `BindEnv` 逐键白名单（`server.port`、`scheduler.workers` 等），要让 `GODELAYQ_EXECUTORS_ENABLED`、`GODELAYQ_EXECUTORS_WORKSPACE` 这类标量键可覆盖，必须把它们逐个加进那张列表。`executors.commands` 是嵌套列表，与 `server.auth.users` 同一条限制：不做环境变量绑定，并把理由写进 `LoadConfig` 的既有注释里。解码用 `UnmarshalExact`，所以配置里出现未定义键会直接启动失败。
 
 ### 6.8 API 增量
@@ -320,11 +374,44 @@ executors:
 | `POST /api/v1/jobs`、`/batch` | 不变（operator），**处理器内**再判 `exec.` 前缀的 `required_role` | 档位取决于 body，正是 `allowRole` 的既有用法（`api/handlers_lifecycle.go` 的 force-pause 先例） |
 | `PUT /jobs/:id` | — | 允许改 `payload`，但改后必须重过 profile 参数校验；不允许把非 exec 任务改成 exec 前缀 |
 
+⚠️ 两行的最终形状以 `docs/api.md` 的"读取执行输出"一节为准（TASK-E07 定稿、E15/E16/E18 各自扩过键）：
+
+- `GET /executors` 的响应除表里那些之外还有：顶层 `enabled`/`required_role`/`max_timeout`
+  （`required_role` 在执行器关闭时是 `null`，`max_timeout` 关闭时整个键省略），每个档位
+  `reason`、`timeout`、`max_parallel`、`args[]`（含 `pattern`/`secret`）、`positional{max,pattern}`
+  （档位没声明位置参数时整个键省略）、`env_allow`（只有变量名）、`has_secret_args`、
+  `preferred_result_direction`，以及只在 http 档位出现的 `method`/`header_allow`/`body_mode`/`url`。
+  实现里 `env_allow` 与 http 的 `header_allow` 空表给 `[]` 而不是省略，`body_mode` 的空取值归一成 `none`。
+- `GET /jobs/:id/result` 的查询参数是四个：`stream`（`out`|`err`，默认 `out`；http 档位的 `err` 是两侧头而不是
+  stderr）、`from`（`tail`|`head`，默认 `tail`；`head` 是 http 档位的建议起点，由响应里的
+  `preferred_result_direction` 给出）、`attempt`（省略或 0 用快照的 `attempts`，显式给值必须在 `1..attempts`）、
+  `max_bytes`（默认 `executors.output.inline_preview` 的 4 倍，上限是单请求 8 MiB 与 `output.max_bytes`
+  的较小者，超过单请求上限返回 400）。响应恒带 `Cache-Control: no-store`；产物读不到时是 `200` +
+  `found: false` + `meta.artifact: "purged"`（不是 404），404 只表示任务快照不存在，未装配产物存储时 503。
+- `POST /jobs` 的 `required_role` 判定与 `PUT /jobs/:id` 的四条约束（禁改名、payload 重跑提交期判定、
+  判定顺序 404→改名 400→档位 403→非 pending 409）见 `docs/api.md`；两处都落在
+  `api/handlers_executors.go` 的 `gateExecutorSubmission`，`allowRole` 的先例仍是
+  `api/handlers_lifecycle.go` 的 force-pause。
+
+
 事件契约：`job.completed`/`job.failed` 的 `Data` 追加 `result` 摘要对象（exit code / http status / duration / truncated / `preview` 上限 `inline_preview` 字节）。**stdout 正文绝不进事件**——事件会广播给全部 WS/SSE 订阅者，并按 §3 的环形缓冲驻留内存。SSE 的类型白名单（`api/sse.go` 的 `publishedEventTypes`）本期不加新类型，只扩 `Data`。
+
+⚠️ 落地后的事件形状（`core/scheduler.go` 的 `eventData` 与各发布点，字段说明见 `docs/api.md` 的"事件里的执行结论"）：
+`Data` 是 `{"error": …, "result": …}`，失败时两者同时出现；`job.failed.metadata` 在既有三项之外**只在永久失败时**
+加 `permanent: true`（不写真值以外的取值，为了让既有事件的 JSON 一字不变）；`job.completed.metadata` 是
+`{duration_ms}`；`job.started.metadata` 是 `{attempt}`；`job.paused.metadata` 带 `reason`/`forced`/`attempts`（§2 D6）。
+`api/sse.go` 的类型白名单确实一字未改。
 
 ### 6.9 目录加载器边界
 
 `core/load.go` 在 `HandlerMap` 绑定处之前加一道前缀判断：`exec.` 开头且不允许 → 文件移入 `error_dir` 并记 warn。**理由要写进代码注释**：`job_queue/` 的写权限今天只是"能提交任务"，开了执行器之后它是"能执行命令"，而这条路径上没有凭据。
+
+⚠️ 落地的判断位置与去向（`core/load.go` 的 `rejectExecJob`，TASK-E17）：判断在 JSON 解析之后、绑定 Handler
+与入队之前，所以被拒绝的文件既没进调度器也没调用任何 Handler。文件不是"移入"而是**复制一份进 `ErrorDir`
+并在末尾追加一行原因**，源文件仍按 `PostLoadAction` 处理（删除策略下由 `handleErrorFile` 顺手删源，避免对
+同一个不存在的文件删第二次）；没配 `ErrorDir` 时源文件照常按 `PostLoadAction` 走，`KeepAfterLoad` 会把该文件
+记入已处理集合，所以不会每轮扫描重复拒绝同一个文件。日志原文是
+`executor job file rejected by the loader`（warn，含文件路径与任务名）。
 
 一条必须澄清的现状：`cmd/server` **并没有启用目录加载器**（`LoaderOptions` 只在 `core/load.go`、`examples/demo2` 与测试里出现，`configs/config.example.yaml` 里也没有加载器配置项——`core/config.go` 的注释说明未实现的选项故意不收录）。所以这条边界是**给库使用者的防护**：谁在自己的程序里把 `Scheduler` 与 `DirectoryLoader` 接起来，谁就继承这道判断；`executors.loader_allow` 的取值由 `Registry` 提供给库调用方读取，服务端二进制本身今天不受它影响。这个前提要写进 `LoaderOptions` 的字段注释，避免误以为已经堵住了服务端的一条提交路径。
 
@@ -365,14 +452,19 @@ executors:
 
 ## 9. 实施计划
 
+五个里程碑已全部落地（M0=E01–E04、M1=E05–E07、M2=E08–E12、M3=E13–E14、M4=E15、M5=E16–E19），
+逐卡的状态与实现记录见 `tasks/executor/README.md` 的状态表和各卡第 10 节。下表保留规划时的判据原文，
+⚠️ 标注的是落地时与判据不同或只做到一部分的项。
+
 | 里程碑 | 内容 | 完成判据 |
 | --- | --- | --- |
 | M0 | 配置段 + `executor` 包骨架（profile 校验、探测、登记表、注册）+ `cmd/server` 装配 | `enabled: false` 时全仓测试行为零变化；非法 profile 启动即失败并有可读原因；两份 yaml 键同步（守卫测试绿） |
-| M1 | `ExecMeta` + `ArtifactStore` + `GET /executors` + `GET /jobs/:id/result` + 事件摘要 | 旧 `jobs.json` 能读；产物按 attempt 分文件；TTL 与孤儿清扫各有测试 |
-| M2 | script/binary runner + 进程树取消 + 强制超时 + `Permanent()` 重试分类 | Unix/Windows 各自断言"kill 后无残留进程"；`exit 3`、`sleep 100` + cancel、超时三条链路集成测试 |
+| M1 | `ExecMeta` + `ArtifactStore` + `GET /executors` + `GET /jobs/:id/result` + 事件摘要 | ⚠️ 旧 `jobs.json` 能读；TTL 与孤儿清扫各有测试。**"产物按 attempt 分文件"只做对了 http/首次执行的那一半**：`Attempts` 不被 `CloneForRetry` 搬运，重试仍写 `a1.*`，见 §6.4 与 §11 第 7 条 |
+| M2 | script/binary runner + 进程树取消 + 强制超时 + `Permanent()` 重试分类 | ⚠️ Windows 侧"kill 后无残留进程"在实测中未稳定成立（`taskkill /T /F` 非原子，见 §11 第 2 条）；`exit 3`、`sleep 100` + cancel、超时三条链路集成测试有（Windows 实跑，Linux 侧只交叉编译验证） |
 | M3 | `JobClass` 双池分流 + `restore_policy` + `RuntimeStats`/`/stats`/运维页字段 | 压测：100 个 exec 任务到期时主池 Handler 仍按时执行；崩溃恢复断言 running→paused、pending→pending |
 | M4 | HTTP 执行器（模板/参数/headers/body/响应捕获 + SSRF 防线） | `httptest` 覆盖 2xx/4xx/5xx/超时/重定向/私有 IP/元数据地址/超大响应 |
-| M5 | 档位收严（`required_role`、`allowRole`、`secret_args` 掩码）+ loader 边界 + 控制台结果面板与模板 + 文档收尾 | 权限矩阵逐条 403/200 断言；README 特性表、`docs/api.md`、`docs/deployment.md` 更新 |
+| M5 | 档位收严（`required_role`、`allowRole`、`secret_args` 掩码）+ loader 边界 + 控制台结果面板与模板 + 文档收尾 | ⚠️ 权限矩阵逐条 403/200 断言、四份文档与 README 更新已完成；`docs/api.md` 写的是超时会 **400 拒掉**而不是夹取，与 M5 判据无关但与 §10 那条措辞相反，以 §2 D5 的标注为准 |
+
 
 依赖：只有既有依赖 + 可选 `golang.org/x/sys`（若 Job Object 提前到本期）。核心路径不需要新依赖。
 
@@ -382,24 +474,35 @@ executors:
 
 验证口径照仓库既有约定：`go build ./...`、`go vet ./...`、`go test ./... -race` 全绿；`go test -run TestExampleConfigMatchesLocal ./core`；前端 `npx vue-tsc --noEmit` + `npm run build`。**注意 `gofmt -l` 在本仓因 CRLF 全量误报**，格式化检查须走既有流程，不要按它的输出判断。
 
-- [ ] `executors.enabled: false`（默认）时：`GET /job-types` 与 `GET /executors` 不含任何 `exec.` 项，提交 `exec.*` 返回 400 `unknown job type`，全仓既有测试零改动通过
-- [ ] profile 校验逐条报错：脚本越出 workspace、`args_render` 引用未声明键、与既有 Handler 同名、timeout 超 `max_timeout`、`runtime_allow` 外的解释器
-- [ ] 运行时缺失（未装 node/php）时：`/executors` 显示 `runtime_ok: false` 与探测到的路径，提交该 profile 返回 400 且 `details` 说明原因；其余 profile 不受影响
-- [ ] 参数校验：多传键、值不符 pattern、值以 `-` 开头（未声明 positional）、`args` 非对象 → 全部 400，且在 `POST /jobs` 与 `POST /jobs/batch` 两条路径上行为一致
-- [ ] 进程取消：`bash` 脚本内部再 `sleep 600 &`，Cancel 后**孙子进程也消失**（Unix 用 `ps -o pid,pgid` 断言；Windows 用 `Get-CimInstance Win32_Process` 查父 PID 断言）
-- [ ] 强制超时：payload 不带 `timeout` 时生效值为 `default_timeout`；带超大值时被夹到 `max_timeout`；落盘快照即为夹后的值
-- [ ] 输出上限：单流超 `max_bytes` 后停止写入并置 `truncated: true`，`/result` 响应带截断标记；`inline_preview` 在快照与事件两处都不被越过
-- [ ] 重试链产物：重试一次产生 `a1`/`a2` 两份文件，`GET /jobs/:id/result?attempt=` 能分别读到
-- [ ] 崩溃恢复：任务 running 时 kill -9 进程，重启后该任务为 `paused`（`restore_policy: pause`）且 `ExecMeta` 写明原因；pending 任务照常复活
-- [ ] 隔离：`executors.concurrency: 1` + 20 个 exec 任务到期，主池 Handler 的执行间隔不受影响；`/admin/runtime` 能看到 exec 池占用
-- [ ] 重试分类：`exit 1`（默认 permanent）不产生 `job.retrying`；`retry_on_exit: [75]` 的退出码走退避；`RetryDelay` 上限仍受 `scheduler.max_retry_delay` 约束
-- [ ] SSRF：`http://127.0.0.1`、`http://169.254.169.254`、`http://<内网 IP>`（`allowed_hosts` 未含）、指向私有 IP 的域名（DNS rebinding 模拟）→ 全部拒绝，且拒绝发生在建连之前
-- [ ] HTTP 响应：超大 body 被 `max_body_bytes` 截断；`expect_status` 外的状态码判 failed；重定向默认不被跟随
-- [ ] 权限矩阵（启用鉴权）：operator/machine 提交 exec → 403；admin → 201；`secret_args` 的值在 `GET /jobs/:id`、`/jobs`、`/executors`、事件流四处均不外泄；`/result` 档位符合 §6.8
-- [ ] 目录加载器：`loader_allow: false` 时 `exec.*` 的任务文件进 `error_dir` 且不执行；开启后按 §6.9 的注释可查到风险声明
-- [ ] env 清洗：子进程内 `env` 打出的清单不含 `GODELAYQ_*`；`env_allow` 增删能生效
-- [ ] 未启用鉴权（本机开发形态）：所有档位判定视为通过，但 `enabled` 仍是 false，需显式打开——`deployment.md` 的警告段可读到这条因果
-- [ ] 前端：任务详情页结果卡片在 script/binary/http 三种 kind 下渲染正确（含截断与产物已清理态）；模板页四类示例照抄可跑
+- [x] `executors.enabled: false`（默认）时：`GET /job-types` 与 `GET /executors` 不含任何 `exec.` 项，提交 `exec.*` 返回 400 `unknown job type`，全仓既有测试零改动通过
+- [x] profile 校验逐条报错：脚本越出 workspace、`args_render` 引用未声明键、与既有 Handler 同名、timeout 超 `max_timeout`、`runtime_allow` 外的解释器
+- [x] 运行时缺失（未装 node/php）时：`/executors` 显示 `runtime_ok: false` 与探测到的路径，提交该 profile 返回 400 且 `details` 说明原因；其余 profile 不受影响
+- [x] 参数校验：多传键、值不符 pattern、值以 `-` 开头（未声明 positional）、`args` 非对象 → 全部 400，且在 `POST /jobs` 与 `POST /jobs/batch` 两条路径上行为一致
+- [ ] ⚠️ 进程取消：`bash` 脚本内部再 `sleep 600 &`，Cancel 后**孙子进程也消失**。Windows 实测：`bash.exe` 立即消失，
+  但一条 `sleep.exe` 活过了它自己的 60 秒——`taskkill /T /F` 的父子快照与派生之间有竞态（§11 第 2 条）。
+  Unix 侧（`Setpgid` + 进程组信号）只有单元测试与交叉编译，本机没有可跑 `-race` 的 Linux 环境，**未实跑**。
+- [ ] ⚠️ 强制超时：payload 不带 `timeout` 时生效值为 `default_timeout`（已实测）；带超大值时**400 拒掉**而不是夹到
+  `max_timeout`（TASK-E16 改了策略，见 §2 D5 的标注）；落盘快照即为生效值
+- [x] 输出上限：单流超 `max_bytes` 后停止写入并置 `truncated: true`，`/result` 响应带截断标记；`inline_preview` 在快照与事件两处都不被越过
+- [ ] ⚠️ 重试链产物：**未达成**。`CloneForRetry` 不搬 `Attempts`，重试仍写 `a1.*` 并覆盖上一次，`?attempt=2` 读不到
+  （登记为 §11 第 7 条，本卡只写文档不改代码）
+- [x] ⚠️ 崩溃恢复：任务 running 时 kill -9 进程，重启后该任务为 `paused`（`restore_policy: pause`）且 `ExecMeta` 写明原因；pending 任务照常复活。
+  实测成立（本机 Windows 用 `taskkill /F` 强杀留 `running` 快照，重启日志 `paused executor jobs after crash count=1`），
+  但"写明原因"的位置不是 `ExecMeta` 而是 `job.paused` 的 `metadata.reason=restore_after_crash`，见 §2 D6 的标注
+- [x] 隔离：`executors.concurrency: 1` + 20 个 exec 任务到期，主池 Handler 的执行间隔不受影响；`/admin/runtime` 能看到 exec 池占用
+- [x] 重试分类：`exit 1`（默认 permanent）不产生 `job.retrying`；`retry_on_exit: [75]` 的退出码走退避；`RetryDelay` 上限仍受 `scheduler.max_retry_delay` 约束
+- [x] SSRF：`http://127.0.0.1`、`http://169.254.169.254`、`http://<内网 IP>`（`allowed_hosts` 未含）、指向私有 IP 的域名（DNS rebinding 模拟）→ 全部拒绝，且拒绝发生在建连之前（`executor/http_test.go` 的 `TestHTTP_Dial_Rebinding`；实跑侧另以 TCP 监听器证明连接根本没到对端）
+- [x] HTTP 响应：超大 body 被 `max_body_bytes` 截断；`expect_status` 外的状态码判 failed；重定向默认不被跟随
+- [x] 权限矩阵（启用鉴权）：operator/machine 提交 exec → 403；admin → 201；`secret_args` 的值在 `GET /jobs/:id`、`/jobs`、`/executors`、事件流四处均不外泄；`/result` 档位符合 §6.8
+- [x] ⚠️ 目录加载器：`loader_allow: false` 时 `exec.*` 的任务文件进 `error_dir` 且不执行（去向是"复制一份带原因的副本"，
+  源文件仍按 `PostLoadAction` 处理，见 §6.9 的标注；E17 用 `examples/demo2` 真实跑过）；开启后按 §6.9 的注释可查到风险声明
+- [x] env 清洗：子进程内 `env` 打出的清单不含 `GODELAYQ_*`；`env_allow` 增删能生效
+- [x] 未启用鉴权（本机开发形态）：所有档位判定视为通过，但 `enabled` 仍是 false，需显式打开——`deployment.md` 的警告段可读到这条因果
+- [x] ⚠️ 前端：任务详情页结果卡片在 script/binary/http 三种 kind 下渲染正确（含截断与产物已清理态）；模板页四类示例照抄可跑。
+  走查在 Windows 的内嵌形态完成（TASK-E18 第 10 节，逐条结果与"未观测"项都在那里）；`cmd`/`pwsh` 那两条示例走的是
+  `kind: binary` + `fixed_args` 的写法（§11 第 8 条的现成绕法）。同一次走查**没有在 Linux/macOS 图形浏览器上复走**：
+  本机没有可用的 Linux 图形环境，只有交叉编译产物（TASK-E19 第 10 节）
+
 
 ---
 
@@ -407,7 +510,23 @@ executors:
 
 1. **默认关闭挡不住"顺手打开"**。最大的真实风险不是设计漏洞，而是有人在公网可达、未配凭据的实例上把 `enabled` 拧成 true。缓解：启动时若 `executors.enabled && !auth_enabled` 直接记 **error 级**横幅（与 `allow_credentials` 与 `"*"` 互斥那种启动期硬拦同级），并在 `deployment.md` 把它写成必做项。
 2. **Windows 进程树终止非原子**。`taskkill /T /F` 依赖快照式父子遍历，杀的瞬间新派生的分支可能漏网；正解是 Job Object + `KILL_ON_JOB_CLOSE`，列为 M2 之后的加固（需要 `x/sys` 或 `NewLazyDLL` 三函数）。文档与验收清单都要如实标注这一条，别让读者以为两端等价可靠。
+   ⚠️ 加固仍未做，且 M2 之后实测坐实了这条风险：TASK-E19 在 Windows 上取消一条派生子进程的档位任务，直接子进程
+   `bash.exe` 立刻消失，一条孙子 `sleep.exe` 活过了它自己的 60 秒。`docs/deployment.md` 的"Windows 整树终止"一节
+   按这个现场写明：终止是尽力而为，运维要用 `tasklist` 而不是"任务已 cancelled"来判断机器干净。
 3. **白名单会让"再灵活一点"的诉求不断回来**（能不能 payload 传脚本路径？传命令行？换个解释器？）。每一次松动都是在重开 D1/D2/D3 挡住的洞。演进方向应当是"更多已声明的档位"，必要时允许 profile 级 `fixed_args` 前缀 + 位置参数的组合，而不是引入 raw 通道。
 4. **参数仍会明文进 `jobs.json`**（D9 只解决"不显示"，不解决"不落盘"）。真正的解法是 payload 级加密或凭据托管，本期不做；若走到那一步，产物文件（含 stdout，可能回显参数）必须一起纳入同一保密边界。
 5. **至少一次语义的根因在架构里**（单进程内执行 + 快照落盘），D6 只是把"未知结果"这一类从静默重跑变成人工确认。彻底解法是执行租约/幂等键或外部编排（Step/Argo 式），超出本仓库定位。
 6. **输出正文与任务快照分处两地**，会漂移（快照在、产物被 TTL 清了）。`ExecMeta.Artifact` 的 `purged` 态与 UI 的降级提示是为此而设，不是装饰。
+7. **`Job.Attempts` 在重试链上断掉**（TASK-E19 实测确认，不是推测）。`core/job.go` 的 `CloneForRetry` 不搬运 `Attempts`，
+   而 `core/scheduler.go` 的 `executeJob` 每次执行把它加 1，于是重试副本又从头数到 1。后果有三处：产物文件恒叫
+   `a1.*` 且后一次覆盖前一次（§6.4）、`GET /jobs/:id` 的 `attempts` 恒为 1（`docs/api.md` 已按现状写明）、
+   控制台详情页的"尝试"下拉因此只有一项（TASK-E18 第 10 节"未验证与遗留"第一条）。
+   修法要动 core 的字段搬运并同步 `/result` 的 `attempt` 上界，不属于 E19 的文档范围，留作后续任务卡。
+8. **`cmd` / `pwsh` 作为 `script` 档位跑不起来**：`script` 形状生成的 argv 是 `[解释器, 脚本路径]`，而这两个解释器
+   必须带 `/c`、`-File` 之类的开关才会去执行文件。当前可用写法是 `kind: binary` + `fixed_args: ["/c", 脚本名]`
+   （`docs/deployment.md` 第 7 条与 `web/src/content/job-template.md` 都给了可照抄的 yaml）。
+   把"解释器的执行开关"做成档位声明的一部分需要扩配置形状与 argv 合成规则，属后续任务卡。
+9. **Windows 控制台输出是系统本地代码页**：中文 Windows 上脚本写出的 stdout 是 GBK，产物文件按原样字节保存，
+   于是接口与 `meta.json` 的尾部预览把非 UTF-8 字节显示成替换字符。本期只写文档口径（`chcp 65001` 或在脚本里
+   重定向编码）；按档位声明代码页转码若要实现就开新卡（TASK-E18/E19 的实测现场如此）。
+
