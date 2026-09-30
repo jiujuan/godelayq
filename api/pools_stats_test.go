@@ -83,7 +83,24 @@ func TestAdminRuntime_ExposesExecPool(t *testing.T) {
 
 	startTwoPools(t, srv, 1)
 
-	runtime := decodeRuntime(t, doGet(t, srv, "/api/v1/admin/runtime", nil))
+	// 第二条档位任务进队列的时刻晚于"worker 取走第一条"，而 startTwoPools 只等到
+	// 两个 Handler 进入的信号；机器忙时这一步会拖到读接口之后，所以在测试协程里
+	// 轮询到队列计数到位再断言（同 handlers_lifecycle_test.go 的收尾轮询写法，
+	// 交给 require.Eventually 会让断言跑在非测试 goroutine 上）。
+	deadline := time.Now().Add(5 * time.Second)
+	var runtime RuntimeResponse
+	for {
+		runtime = decodeRuntime(t, doGet(t, srv, "/api/v1/admin/runtime", nil))
+		if runtime.Scheduler.ExecRunning == 1 && runtime.Scheduler.ExecQueueLength == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("执行器池没进入预期状态：running=%d queue_length=%d， wanted 1/1",
+				runtime.Scheduler.ExecRunning, runtime.Scheduler.ExecQueueLength)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
 	assert.Equal(t, 1, runtime.Scheduler.ExecWorkers)
 	assert.Equal(t, 1, runtime.Scheduler.ExecQueueCap, "未显式配置队列容量时与 exec worker 数相等")
 	assert.Equal(t, 1, runtime.Scheduler.ExecRunning)
