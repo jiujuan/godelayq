@@ -327,7 +327,7 @@ type AuditLog struct{ ... }        // 实现 api 侧的 auditRecorder
 
 ### 9.6 装配（`cmd/server/main.go`）
 
-`runtimeDeps` 新增闭包 `newObservabilityDB func(core.Config, *slog.Logger) (*sqlite.DB, error)`，列入既有的依赖完整性检查（`run` 开头那段 `== nil` 判断，参照 `newExecutorRegistry`/`newArtifactStore` 的处理：**闭包必须显式提供，缺了不让启动**）。`newServer` 的签名扩到传事件与审计依赖，测试里的替身跟着改。
+`runtimeDeps` 新增闭包 `newObservabilityDB func(core.Config, *slog.Logger) (observabilityDB, error)`，返回的是 `cmd/server` 一侧定义的窄接口（`Path`/`JournalMode`/`Stats`/`Close`）而不是 `*sqlite.DB`：关闭顺序只有在句柄可替换时才断言得出来，且与本文件既有的 `schedulerAPI`/`serverAPI` 同一做法（接口定义在消费方）。实现列入既有的依赖完整性检查（`run` 开头那段 `== nil` 判断，参照 `newExecutorRegistry`/`newArtifactStore` 的处理：**闭包必须显式提供，缺了不让启动**）。`newServer` 的签名扩到传事件与审计依赖，测试里的替身跟着改。
 
 `observability.enabled == false` 时：不调用该闭包、不建目录、三个注入全部传 nil，行为与本设计之前逐字节一致。
 
@@ -364,7 +364,7 @@ type AuditLog struct{ ... }        // 实现 api 侧的 auditRecorder
 
 | # | 风险 | 应对 |
 | --- | --- | --- |
-| 1 | 二进制约 +8~10MB、`go.sum` 新增一条重依赖树 | 记进 `docs/deployment.md`；驱动只在 `store/sqlite` 出现，删掉该包即可完全回到现状 |
+| 1 | 二进制约 +8~10MB、`go.sum` 新增一条重依赖树（实测：S02 落地为 **+5.5 MiB / +17.7%**，`windows/amd64` 的 32,773,120 B → 38,583,808 B；驱动取 `modernc.org/sqlite v1.46.0`，因为 v1.47.0 起要求 `go 1.25`、v1.60.x 要求 `go 1.26`，抬版本会连带抬高整仓最低工具链与 `examples` 的 `go run` 门槛） | 记进 `docs/deployment.md`；驱动只在 `store/sqlite` 出现，删掉该包即可完全回到现状 |
 | 2 | 备份口径变化：WAL 模式带 `-wal`/`-shm` 旁文件 | `docs/deployment.md` 明确"运行中备份用 `VACUUM INTO` 而不是拷单文件" |
 | 3 | 表可能缺页（队满丢弃 / 事务二次失败） | `dropped` 计数公开在 `/admin/runtime`；读端点的 `Note` 说明写入延迟。**不做"绝不丢"承诺** |
 | 4 | `write_audit` 随写请求量线性增长 | 默认 90 天 + 条数上限；部署方按吞吐调低。本期不做按列裁剪配置（未生效的选项不进配置） |

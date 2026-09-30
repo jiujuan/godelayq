@@ -13,9 +13,9 @@
 
 设计文档 §5 的依赖边界要有唯一的落点：`core` 现在不认识任何存储驱动（`core/store.go` 只用标准库 `os`/`encoding/json`），`examples/demo1`、`demo2` 直接构造 `core.Scheduler`，一旦 `core` import 了驱动，这两个示例和全部 `core` 测试都会被动继承一个 CGO/大体积依赖。
 
-装配侧也有一个既有惯例要照抄：`cmd/server/main.go` 的 `runtimeDeps` 用闭包提供每个重依赖，并在 `run()` 开头做依赖完整性检查（`main.go:154-157`）——`newExecutorRegistry` 与 `newArtifactStore` 的注释都写着"缺了它会静默不生效，所以列入检查"。观测层同理：少装配一个闭包的后果是"三张表永远是空的"，看起来正常、实际没记，必须在启动期就报错。
+装配侧也有一个既有惯例要照抄：`cmd/server/main.go` 的 `runtimeDeps` 用闭包提供每个重依赖，并在 `run()` 开头做依赖完整性检查（S01 基线在 `main.go:154-157`，本卡加上 `newObservabilityDB` 之后是 181-185）——`newExecutorRegistry` 与 `newArtifactStore` 的注释都写着"缺了它会静默不生效，所以列入检查"。观测层同理：少装配一个闭包的后果是"三张表永远是空的"，看起来正常、实际没记，必须在启动期就报错。
 
-关闭顺序是另一处已有先例：`main.go:221-227` 用 `defer` 的声明顺序保证产物清理协程先退、存储后关，注释明确写了原因（否则协程可能在存储已关闭后再读一次任务集合）。观测层的撤订阅与关闭要排在同一批 `defer` 里，理由一致（设计文档 §7.3）。
+关闭顺序是另一处已有先例：`main.go` 用 `defer` 的声明顺序保证产物清理协程先退、存储后关（S01 基线在 221-227，现为 249-255），注释明确写了原因（否则协程可能在存储已关闭后再读一次任务集合）。观测层的撤订阅与关闭要排在同一批 `defer` 里，理由一致（设计文档 §7.3）。
 
 ## 3. 要实现的功能
 
@@ -45,7 +45,7 @@
 
    `synchronous=normal` 的持久化含义要写进注释：WAL + NORMAL 下断电最多丢最后若干次已提交事务，与 `core/store.go:17-19` 记录的"崩溃最多丢失一个合并周期"是同一量级的保证；需要更强保证的部署改配 `full`。
 5. `schema.go`：三张表的 DDL 原样落进本包（`job_events`、`artifact_index`、`write_audit`，见设计文档 §6），列注释保留；另外建 `observe_schema_migrations(version INTEGER, applied_at INTEGER)`。
-   迁移方式是"按版本号顺序执行内置语句切片"，本卡只写 `version 1`（建全部三张表 + 6 个索引）。**表名与索引名与设计文档 §6 逐字一致，S03/S05/S06 不再建表。**
+   迁移方式是"按版本号顺序执行内置语句切片"，本卡只写 `version 1`（建全部三张表 + 8 个索引：事件 3、产物 1、审计 4）。**表名与索引名与设计文档 §6 逐字一致，S03/S05/S06 不再建表。**
    迁移版本表带 `observe_` 前缀：将来若把任务快照也换成 SQLite（设计文档 §4.3），两张迁移表不能撞名。
 6. `batch.go`：三张表共用的批量写入骨架，本卡就要写完（S03/S06 各自只有一个写入器，重复实现三遍必然分岔）：
 
@@ -82,7 +82,7 @@
 
 ## 5. 测试要求
 
-1. `TestOpen_CreatesFileAndSchema`：临时目录下不存在的 `observe.sqlite`，`Open` 后文件存在、`Stats().SchemaVersion == 1`、三张表用 `sqlite_master` 查询都能取到、6 个索引都在。
+1. `TestOpen_CreatesFileAndSchema`：临时目录下不存在的 `observe.sqlite`，`Open` 后文件存在、`Stats().SchemaVersion == 1`、三张表用 `sqlite_master` 查询都能取到、8 个索引逐个点名。
 2. `TestOpen_ParentDirCreated`：`path` 指向两级不存在的目录，`Open` 成功而不是报错。
 3. `TestOpen_InvalidPathRejected`：`path` 是已存在目录的路径 → 返回错误且不 panic。
 4. `TestOpen_WALModeEnabled`：`PRAGMA journal_mode` 查询结果是 `wal`。
@@ -131,7 +131,7 @@ go build -tags dashboard ./...
 
 ## 9. 风险与回滚
 
-- 风险：`modernc.org/sqlite` 依赖树较大、二进制增加约 8~10MB。这是 D2 选择的代价，记进 `docs/deployment.md`（S07）。
+（记录的实测见第 10 节验证结果）风险：`modernc.org/sqlite` 依赖树较大，二进制实测增加 5.5 MiB（+17.7%，windows/amd64）。这是 D2 选择的代价，记进 `docs/deployment.md`（S07）。
 - 风险：WAL 模式在部分网络文件系统上不可用（`journal_mode` 设置会静默退回 `delete` 或报错）。本卡不特殊处理，但 `Open` 要把实际生效的 `journal_mode` 记进启动日志的 debug 级，便于现场判断。
 - 风险：`-race` 下 `database/sql` 与 ticker 的组合容易出偶发调度问题。所有用例用注入的时钟或显式 `Flush()`，不允许用 sleep 等结果（与 `executor/artifact_test.go` 的 `TestStart_StopsWithContext` 同一处理）。
 - 回滚：本卡改动分三个可独立 revert 的提交——新增 `store/sqlite/`、`cmd/server` 装配、`go.mod`。回滚即全部删除，既有行为无残留。
@@ -154,6 +154,7 @@ go build -tags dashboard ./...
   - `grep -rln "modernc.org/sqlite" --include=*.go .` → 只有 `store/sqlite/db.go`（真正 import 驱动的那一个）与 `store/sqlite/doc.go`（包注释里提到名字）
   - `grep -ci mattn/go-sqlite3 go.mod go.sum` → `0` / `0`（没有第二套驱动）
 - `go test -run TestExampleConfigMatchesLocal ./core` 通过（S01 那份守卫不受影响；本卡没改配置键）。
+- §9 风险 1 的体积代价实测（S07 写 `docs/deployment.md` 时直接引用）：`windows/amd64` 的 `godelayq-server` 从 32,773,120 B（`04a764c`，接入本包之前）涨到 38,583,808 B，**+5.5 MiB / +17.7%**；设计文档 §13 估的是 +8~10 MB，实际落在下沿之外，按实测记。
 - 冒烟（系统临时目录独立二进制 + 独立配置 + 独立 `data/`，未触碰仓库的 `configs/config.yaml` 与 `data/`）：
   1. `enabled: true` + 合法 `path` → 启动日志 `level=INFO msg="observability enabled" path=... schema_version=1 journal_mode=wal`；运行期 `data/` 下出现 `observe.sqlite`(4 KB) 与 `-wal`(70 KB)、`-shm`(32 KB) 旁文件；对端 `/api/v1/stats` 可达。
   2. `enabled: false` + 同一个 `path` → 目录里一个文件都没有、日志里搜不到 `observability` 字样（`grep -ci` = 0）。
