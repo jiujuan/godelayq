@@ -812,6 +812,69 @@ GET /api/v1/jobs/01a0f1f7-77bc-7209-bee8-daf1506f288e/result?stream=err&from=tai
 
 档位没声明 `secret` 参数时，这个端点的门槛就是 `reader`（`viewer` 及以上）。
 
+一个任务有哪些尝试、各自的输出多大、产物还在不在，不必逐个 `attempt` 试读：见下一节
+[列出各次尝试的输出](#列出各次尝试的输出-get-jobsidartifacts)。
+
+### 列出各次尝试的输出：`GET /jobs/:id/artifacts`
+
+回答"这个任务跑过哪几次、每次输出多大、被清理了没有"，**不含输出正文**。
+数据来自观测库的 `artifact_index` 表（SQLite 观测层，设计依据见
+`docs/design/sqlite-observability-design.md` 的 D8 与 §6.2），
+正文仍然只存在于磁盘上的产物文件里，读它是上面那个 `/result` 端点的事。
+
+```json
+GET /api/v1/jobs/01a0f3eb-7670-78bf-bdf4-605434827d4b/artifacts
+```
+
+```json
+200 OK
+{
+  "job_id": "01a0f3eb-7670-78bf-bdf4-605434827d4b",
+  "count": 1,
+  "items": [
+    { "attempt": 1, "kind": "script", "profile": "fail3",
+      "out_bytes": 34, "err_bytes": 41, "truncated": false,
+      "state": "available", "created_at": "2026-10-01T04:04:51+08:00" }
+  ]
+}
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `attempt` | 第几次尝试，**按升序返回**（重试链的自然阅读顺序）。同一 `(任务, 尝试)` 只有一行：重复跑到同一个 `attempt` 是覆盖，`created_at` 跟着走 |
+| `kind` / `profile` | 与 `exec.kind` / `exec.profile` 同一取值，来自执行侧而不是快照：这一行登记的时刻就是产物写完的时刻 |
+| `out_bytes` / `err_bytes` | 落盘字节数，与 `exec` 里那两个数**同源**（都来自写盘收尾的同一份结论），也就是产物文件的实际大小 |
+| `truncated` | 该次输出撞到 `executors.output.max_bytes` 上限，后面的部分没写进文件 |
+| `state` | `available` / `purged`。见下面两条 |
+| `created_at` | 这一行写入的时刻，不是任务的执行时刻（两者通常只差几毫秒） |
+
+`state` 的两条来历：`purged` 要么由**启动对账**标的（这一次启动时发现目录已经不在了），
+要么由**读取端点**标的（`/result` 去读文件时读到了"不存在"，顺手把快照与索引一起纠正）。
+一张表只登记一次执行的输出属性，所以**删掉某一路文件会让整行变成 `purged`**，
+而另一路文件可能还在、`/result?stream=err` 照样读得到（本机实测：删掉 `a1.out` 之后
+`state` 已是 `purged`，同一个 attempt 的 `a1.err` 仍以 41 字节返回 `found: true`）。
+
+档位是 `reader`（`viewer` 及以上）：这里出去的全是元信息。含 `secret` 参数的档位
+会把**读正文**的门槛抬到提交档，那道判定不在这个端点上，别把它当成读输出的捷径。
+
+失败返回：
+
+| HTTP | 触发条件 | 响应原文 |
+| --- | --- | --- |
+| 400 | `id` 不是合法的任务 ID（含路径写法、点号、非 ASCII） | `{"code":400,"message":"invalid id","details":"got \"..escape\": artifact: job id \"..escape\" contains an unusable character '.'"}` |
+| 500 | 索引读不出东西（观测库坏了、表被外部改坏）。不静默退回"扫目录"，也不假装是空列表 | `{"code":500,"message":"failed to load artifact records","details":"..."}` |
+| 503 | 这次部署没挂索引（`observability.enabled`、`observability.artifacts.enabled`、`executors.enabled` 任一为 `false`） | `{"code":503,"message":"artifact index is not configured","details":"start the server with executors.enabled and observability.artifacts.enabled to enable /api/v1/jobs/:id/artifacts"}` |
+
+任务存在但一行记录都没有 → `200` + `"items": []`（不是 404，与事件端点同一口径）；
+这个端点也不查任务是否存在，所以对一个不存在的 ID 同样回空列表。
+
+上表里 400 与 503 是本机实测原文；500 那条由用例取证（`TestListJobArtifacts_ReadErrorIs500`），
+手工环境里造不出"库在但读不动"的状态。
+
+**索引从启用它的那个版本开始记**：在此之前就落在产物目录里的输出没有索引行，
+它们不出现在这里，但 `/result` 照旧读得到（那个端点直接读文件）。产物被 TTL 清理之后
+这一行的处理是**整行删掉**（先删目录、再删行），所以过期产物的列表会变短而不是变成一堆 `purged`。
+
 ### 任务对象里的 `exec` 与 `attempts`
 
 执行器任务进入终态后带一个 `exec` 对象（普通任务没有这个键，读取方不要假设它一定存在）：
