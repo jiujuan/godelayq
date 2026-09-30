@@ -171,6 +171,7 @@ go test ./api -run "Event|Events" -v               35 条 PASS
 go test ./store/sqlite -run EventLog -v            22 条 PASS
 go test ./cmd/server -run "Observability|EventLog|NoServerReader" -v   10 条 PASS
 cd web && npx vue-tsc --noEmit                     通过（真实工作树，web/dist 在位）
+cd web && npm run build                            通过（产物 8 个 chunk，built in 3.70s）
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...      通过
 GOOS=windows GOARCH=386 CGO_ENABLED=0 go build ./...      通过
 go build -tags dashboard ./... && go vet -tags dashboard ./...  通过
@@ -213,5 +214,6 @@ GET /api/v1/jobs/01a0f3a8-…188a/events
 - **优雅停服这一步在本机做不到**：Windows 下无法从外部给控制台进程发 SIGTERM。三轮手工验收的"停"都是强制结束，因此"重启后仍有历史"是在最硬的停法下验的，而"干净关闭会检查点 WAL"仍只有 S02 的 `TestCloseCheckpointsWAL` 覆盖。
 - **恢复阶段的 `job.scheduled` 是否进库仍未手工验证**（S03 的 §10.6 留待本卡补，本卡没有补上）：三轮冒烟用的任务都是新提交后当场跑完，`jobs.json` 里没有崩溃时正在执行的任务，所以时间线头几条不是恢复产生的。要验它需要制造一条 `running` 状态的任务再强制结束。登记给后续（与本卡名义范围无关，且需要真任务执行到一半）。
 - **`?limit=` 上界 1000 的实际响应体积没有测**：§9 第二条风险给的是推算（1000 条 × 2KB 预览）。冒烟只有三条事件，压不出体积。真要收紧到 200 不需要改库结构。
-- **替身用例里的 `Note` 文本是断言常量值**，没有断言"界面显示出来的那句话"——前端只引用 `note`，本卡未改前端逻辑，界面文字仍由 `note` 决定。浏览器实测留给 S07/S08（D-0403 的三处文案一并处理时再截图）。
+- **本卡 §2 的两处行号有漂移**（写卡时的代码与执行时差 3 行）：内存读取实际在 `api/handlers_events.go:45`（`Events`）与 `:59`（`Recent`），卡上写的是 `:42`、`:58`。引用的内容与结论不受影响，只是照行号跳转会偏。§2 提到的 `api/history.go:12-19`、`api/events.ts:1`、`useJobEvents.ts:62-63`、`JobDetailView.vue:286` 逐条核实过，准确。
+- **前端没有做浏览器实测**：本卡未改前端逻辑，界面文字仍由后端 `note` 决定，`npx vue-tsc --noEmit` 与 `npm run build` 都通过。替身用例断言的是常量值，不是"界面显示出来的那句话"；要截图取证应与 D-0403 的三处文案一并处理（S07 或 S08）。
 
