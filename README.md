@@ -426,7 +426,9 @@ executors:
     max_bytes: 262144         # 单条流的落盘上限，达到即标记截断
     dir: ./data/exec          # 产物目录，与 store.path 分开放，便于单独设权限与清理
     ttl: 168h                 # 产物保留时长；0 表示只做起动时的孤儿清理
-  commands: []                # 档位列表：脚本 / 已编译产物 / HTTP 三种，字段见模板注释与设计文档 §5
+  # 档位列表：脚本 / 已编译产物 / HTTP 三种，字段见模板注释与设计文档 §5。
+  # 与 server.auth.users 同理，这里不写 []（解开示例即可启用；写 [] 再挂列表项会让 YAML 报错）。
+  commands:
 ```
 
 配置 `server.auth.token` 或 `server.auth.users` 任一后，除两个登录入口
