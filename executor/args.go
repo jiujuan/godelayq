@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -791,4 +793,126 @@ func (p *Profile) foldedSecretArgNames() map[string]bool {
 // foldArgName 把参数名、HTTP 头名与环境变量名折成同一种写法用于比较。
 func foldArgName(name string) string {
 	return strings.ReplaceAll(strings.ToLower(name), "-", "_")
+}
+
+// maskedTextValue 是输出文本里被掩掉的取值写法：与 payload 掩码同一个记号，只是不带 JSON 引号。
+const maskedTextValue = "***"
+
+// MaskSecretText 把一段输出文本里出现的 secret 参数取值换成 ***（TASK-E16 §3.3 第 2 条）。
+//
+// 用在摘要的预览上：预览随任务快照落盘、被完成与失败事件带走、并从任务详情与列表接口出去，
+// 而读到它的身份（viewer）远低于读到完整产物的身份（后者由 api 侧收到提交档位）。
+// 脚本或对端把凭据原样打印进输出是最常见的形态，按值替换盖得住这一种；
+// 换个写法再打印（例如 base64）就盖不住，那部分仍然只靠结果端点的档位判断与 redaction_note，
+// 卡片 §9 不许把这条写成"已防护"。
+//
+// 要替换的取值取自档位里声明为 secret 的那些参数：payload 给了值就用 payload 里的，
+// 没给就用配置里的默认值。比较时同时试原值与 URL 转义写法——
+// http 档位把参数拼进地址，输出里可能是转义之后的那一版。
+func (p *Profile) MaskSecretText(payload []byte, text string) string {
+	if text == "" {
+		return text
+	}
+
+	forms := p.secretTextForms(payload)
+	if len(forms) == 0 {
+		return text
+	}
+
+	// 先长后短：短值先换会把长值切成碎片，剩下那截还是明文凭据。
+	out := text
+	for _, form := range forms {
+		out = strings.ReplaceAll(out, form, maskedTextValue)
+	}
+	return out
+}
+
+// secretTextForms 列出这个档位的 secret 参数取值可能出现的全部写法：配置里的默认值，
+// 以及 payload 里那些命中 secret 参数名的键。按长度降序排列，短值先换会把长值切成碎片。
+func (p *Profile) secretTextForms(payload []byte) []string {
+	wanted := p.foldedSecretArgNames()
+	if len(wanted) == 0 {
+		return nil
+	}
+
+	seen := make(map[string]bool)
+	var forms []string
+	add := func(form string) {
+		if form == "" || seen[form] {
+			return
+		}
+		seen[form] = true
+		forms = append(forms, form)
+	}
+
+	// 配置里写死的默认值同样是凭据：payload 没给值时，执行用的就是它。
+	for _, spec := range p.Args {
+		if spec.Secret {
+			for _, form := range valueForms(spec.Default) {
+				add(form)
+			}
+		}
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimSpace(payload), &fields); err != nil {
+		sort.Slice(forms, func(i, j int) bool { return len(forms[i]) > len(forms[j]) })
+		return forms
+	}
+
+	for _, field := range maskablePayloadFields {
+		raw, present := fields[field]
+		if !present {
+			continue
+		}
+
+		var values map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &values); err != nil {
+			// 字段不是对象：看不出哪个值是凭据。这种输入在提交期就被 ValidateSubmission 拒了，
+			// 到不了执行侧，所以这里按"没有取值"处理，不降级成整段掩掉。
+			continue
+		}
+
+		for name, value := range values {
+			if !wanted[foldArgName(name)] {
+				continue
+			}
+			for _, form := range secretValueForms(value) {
+				add(form)
+			}
+		}
+	}
+
+	sort.Slice(forms, func(i, j int) bool { return len(forms[i]) > len(forms[j]) })
+	return forms
+}
+
+// secretValueForms 解码一个 payload 取值并给出它可能出现的写法。
+// 取值不是字符串时按这段 JSON 文本比较（数字与布尔同样可能是凭据）；
+// 对象与数组不当作凭据值，按整段替换会掩掉无关内容。
+func secretValueForms(raw json.RawMessage) []string {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] == '{' || trimmed[0] == '[' {
+		return nil
+	}
+
+	var text string
+	if err := json.Unmarshal(trimmed, &text); err != nil {
+		text = string(trimmed)
+	}
+	return valueForms(text)
+}
+
+// valueForms 给出一个取值在输出文本里可能出现的写法：原文，以及它的 URL 路径转义形式
+// （http 档位把参数拼进地址，对端回显时可能带着转义之后的那一版）。
+func valueForms(text string) []string {
+	if text == "" {
+		return nil
+	}
+
+	escaped := url.PathEscape(text)
+	if escaped == text {
+		return []string{text}
+	}
+	return []string{text, escaped}
 }

@@ -611,3 +611,63 @@ func TestMaskPayload(t *testing.T) {
 		assert.Equal(t, []byte("null"), withSecret.MaskPayload([]byte("null")))
 	})
 }
+
+// TestMaskSecretText 覆盖输出预览的按值掩码（TASK-E16 §3.3 第 2 条）：
+// 预览会随快照落盘、被事件带走，读取它的身份远低于读取完整产物的身份。
+func TestMaskSecretText(t *testing.T) {
+	secret := core.ExecutorArg{Name: "token", Required: true, Secret: true}
+	plain := core.ExecutorArg{Name: "day", Pattern: `^\d{4}-\d{2}-\d{2}$`}
+
+	t.Run("原值与 URL 转义写法都掩", func(t *testing.T) {
+		profile, _ := loadOneProfile(t, maskHTTPCommand(secret))
+		payload := []byte(`{"params":{"token":"a b/c"}}`)
+
+		assert.Equal(t, "order *** accepted", profile.MaskSecretText(payload, "order a b/c accepted"))
+		assert.Equal(t, "order *** accepted", profile.MaskSecretText(payload, "order a%20b%2Fc accepted"),
+			"http 档位把参数拼进地址，对端回显的可能是转义后的写法")
+	})
+
+	t.Run("长值先掩，不留碎片", func(t *testing.T) {
+		profile, _ := loadOneProfile(t, maskHTTPCommand(
+			core.ExecutorArg{Name: "short", Secret: true},
+			core.ExecutorArg{Name: "long", Secret: true},
+		))
+		payload := []byte(`{"params":{"short":"abc","long":"abcdef"}}`)
+
+		assert.Equal(t, `{"value":"***"}`, profile.MaskSecretText(payload, `{"value":"abcdef"}`),
+			"短值先换会把 abcdef 切成 ***def，剩下的那截仍是明文凭据")
+	})
+
+	t.Run("配置里的默认值同样算凭据", func(t *testing.T) {
+		profile, _ := loadOneProfile(t, maskHTTPCommand(
+			core.ExecutorArg{Name: "token", Secret: true, Default: "fixed-from-config"},
+		))
+
+		assert.NotContains(t, profile.MaskSecretText(nil, "echo fixed-from-config"), "fixed-from-config",
+			"payload 没给值时执行用的是默认值，预览里一样不能留")
+	})
+
+	t.Run("数字取值与 env 字段命中", func(t *testing.T) {
+		profile, _ := loadOneProfile(t, maskScriptCommand(
+			core.ExecutorArg{Name: "token", Secret: true},
+		))
+
+		assert.NotContains(t, profile.MaskSecretText([]byte(`{"args":{"token":123456}}`), "id=123456"), "123456")
+		assert.NotContains(t, profile.MaskSecretText([]byte(`{"env":{"TOKEN":"s3cr3t"}}`), "TOKEN=s3cr3t"), "s3cr3t")
+	})
+
+	t.Run("不该改动的几种输入", func(t *testing.T) {
+		withSecret, _ := loadOneProfile(t, maskHTTPCommand(secret, plain))
+		noSecret, _ := loadOneProfile(t, maskHTTPCommand(plain))
+		payload := []byte(`{"params":{"token":"s3cr3t","day":"2026-09-30"}}`)
+
+		assert.Equal(t, "", withSecret.MaskSecretText(payload, ""))
+		assert.Equal(t, "nothing here", withSecret.MaskSecretText(payload, "nothing here"))
+		assert.Equal(t, "2026-09-30", withSecret.MaskSecretText(payload, "2026-09-30"),
+			"非 secret 参数的值原样保留")
+		assert.Equal(t, "s3cr3t", noSecret.MaskSecretText(payload, "s3cr3t"),
+			"档位没声明 secret 时一个字节都不改")
+		assert.Equal(t, "s3cr3t", withSecret.MaskSecretText([]byte("not json"), "s3cr3t"),
+			"payload 读不出来时只失去按值掩码，不报错")
+	})
+}

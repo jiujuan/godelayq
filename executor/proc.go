@@ -112,6 +112,11 @@ func (r *Runner) Handler() core.Handler {
 		// "摘要说会重试、实际不再重试"这种自相矛盾迟早会出现在某条早退路径上。
 		defer func() {
 			result.Meta.Permanent = summaryPermanent(err)
+			// 摘要里的预览按值掩掉 secret 参数的取值（TASK-E16 §3.3 第 2 条）：
+			// 这一份预览会随快照落盘、被完成与失败事件带走，并从任务详情与列表接口出去，
+			// 读到它的身份远低于读完整产物的身份。产物文件保持原样，那里由 api 的档位判断守着。
+			// 放在这条 defer 里而不是各分支：每条返回路径都要经过这里，早退路径也不例外。
+			result.Meta.Preview = p.MaskSecretText(job.Payload, result.Meta.Preview)
 			job.Exec = &result.Meta
 			r.logRun(key, job, result.Meta)
 		}()

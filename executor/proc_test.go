@@ -464,6 +464,30 @@ func TestRunner_NoSecretInLogs(t *testing.T) {
 	assert.Contains(t, output, "duration_ms=")
 }
 
+// TestRunner_SecretValueMaskedInPreview 覆盖摘要预览的按值掩码（TASK-E16 §3.3 第 2 条）：
+// 脚本把参数值打印进输出时，那份预览会随快照落盘、被完成与失败事件带走，并从读取档位很低的
+// 任务详情与列表接口出去，因此不能留明文。产物文件保持原文——读它的门槛在 api 侧收到提交档位。
+//
+// 命令串在两个平台上都会把这行打印出来：sh -c 把追加的参数放进 $0，
+// cmd /c 则是把余下的命令行原样交给 echo。
+func TestRunner_SecretValueMaskedInPreview(t *testing.T) {
+	command := shellCommand(t, "echo $0")
+	command.Args = []core.ExecutorArg{{Name: "token", Secret: true}}
+	command.ArgsRender = []string{"--token={token}"}
+	fixture := newRunnerFixture(t, command, nil)
+
+	job, err := fixture.run(context.Background(), "job-secret-preview", `{"args":{"token":"s3cr3t-value"}}`)
+	require.NoError(t, err)
+
+	require.NotNil(t, job.Exec)
+	assert.NotContains(t, job.Exec.Preview, "s3cr3t-value", "预览里的 secret 取值要按值掩掉")
+	assert.Contains(t, job.Exec.Preview, "--token=***", "掩码只替换取值，命令行形状仍可读")
+	assert.NotContains(t, fixture.logs.String(), "s3cr3t-value")
+
+	assert.Contains(t, string(fixture.stream("job-secret-preview", 1, "out")), "s3cr3t-value",
+		"产物文件保持原文：那一路由 api 的档位判断守着，不在执行侧改动")
+}
+
 func TestRunner_HttpProfileIsNotExecutedByProcessRunner(t *testing.T) {
 	command := core.ExecutorCommand{
 		Name:         "rebuild",

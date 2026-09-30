@@ -718,3 +718,29 @@ func TestHTTP_ResultDirectionHint(t *testing.T) {
 	assert.Equal(t, ResultDirectionTail, PreferredResultDirection(&Profile{Kind: KindScript}))
 	assert.Equal(t, ResultDirectionTail, PreferredResultDirection(&Profile{Kind: KindBinary}))
 }
+
+// TestHTTP_SecretValueMaskedInPreview 是 §3.3 第 2 条在 http 档位的落点：
+// 对端把参数值回显进响应体时，摘要预览不能留明文（那份预览会进事件与低档位读取接口），
+// 而产物文件保持原文——读它的门槛在 api 侧已收到提交档位，并带一句 redaction_note。
+func TestHTTP_SecretValueMaskedInPreview(t *testing.T) {
+	target := newCountingTarget(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"order": "` + r.URL.Path + `"}`))
+	}), false)
+
+	command := httpGetCommand(target.server.URL+"/orders/{token}", target.hostPort())
+	command.DenyPrivate = boolPtr(false)
+	command.Args = []core.ExecutorArg{{Name: "token", Secret: true}}
+	fixture := newHTTPFixture(t, command, nil)
+
+	job, err := fixture.run(context.Background(), "job-http-secret-preview", `{"params":{"token":"pa55,in-preview"}}`)
+	require.NoError(t, err)
+
+	require.NotNil(t, job.Exec)
+	assert.NotContains(t, job.Exec.Preview, "pa55,in-preview", "原值不留进预览")
+	assert.NotContains(t, job.Exec.Preview, "pa55%2Cin-preview", "URL 转义写法同样不留")
+	assert.Contains(t, job.Exec.Preview, "orders/***", "预览仍要能看出打到了哪个地址")
+
+	assert.Contains(t, fixture.artifact("job-http-secret-preview", "out"), "pa55,in-preview",
+		"产物文件保持原文，由 api 的档位判断守着")
+	assert.NotContains(t, fixture.logs.String(), "pa55,in-preview")
+}

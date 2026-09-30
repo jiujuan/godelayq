@@ -129,6 +129,9 @@ func (r *HTTPRunner) Handler() core.Handler {
 		// 摘要在每条返回路径上都要落进 job.Exec，permanent 与返回的错误同源（TASK-E12 的口径）。
 		defer func() {
 			result.Meta.Permanent = summaryPermanent(err)
+			// 对端把参数值回显进响应体是最常见的泄露形态：预览按值掩掉再进摘要
+			// （TASK-E16 §3.3 第 2 条）。产物文件保持原样，读它的门槛在 api 侧已收到提交档位。
+			result.Meta.Preview = p.MaskSecretText(job.Payload, result.Meta.Preview)
 			job.Exec = &result.Meta
 			r.logRun(key, job, result.Meta)
 		}()
@@ -218,7 +221,8 @@ func (r *HTTPRunner) logRun(key string, job *core.Job, meta core.ExecMeta) {
 // 只检查片段不足以证明整体没问题。
 //
 // 第二个返回值是给产物文件看的"同一地址的打码写法"：声明为 secret 的参数值换成 <secret>。
-// 真正发出去的请求用第一个值。产物文件与 jobs.json 同等级（都在磁盘上，E16 的掩码只管响应），
+// 真正发出去的请求用第一个值。产物文件与 jobs.json 同等级（都在磁盘上，而磁盘上的原文
+// 不归响应层的掩码管，见 TASK-E16 §3.3 第 3 条），
 // 但把口令抄进一份"给人排查用的请求记录"里没有收益，能不留就不留。
 func (r *HTTPRunner) renderURL(sub *Submission) (*url.URL, string, error) {
 	target, err := r.fillTemplate(sub.Params)
