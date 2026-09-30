@@ -205,13 +205,15 @@
 
 ## 6. 完成标准（DoD）
 
-- [ ] `docs/api.md` 里两个新端点、事件新字段、权限矩阵新行齐备，示例可复制执行。
-- [ ] `docs/deployment.md` 的"开启执行器"一节 9 条全部落地，每条含原因，不含"注意安全"这类空话。
-- [ ] `README.md` 四处更新完成（特性、配置、目录结构、架构图 + 适用场景），且"执行器"不再出现在未实现清单里。
-- [ ] 设计文档状态与偏差标注更新；本目录状态表逐条更新。
-- [ ] 代码注释里没有遗留的"待补文档"TODO（`grep -rn "待补文档\|TODO(docs)" --include=*.go .` 为空）。
-- [ ] 第 5 节六类验证在 Linux 与 Windows 上各跑过一次，结果写进本卡的"实现记录"小节（新增小节，逐条记 通过 / 未观测 / 失败已修）。
-- [ ] 默认配置（`enabled=false`）下的用户体验与改动前一致，有第 5.6 条的回归确认。
+- [x] `docs/api.md` 里两个新端点、事件新字段、权限矩阵新行齐备，示例可复制执行。
+- [x] `docs/deployment.md` 的"开启执行器"一节 9 条全部落地，每条含原因，不含"注意安全"这类空话。（实际写了 12 条，见第 10 节"偏离"第 2 条）
+- [x] `README.md` 四处更新完成（特性、配置、目录结构、架构图 + 适用场景），且"执行器"不再出现在未实现清单里。
+- [x] 设计文档状态与偏差标注更新；本目录状态表逐条更新。
+- [x] 代码注释里没有遗留的"待补文档"TODO（`grep -rn "待补文档\|TODO(docs)" --include=*.go .` 为空）。
+- [~] 第 5 节六类验证在 Linux 与 Windows 上各跑过一次，结果写进本卡的"实现记录"小节（新增小节，逐条记 通过 / 未观测 / 失败已修）。
+  **Windows 六类全跑；Linux 侧只有交叉编译**（本机 WSL2 没有 gcc，跑不了 `-race`；也没有可用的 Linux 图形浏览器），见第 10 节"未验证与遗留"。
+- [x] 默认配置（`enabled=false`）下的用户体验与改动前一致，有第 5.6 条的回归确认。
+
 
 ## 7. 验收方式
 
@@ -238,3 +240,123 @@ git diff --stat HEAD~6..HEAD                                        # 确认四�
 - 风险：架构图与目录结构容易只改一处（README 改了、设计文档没改）。要求两份文档在同一提交里改完，`git diff` 一次看全。
 - 风险：`docs/core-scheduler-heap-event-load-analysis.md` 里关于调度循环的描述在 E13 之后会过期。本卡不重写它，但要显式记录这条已知过期项，别让下一个人误以为文档全量准确。
 - 回滚：纯文档，可逐份 revert。
+
+## 10. 实现记录（2026-09-30）
+
+落地文件（全部是文档与代码注释，没有新增 Go 代码）：
+
+- `docs/api.md`：新增 `## 执行器 API` 一节（八个子节：与 `/job-types` 的关系、档位清单、提交执行器任务、
+  提交期被拒的四种响应、读取执行输出、任务对象里的 `exec` 与 `attempts`、事件里的执行结论、
+  敏感参数出现在哪些地方），并修订权限矩阵表、`POST /jobs` 参数表、`PUT /jobs/:id`、
+  `GET /admin/runtime`、`GET /stats`、事件端点与 `/job-types` 的措辞。全文 922 → 1365 行。
+- `docs/deployment.md`：新增 `## 开启执行器` 一节，12 个编号小节，每条都写"为什么"。
+  另在 `scheduler.shutdown_timeout` 的行内注释与加载器小节各加一处指向本节的链接。全文 257 → 435 行。
+- `README.md`：适用场景、核心特性 §3、配置项骨架、目录结构（`executor/` 15 个文件与 `api/handlers_executors.go`）、
+  架构图新增执行层框、"其它文档"里执行器条目的状态。
+- `docs/example.md`：目录加载器示例补 `AllowExecJobs: false` 一行与一段拒绝现场。
+- `docs/design/executor-design.md`：状态改"已实现（M0–M5）"，⚠️ 标注 §2 的 D5/D6/D7/D9 落地位置、
+  §5.1 第 3/4 条、§6.2 的平台文件名、§6.4 的四条（搬运、字段、产物布局、清扫）、§6.7 的取值规则、
+  §6.8 的端点参数与事件形状、§6.9 的被拒文件去向、§9 的 M1/M2/M5、§10 逐条勾选、§11 新增第 7/8/9 条
+  ——全文 26 个 ⚠️ 标记，覆盖卡片点名的四处之外的七处。
+- `docs/design/tasks/executor/README.md`：状态表 E19 行与 M5 段落。
+- 四条代码注释收口（`core/scheduler.go` 的失败事件 metadata、`api/handlers.go` 的 `stats.Running`、
+  `executor/proc.go` 的 `processWaitDelay`、`api/executors_submission_test.go` 的矩阵用例说明）。
+
+### 与卡片的偏离与补充
+
+1. **§3.2 要求 9 条，实际写了 12 条**：多出的三条是 E15/E06/E17 在各自卡片里追加给本卡的口径
+   （`deny_private_ranges: false` 的现场线索、TTL 与留痕的配对、目录加载器的作用范围）。
+   §3.2 正文第 8/9/10/12 条本身就要求这些内容，所以是"9 条编号"过时而不是内容超范围。
+2. **§3.3 说"四处更新"，实际六处**：卡片列的四条（特性/配置/目录结构/架构图+适用场景）加上"其它文档"状态行，
+   加上架构图下面那条"Redis/MySQL 尚未实现"的注记复查（确认它仍然准确，未改）。
+3. **§3.4.3 的"删除代码里的'待补文档'注释"这条，DoD 的那条 grep 从一开始就是空的**：
+   前面各卡登记待办时用的措辞是"归 TASK-E19 统一补文档""登记在 E19 的文档收口清单里"，
+   不含 `待补文档` 这个连续四字，也不含 `TODO(docs)`。本卡把四条 E19 署名的注释全部改掉，
+   并加了一条更严的检查：`grep -rn "E19" --include=*.go .` 现在也为空。
+4. **§3.4.1 点名四处，实际标注了十处**：复查时新发现的偏差比点名多
+   （§5.1 的超时夹取与位置参数写法、§6.7 的三条取值规则、
+   §9 里程碑表的 M1/M2/M5、§10 验收清单的逐条状态、§11 的三条后续项，加上点名之外的
+   §6.4 拆成四条、§6.8 拆成端点形状与事件形状两段）。§6.2 标题里的平台文件名写错（`proc_win.go`），
+   这一处直接改成实际的 `proc_windows.go`，没有加标注。
+   点名之外的部分照同样体例标了，没有另开一节。
+5. **§3.5 的 `examples/demo3` 未做**。理由：DoD 不要求它；`examples/demo2` 已经在 TASK-E17 的冒烟里
+   承担了"加载器 + `AllowExecJobs`"的演示（真实跑过、拒绝现场写在该卡第 10 节）；
+   再加一份示例要么重复 `demo1` 的编程式提交，要么把档位脚本放进需要独立 workspace 目录的示例里
+   （示例目录与 `executors.workspace` 是两套路径，读者容易把两者当成一个）。
+   如果要做，建议开一张新卡并先定示例要落在哪条路径。
+6. **§5.5 的"HTTP 档位指向 `http://127.0.0.1:8080/api/v1/health`"改成两个本机对端**：
+   `exec.local_health` 打自己的 `/api/v1/health`（同端口 18090）、`exec.local_target` 打一个自行
+   起在 `127.0.0.1:18091` 的裸 TCP 监听器。第二条是"服务端没有收到请求"这条判据的正面证据：
+   监听器日志只有 `listening on 127.0.0.1:18091` 一行，没有 accept——
+   之前想用应用日志证明"没收到"是站不住的，那轮构建没开请求日志。
+7. **§5.4 的"在 Linux 复走三条"没做**：本机没有可用的 Linux 图形浏览器，WSL2 里连 gcc 都没有
+   （`-race` 跑不起来，见本目录共同的验证口径）。这条与 §5.1/§5.5 的 Linux 侧一起落到"未验证与遗留"。
+8. **§7 验收里的 `git diff --stat HEAD~6..HEAD` 换成按文件核对**：本卡的提交数是 8（四份使用者文档拆了 5 次，
+   代码注释 1 次，设计文档 1 次，卡片与状态表 1 次），用固定回看步数会漏掉前面的文档。
+
+### 验证（§5 六类逐条）
+
+| # | 命令 | 结果 |
+| --- | --- | --- |
+| 5.1 | `go build ./...`、`go vet ./...` | 通过，无输出 |
+| 5.1 | `go test ./... -race -count=1` | 全绿：`api` 103.09s、`cmd/server` 5.52s、`core` 12.34s、`executor` 23.26s，其余包 no test files |
+| 5.1 | `go test ./api -race -count=50 -run TestAdminRuntime` | 通过（1.71s，50 轮无失败），TASK-E17 登记的偶发已消失 |
+| 5.2 | `GOOS=linux GOARCH=amd64`、`GOOS=darwin GOARCH=arm64`、`GOOS=windows GOARCH=amd64` 各 `go build ./...` | 三个都通过 |
+| 5.3 | `go test -run TestExampleConfigMatchesLocal ./core` | 通过；本机 `configs/config.yaml`（不入库）与模板键集合一致 |
+| 5.4 | `cd web && npx vue-tsc --noEmit` | 通过，无输出 |
+| 5.4 | `npm run build` | 通过，`dist` 产物最大块 `index-*.js` 156.25 kB（gzip 57.22 kB）、模板页 118.19 kB |
+| 5.4 | `go build -tags dashboard ./cmd/server` 与 `go vet -tags dashboard ./...` | 都通过（`web/dist` 存在，嵌入生效） |
+| 5.4 | Linux 侧复走 TASK-E18 三条走查 | **未做**（见"偏离"第 7 条） |
+| 5.5 | 七个端到端场景 | Windows 全部跑过，见下表；Linux 侧**未做** |
+| 5.6 | 默认配置回归 | 通过，见下表最后一行 |
+| DoD | `grep -rn "待补文档\|TODO(docs)" --include=*.go .` | 无输出（`grep -rn "E19" --include=*.go .` 同样无输出） |
+| DoD | `gofmt -l`（对照用） | 仍因 CRLF 全量误报，按本目录口径不采信；本轮只改注释与文档，未做格式化 |
+
+### 端到端场景（§5.5，Windows 真实进程）
+
+冒烟环境：`%TEMP%/gd-e19smoke/`（配置、store、`data/exec`、workspace 全在临时目录，仓库的 `data/` 没被写过），
+服务监听 `:18090`，`executors` 取 `runtime_allow: [bash]`、`concurrency: 2`、`scheduler.workers: 2`、
+`required_role: admin`、`restore_policy: pause`、`output.ttl: 1m`，档位 7 条
+（`fail3`/`long60`/`nap`/`show_token`/`not_deployed` + 两条 http）。账号四种身份齐（admin/operator/viewer/ops）。
+
+| 场景 | 结果与证据 |
+| --- | --- |
+| 打开 `enabled` + stderr 退 3 的脚本档位：参数越界与低权限 → 正常提交 → 事件 `exit_code:3` → `/result` 读到输出 | **通过**。四条拒绝文案各一条实拍（403 `insufficient role`、400 `invalid executor payload` 两条不同 details、400 `executor profile is not available on this server`、400 `invalid timeout`），响应原文全部写进 `docs/api.md`；`exec.fail3` 跑完 `exit_code:3`、`out_bytes`/`err_bytes` 与两条 stderr 行在 `/result?stream=err` 里读到 |
+| 60 秒脚本中途 `POST /jobs/:id/cancel` → cancelled、无残留进程 | **部分通过**。取消返回 204、任务转 cancelled、`exec_running` 归零；残留断言用 `tasklist` 的镜像名计数（msys 的 `$$` 不是 Windows PID，这条口径记在下面"补充观测"）：`bash.exe` 立刻回到基线，**一条 `sleep.exe` 活过了它自己的 60 秒** → 记为缺陷，见设计文档 §11 第 2 条与 `docs/deployment.md` 第 5 小节 |
+| 超时档位（2 秒超时 + `sleep 3`）→ 事件 `metadata.timeout==true` | **通过**。日志 `msg="job timed out" ... timeout=2s error="profile \"nap\": timed out: exit status 1"`，`duration_ms=3051`（2 秒判定 + 终止与管道收尾，与 `killGrace`/`processWaitDelay` 的口径一致）；`metadata.timeout` 走的是同一条 `timedOut` 分支，因此为 true（这一条由代码路径与上面那条日志共同支撑，事件正文本轮没再抓一次） |
+| HTTP 档位指向回环地址 → 被拒，且服务端没收到请求 | **通过**。warn `executor http target address refused profile=local_target host=127.0.0.1 address=127.0.0.1 reason="loopback address"` + 同主题的 `job failed`，18091 的监听器没有 accept（见"偏离"第 6 条）；这类失败 `permanent` 为真、不消耗重试 |
+| `kill -9`（Windows 用 `taskkill /F`）→ 重启后正在跑的任务 `paused`，事件带 `reason:"restore_after_crash"` | **通过**。重启日志 `paused executor jobs after crash count=1 reason=restore_after_crash`，`GET /jobs/:id/events` 里那条 paused 带 `reason` 与 `forced:true`、`attempts`；`/api/v1/stats` 的 `paused` 计数含它。对照的 `replay` 现象沿用 TASK-E14 那一轮 |
+| 20 条执行器 + 20 条普通任务同时到期 → 普通任务不被阻塞 | **通过**。轮询采样 12 次都是两池同时忙（`exec_running=2`、普通池 2），`stats.running` 全程是 4（两池之和），40 条最终全部 success；`concurrency: 2` 没有挤掉 `workers: 2` |
+| 产物 TTL 与孤儿清理 | **通过**。手工造 3 个"ID 已不存在"的目录与 24 个过期目录，重启日志两行：`artifact orphan directories purged count=3`、`artifact expired directories purged count=24 ttl=1m0s`；再启一轮（第三实例）时孤儿/过期计数各 2，说明上一轮的产物按策略继续收敛 |
+| 批量接口的混合权限 | **通过**。一条普通 + 一条 `exec.*` 用 operator 提交：207、`succeeded:1`、`errors[0].code=403`，响应原文进 `docs/api.md` |
+| `PUT /jobs/:id` 的四条约束 | **通过**。改 `name` 为不同值 → 400 `job name cannot be changed`（普通任务同样生效）；档位不够的身份改执行器任务 → 403 而不是 409（判定顺序 404→400→403→409）；payload 改坏 → 400 且详情不落库 |
+| `GET /executors` 的形状 | **通过**。启用时给 `enabled:true`、`required_role:"admin"`、`max_timeout:"5m0s"` 与七条档位（含 `positional`、`preferred_result_direction`、http 的 `method`/`header_allow`/`body_mode`）；未启用那一轮（见下）`enabled:false`、`required_role:null`、`max_timeout` 整个键不出现 |
+| 含 secret 参数的档位掩码六处出口 + `/result` 的 `redaction_note` | **通过**。`exec.show_token` 提交后，创建/列表/详情/更新/重试/批量六处的 `payload` 与 `exec.preview` 都看不到本机那个取值，`args.token` 是 `***`；operator 读该任务产物正文 403（warn 原文 `access denied who=oper01 have=operator need="execution output of a profile with secret arguments" required=admin`）、admin 读到正文并带 `redaction_note`（原文在 `docs/api.md`）；磁盘上的 `jobs.json` 与产物文件按设计仍是原文（文档写明） |
+| `/result` 的参数与不存在路径 | **通过**。同一任务的 `?stream=err&from=tail` 与 `?stream=out` 均 200；`?attempt=9`、`?max_bytes=0`、`?stream=nope` 三条各自 400；一个不存在的 ID 是 404。四条 400/404 的响应原文都按实测写进 `docs/api.md`；未装配产物存储时的 503 只有后端用例覆盖（`api/handlers_executors_test.go`），本轮没法用真实进程造出来 |
+| 5.6 默认配置回归（`executors` 不打开） | **通过**。用 `configs/config.example.yaml` 原样起服务（`:8080`，无鉴权）：`/health`、`/job-types`、`/executors`、`POST /jobs` 提交 `payment_check`、任务按 delay 执行、`/jobs/:id`、`/stats` 逐条 200/201，行为与改动前的 README 快速上手一致 |
+
+补充观测（不在 §5.5 清单里，但影响读文档的人）：
+
+1. msys 的 `$$` 不是 Windows 进程号，`subprocess.run(['tasklist', ...])` 从 python 里拿不到输出，
+   所以残留断言只能按镜像名计数。这条口径已经写进 TASK-E19 的脚本注释，后续任何 Windows 进程断言都要照做。
+2. `POST /jobs/:id/cancel` 成功时是 **204 无响应体**，第一版验证脚本按"总是 JSON"解析直接崩了。
+   `docs/api.md` 的取消一节早已写明 204，是脚本没照文档写。
+3. 被取消的任务在列表与详情里都读不到（`GET /jobs/:id` 返回 404，`total` 也不含它），
+   与 §10 验收清单无关，但和"取消之后去读输出"这条使用路径直接冲突，已写进下面"未验证与遗留"。
+4. `stats` 的 `completed` 在这一轮是 41（40 条本轮任务 + 上一轮的一条终态留痕），
+   说明留痕计数与本轮跑动是同一份存储，冒烟目录复用时要按这个理解读数字。
+
+### 未验证与遗留
+
+| 项 | 状态与处置 |
+| --- | --- |
+| Linux 与 macOS 的真实运行、那一侧的 `-race`、§5.4 的三条走查复走 | **未做**（WSL2 无 gcc、无可用 Linux 图形浏览器）。登记不修，等有真实环境时按本卡 §5.4/§5.5 复跑；这是执行器系列收口时唯一成块的外部依赖 |
+| Windows 整树终止的残留（实测一条 `sleep.exe` 存活） | 登记不修（本卡不改代码）。已写进设计文档 §11 第 2 条与 `docs/deployment.md` 第 5 小节；彻底方案 Job Object 仍是 E11a |
+| `CloneForRetry` 不搬 `Attempts`，重试产物覆盖、`?attempt=2` 读不到 | 登记不修（要动 `core`）。已写进设计文档 §6.4/§10/§11 第 7 条与 `docs/api.md` 的 `attempts` 说明；E15 末尾与 E18 第 10 节各有一条现场 |
+| `cmd`/`pwsh` 在 `script` 档位下拿不到执行开关 | 登记不修。绕法（`kind: binary` + `fixed_args`）已写进 `docs/deployment.md` 第 7 小节与模板页；改造归后续任务卡（设计文档 §11 第 8 条） |
+| Windows 控制台输出是 GBK，预览里出现替换字符 | 登记不修（本卡只写文档）。口径在 `docs/deployment.md` 第 6 小节，设计文档 §11 第 9 条留了转码这条后续 |
+| 被取消的执行器任务读不到任务与输出（`GET /jobs/:id` 404） | 登记不修，属既有语义（取消即从存储删除，见 `core/scheduler.go` 的 `Cancel`）。作为已知使用冲突记录在本卡"补充观测"第 3 条，若要改需另立任务 |
+| 档位超时在事件里记成 `timeout=0s`（E15 末尾登记的那条既有现象） | 本轮没有复现：这一轮 `job.timed out` 日志与事件里的 `metadata.timeout` 都是生效值。原因是 E16 把生效超时写进了 `job.Timeout`。登记不修，等 core 侧统一收口时再判 |
+| `docs/core-scheduler-heap-event-load-analysis.md` 的调度循环描述在 E13 之后过期 | 本卡按 §8 不改它，在这里显式记录这条已知过期项（§9 要求的那条）：`dispatch` 现在是双队列两池、`executeJob` 多了类别与 `Exec` 摘要两处 |
+| 冒烟临时目录 `%TEMP%/gd-e19smoke`（含本机 dev 凭据） | 本卡收尾时删除，不入库；仓库的 `configs/config.yaml` 与 `data/` 全程未被写入 |
+
