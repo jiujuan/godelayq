@@ -340,6 +340,71 @@ func TestCreateJob_TimeoutNormalized(t *testing.T) {
 	})
 }
 
+// TestUpdateJob_ExecutorGuards 覆盖 DoD 第六条：PUT 不能绕过提交档位与参数校验。
+func TestUpdateJob_ExecutorGuards(t *testing.T) {
+	srv := submissionServer(t, "admin", nil,
+		submissionProfile("callback", core.ExecutorArg{Name: "day", Required: true, Pattern: `^\d{4}-\d{2}-\d{2}$`}))
+	creds := identities(t, srv)
+	admin := creds("admin")
+
+	created := doJSON(t, srv, http.MethodPost, "/api/v1/jobs",
+		`{"name":"exec.callback","payload":{"params":{"day":"2026-09-30"}}}`, admin)
+	require.Equal(t, http.StatusCreated, created.Code, created.Body.String())
+	var job JobResponse
+	require.NoError(t, json.Unmarshal(created.Body.Bytes(), &job))
+	target := "/api/v1/jobs/" + job.ID
+
+	t.Run("operator 改执行器任务的 payload 被档位判定拦住", func(t *testing.T) {
+		recorder := doJSON(t, srv, http.MethodPut, target,
+			`{"payload":{"params":{"day":"2026-10-01"}}}`, creds("operator"))
+		assert.Equal(t, http.StatusForbidden, recorder.Code, recorder.Body.String(),
+			"路由是 operator 档，但执行器任务的判定在处理器里，PUT 也一样要过")
+
+		// 拒绝之后 payload 没被改动
+		after := doGet(t, srv, target, admin)
+		assert.Contains(t, after.Body.String(), "2026-09-30")
+	})
+
+	t.Run("非法 payload 被重校验", func(t *testing.T) {
+		recorder := doJSON(t, srv, http.MethodPut, target,
+			`{"payload":{"params":{"day":"yesterday"}}}`, admin)
+		require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+		assert.Contains(t, recorder.Body.String(), "invalid executor payload")
+	})
+
+	t.Run("改名字被拒，改法向两边都拦", func(t *testing.T) {
+		recorder := doJSON(t, srv, http.MethodPut, target,
+			`{"name":"payment_check"}`, admin)
+		require.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+		assert.Contains(t, recorder.Body.String(), "job name cannot be changed",
+			"换成普通任务名等于绕开提交档位判定")
+
+		plain := doJSON(t, srv, http.MethodPost, "/api/v1/jobs", `{"name":"payment_check"}`, admin)
+		var plainJob JobResponse
+		require.NoError(t, json.Unmarshal(plain.Body.Bytes(), &plainJob))
+		recorder = doJSON(t, srv, http.MethodPut, "/api/v1/jobs/"+plainJob.ID,
+			`{"name":"exec.callback"}`, admin)
+		assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+	})
+
+	t.Run("传回相同名字按没传处理", func(t *testing.T) {
+		recorder := doJSON(t, srv, http.MethodPut, target,
+			`{"name":"exec.callback","payload":{"params":{"day":"2026-10-05"}}}`, admin)
+		require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+		assert.Contains(t, recorder.Body.String(), "2026-10-05")
+	})
+
+	t.Run("普通任务的 PUT 不受影响", func(t *testing.T) {
+		plain := doJSON(t, srv, http.MethodPost, "/api/v1/jobs", `{"name":"payment_check"}`, admin)
+		var plainJob JobResponse
+		require.NoError(t, json.Unmarshal(plain.Body.Bytes(), &plainJob))
+
+		recorder := doJSON(t, srv, http.MethodPut, "/api/v1/jobs/"+plainJob.ID,
+			`{"payload":{"anything":true},"timeout":"2m"}`, admin)
+		assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
+	})
+}
+
 // TestCreateJob_MachineTokenDeniedUnderDefaultRole 是配置注释里那句结论的现场：
 // 默认 required_role: admin 时，静态凭据（machine，与 operator 同级）提交不了执行器任务。
 func TestCreateJob_MachineTokenDeniedUnderDefaultRole(t *testing.T) {

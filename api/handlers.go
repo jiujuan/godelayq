@@ -316,6 +316,16 @@ func (s *Server) UpdateJob(c *gin.Context) {
 
 	// 原地更新：不再走 Cancel→Schedule，避免两步之间失败导致任务丢失
 	job, err := s.scheduler.UpdatePending(id, func(j *core.Job) error {
+		if req.Name != nil && *req.Name != j.Name {
+			// 本端点不能换任务类型：换了名字就换了执行体，而提交档位的判定是按档位做的
+			// （TASK-E16 §3.2 第 2 条）。相同值按没传处理，见 api/dto.go 里这条注释。
+			return &submissionRejected{failure: &ErrorResponse{
+				Code:    400,
+				Message: "job name cannot be changed",
+				Details: fmt.Sprintf("this job is %q; PUT /jobs/:id does not switch a job to another type (%q), delete and recreate it instead",
+					j.Name, *req.Name),
+			}}
+		}
 		if req.TriggerAt != nil {
 			j.TriggerAt = *req.TriggerAt
 		}
@@ -331,8 +341,22 @@ func (s *Server) UpdateJob(c *gin.Context) {
 		if req.Group != nil {
 			j.Group = *req.Group
 		}
+
+		// 执行器任务重跑提交期判定：改 payload 不能绕过参数校验，改这个任务也不能绕过提交档位
+		// （DoD 第六条）。判定通过时它会把生效超时重新写进 j.Timeout。
+		if failure := s.gateExecutorSubmission(c, j, timeout); failure != nil {
+			return &submissionRejected{failure: failure}
+		}
 		return nil
 	})
+
+	// 判定不过时 apply 返回的是 submissionRejected：状态码与文案在 ErrorResponse 里，
+	// 而 core 的回调只认 error，所以在这里把它换回HTTP 结论。
+	var rejected *submissionRejected
+	if errors.As(err, &rejected) {
+		c.JSON(rejected.failure.Code, *rejected.failure)
+		return
+	}
 
 	switch {
 	case errors.Is(err, core.ErrJobNotFound):

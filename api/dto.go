@@ -38,6 +38,10 @@ type UpdateJobRequest struct {
 	TriggerAt  *time.Time      `json:"trigger_at,omitempty"`
 	Payload    json.RawMessage `json:"payload,omitempty"`
 	MaxRetries *int            `json:"max_retries,omitempty"`
+	// Name 任务类型名。**这里只用来发现误用，不用来改名**：本端点不支持换类型
+	// （换了名字就等于换了一个执行体，提交档位的判定也会跟着失效，TASK-E16 §3.2）。
+	// 传了且与当前名字不同 → 400；传了相同值按没传处理，方便客户端把读到的对象改几个字段再 PUT 回来。
+	Name *string `json:"name,omitempty"`
 	// Timeout 单次执行超时，如 "30s"；传 "0s" 可取消限制
 	Timeout string `json:"timeout,omitempty"`
 	// Group 分组标签。用指针区分"没传"与"传了空串"：
