@@ -51,6 +51,12 @@ func main() {
 		Recursive:      true,                  // 递归子目录
 		EnableWatcher:  true,                  // 实时监控新文件
 		HandlerMap:     handlers,              // 自动绑定handler
+		// AllowExecJobs 这里显式留 false（TASK-E17）：任务文件这条路上没有任何凭据，
+		// 打开它等于把"能往 ./job_queue 写文件"变成"能执行 exec.<档位名> 声明的命令"。
+		// 真要这么用，就把它改成 true 并把这个目录收成只有服务账号可写；
+		// 如果程序同时装配了执行器登记表，配置项 executors.loader_allow 的取值可以从
+		// executor.Registry.LoaderAllowed() 读出来接到这里。
+		AllowExecJobs: false,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -64,6 +70,7 @@ func main() {
 	fmt.Println("系统运行中，请将任务JSON文件放入 ./job_queue 目录...")
 	fmt.Println("支持的JSON格式示例：")
 	fmt.Println(string(exampleJob()))
+	fmt.Println("提示：name 以 exec. 开头的任务文件默认不被接受，会被移入 ./job_errors 并留一行 warn")
 
 	select {} // 保持运行
 }
