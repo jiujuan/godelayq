@@ -211,6 +211,7 @@ Close(ctx)        → 撤订阅 → 最后一次 Flush → 关连接；幂等
 
 - 队列容量默认 4096 条。丢弃时记一条 warn 并把累计值挂到 `/admin/runtime` 的观测输出里——**丢了多少必须是可查的**，否则这张表看起来完整、实则缺页。
 - 事务失败（含 `SQLITE_BUSY`）时整批重新入队一次，二次失败则丢弃并记 error。不无限重试：磁盘满这类故障下无限重试会把队列变成内存泄漏点。
+- `dropped` 只记写入器自己这一段的丢弃数。总线给每个订阅者的通道同样是非阻塞投递（`core/event.go` 的 `select/default`，缓冲 `core.NewEventBus` 的 `bufferSize`），到不了写入器的事件不计在这里：`dropped` 加落库条数因此小于等于发布条数，差额属于总线自身的过载，与 `api.EventHistory` 那一份内存缓冲看到的是同一件事。写用例时要么把发布条数控制在一个订阅缓冲以内，要么只断言下界。
 - 每条语句都是 `INSERT`，`artifact_index` 用 `INSERT ... ON CONFLICT(job_id,attempt) DO UPDATE`（清理与重复读结果会二次触达同一行）。
 
 ### 7.2 连接设置
