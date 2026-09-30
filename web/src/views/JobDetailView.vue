@@ -8,6 +8,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
 import { ArrowLeft } from 'lucide-vue-next'
 import JobEventTimeline from '../components/jobs/JobEventTimeline.vue'
+import JobExecResult from '../components/jobs/JobExecResult.vue'
 import JobForm from '../components/jobs/JobForm.vue'
 import JobStatusBadge from '../components/jobs/JobStatusBadge.vue'
 import PageHeader from '../components/layout/PageHeader.vue'
@@ -130,6 +131,9 @@ const payloadText = computed(() => {
   if (payload === undefined || payload === null) return ''
   return typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2)
 })
+
+/** 任务类型名是不是执行器档位的注册键（前缀只在 core.ExecPrefix 一处定义，这里跟着它走） */
+const isExecutorJob = computed(() => (job.value?.name ?? '').trimStart().startsWith('exec.'))
 
 const fields = computed(() => {
   const current: Job | null = job.value
@@ -263,7 +267,18 @@ const fields = computed(() => {
           class="max-h-64 overflow-auto rounded-[var(--radius-control)] bg-[var(--color-surface)] p-3 font-mono text-xs leading-relaxed"
           >{{ payloadText }}</pre>
         <p v-else class="text-sm text-[var(--color-text-muted)]">这个任务不带 payload。</p>
+
+        <!-- 掩码只发生在读取响应这一层（TASK-E16）：看的人要知道 *** 不是任务本身的样子 -->
+        <p
+          v-if="isExecutorJob"
+          class="mt-2 text-xs text-[var(--color-text-muted)]"
+        >
+          档位声明为 secret 的参数在这里显示成 <code>***</code>，输出预览里被替换掉的也是同一批值；
+          任务快照与产物文件里存的仍是提交时的原值。
+        </p>
       </section>
+
+      <JobExecResult :job="job" :events="timeline" />
 
       <section class="rounded-[var(--radius-card)] border border-[var(--color-border)] bg-white p-4 lg:col-span-2">
         <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
