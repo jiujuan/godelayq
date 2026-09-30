@@ -26,6 +26,12 @@ export interface Job {
   next_run_in?: string
   /** 最近一次执行的结论摘要；非执行器任务没有这个字段 */
   exec?: ExecMeta
+  /**
+   * 已经启动过的执行次数（含重试），与 GET /jobs/:id/result 的 attempt 可取范围同一条。
+   * 后端恒给这个键（未执行过是 0），所以这里不加 ?：
+   * "缺键"与"0 次"对尝试下拉是两件事。
+   */
+  attempts: number
 }
 
 /** 一次执行的结论摘要（core.ExecMeta）。输出正文不在这里，走 /jobs/:id/result */
@@ -64,6 +70,12 @@ export interface JobResultResponse {
   /** 该次尝试的结论摘要；非执行器任务为 null */
   meta: ExecMeta | null
   content: string
+  /**
+   * 档位声明了 secret 参数时后端给的固定一句提醒：正文由脚本或对端产生，
+   * 框架层的参数掩码管不到它把值打印出来。
+   * 这是提醒，不是"已脱敏"的声明——面板原样显示它，别改写成另一种说法（TASK-E16 §3.4）。
+   */
+  redaction_note?: string
 }
 
 /** GET /jobs/:id/result 的查询参数，省略即取后端默认值 */
@@ -88,10 +100,32 @@ export interface ExecutorProfile {
   timeout: string
   max_parallel: number
   args: ExecutorArgSpec[]
+  /** 位置参数规则（payload 的 args._positional）；档位没声明就没有这个键 */
+  positional?: ExecutorPositional
   /** 允许 payload 注入的环境变量键名；取值一律不外露 */
   env_allow: string[]
+  /** 档位声明了至少一个 secret 参数：读取接口会掩码，结果端点会升档位 */
+  has_secret_args: boolean
+  /**
+   * 读这个档位输出时的建议起点：http 是 head（结论在开头），进程档位是 tail（结论在末尾）。
+   * 取值来自后端 executor.PreferredResultDirection，前端不再按 kind 自己判。
+   */
+  preferred_result_direction: 'head' | 'tail' | string
+  /** 仅 http 档位有 */
+  method?: string
+  /** 仅 http 档位有：payload 可以覆盖的请求头名（档位自己的固定头不在这里） */
+  header_allow?: string[]
+  /** 仅 http 档位有：请求体形态 json | raw | none，none 时表单不该给 body 输入区 */
+  body_mode?: 'json' | 'raw' | 'none' | string
   /** 仅 http 档位有，给的是模板原文（含 {占位符}） */
   url?: string
+}
+
+/** 档位的位置参数规则（ExecutorPositionalResponse） */
+export interface ExecutorPositional {
+  max: number
+  /** 实际生效的正则：配置留空时是后端给的默认安全字符集 */
+  pattern: string
 }
 
 export interface ExecutorArgSpec {
@@ -106,8 +140,13 @@ export interface ExecutorArgSpec {
 export interface ExecutorListResponse {
   enabled: boolean
   profiles: ExecutorProfile[]
-  /** 提交执行器任务的最低档位；后端在 TASK-E16 之前固定给 null */
+  /** 提交执行器任务的最低档位；执行器关闭时是 null */
   required_role: string | null
+  /**
+   * payload 的 timeout 能填的上限（executors.max_timeout）。
+   * 只在 enabled=true 时给出，缺键表示这份部署没有可提交的档位。
+   */
+  max_timeout?: string
 }
 
 export interface ListJobsResponse {
@@ -272,6 +311,15 @@ export interface SchedulerRuntime {
   heap_size: number
   suspended: boolean
   force_pause_pending: number
+  /**
+   * 执行器池的四格（TASK-E13）。后端恒给这四个键，没建池时全是 0，
+   * 所以页面要按 exec_workers===0 显示"未启用执行器"而不是四个 0。
+   * running 仍然只算普通池，两池之和在 /stats 的 running 里。
+   */
+  exec_workers: number
+  exec_queue_capacity: number
+  exec_queue_length: number
+  exec_running: number
 }
 
 export interface EventHistoryStats {

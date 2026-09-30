@@ -13,4 +13,20 @@ export const queryKeys = {
   groups: ['groups'] as const,
   jobTypes: ['job-types'] as const,
   runtime: ['admin', 'runtime'] as const,
+  /** 档位列表：只有启动期配置会改它，页面自己不带轮询 */
+  executors: ['executors'] as const,
+  /**
+   * 某次尝试的输出正文。
+   * attempt / stream / from / maxBytes 都要进键：结果面板的四个控件改的就是这四元组，
+   * 少一个维度就会把"读头部 4KB"的缓存当成"读尾部 4KB"的用，切标签页时显示错内容。
+   */
+  jobResult: (
+    id: string,
+    attempt: number,
+    stream: 'out' | 'err',
+    from: 'head' | 'tail',
+    maxBytes: number,
+  ) => ['job-result', id, attempt, stream, from, maxBytes] as const,
+  /** 某条任务全部结果查询的前缀，供事件失效用（TASK-E18 §3.1 第 3 条） */
+  jobResultAll: (id: string) => ['job-result', id] as const,
 }

@@ -16,6 +16,7 @@ export function bindRealtimeToQueries(
   queryClient: QueryClient,
 ): () => void {
   const touchedJobIDs = new Set<string>()
+  const finishedWithResult = new Set<string>()
   let timer: ReturnType<typeof setTimeout> | null = null
 
   function flush(): void {
@@ -30,13 +31,21 @@ export function bindRealtimeToQueries(
       void queryClient.invalidateQueries({ queryKey: queryKeys.job(jobID) })
       // 详情页时间线不靠重取：打开时拉一次，此后由 WS 事件 append（§4.7）
     }
+    // 执行结论落定的那条任务，输出正文也可能刚被写进产物文件：让结果面板下次点击重取。
+    // 只在这里失效、不去预取——/result 是 no-store 的按次读取，事件到页面开之间那段时间
+    // 没有任何人会看它（TASK-E18 §3.1 第 3 条）。
+    for (const jobID of finishedWithResult) {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.jobResultAll(jobID) })
+    }
     touchedJobIDs.clear()
+    finishedWithResult.clear()
   }
 
   function onEvent(event: JobEvent): void {
     // heap.updated 这类没有归属的事件不改任何任务，重取只是白费一次往返
     if (!event.job_id) return
     touchedJobIDs.add(event.job_id)
+    if (carriesResult(event)) finishedWithResult.add(event.job_id)
     if (timer !== null) return
     timer = setTimeout(flush, DEBOUNCE_MS)
   }
@@ -48,5 +57,18 @@ export function bindRealtimeToQueries(
     if (timer !== null) clearTimeout(timer)
     timer = null
     touchedJobIDs.clear()
+    finishedWithResult.clear()
   }
+}
+
+/**
+ * 事件里有没有执行结论。
+ *
+ * 只有 job.completed / job.failed 会带 `data.result`（core 的 eventData 在有结论时才写这个键），
+ * 按类型 + 按键存在一起判：类型会漏掉以后新增的带结论事件，只判键会把无关事件也算进来。
+ */
+function carriesResult(event: JobEvent): boolean {
+  if (event.type !== 'job.completed' && event.type !== 'job.failed') return false
+  const data = event.data as { result?: unknown } | null | undefined
+  return !!data && data.result !== undefined && data.result !== null
 }
