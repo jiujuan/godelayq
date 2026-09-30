@@ -104,6 +104,15 @@ func (b *batcher[T]) append(item T) bool {
 	return true
 }
 
+// queued 返回还在队列里、尚未落盘的条数。
+// 它只在本包内可见，用途是把测试里的"睡一会儿再看结果"换成"等到条数对上"；
+// 将来要把队列占用透出到运维端点时，读的是同一个数。
+func (b *batcher[T]) queued() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return len(b.queue)
+}
+
 // Dropped 返回累计丢弃条数：队满、关闭后写入、以及二次失败被放弃的批次都计在这里。
 // 这个数必须可查，否则一张看起来完整的表实际缺页，运维无从判断（设计文档 §7.1）。
 func (b *batcher[T]) Dropped() int64 {
