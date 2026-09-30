@@ -43,6 +43,9 @@ type schedulerAPI interface {
 	// HandlerClass 查注册键的执行类别；第二个返回值为 false 表示这个键没登记过。
 	// 守卫靠它判断"崩溃瞬间在跑的是不是执行器任务"。
 	HandlerClass(key string) (core.JobClass, bool)
+	// GetEventBus 取调度器持有的事件总线，观测层的事件写入器要往上挂第二个订阅者。
+	// api.Server 走的是同一个入口（api/server.go 里给内存缓冲挂订阅），本卡不改 core。
+	GetEventBus() *core.EventBus
 }
 
 type serverAPI interface {
@@ -64,6 +67,16 @@ type observabilityDB interface {
 	Close() error
 }
 
+// eventLogAPI 是 run 对事件写入器的要求：关停，外加一个丢弃计数。
+//
+// 与 observabilityDB 同样定义在消费方，理由一致：关闭顺序（写入器先撤订阅并落完最后一批，
+// 连接后关）只有在句柄可替换时才断言得出来。落盘本身由写入器自己的周期负责，
+// 关停时它自己会把剩余批次写完，所以这里不需要 Flush。
+type eventLogAPI interface {
+	Close() error
+	Dropped() int64
+}
+
 type signalNotifier func(chan<- os.Signal, ...os.Signal)
 
 type runtimeDeps struct {
@@ -80,10 +93,14 @@ type runtimeDeps struct {
 	// observability.enabled=true 时调用。它同样列入依赖完整性检查：少装配一个闭包的后果是
 	// "三张表永远是空的"，看起来正常、实际没记，必须在启动期就报错。
 	newObservabilityDB func(core.Config, *slog.Logger) (observabilityDB, error)
-	newServer          func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore) (serverAPI, error)
-	notifySignals      signalNotifier
-	timeout            time.Duration
-	logger             *slog.Logger
+	// newEventLog 给事件总线挂上第二个订阅者并把 job.* 事件写进 job_events，
+	// 只在 observability.enabled 与 observability.events.enabled 同时为真时调用。
+	// 它同样列入依赖完整性检查（按上一条的组合条件）：少了它事件表永远是空的。
+	newEventLog   func(bus *core.EventBus, db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (eventLogAPI, error)
+	newServer     func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore) (serverAPI, error)
+	notifySignals signalNotifier
+	timeout       time.Duration
+	logger        *slog.Logger
 }
 
 // defaultRuntimeDeps 把配置注入各构造闭包，run() 本身不再关心具体取值来源
@@ -117,6 +134,21 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				return nil, err
 			}
 			return db, nil
+		},
+		newEventLog: func(bus *core.EventBus, db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (eventLogAPI, error) {
+			handle, ok := db.(*sqlite.DB)
+			if !ok {
+				// 真实装配里这一步一定成立：句柄就是上面 sqlite.Open 建出来的那一个。
+				// 不成立说明有人把假句柄接到了要真连接的写入器上，直接报错，
+				// 而不是让写入器静默缺席、事件表永远为空。
+				return nil, fmt.Errorf("event writer needs the real observability handle, got %T", db)
+			}
+			return sqlite.NewEventLog(bus, handle, sqlite.EventLogOptions{
+				FlushInterval:  cfg.FlushInterval,
+				QueueCapacity:  cfg.QueueCapacity,
+				RetentionCount: cfg.Events.RetentionCount,
+				RetentionAge:   cfg.Events.RetentionAge,
+			}, logger)
 		},
 		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore) (serverAPI, error) {
 			coreScheduler, ok := scheduler.(*core.Scheduler)
@@ -181,6 +213,12 @@ func run(deps runtimeDeps) error {
 	if deps.newStore == nil || deps.newScheduler == nil || deps.newExecutorRegistry == nil ||
 		deps.newArtifactStore == nil || deps.newObservabilityDB == nil || deps.newServer == nil ||
 		deps.notifySignals == nil {
+		return fmt.Errorf("runtime dependencies are incomplete")
+	}
+	// 事件写入器的闭包按"这次要不要用它"来判断必需性：观测层总开关或事件子开关任一关闭时
+	// 不构造才是预期行为（默认配置就该一个订阅者都不挂）。
+	// 两个开关都打开却少了闭包，后果是"三张表里的事件那张永远是空的"，所以必须启动期报错。
+	if deps.config.Observability.Enabled && deps.config.Observability.Events.Enabled && deps.newEventLog == nil {
 		return fmt.Errorf("runtime dependencies are incomplete")
 	}
 
@@ -258,11 +296,8 @@ func run(deps runtimeDeps) error {
 	// 观测层（运行事件、产物索引、写操作审计三张表）只在总开关打开时装配。
 	//
 	// defer 的顺序有讲究：这里的 defer 晚于上面 store.Close 的 defer 声明，因此实际执行顺序
-	// 是先关观测层、后关存储（设计文档 §7.3）。反过来就会在已关闭的任务存储之上再读一次快照，
-	// S03 起这条链上还要先撤掉事件总线的订阅。
-	//
-	// 句柄没有存到 if 外面：本卡它除了关闭之外没有读取方，而 Go 不允许声明用不上的变量。
-	// S03 注入事件写入器时再把它取出来，关闭顺序仍由这一行的 defer 保证。
+	// 是先关事件写入器、再关观测库、最后关任务存储（设计文档 §7.3）。反过来就会在已关闭的
+	// 连接上继续写入，或在已关闭的任务存储之上再读一次快照。
 	if cfg.Observability.Enabled {
 		db, err := deps.newObservabilityDB(cfg, deps.logger)
 		if err != nil {
@@ -284,12 +319,37 @@ func run(deps runtimeDeps) error {
 			// 报出来比让三张表安静地空着强。
 			return fmt.Errorf("observability database %s is unusable: %w", db.Path(), err)
 		}
+
+		// 事件写入器必须在 scheduler.Start() 之前挂上：Restore 是 Start 的第一步，
+		// 恢复阶段会重新发布一批 job.scheduled。挂晚了的后果是这一批静默不进库，
+		// 而"重启后时间线少了头几条"看起来跟"任务本来就没排期"一模一样，事后无从分辨。
+		var events eventLogAPI
+		if cfg.Observability.Events.Enabled {
+			events, err = deps.newEventLog(scheduler.GetEventBus(), db, cfg.Observability, deps.logger)
+			if err != nil {
+				return fmt.Errorf("observability event writer: %w", err)
+			}
+			// 这条 defer 晚于上面 db.Close 的那条，因此先执行：撤订阅 → 等转发协程退出 →
+			// 落完最后一批，然后才关连接（顺序反过来就是往已关闭的连接里写）。
+			defer func() {
+				if err := events.Close(); err != nil {
+					deps.logger.Error("failed to close observability event writer", "error", err)
+				}
+				// 丢了多少必须在关停时也能看见：库里缺页是读不出来的（设计文档 §7.1）。
+				if dropped := events.Dropped(); dropped > 0 {
+					deps.logger.Warn("observability event writer dropped records",
+						"dropped", dropped, "path", db.Path())
+				}
+			}()
+		}
+
 		// journal_mode 记的是实际生效值：网络文件系统上 WAL 会静默退回 delete，
 		// 只看配置文件里的写法看不出降级已经发生（本卡 §9 风险 2）。
 		deps.logger.Info("observability enabled",
 			"path", db.Path(),
 			"schema_version", stats.SchemaVersion,
-			"journal_mode", db.JournalMode())
+			"journal_mode", db.JournalMode(),
+			"events_writer", events != nil)
 	}
 
 	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts)

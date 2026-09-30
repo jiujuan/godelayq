@@ -336,6 +336,7 @@ func TestDefaultRuntimeDeps(t *testing.T) {
 
 	if deps.newStore == nil || deps.newScheduler == nil || deps.newExecutorRegistry == nil ||
 		deps.newArtifactStore == nil || deps.newObservabilityDB == nil ||
+		deps.newEventLog == nil ||
 		deps.newServer == nil || deps.notifySignals == nil {
 		t.Fatal("expected all runtime dependencies to be set")
 	}

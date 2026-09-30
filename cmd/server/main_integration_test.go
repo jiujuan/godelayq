@@ -676,9 +676,37 @@ func (s *observabilityStub) Close() error {
 	return s.closeErr
 }
 
-// runWithObservability 用一份观测层配置跑一次完整装配（不起真服务），返回替身观测库、
-// 替身存储与启动日志。三条观测层装配用例只差在配置与闭包返回值上，共用这一份骨架。
-func runWithObservability(t *testing.T, tune func(*core.Config), newDB func(core.Config, *slog.Logger) (observabilityDB, error)) (*observabilityStub, *stubStore, []string, string) {
+// eventLogStub 是事件写入器的替身：它只回答"关了几次、什么时候关的、丢了多少"。
+// 真实写入器的行为在 store/sqlite 那一侧有用例，这里守的是装配与关停顺序。
+type eventLogStub struct {
+	closeCalls int
+	dropped    int64
+	closeErr   error
+	order      *[]string
+}
+
+func (s *eventLogStub) Close() error {
+	s.closeCalls++
+	if s.order != nil {
+		*s.order = append(*s.order, "event_log")
+	}
+	return s.closeErr
+}
+
+func (s *eventLogStub) Dropped() int64 { return s.dropped }
+
+// observabilityCase 是三条观测层装配用例共用的输入：配置改法、两个闭包的返回值，
+// 以及"在 newServer 那一刻能拿到总线"的钩子（那时事件写入器已经挂上，发出去的事件会走完整链路）。
+type observabilityCase struct {
+	tune     func(*core.Config)
+	newDB    func(core.Config, *slog.Logger) (observabilityDB, error)
+	newLog   func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error)
+	onServer func(*core.EventBus)
+}
+
+// runWithObservability 用一份观测层配置跑一次完整装配（不起真服务），返回两个替身、
+// 替身存储、共享的关闭顺序表与启动日志。
+func runWithObservability(t *testing.T, tc observabilityCase) (*observabilityStub, *eventLogStub, *stubStore, []string, string) {
 	t.Helper()
 
 	var order []string
@@ -688,16 +716,23 @@ func runWithObservability(t *testing.T, tune func(*core.Config), newDB func(core
 	var logs strings.Builder
 
 	cfg := core.DefaultConfig()
-	if tune != nil {
-		tune(&cfg)
+	if tc.tune != nil {
+		tc.tune(&cfg)
 	}
 
 	stub := &observabilityStub{path: cfg.Observability.Path, order: &order,
 		stats: sqlite.Stats{SchemaVersion: 1}}
-	// 闭包由用例决定返回替身还是报错；返回替身时把用例给的错误与路径一并接上
-	closure := newDB
-	if closure == nil {
-		closure = func(core.Config, *slog.Logger) (observabilityDB, error) { return stub, nil }
+	logStub := &eventLogStub{order: &order}
+	// 闭包由用例决定返回替身还是报错；传 nil 就用上面两份替身
+	newDB := tc.newDB
+	if newDB == nil {
+		newDB = func(core.Config, *slog.Logger) (observabilityDB, error) { return stub, nil }
+	}
+	newLog := tc.newLog
+	if newLog == nil {
+		newLog = func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error) {
+			return logStub, nil
+		}
 	}
 
 	err := run(runtimeDeps{
@@ -706,8 +741,13 @@ func runWithObservability(t *testing.T, tune func(*core.Config), newDB func(core
 		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
-		newObservabilityDB:  closure,
+		newObservabilityDB:  newDB,
+		newEventLog:         newLog,
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+			// 装配已经走到"观测层挂好、服务还没起"这一步，总线此刻可用
+			if tc.onServer != nil {
+				tc.onServer(scheduler.GetEventBus())
+			}
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -721,7 +761,7 @@ func runWithObservability(t *testing.T, tune func(*core.Config), newDB func(core
 	if err != nil {
 		t.Fatalf("expected run to succeed, got %v", err)
 	}
-	return stub, store, append([]string(nil), order...), logs.String()
+	return stub, logStub, store, append([]string(nil), order...), logs.String()
 }
 
 // TestRun_ObservabilityDisabledOpensNothing 是本卡的第一条 DoD：
@@ -798,6 +838,10 @@ func TestRun_ObservabilityOpenFailureStopsStartup(t *testing.T) {
 		newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
 			return nil, wantErr
 		},
+		newEventLog: func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error) {
+			t.Fatal("the event writer should not be constructed when the database is unavailable")
+			return nil, nil
+		},
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			t.Fatal("the server should not be created when the observability database fails")
 			return nil, nil
@@ -837,6 +881,10 @@ func TestRun_ObservabilityStatsFailureStopsStartup(t *testing.T) {
 		newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
 			return stub, nil
 		},
+		newEventLog: func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error) {
+			t.Fatal("the event writer should not be constructed when the database is unusable")
+			return nil, nil
+		},
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
 			t.Fatal("the server should not be created when the observability database is unusable")
 			return nil, nil
@@ -861,10 +909,12 @@ func TestRun_ObservabilityStatsFailureStopsStartup(t *testing.T) {
 // 观测层的 defer 晚于 store.Close 的 defer 声明，因此先执行。顺序颠倒时，
 // S03 起的事件写入器会在已关闭的任务存储之上再读一次快照。
 func TestRun_ObservabilityClosedBeforeStore(t *testing.T) {
-	stub, store, order, logs := runWithObservability(t, func(cfg *core.Config) {
-		cfg.Observability.Enabled = true
-		cfg.Observability.Path = filepath.Join(t.TempDir(), "observe.sqlite")
-	}, nil)
+	stub, logStub, store, order, logs := runWithObservability(t, observabilityCase{
+		tune: func(cfg *core.Config) {
+			cfg.Observability.Enabled = true
+			cfg.Observability.Path = filepath.Join(t.TempDir(), "observe.sqlite")
+		},
+	})
 
 	if stub.closeCalls != 1 {
 		t.Fatalf("expected the observability handle to be closed once, got %d", stub.closeCalls)
@@ -872,11 +922,14 @@ func TestRun_ObservabilityClosedBeforeStore(t *testing.T) {
 	if store.closeCalls != 1 {
 		t.Fatalf("expected the store to be closed once, got %d", store.closeCalls)
 	}
-	// 这一条才是本卡的顺序断言：观测层先关、任务存储后关。
-	// 只断言"两个都关过"是不够的——反过来的顺序同样能通过，而那时 S03 的事件写入器
-	// 会在已关闭的存储上再读一次快照。
-	if len(order) != 2 || order[0] != "observability" || order[1] != "store" {
-		t.Fatalf("expected the close order [observability, store], got %v", order)
+	// 这一条才是关闭顺序断言：事件写入器先撤订阅并落完最后一批、观测库再关连接、任务存储最后关。
+	// 只断言"三个都关过"是不够的——顺序反过来同样能通过，而那时就是往已关闭的连接里写、
+	// 或在已关闭的存储之上再读一次快照。
+	if len(order) != 3 || order[0] != "event_log" || order[1] != "observability" || order[2] != "store" {
+		t.Fatalf("expected the close order [event_log, observability, store], got %v", order)
+	}
+	if logStub.closeCalls != 1 {
+		t.Fatalf("expected the event writer to be closed once, got %d", logStub.closeCalls)
 	}
 
 	// 关观测层时报的 Stats 调用次数固定为 1（启动日志那一行），关闭本身不再查
@@ -900,16 +953,27 @@ func TestRun_ObservabilityEnabledOpensAndClosesForReal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data", "observe.sqlite")
 
 	var opened observabilityDB
-	stub, _, _, logs := runWithObservability(t, func(cfg *core.Config) {
-		cfg.Observability.Enabled = true
-		cfg.Observability.Path = path
-	}, func(cfg core.Config, logger *slog.Logger) (observabilityDB, error) {
-		db, err := sqlite.Open(cfg.Observability, logger)
-		if err != nil {
-			return nil, err
-		}
-		opened = db
-		return db, nil
+	_, _, _, _, logs := runWithObservability(t, observabilityCase{
+		tune: func(cfg *core.Config) {
+			cfg.Observability.Enabled = true
+			cfg.Observability.Path = path
+		},
+		newDB: func(cfg core.Config, logger *slog.Logger) (observabilityDB, error) {
+			db, err := sqlite.Open(cfg.Observability, logger)
+			if err != nil {
+				return nil, err
+			}
+			opened = db
+			return db, nil
+		},
+		newLog: defaultRuntimeDeps(core.DefaultConfig(), slog.Default()).newEventLog,
+		// 装配完成、服务未起：此刻事件写入器已经挂上总线，发两条就该进库
+		onServer: func(bus *core.EventBus) {
+			bus.Publish(core.Event{Type: core.EventJobScheduled, JobID: "job-real",
+				JobName: "demo", Status: core.StatusPending, Timestamp: time.Now()})
+			bus.Publish(core.Event{Type: core.EventJobStarted, JobID: "job-real",
+				JobName: "demo", Status: core.StatusRunning, Timestamp: time.Now()})
+		},
 	})
 
 	if opened == nil {
@@ -918,15 +982,160 @@ func TestRun_ObservabilityEnabledOpensAndClosesForReal(t *testing.T) {
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("expected the database file at the configured path: %v", err)
 	}
-	if stub.closeCalls != 0 {
-		t.Fatalf("the real handle is not a stub, closeCalls should stay 0, got %d", stub.closeCalls)
-	}
 	// run 返回即观测层已关：关掉之后 Stats 必须报错，而不是还能读出行数
 	if _, err := opened.Stats(); err == nil {
 		t.Fatal("expected the database to be closed when run returns")
 	}
 	if !strings.Contains(logs, `msg="observability enabled"`) || !strings.Contains(logs, path) {
 		t.Fatalf("expected the startup line to name the path, got %q", logs)
+	}
+	// 生产闭包接上了真句柄：类型断言那条路径只有在这里被真的走过，
+	// 才能确认装配时事件写入器真的挂上了（events_writer=true）
+	if !strings.Contains(logs, "events_writer=true") {
+		t.Fatalf("expected the event writer to be assembled, got %q", logs)
+	}
+
+	// 端到端：从总线发出去的两条事件，经过订阅、队列、批量事务落到库里；
+	// 重新打开这份文件还能读到那两行，就是"重启后历史仍在"这条需求的本体。
+	again, err := sqlite.Open(sqliteOptionsForTest(path), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatalf("reopening the database failed: %v", err)
+	}
+	defer again.Close()
+	reopened, err := again.Stats()
+	if err != nil {
+		t.Fatalf("reading the reopened stats failed: %v", err)
+	}
+	if reopened.Events != 2 {
+		t.Fatalf("expected the two published events in the table, got %d", reopened.Events)
+	}
+	if reopened.SchemaVersion != 1 {
+		t.Fatalf("expected schema version 1 to come back unchanged, got %d", reopened.SchemaVersion)
+	}
+}
+
+// sqliteOptionsForTest 把路径包成一份打开观测库用的配置，其余取值一律用 core 的默认。
+// store/sqlite 的用例里有同名的 openConfig，这里是要跨包用，所以放在装配侧的这一份测试里。
+func sqliteOptionsForTest(path string) core.ObservabilityConfig {
+	cfg := core.DefaultConfig()
+	cfg.Observability.Enabled = true
+	cfg.Observability.Path = path
+	return cfg.Observability
+}
+
+// TestRun_EventLogDisabledOpensNoWriter 固定事件子开关关闭时的形态：库照建、表照在，
+// 但写入器一个都不构造（闭包被调用即失败），启动日志里 events_writer=false。
+func TestRun_EventLogDisabledOpensNoWriter(t *testing.T) {
+	_, logStub, store, order, logs := runWithObservability(t, observabilityCase{
+		tune: func(cfg *core.Config) {
+			cfg.Observability.Enabled = true
+			cfg.Observability.Path = filepath.Join(t.TempDir(), "observe.sqlite")
+			cfg.Observability.Events.Enabled = false
+		},
+		newLog: func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error) {
+			t.Fatal("the event writer must not be built while observability.events.enabled is false")
+			return nil, nil
+		},
+	})
+
+	if logStub.closeCalls != 0 {
+		t.Fatalf("no writer was built, so nothing should be closed, got %d", logStub.closeCalls)
+	}
+	if store.closeCalls != 1 {
+		t.Fatalf("expected the store to be closed once, got %d", store.closeCalls)
+	}
+	if len(order) != 2 || order[0] != "observability" || order[1] != "store" {
+		t.Fatalf("expected the close order [observability, store], got %v", order)
+	}
+	if !strings.Contains(logs, "events_writer=false") {
+		t.Fatalf("expected the startup line to say the writer is off, got %q", logs)
+	}
+}
+
+// TestRun_EventLogOpenFailureStopsStartup：写入器建不起来就别启动。
+// 这一条与"库建不起来"同口径：静默跳过会让人以为只是这次没跑任务。
+func TestRun_EventLogOpenFailureStopsStartup(t *testing.T) {
+	store := newStubStore()
+	scheduler := newSpyScheduler()
+	wantErr := errors.New("event writer: subscribe failed")
+
+	cfg := core.DefaultConfig()
+	cfg.Observability.Enabled = true
+	cfg.Observability.Path = filepath.Join(t.TempDir(), "observe.sqlite")
+
+	err := run(runtimeDeps{
+		config:              cfg,
+		newStore:            func() (core.Store, error) { return store, nil },
+		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
+		newExecutorRegistry: staticExecutorRegistry(nil, nil),
+		newArtifactStore:    staticArtifactStore(nil, nil),
+		newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
+			return &observabilityStub{path: cfg.Observability.Path, stats: sqlite.Stats{SchemaVersion: 1}}, nil
+		},
+		newEventLog: func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error) {
+			return nil, wantErr
+		},
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+			t.Fatal("the server should not be created when the event writer fails")
+			return nil, nil
+		},
+		notifySignals: func(chan<- os.Signal, ...os.Signal) {},
+		logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected the event writer error, got %v", err)
+	}
+	if scheduler.startCalls != 0 {
+		t.Fatalf("expected the scheduler not to start, got %d", scheduler.startCalls)
+	}
+	if store.closeCalls != 1 {
+		t.Fatalf("expected the store to be closed once, got %d", store.closeCalls)
+	}
+}
+
+// TestRun_EventLogClosureIsMandatoryWhenEnabled 把"少了写入器闭包就不许启动"钉住：
+// 只打开观测层与事件子开关、不给闭包 → 依赖不完整；同样配置下关掉事件子开关 → 不该再要求它。
+func TestRun_EventLogClosureIsMandatoryWhenEnabled(t *testing.T) {
+	newDeps := func(eventsEnabled bool) runtimeDeps {
+		cfg := core.DefaultConfig()
+		cfg.Observability.Enabled = true
+		cfg.Observability.Events.Enabled = eventsEnabled
+		cfg.Observability.Path = filepath.Join(t.TempDir(), "observe.sqlite")
+		return runtimeDeps{
+			config:              cfg,
+			newStore:            func() (core.Store, error) { return newStubStore(), nil },
+			newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
+			newExecutorRegistry: staticExecutorRegistry(nil, nil),
+			newArtifactStore:    staticArtifactStore(nil, nil),
+			newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
+				return &observabilityStub{stats: sqlite.Stats{SchemaVersion: 1}}, nil
+			},
+			newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+				return newFakeServer(), nil
+			},
+			notifySignals: func(chan<- os.Signal, ...os.Signal) {},
+			timeout:       5 * time.Millisecond,
+			logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		}
+	}
+
+	deps := newDeps(true)
+	err := run(deps)
+	if err == nil || !strings.Contains(err.Error(), "runtime dependencies are incomplete") {
+		t.Fatalf("expected a missing event writer closure to be reported, got %v", err)
+	}
+
+	// 同样的配置只关事件子开关：不构造写入器是预期行为，不该因为它报错。
+	// 这一条会跑到等信号那一步，所以给它一个立刻发 SIGTERM 的替身。
+	deps = newDeps(false)
+	deps.notifySignals = func(ch chan<- os.Signal, sig ...os.Signal) {
+		go func() {
+			ch <- syscall.SIGTERM
+		}()
+	}
+	if err := run(deps); err != nil {
+		t.Fatalf("expected run to work without the closure while events are off, got %v", err)
 	}
 }
 
@@ -1070,13 +1279,23 @@ type spyScheduler struct {
 	restoreGuard core.RestoreGuard
 	// guardSetBeforeStart 记录装钩子时 Start 还没被调用过（装配顺序断言，见 SetRestoreGuard）
 	guardSetBeforeStart bool
+	// eventBus 是替身调度器自带的总线：观测层的事件写入器从这里取订阅入口，
+	// 用例也可以在装配完成之后往它上头发事件，看写入链路是不是真的通了。
+	eventBus *core.EventBus
 }
 
 func newSpyScheduler() *spyScheduler {
 	return &spyScheduler{
 		registered: make(map[string]core.Handler),
 		classes:    make(map[string]core.JobClass),
+		eventBus:   core.NewEventBus(100),
 	}
+}
+
+// GetEventBus 满足 schedulerAPI。真实调度器返回的是它自己那一条总线，
+// 替身返回用例可见的那一条，装配链路在两种实现下走的是同一个入口。
+func (s *spyScheduler) GetEventBus() *core.EventBus {
+	return s.eventBus
 }
 
 func (s *spyScheduler) SetConcurrency(n int) {
