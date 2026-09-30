@@ -67,14 +67,19 @@ type observabilityDB interface {
 	Close() error
 }
 
-// eventLogAPI 是 run 对事件写入器的要求：关停，外加一个丢弃计数。
+// eventLogAPI 是 run 对事件写入器的要求，两面都用得上：
+//   - 关停面（Close / Dropped）：撤销订阅、落完最后一批、把丢弃数记进关停日志；
+//   - 读取面（Events / Recent）：原样交给 api.WithEventLog，让两个事件端点改读库。
 //
 // 与 observabilityDB 同样定义在消费方，理由一致：关闭顺序（写入器先撤订阅并落完最后一批，
-// 连接后关）只有在句柄可替换时才断言得出来。落盘本身由写入器自己的周期负责，
-// 关停时它自己会把剩余批次写完，所以这里不需要 Flush。
+// 连接后关）只有在句柄可替换时才断言得出来。这里不列 Flush：落盘由写入器自己的周期负责，
+// 关停时它自己会把剩余批次写完，run 里没有单独 Flush 的时机。
+// api 侧只声明读取能力（api.server.go 的 eventReader），所以这里带上读方法不会让 api 碰驱动。
 type eventLogAPI interface {
 	Close() error
 	Dropped() int64
+	Events(jobID string, limit int) ([]core.Event, error)
+	Recent(limit int) ([]core.Event, error)
 }
 
 type signalNotifier func(chan<- os.Signal, ...os.Signal)
@@ -97,7 +102,7 @@ type runtimeDeps struct {
 	// 只在 observability.enabled 与 observability.events.enabled 同时为真时调用。
 	// 它同样列入依赖完整性检查（按上一条的组合条件）：少了它事件表永远是空的。
 	newEventLog   func(bus *core.EventBus, db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (eventLogAPI, error)
-	newServer     func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore) (serverAPI, error)
+	newServer     func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore, events eventLogAPI) (serverAPI, error)
 	notifySignals signalNotifier
 	timeout       time.Duration
 	logger        *slog.Logger
@@ -150,7 +155,7 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				RetentionAge:   cfg.Events.RetentionAge,
 			}, logger)
 		},
-		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry, artifacts *executor.ArtifactStore, events eventLogAPI) (serverAPI, error) {
 			coreScheduler, ok := scheduler.(*core.Scheduler)
 			if !ok {
 				return nil, fmt.Errorf("default server requires *core.Scheduler, got %T", scheduler)
@@ -166,7 +171,7 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 			if err != nil {
 				return nil, err
 			}
-			return api.NewServer(coreScheduler, store, port, security, logger,
+			opts := []api.Option{
 				api.WithGroupStore(groups),
 				api.WithExecutorRegistry(executors),
 				// 执行器关闭时 artifacts 是 nil，等价于不注入：/jobs/:id/result 回 503，
@@ -174,7 +179,14 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				api.WithArtifacts(artifacts),
 				// 不带 -tags dashboard 时 web.Dist 恒为 nil，这一行等价于"不提供控制台"。
 				// 写成无条件调用而不是两份装配，是为了让单二进制的差异只留在 web 包那一处。
-				api.WithConsole(web.Dist)), nil
+				api.WithConsole(web.Dist),
+			}
+			// 事件读取方按装没装配分岔：观测层或事件子开关关闭时这里是 nil，
+			// 两个事件端点继续读内存缓冲（未启用时的默认行为必须一字不变）。
+			if events != nil {
+				opts = append(opts, api.WithEventLog(events))
+			}
+			return api.NewServer(coreScheduler, store, port, security, logger, opts...), nil
 		},
 		notifySignals: signal.Notify,
 		timeout:       cfg.Scheduler.ShutdownTimeout,
@@ -293,6 +305,10 @@ func run(deps runtimeDeps) error {
 		}()
 	}
 
+	// 事件写入器在观测层装配那段里创建，声明放在外面：它同时是 api.Server 的事件读取方，
+	// 而 newServer 在观测层之后调用。未启用时保持 nil，两个事件端点因此走内存缓冲。
+	var events eventLogAPI
+
 	// 观测层（运行事件、产物索引、写操作审计三张表）只在总开关打开时装配。
 	//
 	// defer 的顺序有讲究：这里的 defer 晚于上面 store.Close 的 defer 声明，因此实际执行顺序
@@ -323,7 +339,9 @@ func run(deps runtimeDeps) error {
 		// 事件写入器必须在 scheduler.Start() 之前挂上：Restore 是 Start 的第一步，
 		// 恢复阶段会重新发布一批 job.scheduled。挂晚了的后果是这一批静默不进库，
 		// 而"重启后时间线少了头几条"看起来跟"任务本来就没排期"一模一样，事后无从分辨。
-		var events eventLogAPI
+		//
+		// 它的读取面同时交给 api.Server（下面的 deps.newServer 把它作为事件读取方注入）：
+		// 装配了事件库之后两个事件端点改读库，没装配时这里保持 nil，端点走内存缓冲。
 		if cfg.Observability.Events.Enabled {
 			events, err = deps.newEventLog(scheduler.GetEventBus(), db, cfg.Observability, deps.logger)
 			if err != nil {
@@ -352,7 +370,7 @@ func run(deps runtimeDeps) error {
 			"events_writer", events != nil)
 	}
 
-	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts)
+	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts, events)
 	if err != nil {
 		return err
 	}

@@ -78,7 +78,7 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 			return nil, nil
 		},
 		newObservabilityDB: unopenedObservabilityDB(t),
-		newServer: func(gotScheduler schedulerAPI, gotStore core.Store, port string, gotExecutors *executor.Registry, gotArtifacts *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(gotScheduler schedulerAPI, gotStore core.Store, port string, gotExecutors *executor.Registry, gotArtifacts *executor.ArtifactStore, gotEvents eventLogAPI) (serverAPI, error) {
 			if gotScheduler != scheduler {
 				t.Fatalf("expected server to receive scheduler stub, got %T", gotScheduler)
 			}
@@ -199,7 +199,7 @@ func TestRun_ServerStartFailureStopsScheduler(t *testing.T) {
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {},
@@ -239,7 +239,7 @@ func TestRun_StoreCreationFailure(t *testing.T) {
 			return nil, nil
 		},
 		newObservabilityDB: unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			t.Fatal("server should not be created when store creation fails")
 			return nil, nil
 		},
@@ -271,7 +271,7 @@ func TestRun_ExecutorRegistryError(t *testing.T) {
 			return nil, nil
 		},
 		newObservabilityDB: unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			t.Fatal("server should not be created when the registry fails")
 			return nil, nil
 		},
@@ -314,7 +314,7 @@ func TestRun_LogsErrorWhenAuthDisabled(t *testing.T) {
 		newExecutorRegistry: executor.NewRegistry,
 		newArtifactStore:    artifactStoreFromConfig,
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -382,7 +382,7 @@ func runWithExecutorConfig(t *testing.T, tune func(*core.Config)) (*spyScheduler
 		newExecutorRegistry: func(core.Config, *slog.Logger) (*executor.Registry, error) { return executors, nil },
 		newArtifactStore:    artifactStoreFromConfig,
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -483,7 +483,7 @@ func TestRun_ExecPoolSizingReachesScheduler(t *testing.T) {
 		newExecutorRegistry: executor.NewRegistry,
 		newArtifactStore:    artifactStoreFromConfig,
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -514,7 +514,7 @@ func TestRun_WithIncompleteDependencies(t *testing.T) {
 	err = run(runtimeDeps{
 		newStore:     func() (core.Store, error) { return newStubStore(), nil },
 		newScheduler: func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			return newFakeServer(), nil
 		},
 		notifySignals: func(chan<- os.Signal, ...os.Signal) {},
@@ -529,7 +529,7 @@ func TestRun_WithIncompleteDependencies(t *testing.T) {
 		newStore:            func() (core.Store, error) { return newStubStore(), nil },
 		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			return newFakeServer(), nil
 		},
 		notifySignals: func(chan<- os.Signal, ...os.Signal) {},
@@ -556,7 +556,7 @@ func TestRun_ArtifactStoreErrorStopsStartup(t *testing.T) {
 		newExecutorRegistry: executor.NewRegistry,
 		newArtifactStore:    staticArtifactStore(nil, wantErr),
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			t.Fatal("server should not be created when the artifact store fails")
 			return nil, nil
 		},
@@ -603,7 +603,7 @@ func TestRun_ArtifactCleanerStopsWithRun(t *testing.T) {
 			return artifacts, nil
 		},
 		newObservabilityDB: unopenedObservabilityDB(t),
-		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry, gotArtifacts *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry, gotArtifacts *executor.ArtifactStore, _ eventLogAPI) (serverAPI, error) {
 			// 接口拿到的必须就是 run 里那一份：换成新建的存储会读不到刚写出的产物
 			if len(stores) != 1 || gotArtifacts != stores[0] {
 				t.Errorf("expected the server to receive the built artifact store, got %p of %v", gotArtifacts, stores)
@@ -676,8 +676,9 @@ func (s *observabilityStub) Close() error {
 	return s.closeErr
 }
 
-// eventLogStub 是事件写入器的替身：它只回答"关了几次、什么时候关的、丢了多少"。
-// 真实写入器的行为在 store/sqlite 那一侧有用例，这里守的是装配与关停顺序。
+// eventLogStub 是事件写入器的替身：它只回答"关了几次、什么时候关的、丢了多少"，
+// 以及"是不是同一个实例被交给了服务"。真实写入器的读写行为在 store/sqlite 与 api
+// 两侧各有用例，这里守的是装配与关停顺序。
 type eventLogStub struct {
 	closeCalls int
 	dropped    int64
@@ -695,13 +696,21 @@ func (s *eventLogStub) Close() error {
 
 func (s *eventLogStub) Dropped() int64 { return s.dropped }
 
-// observabilityCase 是三条观测层装配用例共用的输入：配置改法、两个闭包的返回值，
-// 以及"在 newServer 那一刻能拿到总线"的钩子（那时事件写入器已经挂上，发出去的事件会走完整链路）。
+// Events 与 Recent 只为满足 eventLogAPI 的读取面：装配用例断言的是实例交接，
+// 不是查询结果。真读库的内容由 api 的替身用例与 store/sqlite 的用例覆盖。
+func (s *eventLogStub) Events(string, int) ([]core.Event, error) { return nil, nil }
+
+func (s *eventLogStub) Recent(int) ([]core.Event, error) { return nil, nil }
+
+// observabilityCase 是观测层装配用例共用的输入：配置改法、两个闭包的返回值、
+// "在 newServer 那一刻能拿到总线"的钩子（那时事件写入器已经挂上，发出去的事件会走完整链路），
+// 以及 newServer 实际收到的事件读取方（未启用时应当是 nil）。
 type observabilityCase struct {
-	tune     func(*core.Config)
-	newDB    func(core.Config, *slog.Logger) (observabilityDB, error)
-	newLog   func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error)
-	onServer func(*core.EventBus)
+	tune      func(*core.Config)
+	newDB     func(core.Config, *slog.Logger) (observabilityDB, error)
+	newLog    func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error)
+	onServer  func(*core.EventBus)
+	gotEvents func(eventLogAPI)
 }
 
 // runWithObservability 用一份观测层配置跑一次完整装配（不起真服务），返回两个替身、
@@ -743,10 +752,13 @@ func runWithObservability(t *testing.T, tc observabilityCase) (*observabilityStu
 		newArtifactStore:    staticArtifactStore(nil, nil),
 		newObservabilityDB:  newDB,
 		newEventLog:         newLog,
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry, _ *executor.ArtifactStore, gotEvents eventLogAPI) (serverAPI, error) {
 			// 装配已经走到"观测层挂好、服务还没起"这一步，总线此刻可用
 			if tc.onServer != nil {
 				tc.onServer(scheduler.GetEventBus())
+			}
+			if tc.gotEvents != nil {
+				tc.gotEvents(gotEvents)
 			}
 			return server, nil
 		},
@@ -788,7 +800,7 @@ func TestRun_ObservabilityDisabledOpensNothing(t *testing.T) {
 			calls++
 			return nil, nil
 		},
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			return newFakeServer(), nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -842,7 +854,7 @@ func TestRun_ObservabilityOpenFailureStopsStartup(t *testing.T) {
 			t.Fatal("the event writer should not be constructed when the database is unavailable")
 			return nil, nil
 		},
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			t.Fatal("the server should not be created when the observability database fails")
 			return nil, nil
 		},
@@ -885,7 +897,7 @@ func TestRun_ObservabilityStatsFailureStopsStartup(t *testing.T) {
 			t.Fatal("the event writer should not be constructed when the database is unusable")
 			return nil, nil
 		},
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			t.Fatal("the server should not be created when the observability database is unusable")
 			return nil, nil
 		},
@@ -1075,7 +1087,7 @@ func TestRun_EventLogOpenFailureStopsStartup(t *testing.T) {
 		newEventLog: func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error) {
 			return nil, wantErr
 		},
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			t.Fatal("the server should not be created when the event writer fails")
 			return nil, nil
 		},
@@ -1111,7 +1123,7 @@ func TestRun_EventLogClosureIsMandatoryWhenEnabled(t *testing.T) {
 			newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
 				return &observabilityStub{stats: sqlite.Stats{SchemaVersion: 1}}, nil
 			},
-			newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+			newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 				return newFakeServer(), nil
 			},
 			notifySignals: func(chan<- os.Signal, ...os.Signal) {},
@@ -1139,6 +1151,57 @@ func TestRun_EventLogClosureIsMandatoryWhenEnabled(t *testing.T) {
 	}
 }
 
+// TestRun_EventLogIsTheServerReader 钉住"注入给服务的事件读取方就是那个写入器"。
+//
+// 装配把同一个句柄分成两面用：run 拿它关停，api.Server 拿它读库。两条路各自都可能有
+// 人接手时接错（比如传了个新建的空写入器），而错的表现是"端点静默回到内存缓冲"——
+// 与未启用观测层一模一样，看不出问题。所以这里比的是实例是否同一个。
+func TestRun_EventLogIsTheServerReader(t *testing.T) {
+	var received []eventLogAPI
+	_, logStub, _, _, _ := runWithObservability(t, observabilityCase{
+		tune: func(cfg *core.Config) {
+			cfg.Observability.Enabled = true
+			cfg.Observability.Path = filepath.Join(t.TempDir(), "observe.sqlite")
+		},
+		gotEvents: func(events eventLogAPI) {
+			received = append(received, events)
+		},
+	})
+
+	if len(received) != 1 {
+		t.Fatalf("expected the server factory to be called once, got %d", len(received))
+	}
+	if received[0] != eventLogAPI(logStub) {
+		t.Fatalf("the server got a different event reader than the assembled writer")
+	}
+}
+
+// TestRun_NoServerReaderWhenEventsDisabled 是上一条的另一半：事件子开关关闭时交给服务的
+// 读取方必须是 nil，两个端点因此留在内存缓冲这条路上（未启用时行为一字不变）。
+func TestRun_NoServerReaderWhenEventsDisabled(t *testing.T) {
+	called := false
+	var received []eventLogAPI
+	runWithObservability(t, observabilityCase{
+		tune: func(cfg *core.Config) {
+			cfg.Observability.Enabled = true
+			cfg.Observability.Path = filepath.Join(t.TempDir(), "observe.sqlite")
+			cfg.Observability.Events.Enabled = false
+		},
+		gotEvents: func(events eventLogAPI) {
+			called = true
+			received = append(received, events)
+		},
+	})
+
+	if !called {
+		t.Fatal("expected the server factory to receive the reader argument")
+	}
+	if received[0] != nil {
+		t.Fatalf("expected no event reader while observability.events.enabled is false, got %v", received[0])
+	}
+}
+
+// TestLiveJobIDs 检查"存储里的 ID 集合"包装：内容一致，存储报错时原样透出
 // TestLiveJobIDs 检查"存储里的 ID 集合"包装：内容一致，存储报错时原样透出
 // （PurgeOrphans 依赖这个错误决定跳过本轮删除）。
 func TestLiveJobIDs(t *testing.T) {
@@ -1174,7 +1237,7 @@ func TestRun_ServerStopErrorIsLoggedAndIgnored(t *testing.T) {
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -1208,7 +1271,7 @@ func TestRun_UsesDefaultTimeoutAndLoggerWhenUnset(t *testing.T) {
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -1246,7 +1309,7 @@ func TestRun_ServerFactoryError(t *testing.T) {
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, eventLogAPI) (serverAPI, error) {
 			return nil, wantErr
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {},
