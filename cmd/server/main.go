@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,6 +37,11 @@ type schedulerAPI interface {
 	// SetEventPreviewLimit 把输出预览的字节上限交给调度器：完成/失败事件由 core 发布，
 	// 尺寸限制必须在发事件的一方生效，而不能只在接口侧裁剪。
 	SetEventPreviewLimit(n int)
+	// SetRestoreGuard 安装崩溃恢复的状态改判钩子（TASK-E14），必须在 Start 之前。
+	SetRestoreGuard(g core.RestoreGuard)
+	// HandlerClass 查注册键的执行类别；第二个返回值为 false 表示这个键没登记过。
+	// 守卫靠它判断"崩溃瞬间在跑的是不是执行器任务"。
+	HandlerClass(key string) (core.JobClass, bool)
 }
 
 type serverAPI interface {
@@ -229,6 +235,8 @@ func run(deps runtimeDeps) error {
 		return err
 	}
 
+	installRestoreGuard(scheduler, cfg)
+
 	scheduler.Start()
 
 	if err := server.Start(); err != nil {
@@ -296,6 +304,44 @@ func registerHandlers(server serverAPI, scheduler schedulerAPI, reg *executor.Re
 	}
 	_, err := executor.Register(scheduler, reg, cfg, artifacts, logger)
 	return err
+}
+
+// installRestoreGuard 按配置决定：崩溃时正在跑的执行器任务，重启后要不要停在 paused 上等人确认。
+//
+// 两种情况不装守卫，行为与 TASK-E14 之前一字不差：
+//   - 没打开执行器（这个进程里根本没有执行器任务）；
+//   - executors.restore_policy=replay（部署方明确表态"重复执行的后果我自己承担"）。
+//
+// 必须在 Start 之前调用：Restore 是 Start 的第一步，任务这时已经跑起来了再装就来不及了。
+func installRestoreGuard(scheduler schedulerAPI, cfg core.Config) {
+	if !cfg.Executors.Enabled {
+		return
+	}
+	if strings.TrimSpace(cfg.Executors.RestorePolicy) == "replay" {
+		return
+	}
+	scheduler.SetRestoreGuard(pauseRunningExecOnRestore(scheduler))
+}
+
+// pauseRunningExecOnRestore 是装上调度器的那个守卫：只拦"快照还是 running 的执行器任务"。
+//
+// running 快照的含义是"进程确实起来过、结果未知"——被强杀的进程来不及写任何结论。
+// 优雅关闭不走这里：那条路径由 handleInterrupted 把任务落成 pending，重启后照常重跑。
+//
+// 档位被删掉之后它的历史任务查不到类别（第二个返回值为 false），这里选择"不改判"：
+// 任务会被重新排期，但在 executeJob 里因为找不到处理函数直接判失败，
+// 外部副作用不会真的再来一遍。别把这条读成"档位删掉=任务被重放"。
+func pauseRunningExecOnRestore(scheduler schedulerAPI) core.RestoreGuard {
+	return func(snap core.JobSnapshot) (core.JobStatus, bool) {
+		if core.JobStatus(snap.Status) != core.StatusRunning {
+			return 0, false
+		}
+		class, registered := scheduler.HandlerClass(snap.HandlerKey())
+		if !registered || class != core.JobClassExec {
+			return 0, false
+		}
+		return core.StatusPaused, true
+	}
 }
 
 func handlePaymentCheck(ctx context.Context, job *core.Job) error {

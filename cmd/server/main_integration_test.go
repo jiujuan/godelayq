@@ -341,6 +341,119 @@ func TestRun_LogsErrorWhenAuthDisabled(t *testing.T) {
 	}
 }
 
+// installedGuard 取装上的崩溃恢复钩子，第二个返回值表示安装时 Start 还没跑过。
+func (s *spyScheduler) installedGuard() (core.RestoreGuard, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.restoreGuard, s.guardSetBeforeStart
+}
+
+// runWithExecutorConfig 用给定配置跑一次完整装配（不起真服务、不建监听），
+// 返回替身调度器与它的启动日志。三条守卫装配用例只差在配置取值上，共用这一份骨架。
+func runWithExecutorConfig(t *testing.T, tune func(*core.Config)) (*spyScheduler, string) {
+	t.Helper()
+
+	store := newStubStore()
+	scheduler := newSpyScheduler()
+	server := newFakeServer()
+	var logs strings.Builder
+
+	cfg := core.DefaultConfig()
+	cfg.Executors.Enabled = true
+	// 产物目录指向临时目录：打开执行器会让 run 真的建一次目录与清理协程
+	cfg.Executors.Output.Dir = filepath.Join(t.TempDir(), "exec")
+	if tune != nil {
+		tune(&cfg)
+	}
+
+	// 档位表用测试程序自身当解释器：探测结论必为可用，用例不依赖本机装了什么语言
+	_, executors := scriptRegistry(t, "smoke")
+
+	err := run(runtimeDeps{
+		config:              cfg,
+		newStore:            func() (core.Store, error) { return store, nil },
+		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
+		newExecutorRegistry: func(core.Config, *slog.Logger) (*executor.Registry, error) { return executors, nil },
+		newArtifactStore:    artifactStoreFromConfig,
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore) (serverAPI, error) {
+			return server, nil
+		},
+		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
+			go func() {
+				ch <- syscall.SIGTERM
+			}()
+		},
+		timeout: 20 * time.Millisecond,
+		logger:  newCaptureLogger(&logs),
+	})
+	if err != nil {
+		t.Fatalf("expected run to succeed, got %v", err)
+	}
+	return scheduler, logs.String()
+}
+
+// TestRun_InstallsRestoreGuardWhenPausePolicy 覆盖第 5.2 条：打开执行器且策略为 pause 时装守卫，
+// 并且守卫的判定确实是"running 的档位任务停住、其它一律放行"。
+// 只断言"装了"是不够的：装配方与调度器之间传的是函数值，装错一个闭包看不出差别。
+func TestRun_InstallsRestoreGuardWhenPausePolicy(t *testing.T) {
+	scheduler, _ := runWithExecutorConfig(t, func(cfg *core.Config) {
+		cfg.Executors.RestorePolicy = "pause"
+	})
+
+	guard, beforeStart := scheduler.installedGuard()
+	if guard == nil {
+		t.Fatal("executors.enabled=true 且 restore_policy=pause 时应装上崩溃恢复守卫")
+	}
+	if !beforeStart {
+		t.Error("守卫必须在 Start 之前装上：Start 的第一步就是 Restore")
+	}
+
+	// exec.smoke 由档位注册链路以 JobClassExec 登记（同文件的 E13 断言）
+	if status, hold := guard(core.JobSnapshot{ID: "crashed", Type: "exec.smoke", Status: int(core.StatusRunning)}); !hold || status != core.StatusPaused {
+		t.Errorf("崩溃时正在跑的档位任务应停在 paused，实际 (%s, %v)", status, hold)
+	}
+	if _, hold := guard(core.JobSnapshot{ID: "queued", Type: "exec.smoke", Status: int(core.StatusPending)}); hold {
+		t.Error("没跑过的档位任务不该被停住")
+	}
+	if _, hold := guard(core.JobSnapshot{ID: "plain", Type: "payment_check", Status: int(core.StatusRunning)}); hold {
+		t.Error("普通任务与本卡无关，照旧自动重跑")
+	}
+	// 档位被删掉的历史任务查不到类别：放行（重排后会在 executeJob 里因找不到处理函数而失败）
+	if _, hold := guard(core.JobSnapshot{ID: "gone", Type: "exec.deleted_profile", Status: int(core.StatusRunning)}); hold {
+		t.Error("查不到类别的快照应按不改判处理")
+	}
+}
+
+// TestRun_NoRestoreGuardOnReplayAndWhenDisabled 覆盖第 5.2 的另一半：
+// 策略写成 replay 或干脆没打开执行器时，守卫不装，恢复行为与本卡之前一致。
+func TestRun_NoRestoreGuardOnReplayAndWhenDisabled(t *testing.T) {
+	replay, _ := runWithExecutorConfig(t, func(cfg *core.Config) {
+		cfg.Executors.RestorePolicy = "replay"
+	})
+	if guard, _ := replay.installedGuard(); guard != nil {
+		t.Error("restore_policy=replay 是部署方明确要重跑，不该装守卫")
+	}
+
+	// 策略取值带空格时按 pause 处理：配置校验用 TrimSpace 比较，
+	// 装配也照样比较，落到"认不出的取值就走安全侧"这条一致的口径上。
+	spaced, _ := runWithExecutorConfig(t, func(cfg *core.Config) {
+		cfg.Executors.RestorePolicy = " pause "
+	})
+	if guard, _ := spaced.installedGuard(); guard == nil {
+		t.Error("带空格的 pause 仍应装上守卫")
+	}
+
+	disabled, logs := runWithExecutorConfig(t, func(cfg *core.Config) {
+		cfg.Executors.Enabled = false
+	})
+	if guard, _ := disabled.installedGuard(); guard != nil {
+		t.Error("没打开执行器的进程里没有档位任务，不该装守卫")
+	}
+	if strings.Contains(logs, "restore guard") {
+		t.Errorf("关闭状态下不该出现守卫相关的日志，实际日志：%q", logs)
+	}
+}
+
 // TestRun_ExecPoolSizingReachesScheduler 钉住配置里两个执行器池取值到调度器的接线：
 // 打开执行器后，调度器要按配置建池。数字对不上等于档位规模被静默丢弃，
 // 运维在 /admin/runtime 上看到的 worker 数与配置文件就成了两套说法。
@@ -640,6 +753,11 @@ type spyScheduler struct {
 	execConcurrency   int
 	execQueueCapacity int
 	previewLimit      int
+	// restoreGuard 记录装配上来的崩溃恢复钩子：nil 与非 nil 就是"装没装"这条断言。
+	// 用例可以拿它直接喂快照，验证装配的不只是一个空函数。
+	restoreGuard core.RestoreGuard
+	// guardSetBeforeStart 记录装钩子时 Start 还没被调用过（装配顺序断言，见 SetRestoreGuard）
+	guardSetBeforeStart bool
 }
 
 func newSpyScheduler() *spyScheduler {
@@ -665,6 +783,25 @@ func (s *spyScheduler) SetEventPreviewLimit(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.previewLimit = n
+}
+
+func (s *spyScheduler) SetRestoreGuard(g core.RestoreGuard) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.restoreGuard = g
+	// 钩子必须在 Start 之前装上：Start 的第一步就是 Restore。
+	// 真实调度器在运行后收到这个调用只记日志并忽略，替身跟着忽略就会把装配顺序写错
+	// 这件事咽下去，所以这里额外记一笔，由用例断言。
+	s.guardSetBeforeStart = s.startCalls == 0
+}
+
+// HandlerClass 按注册时记下的类别回答，没注册过的键返回 false——
+// 与真实调度器一致，守卫的"档位被删掉"分支靠的就是这条返回值。
+func (s *spyScheduler) HandlerClass(key string) (core.JobClass, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	class, ok := s.classes[key]
+	return class, ok
 }
 
 func (s *spyScheduler) SetExecConcurrency(n int) {
