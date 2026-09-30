@@ -167,12 +167,10 @@
 本卡没有新增 Go 代码（除可选示例），但承担全项目的最终验证责任，要求逐项记录实际输出：
 
 1. 全仓：`go build ./...`、`go vet ./...`、`go test ./... -race`。
-   其中 `api` 包的 `TestAdminRuntime_ExposesExecPool`（E13 的用例，与执行器无关的池统计）
-   在 TASK-E17 收尾时连续失败两次：一次全仓 `-race` 跑动（同轮其余三包 ok），紧跟着一次 `api` 包单独跑动。
-   之后的复跑都通过——该用例单跑、`-count=30`、`-count=200` 各一轮，`api` 包整包五次，全仓再跑一次。
-   本机没能再复现，所以这条不算已解决，E19 验证时加一项 `go test ./api -race -count=20 -run TestAdminRuntime`；
-   若复现，先查的方向是"调度循环把第二条档位任务放进执行器队列的时机"：该用例只等了两个 Handler
-   进入的信号，没有等队列计数变成 1，机器忙时读到的 `exec_queue_length` 可能还是 0。不要靠加 sleep 掩盖。
+   `api` 包的 `TestAdminRuntime_ExposesExecPool`（E13 的用例）在 TASK-E17 收尾时三次失败，
+   已修：断言跑得太早，没等第二条档位任务进执行器队列，改成轮询到位再断言；
+   原因、修法与修后的跑动记录见 TASK-E17 卡第 10 节"未验证与遗留"最后一条。
+   E19 全仓验证加一项 `go test ./api -race -count=50 -run TestAdminRuntime`，确认这条不再偶发。
 2. 交叉编译：`GOOS=linux`、`GOOS=darwin`、`GOOS=windows` 各 `go build ./...` 一次（平台文件多的包最容易在这里漏编译分支）。
 3. 配置守卫：`go test -run TestExampleConfigMatchesLocal ./core`；并确认本机 `configs/config.yaml`（不入库）与模板键集合一致。
 4. 前端：`cd web && npx vue-tsc --noEmit && npm run build`；随后 `go build -tags dashboard -o godelayq-console ./cmd/server` 能成功（`web/dist` 已存在）。

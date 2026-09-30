@@ -204,8 +204,13 @@ Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
   这一点已写进配置注释与 E19 的部署文档清单，别让读者以为打开它服务端就会接受目录里的
   执行器任务。
 - `docs/deployment.md` 与 `docs/api.md` 的同步归 E19，已把要写的两条补进该卡 §3.2。
-- 收尾时有一条与本卡无关的偶发观察：`api` 包的 `TestAdminRuntime_ExposesExecPool`（E13 的用例）
-  连续两次失败（一次全仓 `-race`，同轮 `cmd/server`、`core`、`executor` 三包 ok；紧跟着一次 `api` 包单独跑），
-  之后的复跑全部通过：该用例单跑、`-count=30`、`-count=200` 各一轮，`api` 包整包五次，全仓再跑一次。
-  本机没能再复现，因此没有改动这条用例，只在 E19 §5.1 登记成待观察项（含复跑命令与该用例缺的等待条件）。
-  本卡只改 `core` 的加载器路径，没有碰调度循环与池统计。
+- 收尾时遇到一条与本卡无关的偶发失败，已当场定位并修掉：`api` 包的 `TestAdminRuntime_ExposesExecPool`
+  （E13 的用例）在一次全仓 `-race` 跑动里失败，紧跟着一次 `api` 包单独跑也失败，
+  用 `-count=20` 复现出第三次。原因是用例少等了一步：第二条档位任务进执行器队列的时刻晚于
+  worker 取走第一条，而 `startTwoPools` 只等到两个 Handler 进入的信号，机器忙时读到的
+  `exec_queue_length` 还是 0，`ExecQueueLength == 1` 那条断言就先跑到了。
+  修法是在测试协程里轮询到 `exec_running==1` 且 `exec_queue_length==1` 再断言
+  （照 `api/handlers_lifecycle_test.go` 的收尾轮询写法，不用 `require.Eventually`——
+  那会让断言跑到非测试 goroutine 上），不是加 sleep 掩盖。
+  修完的跑动：该用例 `-count=200` 一轮、`api` 包整包两次全绿。
+  本卡的代码改动只碰 `core` 的加载器路径，没有动调度循环与池统计。
