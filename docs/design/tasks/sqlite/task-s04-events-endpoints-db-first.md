@@ -90,13 +90,13 @@ S03 把事件写进了库，但两个端点还只读 `api.EventHistory`（`api/h
 
 ## 6. 完成标准（DoD）
 
-- [ ] 未注入事件库时两个端点的响应逐字段与改动前一致，有 §5 第 1 条用例守着。
-- [ ] 注入后重启进程，详情页时间线仍有重启前的事件（手工步骤见 §7）。
-- [ ] `Note` 与实际读取来源一致：不存在"读库却写着内存缓冲"或反之的组合。
-- [ ] 排序契约不变（升序）、`count` 语义不变、空结果仍是 200 + 空列表。
-- [ ] 库读失败返回 500，不静默退回内存。
-- [ ] 前端三处注释不再声称"重启即清空"，且 `api` 包没有 import SQLite 驱动（`go list -deps ./api | grep sqlite` 为空）。
-- [ ] `docs/api.md` 的"运行事件 API"一节同步（`Note` 两个取值、库路径 `limit` 上界 1000、微秒精度）；`web-console-design.md` §5.6 的"持久化审计不在本期范围"标注改为指向本卡。
+- [x] 未注入事件库时两个端点的响应逐字段与改动前一致，有 §5 第 1 条用例守着。（`TestGetJobEvents_MemoryPathUnchanged`：除结构体外还断言响应文本里有原句、且不含 `persisted`；`TestWithEventLogNilKeepsMemoryPath` 补了"显式传 nil 与不注入等价"）
+- [x] 注入后重启进程，详情页时间线仍有重启前的事件（手工步骤见 §7）。（§10.4：三轮启动，第二轮的响应与第一轮逐字节相同）
+- [x] `Note` 与实际读取来源一致：不存在"读库却写着内存缓冲"或反之的组合。（两个常量各只在一处出现；`TestRun_NoServerReaderWhenEventsDisabled` 钉住"没装配时交出去的就是 nil"，所以分岔只有一个依据）
+- [x] 排序契约不变（升序）、`count` 语义不变、空结果仍是 200 + 空列表。（`TestEventLog_EventsAscending`、`TestListRecentEvents_BothPaths` 的"库空结果"子例；`count` 仍是 `len(items)`，见 §10.1）
+- [x] 库读失败返回 500，不静默退回内存。（`TestGetJobEvents_DBReadErrorIs500`：内存缓冲里先放一条真事件，断言 500 的响应体里不带它；全局端点同口径另有一条子例）
+- [x] 前端三处注释不再声称"重启即清空"，且 `api` 包没有 import SQLite 驱动（`go list -deps ./api | grep sqlite` 为空）。（实际改了六处，见 §10.2 第 6 条；依赖边界见 §10.3）
+- [x] `docs/api.md` 的"运行事件 API"一节同步（`Note` 两个取值、库路径 `limit` 上界 1000、微秒精度）；`web-console-design.md` §5.6 的"持久化审计不在本期范围"标注改为指向本卡。（另外补了时区表示、`count` 语义、500 口径，以及 `DELETE /admin/events` 只管内存缓冲那一条，见 §10.5 的 D-0401）
 
 ## 7. 验收方式
 
@@ -129,3 +129,89 @@ cd web && npx vue-tsc --noEmit
 - 回滚：把 `cmd/server` 的注入去掉（传 nil）即回到内存路径，接口行为一字不变；代码层回滚是 revert 本卡单个提交。
 
 ## 10. 实现记录（执行时补写）
+
+完成日期：2026-10-01。改 `store/sqlite/events.go`、`api/server.go`、`api/handlers_events.go`、`cmd/server/main.go` 与三个测试文件，另改前端六处注释与本卡涉及的三份文档。前端与接口的行为分岔只有一处依据：装没装配事件库。
+
+### 10.1 落地的接口
+
+```go
+// store/sqlite/events.go
+func (e *EventLog) Events(jobID string, limit int) ([]core.Event, error)  // 升序
+func (e *EventLog) Recent(limit int) ([]core.Event, error)                // 升序
+
+// api/server.go
+type eventReader interface {
+    Events(jobID string, limit int) ([]core.Event, error)
+    Recent(limit int) ([]core.Event, error)
+}
+func WithEventLog(r eventReader) Option
+```
+
+读侧形状：`ORDER BY seq DESC LIMIT ?` 取回后整体反转成升序（要的是尾部 N 条，降序走 `seq` 索引只读 N 行）；`seq` 而不是 `ts_us` 做定序依据，同微秒连发的两条才分得出先后。行还原由 `scanEvent` 完成，`data` 原样进 `json.RawMessage`，NULL 的 `metadata` 还原成 nil map，`ts_us` 经 `time.UnixMicro` 还原。
+
+端点侧：两条路径各一句 `Note`（常量并列放在 `api/handlers_events.go`），库路径的 `limit` 上界是新常量 `eventsQueryLimit = 1000`，`count` 仍是 `len(items)`，空结果仍是 200 + `[]`，库读失败是 500 + `ErrorResponse`。
+
+### 10.2 与本卡写法的差异
+
+1. **注入走 `runtimeDeps.newServer` 的新参数**（本卡 §3.1 只说"`cmd/server` 里 `enabled && events.enabled` 时注入，否则传 nil"）。实际把 `newServer` 的闭包签名扩成六参数，最后一个就是事件写入器；默认闭包在非 nil 时追加 `api.WithEventLog(events)`。理由：写入器在 `scheduler.Start()` 之前创建，服务在其后创建，两者之间只有这个闭包是通道，没有别的注入点。连带改了 20 处测试字面量的参数列表。
+2. **`eventLogAPI` 扩了读取面**（S03 的记录里它是 `Close` + `Dropped` 两个方法）。现在是四个：关停面给 `run` 用，读取面原样交给 `api.WithEventLog`。不扩就得在 `run` 里做一次类型断言，而那是编译期就能确定的事，用断言换接口宽度不值得。`api` 侧仍然只有自己的 `eventReader`，`go list -deps ./api` 里没有驱动（§10.3）。
+3. **`limit <= 0` 的兜底常量放在 store 侧**（本卡 §3.2 指向 §3.4 的上界）。实现是 `store/sqlite` 的 `eventsReadLimitFallback = 1000`，与 `api` 的 `eventsQueryLimit` 同值、两份独立，注释互指。不让 `store/sqlite` 反向依赖 `api` 的常量，也不为这一个数开配置项（本仓库惯例）。
+4. **端点多了一个 `eventList` 归一**（本卡未列）。读取方返回 nil 切片时，响应会序列化成 `"items": null`，而 §5 第 5 条要求 `[]`。替身用例把这条暴露出来后，归一放在端点侧而不是要求每个读取方都返回非 nil——内存路径本来就返回非 nil（`api/history.go` 的 `tail` 总是新建切片），所以这个归一只作用在库路径。
+5. **§5 第 3 条用例换了实现方式**（`TestGetJobEvents_DBPathLimit` → `TestEventLimitCapacityDiffersByPath`）。库路径收到的 `limit` 用替身记录（`?limit=500` 原样、`?limit=5000` 压到 1000）；内存路径的压制在只有两三条事件的响应里看不出来，所以那半边直接对 `parseEventLimit` 断言两个 capacity 的差值。断言的内容与卡片要求一致，只是可观察的位置不同。
+6. **前端注释改了六处而不是三处**（本卡 §3.8 点名三个文件）。同一次改动会让另外三处也变成过时描述：`useJobEvents.ts:3`（同一文件的另一句，写着"后端内存缓冲"）、`useEventFeed.ts:4`（"两边都来自同一个内存环形缓冲"——装配库之后首屏读的是库）、`api/admin.ts:19`（"清空…各详情页时间线从当前时刻重新开始"——清空只动缓冲，时间线读库时不受影响）、`MonitorView.vue:69` 的一条注释。全是注释与文档字符串，前端逻辑一行未改，`npx vue-tsc --noEmit` 通过。
+7. **§5 的九条用例全部实现**，另有补充：`store/sqlite` 的读侧从 3 条加到 7 条（多出的 `TestEventLog_EventsOrderWithinSameMicrosecond`、`TestEventLog_Recent`、`TestEventLog_EventsIsolateJobs`、`TestEventLog_EventsAfterClose` 各守一条读侧契约），`cmd/server` 加两条装配用例（§10.2 第 1 条那个新参数带来的），`api` 加 `TestWithEventLogNilKeepsMemoryPath`。
+
+### 10.3 验证证据
+
+```
+go build ./...                                     通过
+go vet ./...                                       通过
+go test ./... -race -count=1                       全绿（api 76s / cmd/server / core / executor / store/sqlite）
+go test ./api -run "Event|Events" -v               35 条 PASS
+go test ./store/sqlite -run EventLog -v            22 条 PASS
+go test ./cmd/server -run "Observability|EventLog|NoServerReader" -v   10 条 PASS
+cd web && npx vue-tsc --noEmit                     通过（真实工作树，web/dist 在位）
+GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build ./...      通过
+GOOS=windows GOARCH=386 CGO_ENABLED=0 go build ./...      通过
+go build -tags dashboard ./... && go vet -tags dashboard ./...  通过
+go list -deps ./api | grep -i "sqlite|modernc"     空
+grep -rln "modernc.org/sqlite" --include=*.go .    只有 store/sqlite/db.go、store/sqlite/doc.go
+git diff -- core                                   空
+```
+
+前两个代码提交各用 `git archive <sha> | tar -x` 在新目录里重建中间态，跑 `go build ./...`、`go vet ./...` 与 `go test ./store/sqlite ./api ./cmd/server`，两轮都通过。格式检查用剥 CR 的副本配 `gofmt -s`，七个改动文件全部干净。
+
+### 10.4 手工验收（本卡 §7）
+
+临时目录里独立二进制 + `configs/config.example.yaml` 的副本，路径全部走 `GODELAYQ_*` 覆盖，仓库的 `configs/config.yaml` 与 `data/` 未写。端口 8141，`workers: 2`，`observability.flush_interval: 50ms`，鉴权用静态 token。
+
+第一轮（`observability.enabled: true`）提交一条 `delay: 3s` 的 `payment_check`，跑完后：
+
+```
+GET /api/v1/jobs/01a0f3a8-…188a/events
+{"job_id":"01a0f3a8-…188a","count":3,
+ "items":[job.scheduled / job.started / job.completed 三条，升序],
+ "note":"persisted event store; newest entry may lag by the write flush interval"}
+```
+
+强制结束进程、第二轮同样配置再起：同一请求的响应体与第一轮 **逐字节相同**（`diff` 无输出），三条事件、顺序、`metadata` 内容都不变。这就是"重启后详情页时间线仍有历史"在本卡能取到的最强证据——注意是在进程被强制结束时验的，不是干净关闭。
+
+第三轮把 `GODELAYQ_OBSERVABILITY_ENABLED` 改成 `false`（库文件原地不动）：同一请求回 `{"count":0,"items":[],"note":"in-memory buffer, cleared on restart"}`，启动日志里没有 `observability enabled` 那一行。同一次请求里 `?limit=500` 也回内存那句，说明分岔只看装配、不看参数。
+
+顺带取到两条本卡 §9 第一条风险的实测证据：库里读回的 `timestamp` 是 `2026-10-01T02:51:09.902971+08:00`，而任务创建响应里同一条事件的时间是 `…9029713+08:00`——纳秒部分被截断，且偏移是本地时区。已写进 `docs/api.md`。
+
+### 10.5 缺陷处置
+
+| 编号 | 严重度 | 事实 | 处置 |
+| --- | --- | --- | --- |
+| D-0401 | 中 | `DELETE /api/v1/admin/events` 只清内存缓冲（`api/handlers_admin.go:63` 的 `ClearEventHistory` 调 `s.history.Clear()`）。装配事件库后详情页时间线读的是库，这个端点不再影响运维在界面上看到的"清一下时间线"；`AdminView.vue:223` 的说明文字因此过时 | **已文档化 + 功能登记不修**（口径写进 `docs/api.md` 的"运行事件 API"：清空只动缓冲，库里的事件由 `retention_count`/`retention_age` 淘汰）。要给库加清空能力需要新方法与权限设计，本卡 §8 未含 |
+| D-0402 | 中 | 前端去重键是 `job_id|timestamp|type`（`useEventFeed.ts:16` 的 `eventKey`，本卡改过该文件头部注释所以行号有漂移）。库里读回的时间戳精确到微秒且是本地时区表示，与 WS 直接推的那份文本不严格相等，所以"同一条事件既被 WS 推过、又出现在首屏"时归并不去重，界面上会短暂重复一行 | **登记不修**（本卡 §8 明确不改前端逻辑；触发条件是刷新与推送抢同一瞬间，而实时增量本来就由 WS 负责）。要修的形态是把归并键换成事件自带的单调量，但库里没有把它透出到 `core.Event`，属于后续卡 |
+| D-0403 | 低 | 三处用户可见文案仍写"后端缓冲/内存缓冲是时间线数据源"：`MonitorView.vue:110` 副标题、`AdminView.vue:223` 段落、`web/src/content/job-template.md:253`（模板页表格）。本卡只改了注释 | **登记待点**（§8 写着"不做前端页面改动（只改注释文本）"，所以没动）。改动都是一行措辞，等用户点头再改，或者并进 S08 |
+
+### 10.6 未覆盖与已知边界
+
+- **优雅停服这一步在本机做不到**：Windows 下无法从外部给控制台进程发 SIGTERM。三轮手工验收的"停"都是强制结束，因此"重启后仍有历史"是在最硬的停法下验的，而"干净关闭会检查点 WAL"仍只有 S02 的 `TestCloseCheckpointsWAL` 覆盖。
+- **恢复阶段的 `job.scheduled` 是否进库仍未手工验证**（S03 的 §10.6 留待本卡补，本卡没有补上）：三轮冒烟用的任务都是新提交后当场跑完，`jobs.json` 里没有崩溃时正在执行的任务，所以时间线头几条不是恢复产生的。要验它需要制造一条 `running` 状态的任务再强制结束。登记给后续（与本卡名义范围无关，且需要真任务执行到一半）。
+- **`?limit=` 上界 1000 的实际响应体积没有测**：§9 第二条风险给的是推算（1000 条 × 2KB 预览）。冒烟只有三条事件，压不出体积。真要收紧到 200 不需要改库结构。
+- **替身用例里的 `Note` 文本是断言常量值**，没有断言"界面显示出来的那句话"——前端只引用 `note`，本卡未改前端逻辑，界面文字仍由 `note` 决定。浏览器实测留给 S07/S08（D-0403 的三处文案一并处理时再截图）。
+

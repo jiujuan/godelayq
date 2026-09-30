@@ -990,9 +990,12 @@ DELETE /groups/:name?strategy=block
 
 ## 运行事件 API
 
-事件历史是**进程内的环形缓冲**（每个任务最近 100 条、全局最近 500 条、
-最多记录 2000 个任务后按 LRU 整体淘汰），不是审计日志：**重启即清空**。
-需要长期留痕请接外部日志/存储。
+两个端点的数据来源有两个，由这次部署的观测层配置决定，响应里的 `note` 字段会说清是哪一个：
+
+| 装配情况 | 读的是 | `note` |
+| --- | --- | --- |
+| `observability.enabled` 与 `observability.events.enabled` 都为真 | 持久化事件库（`store/sqlite` 的 `job_events`） | `persisted event store; newest entry may lag by the write flush interval` |
+| 其余情况（默认配置即此） | 进程内的环形缓冲：每任务最近 100 条、全局最近 500 条、最多 2000 个任务后按 LRU 整体淘汰 | `in-memory buffer, cleared on restart` |
 
 ```json
 GET /jobs/:id/events?limit=50   # viewer 及以上
@@ -1013,8 +1016,34 @@ GET /events?limit=100           # viewer 及以上，跨任务的全局最近事
 }
 ```
 
-`limit` 缺省或非法表示"给我全部已留存的"，上限就是窗口容量本身。
-没有记录时返回空列表而不是 404：详情页时间线本来就可能在等第一个事件。
+`count` 是**本次返回的条数**，不是库里/缓冲里的总数。
+`limit` 缺省或非法表示"给我全部已留存的"，上限按来源分岔：
+
+| 来源 | `limit` 上界 | 说明 |
+| --- | --- | --- |
+| 库 | **1000** | 一次响应的体积界限，不是策略旋钮（不可配置）。任务时间线的常规用法不需要超过 100，1000 是给排障导出用的 |
+| 内存缓冲 | 每任务 100 / 全局 500 | 上限就是窗口容量本身 |
+
+读库时的两条精度口径，前端若拿时间戳做精确比对必须知道：
+
+- `timestamp` **精确到微秒**。库里存的是微秒整数，发布时的纳秒部分在写入时截断。
+- 读回的 `timestamp` 用**进程本地时区**表示同一时刻（`time.UnixMicro` 的口径），
+  所以 JSON 里的时区偏移不一定等于事件当初产生时的偏移。比较时刻，不要比较文本。
+
+同毫秒连发的两条（例如 `job.scheduled` 与 `job.started`）按写入顺序 `seq` 定序，与时间戳无关。
+
+库路径有一条与直觉不同的地方：批量写入按 `observability.flush_interval`（默认 200ms）合并落盘，
+所以刚发生的事件可能还没进库；`note` 的第二句说的就是这件事。实时增量本来就由 WS/SSE 负责，
+不要把"WS 已经推过来的事件在 REST 里查不到"当故障处理。
+
+没有记录时返回空列表（`"items": []`）而不是 404：详情页时间线本来就可能在等第一个事件。
+读库失败返回 500 + `ErrorResponse`，**不会**静默退回内存缓冲——两条路径的数据范围不同，
+给一份缺历史的列表比给一个错误更容易被误用。
+
+`DELETE /api/v1/admin/events`（ops 档）清的是**那份内存缓冲**，返回被清掉的条数。
+装配了事件库时详情页时间线读的是库，因此清空不会让历史消失；库里的事件由
+`observability.events.retention_count` / `retention_age` 淘汰，没有手工清空的端点。
+
 事件与实时通道的关系：这里补的是"打开页面之前"的历史，之后的增量仍由 WS/SSE 推送。
 
 执行器任务的 `job.completed` / `job.failed` 在 `data` 里多带一份执行结论、`job.failed` 的 `metadata`

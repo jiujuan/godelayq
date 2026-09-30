@@ -667,9 +667,14 @@ func (h *EventHistory) Recent(limit int) []Event
   见 `core/config.go 顶部的"只收录生效字段"注释` 注释）。
 - 端点：`GET /api/v1/jobs/:id/events?limit=`；`GET /api/v1/events?limit=`（全局 recent，
   Dashboard 刷新后补历史用）。两者**按时间升序**返回，空结果是空列表而不是 404——
-  详情页时间线本来就可能还没事件。响应带 `note` 字段说明"内存缓冲，重启即清空"。
-- **明确语义并写进前端 UI**：进程重启即清空；详情页时间线标题旁标注"内存缓冲，最近 100 条"。
-  持久化审计不在本期范围。
+  详情页时间线本来就可能还没事件。响应带 `note` 字段说明这批数据从哪儿来。
+- **本节描述的是内存缓冲这一条路径，它现在只是兜底**：`observability.enabled` 且
+  `observability.events.enabled` 时，两个端点改读持久化事件库（`job_events` 表），
+  `note` 换成持久化那句。写入侧见 `TASK-S03`（`docs/design/tasks/sqlite/task-s03-job-events-writer.md`），
+  读取侧与 `note`/`limit` 的分岔见 `TASK-S04`（`task-s04-events-endpoints-db-first.md`），
+  口径落在 `docs/api.md` 的"运行事件 API"一节。
+  本卡当年登记的两处"二期"里，**运行历史的持久化已经落地**；写操作审计（`/admin/audit`）
+  仍在其后的 `TASK-S06`。
 - 反压问题已在实现里核实（`core/event.go 的 Publish`）：总线的发送是
   `select { case ch <- event: default: }`，缓冲区满就丢，所以 drain 协程不可能阻塞总线；
   丢掉的是记录而不是调度事实。`api/history_test.go` 的窗口裁剪用例因此直接调 `record`，
