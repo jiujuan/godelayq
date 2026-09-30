@@ -28,7 +28,7 @@ scheduler:
   workers: 100                # 并发执行协程数；0 表示 core.DefaultConcurrency
   queue_capacity: 0           # 执行队列容量；0 表示与 workers 相等
   max_retry_delay: 30m        # 指数退避的单次重试延迟上限
-  shutdown_timeout: 5s        # 优雅关闭等待时长
+  shutdown_timeout: 5s        # 优雅关闭等待时长；开启执行器时建议 >=10s（见"开启执行器"第 4 条）
 
 store:
   type: json                  # 目前仅支持 json
@@ -42,6 +42,9 @@ logging:
   level: info                 # debug|info|warn|error
   format: text                # text|json
 ```
+
+这份骨架里没有 `executors:`：执行器默认关闭，需要用时照抄
+`configs/config.example.yaml` 的那一节，并把下面"开启执行器"一节的每一条落实。
 
 任务状态与分组是**两个文件**：前者按 `flush_interval` 合并写盘（崩溃最多丢一个周期），
 后者每次改动同步原子重写。备份或迁移时两个都要带走——只带 `jobs.json` 的话，
@@ -160,6 +163,183 @@ go build -tags dashboard -o godelayq-server ./cmd/server
 ```bash
 mkdir -p /var/lib/godelayq && chown godelayq:godelayq /var/lib/godelayq
 ```
+
+## 开启执行器
+
+执行器把"能提交任务"扩展成"能执行档位声明的命令"，默认是关的（`executors.enabled: false`）。
+打开它之前，下面每一条都要落实——这一节的每条都写明了"为什么"，不要只照着抄配置。
+
+字段全表见 `configs/config.example.yaml` 的 `executors:` 一节，接口行为见 [API 文档](./api.md) 的"执行器 API"。
+
+### 1. 必须先有鉴权
+
+`executors.enabled: true` 且 `server.auth.token` 与 `server.auth.users` 都没配时，进程会记一条
+error 级日志后**照常启动**（本机实测原文）：
+
+```
+level=ERROR msg="executors are enabled while server authentication is disabled" hint="set server.auth.token or server.auth.users before exposing executors"
+```
+
+为什么不直接拒绝启动：测试环境需要在没有凭据的情况下打开执行器跑用例。代价是这条界限交给部署检查，
+所以生产部署看到这一行就要停下来补配置——未鉴权的执行端点等于把这台机器的命令执行能力开放出去。
+
+### 2. 运行账号与 workspace 的归属
+
+用最小权限的系统用户跑服务，`executors.workspace` 目录的属主就是这个用户，权限建议 `0750`。
+
+理由：**脚本内容等同于该用户的执行权限**。档位只能引用 workspace 内的脚本与已编译产物
+（越出 workspace 的绝对路径、`..`、指向外部的符号链接在启动阶段就报错），所以
+"谁能改这个目录"就等于"谁能配置命令"。给这个目录写权限的人不是运维协助，而是拿到了这台机器的执行权。
+
+同理，`runtime_allow` 是解释器与程序名的白名单，加一项就是放开一个可执行程序；
+`env_allow` 里 `GODELAYQ_` 前缀的键名会被启动阶段直接拒绝——服务端的 token 与 JWT 密钥就放在进程环境的
+`GODELAYQ_*` 里，透传给子进程等于把服务凭据交给脚本。
+
+### 3. 数据文件与产物目录按凭据等级设权限
+
+`store.path` 指向的 `jobs.json` 里有任务参数**原文**；`executors.output.dir`（默认 `./data/exec`）
+里的产物文件里有脚本输出原文。权限建议 `0640` 起（服务账号可读写，属组只读，其他用户无权限）。
+
+为什么单列一条：API 层会掩码，磁盘上不会。含 `secret` 参数的档位，读取接口给出的 payload 与输出预览是
+`***`（按值替换），但 `jobs.json` 里的 `payload`、产物正文与 `meta.json` 仍是原文；
+接口层也没有"整段抹掉"的能力——脚本自己把值打印出来，框架层管不住。
+要传凭据给 HTTP 档位，走请求头：把它声明成 `secret` 参数并放进 `header_allow`（请求体没有声明"哪个键是凭据"的能力，不会被掩码）。
+
+还有一条联动容易漏：`executors.required_role` **同时**是提交执行器任务所需的档位和读取含 `secret`
+参数档位的产物正文所需的档位（没有另设一个键）。把它降到 `operator` 意味着连带把"输出里可能回显的凭据"
+交给 operator 一档，降档的代价不止是放开提交。
+
+### 4. 关停时长要留出收尾时间
+
+`scheduler.shutdown_timeout` 建议 ≥ 10s（代码默认 5s）。
+
+为什么：中止一个执行器任务要"终止进程 + 宽限 + 等待输出管道收尾"三段，后两段固定是 2s 与 4s
+（`executor/proc.go` 的 `killGrace` 与 `processWaitDelay`），加起来约 6 秒是处理函数最晚返回的时长。
+默认 5s 下，关停会先于收尾触发强制退出。脚本 fork 出去的子进程会继承 stdout/stderr 的写端，
+直接子进程退了、拷贝协程还在等一个没人写的 EOF，这条上限就是防止 worker 名额还不回来。
+
+### 5. Windows 的整树终止不是原子的
+
+Windows 上终止进程树用的是 `taskkill /T /F`，它逐个遍历子进程，极端情况下会有派生进程残留。
+本机实测：取消一个 `bash` 脚本档位任务（脚本里 `sleep 60 &` 起了子进程）后，`bash.exe` 立刻消失、
+`sleep.exe` 又活了约一分钟才自然退出。
+
+彻底方案是 Job Object（把整棵树绑进一个对象，杀对象即杀全树），尚未实现。
+在此之前，长驻型的脚本请自己保证子进程会随父进程退出。Linux/macOS 走进程组信号，没有这个问题
+（但用 `setsid`/`nohup` 主动脱离进程组的进程同样管不住，这是脚本的行为，不是执行器的漏洞）。
+
+### 6. Windows 的输出编码是本地代码页
+
+控制台程序写出的文本按系统本地代码页编码（中文 Windows 是 GBK），产物文件按**原样字节**保存，
+不做转码。因此接口里的尾部预览与 `meta.json` 里的预览遇到非 UTF-8 字节会显示成替换字符。
+
+口径：要么在脚本侧把输出编码统一成 UTF-8（`chcp 65001`，或脚本内部显式按 UTF-8 写），
+要么按档位声明代码页后转码——后者尚未实现，需要的话开新任务卡，不要临时在读取路径上加猜测式转换。
+
+### 7. Windows 上脚本档位的参数形状
+
+`cmd`、`pwsh` 这类解释器必须带 `/c`、`-File` 之类的开关才会去执行文件，而脚本档位生成的命令行是
+`[解释器, 脚本路径, 参数...]`——没有放开关的位置。Windows 上的可用写法是改用产物档位，把开关写进固定前缀：
+
+```yaml
+executors:
+  commands:
+    - name: cleanup_win
+      kind: binary
+      program: cmd                    # 必须在 executors.runtime_allow 里
+      fixed_args: ["/c", "cleanup.bat"]   # 前缀固定，payload 只能追加被校验过的位置参数
+      positional: { max: 1 }
+```
+
+`bash`（Git for Windows / MSYS）不受这条影响，可以按脚本档位正常用。参数形状的改造归后续任务卡。
+
+### 8. `deny_private_ranges: false` 只能待在开发机上
+
+HTTP 档位在建立连接之前就判地址：回环、私网、链路本地、`100.64/10`、组播与未指定地址一律拒绝。
+把 `deny_private_ranges` 关掉，等于允许档位访问内网与本机服务（SSRF 的正面通路），
+所以这个取值只允许出现在开发机上。
+
+启动阶段这种配置是合法的（只有"关掉防线 + 通配主机名"这一组合被直接拒绝），注册完成时会列出这些档位：
+
+```
+level=WARN msg="executor http profiles accept private and loopback addresses" profiles=exec.target_ok reason="deny_private_ranges is false" hint="intended for reaching a service on the same development machine; remove it from production configs"
+```
+
+生产部署在启动日志里看到这一行就是要去改配置。被拒时的现场线索有三处：一条同主题 warn（含档位名、主机与被拒 IP，
+不含完整 URL）、产物 `.err` 末尾一行 `! request failed: address refused by the profile's network policy: ...`、
+以及这类失败算永久失败、不消耗重试名额。
+
+HTTP 档位的产物文件里 `a<attempt>.out` 是**对端返回的响应体**，`a<attempt>.err` 是请求与响应的两侧头
+（`Authorization`、`Cookie`、`Set-Cookie`、`X-Api-Key`、`Proxy-Authorization` 的值写成 `<redacted>`）。
+所以第 3 条的文件权限建议对 HTTP 同样成立：响应体里可能带着对端回显出来的请求参数，
+而 `secret` 参数只在请求行与响应读取层打码。
+
+### 9. `restore_policy: pause` 的运维含义
+
+崩溃（`kill -9`、`taskkill /F`、断电）之后重启，默认会把"上次正在执行"的执行器任务停在 `paused` 上等人确认
+（`executors.restore_policy: pause`）；`replay` 才是照常重新入队。
+
+判据是存储里的 `running` 快照，这一点最容易误解：强杀来不及写任何结论，所以留下 `running`；
+**正常停服不会**——优雅关闭路径把被打断的任务落成 `pending`，重启后照常重跑。
+外部副作用的结果未知时不替人决定重复执行，这就是默认 `pause` 的理由。
+
+重启后的现场（本机实测）：
+
+```
+level=INFO msg="paused executor jobs after crash" count=1 reason=restore_after_crash
+```
+
+`GET /api/v1/stats` 的 `paused` 计数包含它们；逐条有 `job.paused` 事件带
+`metadata.reason="restore_after_crash"`、`forced: true` 与 `attempts`。用 `restore_policy: replay` 时
+这一条汇总日志不会出现，只有 `restored jobs from store count=1`。
+
+确认与恢复的操作：单条 `POST /api/v1/jobs/{id}/resume`（200，任务回到 `pending`），
+批量 `POST /api/v1/jobs/batch-ops` 配 `{"action":"resume","ids":[...]}`（207，逐条结果在 `items`/`errors`）。
+恢复后按既有的"触发时间已过就立即补跑"走——确认一次就跑一次，所以先看一眼这批任务的副作用能不能重复。
+
+### 10. 产物保留策略与留痕配对
+
+`executors.output.ttl` 控制产物目录保留多久；清理发生在两处：进程启动时一轮完整扫描（孤儿目录 + 过期目录），
+之后每 24 小时只做一次过期扫描（`executor/artifact.go` 的 `purgeInterval`）。
+
+启动那一轮的现场（本机实测，`ttl: 1m`）：
+
+```
+level=INFO msg="artifact orphan directories purged" count=3
+level=INFO msg="artifact expired directories purged" count=24 ttl=1m0s
+```
+
+配对建议：把 `executors.output.ttl` 与 `store.history_ttl`、`history_limit` 一起设。
+任务留痕被清掉之后，它的产物目录会在**下次启动**的孤儿清理中被删（"没有对应任务的目录"就是孤儿）；
+`store.history_limit: -1`（关闭留痕）时执行器的产物也就只能活到下一次重启。
+产物被清掉之后详情页与 `/result` 仍能给出摘要，只是 `found: false`、`meta.artifact` 变成 `purged`，
+不是报错。
+
+### 11. 反向代理与结果端点不要缓存
+
+沿用下面"反向代理"一节的既有建议，补一条：`GET /api/v1/jobs/{id}/result` 的响应带
+`Cache-Control: no-store`，正文来自磁盘上的产物文件，同一任务的不同尝试、不同读取方向返回的内容都不同。
+不要把 `/api` 整体配成可缓存。
+
+### 12. 目录任务加载器不接受执行器任务
+
+服务端二进制**不启用**目录加载器（`core.DirectoryLoader` 只给自行接入的程序用），
+所以这一条不影响本仓库的默认部署，别以为改个配置就能让服务端去读任务目录。
+
+对自行接入加载器的程序，默认口径是：任务文件里 `name` 以 `exec.` 开头的会被拒绝。
+判断在 JSON 解析之后、绑定 Handler 与入队之前，因此被拒绝的文件既不会进调度器，也不会调用任何 Handler。
+理由：这条路径上没有身份凭据，"能往这个目录写文件"如果不拒绝就等于"能在这台机器上执行档位声明的命令"。
+
+被拒绝文件的去向（本机实测）：
+
+- 一行 warn：`level=WARN msg="executor job file rejected by the loader" path=job_queue\exec_try.json job_name=exec.echo reason="executor jobs are not accepted from the loader" hint="set LoaderOptions.AllowExecJobs only when writing into this directory is meant to grant execution"`；
+- 配了 `LoaderOptions.ErrorDir` 时复制一份进错误目录，文件名末尾追加 `.error`，副本尾部带一行原因；
+- 源文件仍按 `PostLoadAction` 处理（删除或归档）。`KeepAfterLoad` 会把该文件记入已处理集合，所以不会每轮扫描重复拒绝。
+
+打开这条边界的唯一方式是程序显式设置 `LoaderOptions.AllowExecJobs`：配置项 `executors.loader_allow`
+只由 `executor.Registry.LoaderAllowed()` 读取，调用方把结果填给加载器；加载器自己不回读配置，
+服务端也没有这条链——未接线时这个配置项没有任何行为差别。打开之前请确认监控目录的写权限已收窄到服务账号独占，
+并清楚放弃的是哪一层防护。
 
 ## Systemd 服务配置
 
