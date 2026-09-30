@@ -121,6 +121,21 @@
      日志只有 `restored jobs from store count=1`，不会出现上面那条 paused 汇总。
 10. 保留策略：`executors.output.ttl` 与 `store.history_ttl`、`history_limit` 的配对建议（E06 第 9 条：`history_limit: -1` 时产物会在下次启动的孤儿清理中被删）。
 11. 反向代理注意事项沿用现有章节，补一句：`/api/v1/jobs/:id/result` 的响应不缓存（`no-store`），不要把 `/api` 整体配成可缓存。
+12. 目录任务加载器与执行器任务的边界（E17）。服务端二进制不启用目录加载器，所以这一条只影响
+    自行把 `core.Scheduler` 和 `core.DirectoryLoader` 接起来的程序，文档要把作用范围先说清，
+    别让运维以为改配置就能让服务端读目录：
+    - 默认 `LoaderOptions.AllowExecJobs: false`：任务文件里 `name` 以 `exec.` 开头的会被拒绝。
+      判断在 JSON 解析之后、绑定 Handler 与入队之前，因此被拒绝的文件既不会进调度器，
+      也不会调用任何 Handler。
+    - 被拒绝文件的去向：一条 warn 日志（含文件路径、任务名和固定原因原文
+      `executor jobs are not accepted from the loader`）；配了 `LoaderOptions.ErrorDir` 时复制一份
+      并在末尾追加一行原因；源文件仍按 `PostLoadAction` 处理。`KeepAfterLoad` 会把该文件记入
+      已处理集合，所以不会每轮扫描重复拒绝同一个文件。
+    - 开关的接法：`executors.loader_allow` 只由 `Registry.LoaderAllowed()` 读取，调用方把结果
+      填给 `LoaderOptions.AllowExecJobs`；加载器本身不回读配置，服务端也没有这条链。
+      未接线时该配置项没有任何行为差别，这一点要写明白。
+    - 安全口径：能写监控目录不等于能执行命令。文档给出打开开关的前提（监控目录的写权限
+      收窄到服务账号独占），并说明打开后放弃的是哪一层防护。
 
 ### 3.3 `README.md`
 
