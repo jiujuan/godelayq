@@ -195,7 +195,7 @@ go test ./store/sqlite -run Audit -v
 3. **`logAccessRejection` 一字未改**，`role_denied` 的 stash 落在它的调用点
    （`api/handlers_executors.go:529`，紧挨既有那句 `s.logAccessRejection`）。
    卡片 §3.5 末尾预先允许了这一种落法。实际原因是那个函数没有 `c` 参数（签名是
-   `(p Principal, what string, required core.Role)`），而它同时被路由档位与结果端点共用——
+   `(p Principal, why string, required core.Role)`），而它同时被路由档位与结果端点共用——
    在函数内部 stash 会让"读 `/result` 被挡"这类请求也带上执行器列。
    代价是另外两处档位拒绝（`/jobs/:id/result` 的 secret 门槛、`RequireRole`）不会写 `exec_verdict`，
    它们的行仍靠 `verdict=denied` 与 `action` 说明。
@@ -246,7 +246,7 @@ go vet -tags dashboard ./...  → 通过（无输出）
 
 ### 10.4 手工验收（本卡 §7）
 
-临时目录 `%LOCALAPPDATA%\Temp\s06smoke`：独立二进制 + 自己写的 43 行配置，路径全在临时目录内，
+临时目录 `%LOCALAPPDATA%\Temp\s06smoke`：独立二进制 + 自己写的 42 行配置，路径全在临时目录内，
 仓库的 `configs/config.yaml` 与 `data/` 未写。端口 8143，静态 token 作 `machine`，
 `executors.required_role: admin`，档位 `hello` 是 `kind: script` + `runtime: node` + 一个具名参数 `who`
 （`args_render: ["{who}"]`），`observability.enabled: true`、`flush_interval: 50ms`。
