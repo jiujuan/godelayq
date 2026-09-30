@@ -232,6 +232,9 @@ func (s *Server) setupRoutes() {
 		{
 			jobs.GET("", reader, s.ListJobs)
 			jobs.GET("/:id", reader, s.GetJob)
+			// 产物列表读的是索引表里的元信息，不含输出正文，所以档位与事件端点同为 reader；
+			// 正文端点 GetJobResult 的门槛更严（带 secret 参数的档位会把读取门槛提到提交档位）。
+			jobs.GET("/:id/artifacts", reader, s.requireIndex(), s.ListJobArtifacts)
 			// 这三条写端点的路由档位是 operator，但 exec.* 任务要更高的档位：
 			// 那层判定在请求体解析之后才能做（要看任务名是不是档位），所以落在处理器里，
 			// 位置见 api/handlers_executors.go 的 gateExecutorSubmission（TASK-E16 §3.1）。

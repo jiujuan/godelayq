@@ -117,7 +117,7 @@ func (s *Server) GetJobResult(c *gin.Context) {
 			JobID:         id,
 			Attempt:       attempt,
 			Stream:        stream,
-			Meta:          s.markArtifactPurged(snapshot),
+			Meta:          s.markArtifactPurged(snapshot, attempt),
 			Found:         false,
 			Content:       "",
 			RedactionNote: note,
@@ -179,12 +179,17 @@ func (s *Server) GetJobResult(c *gin.Context) {
 // 这是结果端点读路径上唯一一处写，后来者请不要再往这个函数里加写操作。
 // 理由：带摘要却没有文件的任务会被反复查询（详情页与事件时间线都指向它），
 // 每次都重新撞一次"文件不存在"再重新解释一遍不值得，回写一次就把结论存下来。
-// 已经是 purged 时不再写，所以每个任务每个尝试最多写一次。
-func (s *Server) markArtifactPurged(snapshot core.JobSnapshot) *core.ExecMeta {
+// 已经是 purged 时不再写快照，但索引那一侧仍要标一次：两者可能来自不同的部署，
+// 快照早被标过而索引还没跟上（比如索引是这次重启才挂上的）是可能出现的状态。
+//
+// attempt 是本次读取的那一次尝试，不是 snapshot.Attempts：默认选取的尝试与调用方
+// 显式指定的可能不同，标错那一条会让一个还有文件的尝试在列表里显示成已清理。
+func (s *Server) markArtifactPurged(snapshot core.JobSnapshot, attempt int) *core.ExecMeta {
 	if snapshot.Exec == nil {
 		return nil
 	}
 	if snapshot.Exec.Artifact == core.ArtifactPurged {
+		s.markArtifactIndexed(snapshot.ID, attempt)
 		return s.execForResponse(snapshot.Name, snapshot.Payload, snapshot.Exec)
 	}
 
@@ -197,8 +202,10 @@ func (s *Server) markArtifactPurged(snapshot core.JobSnapshot) *core.ExecMeta {
 
 	if err := s.store.Update(updated); err != nil {
 		s.logger.Warn("failed to record that the execution output is gone",
-			"job_id", snapshot.ID, "attempt", snapshot.Attempts, "error", err)
+			"job_id", snapshot.ID, "attempt", attempt, "error", err)
 	}
+	// 快照与索引两侧同一时刻变成同一个结论，否则列表说 available、正文说没有
+	s.markArtifactIndexed(snapshot.ID, attempt)
 	return s.execForResponse(snapshot.Name, snapshot.Payload, &summary)
 }
 
