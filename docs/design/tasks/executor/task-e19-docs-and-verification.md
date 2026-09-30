@@ -28,6 +28,11 @@
    - `GET /api/v1/admin/runtime` 响应示例补四个 exec 字段。
    - 权限矩阵表补一行"提交执行器任务：`executors.required_role`，默认 admin"，并引用 E16 第 5.1 条那张 15 组矩阵的结论。
    - `PUT /jobs/:id` 的约束（执行器任务禁止改名、改 payload 会重校验）。
+   - `job.paused` 事件的 `metadata` 补两项来源说明（E14）：`reason: "restore_after_crash"` 表示
+     崩溃恢复时把"上次正在执行"的档位任务停在 paused 上等人确认，此时 `forced: true`、并带 `attempts`；
+     没有 `reason` 的暂停事件才是用户在控制台点的。同一节要写明一条现场事实：
+     事件历史是进程内存里的，重启之后崩溃前那几轮 `job.started` 已经不在，
+     时间线上只剩这条 `job.paused`——所以来源标记必须写在事件里，不能靠上下文推断。
 3. 全文检查现有措辞：凡是"任务类型需提前注册 Handler"的地方（例如参数表里 `name` 的说明），补一句"执行器档位由 `executors.commands` 声明"。
 
 ### 3.2 `docs/deployment.md`
@@ -43,6 +48,17 @@
 7. Windows 的 `script` 档位限制：`cmd`、`pwsh` 这类解释器必须带 `/c`、`-File` 之类的开关才会执行文件，而 `script` 档位生成的命令行是 `[解释器, 脚本路径]`（E11 第 10 节第 9 条）。当前可用写法是 `kind: binary` + `fixed_args: [/c, 脚本名]`，文档要写明这条差异，并说明参数形状的改造归后续任务卡。
 8. `deny_private_ranges: false` 只允许在开发机使用；关闭后 HTTP 档位可以访问回环与内网。
 9. `restore_policy: pause` 的运维含义：崩溃后会出现一批 `paused` 的执行器任务，需要人工确认后恢复（E14），并给出确认与批量恢复的操作步骤（`POST /jobs/batch-ops`）。
+   E14 已在本机实测过一遍，文档照这几个结论写：
+   - 判据是存储里的 `running` 快照。`kill -9`/`taskkill /F` 这类强杀会留下 `running`，
+     正常停服（SIGTERM 走优雅关闭）不会——那条路径把被打断的任务落成 `pending`，重启后照常重跑。
+     这一条差异是运维最容易误解的地方，要写在同一段里。
+   - 重启后的现场：启动日志一条 `paused executor jobs after crash count=N`，
+     `/api/v1/stats` 的 `paused` 计数包含它们，逐条有 `job.paused` 事件带 `reason=restore_after_crash`。
+   - 确认动作：单条 `POST /api/v1/jobs/{id}/resume`（200，返回 pending），
+     批量 `POST /api/v1/jobs/batch-ops` + `{"action":"resume","ids":[...]}`（207，逐条结果在 `items`/`errors`）。
+     恢复后按既有的"触发时间已过就立即补跑"走，即确认一次就跑一次。
+   - `restore_policy: replay` 的对照现象：同一条 `running` 快照重启后直接重新执行，
+     日志只有 `restored jobs from store count=1`，不会出现上面那条 paused 汇总。
 10. 保留策略：`executors.output.ttl` 与 `store.history_ttl`、`history_limit` 的配对建议（E06 第 9 条：`history_limit: -1` 时产物会在下次启动的孤儿清理中被删）。
 11. 反向代理注意事项沿用现有章节，补一句：`/api/v1/jobs/:id/result` 的响应不缓存（`no-store`），不要把 `/api` 整体配成可缓存。
 
