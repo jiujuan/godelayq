@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"godelayq/core"
@@ -278,7 +279,7 @@ type ExecutorProfileResponse struct {
 	Name string `json:"name"`
 	Kind string `json:"kind"`
 	// RuntimeOK 是这台机器现在的探测结论：程序在不在 PATH、文件在不在。
-	//  false 时档位仍可提交，执行期的拒绝由 TASK-E16 负责。
+	// false 时提交在 TASK-E16 §3.2 就被拒掉，前端可以提前把这条档位标灰。
 	RuntimeOK bool   `json:"runtime_ok"`
 	Reason    string `json:"reason"`
 	Timeout   string `json:"timeout"`
@@ -386,4 +387,124 @@ func (s *Server) requireArtifacts() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+// ---- 提交期判定与敏感参数输出（TASK-E16）----
+
+// submissionRejected 是提交期判定在 core 的回调里给出的拒绝结论。
+//
+// UpdatePending 的 apply 只能返回 error，而这里要返回的是带状态码与文案的 ErrorResponse，
+// 所以用一个类型把那个结论带出来，处理器侧用 errors.As 认它（见 api/handlers.go 的 UpdateJob）。
+type submissionRejected struct {
+	failure *ErrorResponse
+}
+
+func (e *submissionRejected) Error() string {
+	if e.failure.Details == "" {
+		return e.failure.Message
+	}
+	return e.failure.Message + ": " + e.failure.Details
+}
+
+// executorRole 返回提交执行器任务所需的最低档位（executors.required_role）。
+//
+// 认不出的取值按 admin 处理：这一处判的是"要不要把执行能力开给这个身份"，
+// 判不准时关门比开门便宜，而 core.Config.Validate 本来也不接受别的取值。
+func (s *Server) executorRole() core.Role {
+	if s.executors == nil {
+		return core.RoleAdmin
+	}
+	if role, ok := core.ParseRole(s.executors.RequiredRole()); ok {
+		return role
+	}
+	return core.RoleAdmin
+}
+
+// executorProfile 按任务名取档位；没注入登记表或这个名字不是档位时返回 false。
+//
+// 判据是登记表的键而不是 exec. 前缀：前缀只是档位的命名规则，表里有没有这个名字
+// 才决定"要不要按执行器任务对待"。表里没有的 exec. 名字走既有的"类型未注册"分支。
+func (s *Server) executorProfile(name string) (*executor.Profile, bool) {
+	if s.executors == nil {
+		return nil, false
+	}
+	return s.executors.Lookup(name)
+}
+
+// gateExecutorSubmission 把执行器任务的提交期检查集中在这一个函数里：
+// 身份档位、这台机器能不能跑、payload 合不合法、生效超时是多少。
+//
+// 返回 nil 表示放行，此时生效超时已经写进 job.Timeout；不是执行器任务时同样返回 nil
+// 且不改 job.Timeout（普通任务不受本卡影响）。
+// **必须在 scheduler.Schedule 之前调用**：一旦入队，非法 payload 也会真的被执行一次。
+// requestedTimeout 是请求体顶层的 timeout，档位任务对它的上限与 payload 里那个 timeout 同一条规则。
+func (s *Server) gateExecutorSubmission(c *gin.Context, job *core.Job,
+	requestedTimeout time.Duration) *ErrorResponse {
+
+	profile, ok := s.executorProfile(job.Name)
+	if !ok {
+		return nil
+	}
+	name := job.Name
+
+	if !s.sec.authEnabled() {
+		// 没有凭据的部署里 allowRole 恒为真，所以这条判定等于没做事——
+		// 但它是"执行器默认关闭"那条告警的运行时补充：每次启动后第一次提交留一行 warn。
+		s.warnAuthDisabledOnce()
+	}
+
+	role := s.executorRole()
+	if !s.allowRole(c, role) {
+		principal, _ := PrincipalFrom(c)
+		s.logAccessRejection(principal, "executor job submission", role)
+		return &ErrorResponse{
+			Code:    http.StatusForbidden,
+			Message: "insufficient role",
+			Details: fmt.Sprintf("job type %q is an executor profile; submitting it requires role %s (executors.required_role)",
+				name, role.String()),
+		}
+	}
+
+	if reason, available := s.executors.Available(name); !available {
+		// 与"类型未注册"分开写：那条说这个名字不存在，这条说名字对但这台机器现在跑不了
+		// （脚本没部署、程序不在 PATH 里）。运维需要的是后一种的改正方向。
+		return &ErrorResponse{
+			Code:    http.StatusBadRequest,
+			Message: "executor profile is not available on this server",
+			Details: reason,
+		}
+	}
+
+	if requestedTimeout > profile.Timeout {
+		return &ErrorResponse{
+			Code:    http.StatusBadRequest,
+			Message: "invalid timeout",
+			Details: fmt.Sprintf("timeout %v exceeds the %v allowed by profile %q",
+				requestedTimeout, profile.Timeout, profile.Name),
+		}
+	}
+
+	sub, err := executor.ValidateSubmission(profile, job.Payload)
+	if err != nil {
+		return &ErrorResponse{
+			Code:    http.StatusBadRequest,
+			Message: "invalid executor payload",
+			Details: err.Error(),
+		}
+	}
+
+	// 生效超时在这里算一次并写进任务：执行侧用的是同一个合成函数（Registry.EffectiveTimeout），
+	// 所以任务详情显示的就是实际会断的那一个，不会出现"显示 5m、30s 就超时"。
+	job.Timeout = s.executors.EffectiveTimeout(profile, sub.TimeoutValue)
+	return nil
+}
+
+// warnAuthDisabledOnce 在未启用鉴权的部署里，为第一次执行器提交记一条 warn。
+//
+// 只记一次：这类部署可能就在本机跑批，每条任务都打一行会让其他日志看不到。
+func (s *Server) warnAuthDisabledOnce() {
+	s.executorAuthWarn.Do(func() {
+		s.logger.Warn("executor job submitted while authentication is disabled",
+			"hint", "configure server.auth.token or server.auth.users before enabling executors")
+	})
 }

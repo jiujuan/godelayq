@@ -252,11 +252,12 @@ func ticketAllowedPath(path string) bool {
 // 未启用鉴权时直接放行：那时所有请求都是同一个本机用户的请求，
 // 区分角色没有意义，拒绝反而会让既有单用户部署升级后失能。
 func (s *Server) RequireRole(min core.Role) gin.HandlerFunc {
-	return s.require(func(p Principal) bool { return p.Role.AtLeast(min) })
+	return s.require(func(p Principal) bool { return p.Role.AtLeast(min) }, min)
 }
 
 // require 承载角色比较：认证已通过后，档位不够就是 403。
-func (s *Server) require(check func(Principal) bool) gin.HandlerFunc {
+// required 只用于日志（把"要什么"和"你是谁"一起写出来），判定本身读 check。
+func (s *Server) require(check func(Principal) bool, required core.Role) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !s.sec.authEnabled() {
 			c.Next()
@@ -274,7 +275,7 @@ func (s *Server) require(check func(Principal) bool) gin.HandlerFunc {
 			return
 		}
 		if !check(principal) {
-			s.logAccessRejection(principal, "route role requirement")
+			s.logAccessRejection(principal, "route role requirement", required)
 			c.AbortWithStatusJSON(http.StatusForbidden, ErrorResponse{
 				Code:    http.StatusForbidden,
 				Message: "insufficient role",
@@ -300,9 +301,17 @@ func (s *Server) allowRole(c *gin.Context, min core.Role) bool {
 }
 
 // logAccessRejection 记录被权限层挡下的请求，便于事后排查配错的角色。
-func (s *Server) logAccessRejection(p Principal, why string) {
+//
+// have 与 required 分开写（TASK-E16 §3.4）："要 admin 而你是 operator"与
+// "要 operator 而你是 viewer"是同一条日志的两种成因，只看一句原因分不出来。
+// required 传零值表示这一处判定没有具体档位可比（未知档位被拒那种情况）。
+func (s *Server) logAccessRejection(p Principal, why string, required core.Role) {
 	if s.logger == nil {
 		return
 	}
-	s.logger.Warn("access denied", "who", p.Name, "role", p.Role.String(), "need", why)
+	attrs := []any{"who", p.Name, "have", p.Role.String(), "need", why}
+	if required != 0 {
+		attrs = append(attrs, "required", required.String())
+	}
+	s.logger.Warn("access denied", attrs...)
 }

@@ -48,6 +48,10 @@ type Server struct {
 	// 或测试直接构造 Server）。读它的是 GET /executors 与结果端点的预览上限，
 	// 未注入时不报错：登记表在开关关闭时也是非 nil 的空表，"没装配"是默认状态。
 	executors *executor.Registry
+	// executorAuthWarn 守住"未启用鉴权时提交执行器任务"那条 warn 只记一次（TASK-E16 §3.1.3）。
+	// 它是每个 Server 一份而不是包级变量：测试里一批 Server 各自提交，
+	// 包级 Once 会让第二台以后的部署一条都不记，那条用例就成了碰运气。
+	executorAuthWarn sync.Once
 	// artifacts 是执行输出的文件存储；nil 表示这次部署没有产物文件可读
 	// （executors.enabled=false，或测试直接构造 Server）。
 	// GET /jobs/:id/result 缺它时返回 503，因为"读不到正文"与"正文是空的"必须区分开。
@@ -204,6 +208,10 @@ func (s *Server) setupRoutes() {
 		{
 			jobs.GET("", reader, s.ListJobs)
 			jobs.GET("/:id", reader, s.GetJob)
+			// 这三条写端点的路由档位是 operator，但 exec.* 任务要更高的档位：
+			// 那层判定在请求体解析之后才能做（要看任务名是不是档位），所以落在处理器里，
+			// 位置见 api/handlers_executors.go 的 gateExecutorSubmission（TASK-E16 §3.1）。
+			// 只读 setupRoutes 就断言"建任务只要 operator"是不完整的结论。
 			jobs.POST("", operator, s.CreateJob)
 			jobs.PUT("/:id", operator, s.UpdateJob)
 			jobs.DELETE("/:id", operator, s.CancelJob)
@@ -220,6 +228,8 @@ func (s *Server) setupRoutes() {
 
 			// 执行输出正文。判档在先、依赖检查在后：未认证的连接不该从状态码里
 			// 读出"这次部署装没装产物存储"。
+			// reader 是下限：档位声明了 secret 参数时，处理器会把它升到 executors.required_role
+			// （TASK-E16 §3.3 第 2 条，判档位置见 GetJobResult 里的 resultGuard）。
 			jobs.GET("/:id/result", reader, s.requireArtifacts(), s.GetJobResult)
 		}
 

@@ -56,7 +56,7 @@ func (s *Server) CreateJob(c *gin.Context) {
 		return
 	}
 
-	job, failure := s.createJobFromRequest(req)
+	job, failure := s.createJobFromRequest(c, req)
 	if failure != nil {
 		c.JSON(failure.Code, *failure)
 		return
@@ -67,7 +67,10 @@ func (s *Server) CreateJob(c *gin.Context) {
 
 // createJobFromRequest 校验请求并把任务交给调度器，供单条与批量创建共用。
 // 返回非 nil 的 ErrorResponse 表示失败，调用方决定如何呈现（400/500 或批量里的逐条错误）。
-func (s *Server) createJobFromRequest(req CreateJobRequest) (*core.Job, *ErrorResponse) {
+//
+// c 是 TASK-E16 加的第一个参数：执行器任务的提交档位（executors.required_role）要看请求身份，
+// 而身份只在 gin 上下文里。批量接口逐条独立，档位不够的那一条拿 403，其余照常创建。
+func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*core.Job, *ErrorResponse) {
 	// 计算触发时间
 	triggerAt, err := s.calculateTriggerTime(req)
 	if err != nil {
@@ -120,6 +123,12 @@ func (s *Server) createJobFromRequest(req CreateJobRequest) (*core.Job, *ErrorRe
 		Status:     core.StatusPending,
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
+	}
+
+	// 执行器任务的提交期判定（档位、探测结论、payload、生效超时）。
+	// 必须在 Schedule 之前：入队之后非法 payload 也会真的被执行一次。
+	if failure := s.gateExecutorSubmission(c, job, timeout); failure != nil {
+		return nil, failure
 	}
 
 	// 绑定Handler（与执行侧回查用的是同一份注册表）
@@ -507,7 +516,7 @@ func (s *Server) BatchCreateJobs(c *gin.Context) {
 	failures := make([]BatchItemError, 0)
 
 	for index, req := range reqs {
-		job, failure := s.createJobFromRequest(req)
+		job, failure := s.createJobFromRequest(c, req)
 		if failure != nil {
 			failures = append(failures, BatchItemError{
 				Index:   index,

@@ -27,7 +27,8 @@ type Registration struct {
 	Total int
 	// Registered 是成功写进调度器的数量；键冲突时因为没有任何写入，这个值仍是 0
 	Registered int
-	// Unavailable 是已注册但探测失败的档位数量，它们照常可提交，执行期的拒绝由 E16 负责
+	// Unavailable 是已注册但探测失败的档位数量。提交期会被 api 拒掉（TASK-E16 §3.2 第 1 条），
+	// 因此正常情况下不会有这类任务进到执行侧；真进来了也只是起进程失败，没有第二道拒绝
 	Unavailable int
 }
 
