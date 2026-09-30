@@ -136,4 +136,54 @@ go build -tags dashboard ./...
 - 风险：`-race` 下 `database/sql` 与 ticker 的组合容易出偶发调度问题。所有用例用注入的时钟或显式 `Flush()`，不允许用 sleep 等结果（与 `executor/artifact_test.go` 的 `TestStart_StopsWithContext` 同一处理）。
 - 回滚：本卡改动分三个可独立 revert 的提交——新增 `store/sqlite/`、`cmd/server` 装配、`go.mod`。回滚即全部删除，既有行为无残留。
 
-## 10. 实现记录（执行时补写）
+## 10. 实现记录（2026-10-01）
+
+改动文件：
+- 新增 `store/sqlite/`：`doc.go`（依赖边界三条）、`schema.go`（三张表 DDL + 8 个索引 + `observe_schema_migrations`，version 1）、`db.go`（`Open`/`Close`/`Path`/`Stats`/`JournalMode`/`Synchronous`、PRAGMA 读回、按版本号迁移）、`batch.go`（泛型 `batcher[T]`：非阻塞 append、整批事务、重试一次、`Close` 幂等），以及 `db_test.go`、`batch_test.go`。
+- 改 `cmd/server/main.go`（+75 行：`observabilityDB` 窄接口、`runtimeDeps.newObservabilityDB`、依赖完整性检查、`enabled` 分支里的创建/启动日志/`defer` 关闭、`defaultRuntimeDeps` 里的 `sqlite.Open` 包装）。
+- 改 `cmd/server/main_integration_test.go`（+317 行：12 个既有 `runtimeDeps` 构造点补上新闭包 + `observabilityStub` 替身 + 5 条新用例）、`cmd/server/main_test.go`（`TestDefaultRuntimeDeps` 的完整性断言加一项）。
+- 改 `go.mod`/`go.sum`：`modernc.org/sqlite v1.46.0` 及其间接依赖（`modernc.org/libc`、`mathutil`、`memory`、`strutil`/`sortutil`/`token`/`gc`、`ncruces/go-strftime`、`remyoudompheng/bigfft`、`dustin/go-humanize`、`hashicorp/golang-lru/v2`、`golang.org/x/exp`），并把 `golang.org/x/{crypto,mod,net,sync,sys,text,tools}` 抬到 libc 要求的版本。**`go` 指令保持 1.24.13 未动**（见差异第 9 条）。
+
+验证结果：
+- `go build ./...`、`go vet ./...` 通过；`go test ./... -race` 全绿（api 65.5s、core 11.9s、executor 21.3s、cmd/server 5.4s、store/sqlite 1.6s），`go test -count=1 -race ./store/sqlite ./cmd/server ./core` 重跑亦绿。
+- `go test ./store/sqlite -v`：21 个顶层用例，20 通过 + 1 跳过（`TestOpen_FilePermissions`，Windows 上 NTFS 权限不由 mode bits 表达，照 `executor/artifact_test.go:560` 的既有处理写明原因）。
+- `go test ./cmd/server`：全通过，含本卡 5 条新装配用例（`TestRun_Observability{DisabledOpensNothing,OpenFailureStopsStartup,StatsFailureStopsStartup,ClosedBeforeStore,EnabledOpensAndClosesForReal}`）。
+- 构建矩阵：`GOOS=linux`、`GOOS=darwin`、`CGO_ENABLED=0 GOOS=linux`、`CGO_ENABLED=0 GOOS=darwin`、`go build -tags dashboard ./...` 全部通过。无 CGO 的证据取"`CGO_ENABLED=0` 能构建交叉目标"这一条，不按 `go list -deps | grep cgo` 判断（依赖树里有名字含 cgo 的包，计数会误报）。
+- DoD 第 2 条（依赖方向）的检查方法，三条命令都记在这里：
+  - `go list -deps ./core ./api ./executor ./examples/demo1 ./examples/demo2 | grep -ci modernc` → `0`
+  - `grep -rln "modernc.org/sqlite" --include=*.go .` → 只有 `store/sqlite/db.go`（真正 import 驱动的那一个）与 `store/sqlite/doc.go`（包注释里提到名字）
+  - `grep -ci mattn/go-sqlite3 go.mod go.sum` → `0` / `0`（没有第二套驱动）
+- `go test -run TestExampleConfigMatchesLocal ./core` 通过（S01 那份守卫不受影响；本卡没改配置键）。
+- 冒烟（系统临时目录独立二进制 + 独立配置 + 独立 `data/`，未触碰仓库的 `configs/config.yaml` 与 `data/`）：
+  1. `enabled: true` + 合法 `path` → 启动日志 `level=INFO msg="observability enabled" path=... schema_version=1 journal_mode=wal`；运行期 `data/` 下出现 `observe.sqlite`(4 KB) 与 `-wal`(70 KB)、`-shm`(32 KB) 旁文件；对端 `/api/v1/stats` 可达。
+  2. `enabled: false` + 同一个 `path` → 目录里一个文件都没有、日志里搜不到 `observability` 字样（`grep -ci` = 0）。
+  3. `enabled: true` + `path: "   "` → 启动失败，报 `observability.path must not be empty when observability.enabled is true`（S01 那条路径同时复验）。
+  4. 卡片 §7 要求"`Ctrl-C` 停服后旁文件被合并回收"：Windows 上外部无法向控制台进程发优雅 SIGTERM（`taskkill` 不带 `/F` 对无窗口的控制台进程无效），实测 `taskkill /F` 之后旁文件确实留在原地。因此这条现象改由用例 `TestCloseCheckpointsWAL` 证明：写一次事务后 `-wal` 存在，`Close()` 之后 `-wal` 与 `-shm` 都不在目录里，重开还能读到那一行。强杀后残留、下次打开由 SQLite 自行恢复，与 §11"库文件是加速器"的定位一致。
+  5. 跑完删除临时目录。
+
+与卡片的差异（九处，均为实现时的判断）：
+1. `Stats` 的签名取设计文档 §9.2 的 `Stats() (Stats, error)`，不是卡片 §3.3 的 `Stats() Stats`：把"读不出来"报成"表是空的"会让运维以为观测层在正常工作。`TestStatsReportsQueryError` 钉住这条。
+2. `Stats` 不含 §3.3 列的 `DroppedEvents`/`DroppedAudit`：本卡没有任何写入器，DB 也拿不到它们的计数；S03/S06 卡片把 `Dropped()` 放在 `EventLog`/`AuditLog` 自己身上，所以这里不为将来预留没人填的字段。要汇总时由持有两边的那一层合并。
+3. `newBatcher` 返回 `(*batcher[T], error)`，卡片 §3.6 只返回一个指针：`flush` 传 nil 时若照样给一个实例，它就变成"每次 append 都静默丢弃"的写入器，正是 §2 要避免的"看起来正常、实际没记"。非正的容量与周期则回到 `core` 的默认值（§3.3 的口径），不报错。
+4. PRAGMA 写进 DSN（`?_pragma=busy_timeout(2000)&_pragma=journal_mode(WAL)&...`）而不是 §3.4 说的"连接建立后立刻执行一次"：`synchronous`、`busy_timeout`、`foreign_keys` 是每条连接的设置，连接因故重建后只有 DSN 这份还会生效。打开之后仍然读回**实际生效**的 `journal_mode` 与 `synchronous`（`JournalMode()`/`Synchronous()`），与期望值不一致时记 warn、debug 记进 `Open` 自己那行，符合 §9 风险 2。
+5. 索引数量：§3.5 与 §5.1 都写"6 个索引"，设计文档 §6 实际是 8 个（事件 3 + 产物 1 + 审计 4）。按设计文档建 8 个，用例逐个点名（不是只数总数），DoD 第 3 条的"逐字一致"以设计文档为准。
+6. `newObservabilityDB` 返回消费方定义的窄接口 `observabilityDB`（`Path`/`JournalMode`/`Stats`/`Close`），不是 §3.7 的 `*sqlite.DB`：关闭顺序（§5.14）在真实句柄上没有旁路可观察，而"接口定义在消费方"是本仓库既有惯例（`schedulerAPI`、`serverAPI` 同理）。`defaultRuntimeDeps` 里包一层 `sqlite.Open`，错误分支显式返回 nil 接口而不是类型化空句柄。
+7. 句柄没有按 §3.7 "变量保持 nil" 声明在 `if` 外面：本卡除了关闭它没有读取方，而 Go 不允许声明用不上的变量。注释里写明 S03 注入事件写入器时再取出来，`defer` 的声明位置不变，所以关闭顺序不受影响。
+8. §3.7 关于 `defer` 的那句自相矛盾（"排在 `store.Close` 的 defer 之前声明"与"先执行的是观测层收尾"正好相反，先声明的 defer 会后执行）。按设计文档 §7.3 的执行顺序实现：观测层的 `defer` 晚于 `store.Close` 声明，因此实际先关观测层、后关存储；`TestRun_ObservabilityClosedBeforeStore` 用共享顺序表断言 `[observability, store]`。另外收尾的 `defer` 挂在 `Stats()` **之前**，这样"Open 成功但库读不出版本"这条早退路径也不会留下一条没人认领的连接。
+9. 驱动版本取 `v1.46.0` 而不是 latest：`v1.60.1` 的 `go.mod` 要求 `go 1.26.0`（`v1.47.0` 起要求 `go 1.25.0`），`go get` 会把本仓的 `go` 指令一并抬上去，等于把整仓最低工具链（含 `examples/demo1`、`demo2` 的 `go run` 与任何 CI 镜像）从 1.24.13 改成 1.26。DoD 第 6 条只允许"新增依赖"，所以选了保持 `go 1.24.13` 不动的最新版本。**要升到 1.60.x 需要显式决定抬语言版本**，那是另一件事，不在本卡范围内。
+10. `artifact_index` 的 `PRIMARY KEY (job_id, attempt)` 与设计文档逐字一致；`TestSchemaColumnsMatchDesign` 用 `pragma_table_info` 把三张表的 `name|type|notnull|pk|default` 全部列钉住——这是"DoD 第 3 条：S03/S05/S06 不需要再执行任何 DDL"唯一可执行的守卫（DDL 是字符串，改错一个列名只会在读侧的运行期才暴露）。
+
+实施中发现并修掉的三条缺陷（都由本卡用例抓到，并反向验证过用例不是空转）：
+1. **并发 `Flush` 会重复落同一批**：`Flush` 的"快照 → 落盘 → 摘队"三步不在同一把锁内，周期落盘与关停路径的显式 `Flush` 同时进来时两个轮次读到同一段队首，各写一遍，表里出现重复记录（事件表里就是一条重复的时间线）。已修：新增 `writeMu` 把整轮落盘串行化；钉桩测试 `TestBatcher_ConcurrentFlushDoesNotDuplicate`（用 `gateRecorder` 卡住落盘函数把竞争窗口撑开）。反向验证：临时摘掉 `writeMu` 后该用例报 `record 0 landed 4 times across 4 flush rounds`，装回去通过。
+2. **`newBatcher` 的三条兜底写成 `switch` 只命中第一条**：非正容量会吞掉非正周期，`time.NewTicker(0)` 直接 panic。已修：拆成三条独立 `if`；`TestBatcher_ConstructorGuards` 同时传 0 容量与 0 周期。
+3. **迁移版本表没人创建**：`migrate()` 上来就 `SELECT ... FROM observe_schema_migrations`，而建表语句只作为常量躺在 `schema.go` 里没被引用，`Open` 必定失败。已修：`migrate()` 先执行 `migrationTable` 再读版本。发现方式是第一次跑包测试。
+
+引用核对（卡片与设计文档的行号在本卡执行时的实际值）：`main.go` 的依赖完整性检查卡片写 154-157，本卡之前是 154-157、加上 `newObservabilityDB` 之后是 **181-185**（这个函数上方多了 `observabilityDB` 接口声明 8 行）；产物清理那条 `defer` 的注释卡片写 221-227，实际在 **249-255**；`core/store.go:17-19` 的 `DefaultFlushInterval` ✓；`executor/artifact.go` 的权限常量在 56-57 ✓；`executor/artifact_test.go:560` 的 Windows Skip 体例 ✓；设计文档 §6 的 DDL 逐字搬进 `schema.go`（列注释保留），§9.2 的函数签名除差异第 1、3 条外一致。用例计数：`store/sqlite` 21 个顶层测试函数，其中 `TestSchemaColumnsMatchDesign` 内含三张表、`TestBatcher_RetryOnceThenGiveUp` 内含两个子用例。
+
+留给后续卡的事：
+- 三张表本卡没有任何读写方，`Stats()` 里三张表的行数恒为 0，这是预期状态而不是故障（S03/S05/S06 接手）。
+- `DB.sqlDB` 是未导出字段：S03 的 `EventLog`、S06 的 `AuditLog` 都放在本包内，可以直接用；如果哪天要把写入器挪到别的包，需要显式给出事务入口而不是导出 `*sql.DB`。
+- `batcher[T]` 的"重试一次"取的是"失败的那批留在队首等下一轮"，不是"退回队列尾部"：前者保住事件的时间顺序，也避免退回有界队列时被立刻丢弃。S03/S06 直接复用，别再各自实现一套。
+- 关闭顺序的可观察性依赖 `observabilityDB` 这个窄接口。S03 若要往 `newServer` 注入事件读写器，扩接口面在 `cmd/server` 一侧，不要让 `api` 或 `executor` 因此 import 本包。
+- Linux 侧的权限断言（0640/0750）与 `-race` 实跑仍只在 CI/Unix 有效，本机 Windows 是 Skip；收口（S07）要按"未实跑"记。
+
