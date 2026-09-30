@@ -167,7 +167,7 @@ go build -tags dashboard ./...
 2. `Stats` 不含 §3.3 列的 `DroppedEvents`/`DroppedAudit`：本卡没有任何写入器，DB 也拿不到它们的计数；S03/S06 卡片把 `Dropped()` 放在 `EventLog`/`AuditLog` 自己身上，所以这里不为将来预留没人填的字段。要汇总时由持有两边的那一层合并。
 3. `newBatcher` 返回 `(*batcher[T], error)`，卡片 §3.6 只返回一个指针：`flush` 传 nil 时若照样给一个实例，它就变成"每次 append 都静默丢弃"的写入器，正是 §2 要避免的"看起来正常、实际没记"。非正的容量与周期则回到 `core` 的默认值（§3.3 的口径），不报错。
 4. PRAGMA 写进 DSN（`?_pragma=busy_timeout(2000)&_pragma=journal_mode(WAL)&...`）而不是 §3.4 说的"连接建立后立刻执行一次"：`synchronous`、`busy_timeout`、`foreign_keys` 是每条连接的设置，连接因故重建后只有 DSN 这份还会生效。打开之后仍然读回**实际生效**的 `journal_mode` 与 `synchronous`（`JournalMode()`/`Synchronous()`），与期望值不一致时记 warn、debug 记进 `Open` 自己那行，符合 §9 风险 2。
-5. 索引数量：§3.5 与 §5.1 都写"6 个索引"，设计文档 §6 实际是 8 个（事件 3 + 产物 1 + 审计 4）。按设计文档建 8 个，用例逐个点名（不是只数总数），DoD 第 3 条的"逐字一致"以设计文档为准。
+5. 索引数量：卡片原文的 §3.5 与 §5.1 都写"6 个索引"，设计文档 §6 实际是 8 个（事件 3 + 产物 1 + 审计 4）。按设计文档建 8 个，用例逐个点名（不是只数总数），DoD 第 3 条的"逐字一致"以设计文档为准；§3.5 与 §5.1 的"6"已就地改成"8"，所以现在的卡片文本与代码一致，这条差异记录的是改动前的原文。
 6. `newObservabilityDB` 返回消费方定义的窄接口 `observabilityDB`（`Path`/`JournalMode`/`Stats`/`Close`），不是 §3.7 的 `*sqlite.DB`：关闭顺序（§5.14）在真实句柄上没有旁路可观察，而"接口定义在消费方"是本仓库既有惯例（`schedulerAPI`、`serverAPI` 同理）。`defaultRuntimeDeps` 里包一层 `sqlite.Open`，错误分支显式返回 nil 接口而不是类型化空句柄。
 7. 句柄没有按 §3.7 "变量保持 nil" 声明在 `if` 外面：本卡除了关闭它没有读取方，而 Go 不允许声明用不上的变量。注释里写明 S03 注入事件写入器时再取出来，`defer` 的声明位置不变，所以关闭顺序不受影响。
 8. §3.7 关于 `defer` 的那句自相矛盾（"排在 `store.Close` 的 defer 之前声明"与"先执行的是观测层收尾"正好相反，先声明的 defer 会后执行）。按设计文档 §7.3 的执行顺序实现：观测层的 `defer` 晚于 `store.Close` 声明，因此实际先关观测层、后关存储；`TestRun_ObservabilityClosedBeforeStore` 用共享顺序表断言 `[observability, store]`。另外收尾的 `defer` 挂在 `Stats()` **之前**，这样"Open 成功但库读不出版本"这条早退路径也不会留下一条没人认领的连接。
