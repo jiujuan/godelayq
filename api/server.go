@@ -58,6 +58,10 @@ type Server struct {
 	artifacts *executor.ArtifactStore
 	// history 是事件总线的内存订阅者，为详情页时间线与 Dashboard 提供最近事件
 	history *EventHistory
+	// events 是事件时间线的持久化读取方；nil 表示这次部署没装配事件库，
+	// 两个事件端点退回 history（即 S03 之前的行为）。
+	// 它定义在消费方而不是由 store/sqlite 传一个具体类型进来：api 包不许碰驱动。
+	events eventReader
 	// console 是嵌入的前端产物根；nil 表示这次部署只提供 API（开发形态）。
 	// 它同时决定鉴权中间件是否豁免静态资源——登录页本身也是产物的一部分。
 	console fs.FS
@@ -91,6 +95,26 @@ func WithExecutorRegistry(reg *executor.Registry) Option {
 // /jobs/:id/result 会明确返回 503，而不是回一份"看起来是空输出"的结果。
 func WithArtifacts(store *executor.ArtifactStore) Option {
 	return func(s *Server) { s.artifacts = store }
+}
+
+// eventReader 是事件时间线的持久化读取方，由 store/sqlite.EventLog 实现。
+// 两个方法都按写入顺序升序返回；nil 表示这次部署没装配事件库，
+// GET /jobs/:id/events 与 GET /events 退回内存缓冲（api.EventHistory）。
+//
+// 接口定义在这里而不是拿具体类型：与 groups、artifacts 一样按能力声明，装配方负责给实现，
+// api 包因此不需要知道事件库用的是哪种驱动。
+type eventReader interface {
+	Events(jobID string, limit int) ([]core.Event, error)
+	Recent(limit int) ([]core.Event, error)
+}
+
+// WithEventLog 注入持久化的事件读取方。传 nil 与不注入等价，两者都走内存缓冲。
+//
+// 注入之后两个端点只读库、不与内存合并（设计文档 D5）：批量写入的可见性延迟上界是一个
+// flush_interval，而跨来源去重与定序的复杂度要用它换。响应里的 note 会跟着换成
+// "取自持久化事件库"那句，读的人知道自己在看什么。
+func WithEventLog(r eventReader) Option {
+	return func(s *Server) { s.events = r }
 }
 
 // NewServer 创建API服务器。sec 为零值时不鉴权、接受任意跨域来源；
