@@ -43,6 +43,19 @@
      带给重试副本，重试的每一次执行都是 `attempt=1`，产物文件被后一次覆盖（E15 卡末尾登记为待处理）。
      如果那条先被修掉，本项按卡片原文做；没修之前下拉只有一项，界面要能容忍这种情况。
 
+   E16 落地后的三条补充（实施本卡前先读 `task-e16-submission-role-and-mask.md` 第 10 节）：
+
+   - `GET /api/v1/executors` 现在带 `required_role`（执行器关闭时是 `null`）与每个档位的
+     `has_secret_args`。前端要按这两个值做两件事：`usePermission.ts` 的 `canSubmitExecutorJobs`
+     用 `required_role`（第 3.3 第 4 条），表单里对 `has_secret_args: true` 的档位显示
+     "该档位的参数不会回显"而不是自己再复制一份 `args[].secret` 判断。
+   - 任务详情与列表里的 `payload` 已经是掩码后的（`"***"`），前端拿不到原值，因此
+     "编辑任务"表单对执行器任务不能用响应里的 payload 回填参数；要改参数就得让用户重新输入。
+     `exec.preview` 同样按值掩过（`orders/***` 这类形状），不要把 `***` 当成执行失败。
+   - `GET /jobs/:id/result` 对含 secret 参数的档位会升档位（403 时 details 说明是档位声明），
+     放行时响应多一个 `redaction_note` 字段。结果面板要在正文上方显示这句话，
+     并且不要把它做成"已脱敏"的提示——它说的是输出里可能仍有凭据。
+
 ### 3.3 新建表单
 
 1. `JobForm.vue`：`name` 的候选来自 `fetchJobTypes()`（既有）与 `fetchExecutors()`；选中 `exec.*` 时切换成"参数表单"模式：

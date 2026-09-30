@@ -49,6 +49,32 @@
      默认读取方向对 http 应该取 `head`（响应体开头最有用），取值函数 `executor.PreferredResultDirection`
      已在 E15 落地，是否透出成 `/executors` 的字段由 E18 定；本卡按 E18 的最终形状写文档。
 
+   E16 落地之后同一节要照这些现场写（别照卡片原文抄）：
+
+   - 15 组档位矩阵（`executors.required_role` 取 `operator|admin|ops` × 身份取
+     `viewer|operator|admin|ops|machine`）的结论在 `TestCreateJob_ExecutorRequiredRole` 与
+     E16 卡第 10 节的冒烟 A 组。权限矩阵表照这三条写：viewer 连建任务都进不去（`POST /jobs`
+     的路由本身要 operator）；`machine`（静态 token）与 operator 同档，所以默认配置
+     （`admin`）下脚本凭据不能提交执行器任务；`ops` 高于 `admin`，始终可提交。
+   - 执行器任务在提交期被拒的四条文案各不相同，每条给一个真实响应例子：
+     `insufficient role`（403）、`executor profile is not available on this server`（400，
+     details 是探测原因）、`invalid timeout`（400，请求顶层的 `timeout` 超档位上限）、
+     `invalid executor payload`（400，payload 校验）。批量接口逐条独立：档位不够的那一条在
+     `errors[].code` 里给 403，整批仍是 207。
+   - `PUT /jobs/:id` 现在能出现 `name` 字段，但只允许传回任务原本的名字：不同值 400
+     `job name cannot be changed`（这一条对所有任务生效，普通任务改成 `exec.` 前缀同样被拒）；
+     改 payload 会重跑提交期那一整套判定，因此四种拒绝都可能在这里出现。
+     已结束的任务先拿 409 `only pending jobs can be updated`，档位判定在状态检查之后。
+   - `GET /executors` 的 `required_role` 在执行器关闭时是 `null`；`has_secret_args` 只看档位
+     有没有声明 secret 参数，不看某一次提交有没有真的带值。
+   - 含 secret 参数的档位被掩码的位置要一次写清，别只写"payload 会掩码"：任务对象的六处出口
+     （创建、列表、详情、更新、重试、批量）里的 `payload` 与 `exec.preview`，以及 `/result`
+     响应里的 `meta.preview`。`payload` 掩的是 `args`/`params`/`headers`/`env` 四个字段里
+     命中 secret 参数名的取值，`body` 不掩；`exec.preview` 是按值替换（`orders/***`），
+     不是整段抹掉。磁盘上的 `jobs.json`、产物文件与 `meta.json` 都仍是原文。
+   - `/result` 被档位挡住时 details 说的是档位的声明，不是任务内容；放行时响应多一个
+     `redaction_note` 字段，取值是固定一句英文，文档里给出原文并说明它是提醒而不是"已防护"。
+
 ### 3.2 `docs/deployment.md`
 
 新增"开启执行器"一节，逐条写清（每条都要有"为什么"）：
@@ -56,6 +82,13 @@
 1. 前置条件：必须配置 `server.auth.token` 或 `server.auth.users`。程序在 `enabled=true` 且未启用鉴权时会记 error 级日志（E04），但那只是告警，不会阻止启动。
 2. 运行账号：用最小权限的系统用户跑服务；`executors.workspace` 目录属主是该用户，权限 `0750`，**脚本内容等同于该用户的执行权限**，因此任何能改这个目录的人等于能配置命令。
 3. 文件权限：`jobs.json` 与 `data/exec/` 里的产物都会包含任务参数与输出，可能含敏感值；按凭据文件的等级设权限（`0640` 起），并说明"参数掩码只作用于 HTTP 响应，不作用于磁盘"（E16 的结论）。
+   E16 落地之后这一条可以照现场写：`jobs.json` 里的 `payload` 是原文，`exec.preview` 在新执行的任务上是
+   按值掩码后的文本（见 E16 卡第 10 节"输出预览"一节），而改动之前落盘的旧文件里预览仍是原文——
+   响应层会掩，磁盘上要换数据文件或重跑任务才会变；产物 `.out` 与 `meta.json` 按设计保持原文。
+   同一节的权限说明还要带一条联动：`executors.required_role` 既是提交执行器任务所需的档位，
+   也是读取含 secret 参数档位的产物正文所需的档位（E16 §3.3 第 2 条没有另设一个键）。
+   把它降到 `operator` 就等于把"输出里可能回显出来的凭据"一起交给 operator——
+   E16 冒烟 G 组的现场正是如此。文档要按这个联动写，让运维明白降档的代价不只是放开提交。
 4. 时长关系：`scheduler.shutdown_timeout` 建议 ≥ 10 秒，因为取消执行器任务需要"终止 + 宽限 + 等待输出收尾"三段（E10 的结论），5 秒默认值下关闭会被拖到强制退出。
 5. Windows 限制：`taskkill /T /F` 不是原子操作，极端情况下可能有派生进程残留（E11 第 3.3 条），彻底方案是 Job Object，尚未实现。
 6. Windows 的输出编码：控制台程序写出的文本是系统本地代码页（中文 Windows 是 GBK），产物文件按原样字节保存，因此接口与 `meta.json` 里的尾部预览会把非 UTF-8 字节显示成替换字符（E11 第 10 节第 11 条）。要么在文档里给出"用 `chcp 65001` 或在脚本里重定向编码"的口径，要么按档位声明代码页转码——本卡只做文档，转码需求若要实现就开新任务卡。

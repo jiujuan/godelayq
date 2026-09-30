@@ -108,3 +108,252 @@ go test ./api -run 'Executor|MaskPayload|Secret' -v
 - 风险：`createJobFromRequest` 加参数会影响两个调用点与所有相关测试；`api` 层的批量测试用例较多，改签名容易漏。要求先改签名让编译报错逐个定位，再补测试。
 - 风险：档位判定从"中间件"下移到处理器，是既有风格的延伸（`handlers_lifecycle.go` 的 `force-pause` 是同类先例），但会让"这个端点要什么权限"在路由表里看不全。要求在该路由行加注释指向本卡，避免后来者只读 `setupRoutes` 就下结论。
 - 回滚：本卡是 `api` 层增量，回滚后参数校验退回执行期失败、掩码消失但功能仍可用；`Registry` 注入本身可保留。
+
+## 10. 实现记录（2026-09-30）
+
+落地文件：新增 `api/executors_submission_test.go`（6 条用例，含 §5.1 的 15 组矩阵）与
+`api/executors_secret_mask_test.go`（6 条用例）；改动 `api/handlers.go`
+（`createJobFromRequest` 的第一个参数改成 `c *gin.Context`、`toJobResponse` 与 `execForResponse`
+走掩码出口、`UpdateJob` 的两条守卫）、`api/handlers_executors.go`（`gateExecutorSubmission`、
+`resultGuard`、`payloadForResponse`、`warnAuthDisabledOnce`、`submissionRejected`、
+`RedactionNote`、`HasSecretArgs`、`RequiredRole`）、`api/dto.go`（`UpdateJobRequest.Name`）、
+`api/security.go`（角色比较抽成 `require`，`logAccessRejection` 补 `have` 与 `required`）、
+`api/server.go`（`executorAuthWarn` 字段与两处路由注释）、`executor/args.go`（`MaskPayload`、
+`MaskSecretText` 与两个取值写法函数）、`executor/profile.go`（`HasSecretArgs`）、
+`executor/registry.go`（`EffectiveTimeout`，登记表自己留一份归一化后的 `executors` 配置）、
+`executor/proc.go` 与 `executor/http.go`（摘要生成处掩预览）、`executor/register.go`
+（`Registration.Unavailable` 的说明改成"提交期就拒"）、`api/handlers_executors_test.go`
+（E07 期那条"`required_role` 固定为 null"的断言改成真实取值 `"admin"`，并补
+`has_secret_args` 两条断言）。
+
+**没有新增配置键**：§3 用到的 `executors.required_role` 是 E01 定义、E02 校验的键，本卡把它接进判定。
+
+### 与卡片的偏离与补充
+
+1. **判定集中在 `gateExecutorSubmission` 一个函数，三个入口共用**（`POST /jobs`、
+   `POST /jobs/batch`、`PUT /jobs/:id`）。顺序固定为：未启用鉴权的 warn → 身份档位 →
+   这台机器能否跑 → 请求顶层 `timeout` → payload 校验 → 写入生效超时。
+   理由：档位不够时不应该把探测原因与参数规则讲给没有权限的身份听。
+2. **请求顶层的 `timeout` 也按档位上限拒**（§3.2 只写 payload 里的 `timeout`）：
+   与配置里 `executors.max_timeout`"超过就拒"的姿态一致，两处一条规则。
+   两条错误文案分别是 `invalid timeout` 与 `invalid executor payload`，前端能分清是哪个字段。
+3. **生效超时写进 `job.Timeout` 并落盘**（§3.2 第 1 条的"覆盖"）。冒烟 B0 与 B7 的现场：
+   不填超时任务详情是 `30s`（档位声明值），payload 填 `5s` 就是 `5s`。
+4. **`Registry.EffectiveTimeout` 是本卡新增的**：§3.2 点名的这个函数此前并不存在，执行侧只有
+   包内私有方法 `Profile.timeoutWithin`。新方法直接复用那个私有方法，入参是登记表里那份
+   归一化配置，所以 §5.4 要求的"两处规则一致"落在同一个函数上，而不是两份实现抄同一条规则。
+5. **探测不可用的档位提前到提交期拒**：E04 第 10 节与 E07 的代码注释原本都写着"这类档位照常
+   可提交、执行期拒绝，留给 E16"。本卡按 §3.2 第 1 条改成提交期 400 并带探测原因
+   （`script file "..." does not exist`），文案与"类型未注册"那条 400 分开。
+6. **`UpdateJobRequest` 原本没有 `name` 字段**：请求体里多写的 `name` 会被静默忽略，也就是说
+   §3.2 第 2 条要防的"改名"在旧代码里根本没有入口。本卡加了 `Name *string`，
+   传回与任务相同的值按没传处理，不同值 400；这条判定对所有任务生效——普通任务改成
+   `exec.` 前缀同样被拒（冒烟 D5），因为换名字就等于换执行体。
+7. **PUT 的重校验走同一个 `gateExecutorSubmission`**，所以它同样包含档位判定与可用性判定
+   （§3.2 只写"重跑同一套校验"）。operator 改不动执行器任务的 payload（冒烟 D1 拿 403）。
+8. **PUT 的状态检查在档位判定之前**：已结束的任务先拿到 409
+   `only pending jobs can be updated`。冒烟 D 组第一轮全部命中 409，改用 `delay: 30m`
+   的待执行任务才走到 403/400。如果希望档位不够的身份一律先看到 403，需要把判定提到状态
+   检查之前；本卡没有改，登记在"未验证与遗留"。
+9. **掩码覆盖的 payload 字段是 `args`、`params`、`headers`、`env` 四个**（§3.3 第 1 条只列了
+   args/headers/env）：`params` 是 http 档位的参数入口，漏掉它等于 http 档位的凭据不掩。
+10. **`body` 字段不掩码**：请求体是提交者自己给的业务数据，档位没有"这个 body 键是凭据"的
+    声明能力，整段掩掉会让普通档位的详情页读不出自己提交过什么。要不要按档位加一条
+    "body 整体视为 secret"的开关，留给用户定（登记在"未验证与遗留"）。
+11. **`headers` 与 `env` 的键按归一化名字与 secret 参数名比较**（小写、连字符折成下划线）：
+    档位参数写 `api_key`、payload 头写 `API-KEY` 算同一个凭据。反过来档位参数叫 `token`、
+    payload 头叫 `X-Token` 不算同一个——名字不同的两个键在配置里就是两件事，框架不做前缀猜测。
+12. **掩码只发生在响应层**（§3.3 第 3 条）：存储与执行输入照旧原文，这条限制写进
+    `payloadForResponse` 与 `MaskPayload` 的注释，并有 `TestJobResponses_MaskSecretArgs`
+    最后一条用例专门检查"快照里的 payload 仍是原文"。`markArtifactPurged` 回写存储时用的
+    也是原文摘要，不会把响应层的掩码写进磁盘。
+13. **响应出口实际是六处，不是 §3.3 第 2 条列的四处**：`CreateJob`、`ListJobs`、`GetJob`、
+    `UpdateJob`、`RetryJob`、`BatchCreateJobs` 都走 `toJobResponse`，掩码加在这一个函数里就
+    覆盖六处。卡片列四处是因为它只点名了读接口。
+14. **降级两条**（§5.6 要求覆盖）：payload 里某个字段不是对象 → 该字段的值整体换成 `"***"`；
+    payload 整体不是对象 → 换成 `{"masked":"***"}`。理由是"解析失败就原样返回"等于把默认
+    方向设成泄露。
+15. **`/result` 的收严复用 `executors.required_role`，没有新配置键**（§8 明确不做按档位设档）；
+    判档在查询参数解析之前，越权请求不会去碰文件系统，也不会从状态码里读出产物是否存在。
+16. **`redaction_note` 只在档位声明了 secret 参数时出现**，文案是一个常量、一句英文说明，
+    前端可以直接显示。它按 §9 第一条的要求写成"提醒"，不是"已防护"的声明。
+17. **warn 去重用的是 `Server` 上的 `sync.Once`**（§3.1 第 3 条写的是包级 `sync.Once` 或按档位名
+    去重）：包级变量会让同一进程里的多个 Server 实例互相压制提示，测试也没法各自验证；
+    "每次进程启动提示一次"正是这条告警的原意。
+18. **执行器关闭时 `required_role` 返回 null**（§3.4 只说补字段）：那时没有任何档位可提交，
+    "要什么档位"这个问题不成立；E07 那条"未装配登记表就是默认状态"的用例照旧通过。
+19. **`has_secret_args` 只看档位声明，不看某一次 payload 有没有真的带值**（§3.4）：
+    读侧门槛不该随任务内容变化，否则同一个任务会因身份不同显示成两种形状。
+20. **`logAccessRejection` 补 `have` 与 `required`**（§3.4 第 2 条），两个调用点各带一句用途
+    描述（`executor job submission` 与 `execution output of a profile with secret arguments`）。
+21. **`submissionRejected` 这个错误类型是必要的**：`core.UpdatePending` 的 apply 回调只能返回
+    `error`，而这里要返回带状态码与文案的响应，于是用这个类型把结论带出来，处理器侧用
+    `errors.As` 认（`api/handlers.go` 的 `UpdateJob`）。
+22. **测试令牌用 `authenticator.IssueSession` 直接签发，不走 `POST /auth/login`**：bcrypt 校验在
+    `-race` 下每次登录要几百毫秒，15 组矩阵加掩码用例把 api 包从 100 秒拖到 134 秒。
+    签发路径仍然使用配置里的真实账号名与档位，因为 `VerifyAccessToken` 要求令牌里的 `sub`
+    能在账号表里对上同一个档位。
+23. **`RequireRole` 未启用鉴权时一律放行这条既有行为没动**（§2 提到的"本机单用户"假设）：
+    §3.1 第 3 条要求的是让它可见，不是把它改成拒绝。
+
+### 冒烟跑出来的第二条读取路径：输出预览
+
+§1 写的是"含敏感参数的任务在读取接口里不显示明文"，§3.3 第 2 条列了四处 payload 读取点与
+`/result` 的收严。第一轮冒烟（C 组）撞出一条卡片没列的东西：**输出预览**。
+
+现场是这样：http 档位的 `url_template` 是 `.../orders/{token}`，`token` 声明为 `secret`，
+对端把收到的路径原样回显进响应体（`{"order": "pa55word-in-smoke", ...}`）。这份响应体的尾部
+进了 `ExecMeta.Preview`，而预览会
+
+- 随任务快照落进 `jobs.json`；
+- 被完成与失败事件带走（`core/scheduler.go` 的事件摘要就是按 `inline_preview` 裁这一份），
+  于是 `GET /jobs/:id/events`、`GET /events` 与 WS/SSE 实时推送都带着它；
+- 从 `GET /jobs` 与 `GET /jobs/:id` 出去，而这两个端点的路由档位是 `reader`（viewer 及以上）。
+
+结果就是 §3.3 第 2 条为 `/result` 设的那道收严被绕开：档位不够的身份读不到产物正文，
+却能在任务详情的 `exec.preview` 里读到同一份内容的前 2048 字节。单元测试没抓到它，因为测试桩
+handler 写出的预览本来就不含参数值——这条只有真实档位与真实对端才能暴露。
+
+实现分两层，共用 `MaskSecretText` 这一个纯函数（`executor/args.go`）：
+
+1. **执行侧**：`Runner.Handler` 与 `HTTPRunner.Handler` 那条"摘要落进 job.Exec"的 defer 里，
+   先把预览中出现的 secret 取值换成 `***`。这一层管住所有下游——快照、事件、WS/SSE、接口，
+   不需要每个读点各写一遍。放在 defer 而不是各分支：每条返回路径都要经过它，早退路径也不例外。
+2. **响应层**：`execForResponse` 在把摘要透出去之前再掩一次（`api/handlers.go`）。
+   这一层管的是那之前已经落盘的数据文件：旧快照里的预览带着明文，改代码不会自动改写磁盘。
+
+替换规则四条，各有一条用例：原值与它的 URL 路径转义写法都换（http 档位把参数拼进地址，
+对端回显的可能是转义后的那一版）；档位里 secret 参数的 `default` 也算凭据（payload 没给值时
+执行用的就是它）；先长后短替换，否则短值先换会把长值切成碎片；payload 里的取值是数字或布尔时
+按那段 JSON 文本比。掩码后的文本仍然可读（`orders/***`、`--token=***`），不是整段抹掉。
+
+不掩的两处与理由：产物文件（`a<attempt>.out`）保持原文，读它的门槛已经升到提交档位并带
+`redaction_note`；产物目录里的 `meta.json` 在那条 defer 之前写，因此也保持原文，它与 out/err
+同属磁盘上的产物。§9 第一条的风险照旧成立——把值换个写法再打印（例如 base64）就掩不住，
+这一层只覆盖"原样回显"这一种最常见形态，不能写成已防护。
+
+### 验证结果
+
+Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
+
+| 命令 | 结果 |
+| --- | --- |
+| `go build ./... && go vet ./...` | 通过 |
+| `go test ./... -race -count=1` | api 100.9s、cmd/server 5.3s、core 12.7s、executor 21.4s 全 ok |
+| `go test ./executor ./api -race -count=1`（预览掩码落地后那一轮） | executor 21.9s、api 102.4s 全 ok |
+| `GOOS=linux GOARCH=amd64`、`GOOS=darwin GOARCH=arm64` 的 `go build` | 通过 |
+| `go build -tags dashboard ./...` | 通过 |
+| §7 的 `go test ./api -run 'Executor \| MaskPayload \| Secret' -v` | 全 PASS（新增用例名含 `Executor`、`Mask`、`Secret`、`WarnOnce`） |
+
+新增用例清单：
+
+| 用例 | 覆盖的卡片条目 |
+| --- | --- |
+| `TestCreateJob_ExecutorRequiredRole` | §5.1，`required_role` 三值 × 身份五值 = 15 组 |
+| `TestBatchCreateJobs_MixedPermission` | §5.2 |
+| `TestCreateJob_ExecutorValidation` | §5.3（五条子用例：越界参数、payload 结构非法、档位不可用、普通任务回归、未知名字） |
+| `TestCreateJob_TimeoutNormalized` | §5.4（四条子用例：不填、填小值、payload 超大值、顶层超大值） |
+| `TestUpdateJob_ExecutorGuards` | §5.5（五条子用例：档位、重校验、两个方向的改名、相同值） |
+| `TestCreateJob_MachineTokenDeniedUnderDefaultRole` | §3.1 第 1 条的"machine 等同 operator" |
+| `TestMaskPayload`（`executor/args_test.go`） | §5.6（五条子用例，含两条降级） |
+| `TestMaskSecretText`（`executor/args_test.go`） | 输出预览按值掩码的五种取值形态 |
+| `TestRunner_SecretValueMaskedInPreview` | 真实进程把参数打印进 stdout 时摘要与产物各自的样子 |
+| `TestHTTP_SecretValueMaskedInPreview` | 真实对端回显参数值时摘要与产物各自的样子 |
+| `TestJobResponses_MaskSecretArgs` | §5.6 的四处读取响应 + "掩码不改动存储" |
+| `TestJobResponses_MaskSecretArgsInPreview` | 上面"输出预览"一节的响应层 |
+| `TestGetJobResult_StrictRoleForSecretProfiles` | §5.7（四条子用例，含"判档在参数解析之前"） |
+| `TestEvents_NoSecretLeak` | §5.8 |
+| `TestAuthDisabled_WarnOnce` | §5.9 |
+| `TestLogAccessRejection_RoleFields` | §5.10 |
+
+### 冒烟（Windows 真实服务端 + REST）
+
+配置在临时目录：`executors.required_role: admin`（最后一段改成 `operator` 再跑一遍）、
+三个账号 `worker01`(operator)/`rooter01`(admin)/`keeper01`(ops) 加一个静态 token，
+`runtime_allow: [bash]`，三条档位：`hook_secret`（http，`token` 是必填 secret 参数）、
+`hook_open`（http，无 secret）、`nightly_missing`（script，脚本文件故意不部署）。
+对端仍是 E15 那个本机 Python 服务，它把每个到达的请求记进自己的日志。
+
+**A. 提交档位**
+
+| 身份 | 结果 |
+| --- | --- |
+| 静态 token（machine） | 403 `insufficient role`，details 带 `requires role admin (executors.required_role)` |
+| operator | 403 同上 |
+| admin / ops | 201 |
+| operator 提交普通任务 `payment_check` | 201（回归，普通任务不受影响） |
+
+**B. 提交期校验与超时**
+
+| 用例 | 结果 |
+| --- | --- |
+| 档位 `timeout: 30s`，payload 不填 | 任务详情 `timeout: "30s"` |
+| payload `timeout: "5s"` | 任务详情 `timeout: "5s"` |
+| 顶层 `timeout: "2h"` | 400 `invalid timeout`，`timeout 2h0m0s exceeds the 30s allowed by profile "hook_open"` |
+| payload `timeout: "10m"` | 400 `invalid executor payload` |
+| payload 写 `{"cmd":"rm -rf /"}` | 400，`payload key "cmd" is not accepted by profile "hook_open" (allowed keys: params, headers, body, timeout)` |
+| 提交 `exec.nightly_missing` | 400 `executor profile is not available on this server`，details 是探测原因 |
+| `exec.hook_secret` 不填 token | 400，`params.token: required by profile "hook_secret" but not provided` |
+| `exec.hook_open` 的摘要 | `{"kind":"http","profile":"hook_open","http_status":200,...,"artifact":"available"}` |
+
+**C. secret 参数掩码与结果端点**
+
+| 用例 | 结果 |
+| --- | --- |
+| admin 提交 `{"params":{"token":"pa55word-in-smoke"}}` 的 201 响应 | `"payload":{"params":{"token":"***"}}` |
+| `GET /jobs?limit=50` 与 `GET /jobs/:id` | 全文没有明文；payload 是 `***`，`exec.preview` 是 `{"order": "***", "auth_seen": false}` |
+| `data/jobs.json` | 仍含明文（掩码不作用于存储） |
+| operator 读 `GET /jobs/:id/result` | 403，details `profile "hook_secret" declares secret arguments; reading its execution output requires role admin` |
+| admin 读同一端点 | 200，`content` 是 `{"order": "pa55word-in-smoke", ...}`，并带 `redaction_note` |
+| ops 读同一端点 | 200（档位高于所需） |
+| `GET /jobs/:id/events` 与 `GET /events` | 全文没有明文 |
+| 无 secret 档位的 `/result` | operator 读到 200 正文，响应里没有 `redaction_note`（收严只针对声明了 secret 的档位） |
+
+**D. PUT 的守卫**（目标是 `delay: 30m` 的待执行任务）
+
+| 用例 | 结果 |
+| --- | --- |
+| operator 改 payload | 403 `insufficient role` |
+| admin 把 payload 改成 `{"cmd":"bad"}` | 400 `invalid executor payload` |
+| admin 把 name 改成 `payment_check` | 400 `job name cannot be changed` |
+| admin 把 name 传回同一个值 | 200，响应里的 payload 仍是掩码 |
+| 普通任务改成 `exec.hook_open` | 400 `job name cannot be changed` |
+| 普通任务改 payload | 200 |
+
+**E. 观测**：`GET /executors` 的 `required_role` 是 `"admin"`；`hook_secret` 的
+`has_secret_args` 为 `true`，`hook_open` 为 `false`。
+
+**F. 批量**：operator 提交 `[payment_check, exec.hook_open]` → 207，`succeeded:1`、`failed:1`，
+`errors[0].index=1`、`code=403`；两条普通任务 → 207 `succeeded:2`。
+
+**G. 换成 `required_role: operator` 重启**：operator 与静态 token 都能提交（201）；
+`/executors` 报 `operator`；含 secret 档位的 `/result` 此时对 operator 返回 200 并带
+`redaction_note`——这条说明收严用的就是同一个配置值，把提交档位降下来就等于把输出也降下来。
+
+**H. 未启用鉴权**（第三份配置：无 token、无账号、`required_role: admin`、端口 18078）：
+连提 5 条执行器任务全部 201，`GET /executors` 正常，日志里
+`msg="executor job submitted while authentication is disabled"` 只有一行
+（启动时另有 E04 那条 error 级 `executors are enabled while server authentication is disabled`）。
+
+**被拒的请求在日志里长什么样**（A 组与 C 组现场）：
+
+```
+level=WARN msg="access denied" who=machine have=machine need="executor job submission" required=admin
+level=WARN msg="access denied" who=worker01 have=operator need="execution output of a profile with secret arguments" required=admin
+```
+
+### 未验证与遗留
+
+- **`viewer` 身份在冒烟里没有账号**（配置只建了 operator/admin/ops 三个账号）：
+  15 组矩阵在单元测试里覆盖了 viewer，结论是它在路由层就被挡住（建任务本身要 operator）。
+- **PUT 对已终态任务先给 409 而不是 403**（第 8 条）：要不要把档位判定提到状态检查之前，
+  让档位不够的身份一律先看到 403，登记待确认。
+- **`body` 字段是否整体视为凭据**（第 10 条）：登记待确认。
+- **旧数据文件里已落盘的明文**：payload 与旧任务的预览都在磁盘上；响应层现在会掩，
+  但文件本身仍是原文（§3.3 第 3 条的口径，清理靠换数据文件或重跑任务）。
+- **WS/SSE 实时推送没有单独观测**：事件文本与 `GET /events` 取的是同一份摘要，
+  执行侧掩码之后两者一起变干净；浏览器侧的观测限制与前面卡片同一条。
+- `docs/api.md` 的档位矩阵表、`/executors` 两个新字段与 `/result` 的 `redaction_note`
+  归 E19 写；已把结论补进该卡 §3.1 与 §3.2。
+- E15 登记的两条既有缺陷照旧：重试的产物被后一次尝试覆盖、档位超时在事件里记成 `timeout=0s`。
+- Linux/macOS 的真实运行与那一侧的 `-race`（WSL2 缺 gcc），与其他卡片同一条遗留。
