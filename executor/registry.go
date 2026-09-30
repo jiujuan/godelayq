@@ -92,7 +92,10 @@ func (r *Registry) Enabled() bool { return r.enabled }
 func (r *Registry) RequiredRole() string { return r.requiredRole }
 
 // LoaderAllowed 返回是否允许目录任务加载器接受 exec. 前缀的任务文件。
-// 自行接入 core.DirectoryLoader 的程序用它读取这个决定，避免配置项没有实际读取方（见 TASK-E17）。
+//
+// 它是 executors.loader_allow 唯一的读取方（TASK-E17）：服务端不启用目录加载器，
+// 自行接入 core.DirectoryLoader 的程序用这个取值去填 LoaderOptions.AllowExecJobs。
+// 加载器本身不回读配置，所以把配置接到行为上的那一步在调用方。
 func (r *Registry) LoaderAllowed() bool { return r.loaderAllowed }
 
 // InlinePreview 返回输出预览的字节上限（executors.output.inline_preview）。

@@ -24,8 +24,10 @@ import (
 // HandlerKeyPrefix 是档位在调度器注册表里的键前缀：配置里的 name 变成注册键 "exec.<name>"。
 // 这样档位与代码注册的处理函数共用同一份注册表（core.Scheduler.RegisterHandler），
 // 提交校验、崩溃恢复、重试绑定都不需要新增机制。
-// 注：目录加载器也要判断这个前缀，届时会把它移到 core 以免两处各写一遍（TASK-E17）。
-const HandlerKeyPrefix = "exec."
+//
+// 取值来自 core.ExecPrefix（TASK-E17）：目录加载器要判断同一个前缀，而它不能反向依赖本包，
+// 所以字面量只写在 core 一处，这里只是个同义名字。
+const HandlerKeyPrefix = core.ExecPrefix
 
 // Kind 是档位的执行方式。
 type Kind string

@@ -844,3 +844,16 @@ executors:
 	assert.Equal(t, map[string]string{"REPORT_HOME": "/srv/report"}, profiles[0].Env)
 	assert.Equal(t, []string{"TRACE_ID"}, profiles[0].EnvAllow)
 }
+
+// TestHandlerKeyPrefixMatchesCoreLoader 检查注册键与加载器边界用的是同一个前缀（E17 DoD 第三条）：
+// 字面量只写在 core.ExecPrefix 一处，加载器默认拒绝的正好是档位实际注册出来的那些名字。
+func TestHandlerKeyPrefixMatchesCoreLoader(t *testing.T) {
+	assert.Equal(t, core.ExecPrefix, HandlerKeyPrefix, "两处名字要指着同一个值")
+
+	profile := &Profile{Name: "nightly_report"}
+	key := profile.HandlerKey()
+
+	assert.Equal(t, "exec.nightly_report", key)
+	assert.True(t, core.IsExecHandlerKey(key),
+		"注册键要被加载器的边界判断认出来，否则默认拒绝管不到真正能执行的名字")
+}
