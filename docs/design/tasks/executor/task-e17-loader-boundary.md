@@ -193,8 +193,9 @@ Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
 
 ### 未验证与遗留
 
-- **`AllowExecJobs: true` 的现场只有单元测试**：示例程序按第 9 条保持 false，要跑出"打开之后
-  确实加载"的现场得改示例或另写一个装配程序。单元测试里那条断言的是入队、绑定与调用三层。
+- **`AllowExecJobs: true` 的现场已补跑**（见本节末尾"补充"第 1 条）：示例程序按第 9 条保持 false，
+  打开开关的现场是用一个临时装配程序（`Scheduler` + `DirectoryLoader`，`HandlerMap` 里带
+  `exec.hello`）跑真实进程得到的，跑完即删，没有入库。
 - Linux 的 inotify 路径与那一侧的 `-race` 未实跑（WSL2 缺 gcc），与其他卡片同一条遗留。
   监控模式下的拒绝走的是与扫描模式同一个 `LoadFile`，两条路径共用一个判断。
 - 目录加载器仍未接入服务端（§8 明确不做），因此本卡的边界对 HTTP 提交路径没有影响：
@@ -214,3 +215,30 @@ Windows 本机（`10.0.26200`，go1.26.4 windows/amd64）：
   那会让断言跑到非测试 goroutine 上），不是加 sleep 掩盖。
   修完的跑动：该用例 `-count=200` 一轮、`api` 包整包两次全绿。
   本卡的代码改动只碰 `core` 的加载器路径，没有动调度循环与池统计。
+
+### 补充（同日，两条收尾项）
+
+1. **打开开关的真实进程现场**（补上"未验证与遗留"第 1 条）：临时写一个装配程序
+   （`core.NewScheduler` + `core.NewDirectoryLoader`，`AllowExecJobs: true`，
+   `HandlerMap` 里注册 `exec.hello` 与 `payment_check`，策略 `ArchiveAfterLoad` +
+   `ErrorDir=./job_errors`），编译成 exe 在临时目录里跑，往 `./job_queue` 放两个文件：
+
+   ```
+   {"id":"allow_exec","name":"exec.hello","delay":"1s","payload":{"args":{"msg":"from loader"}}}
+   {"id":"allow_plain","name":"payment_check","delay":"1s","payload":{"order_id":"ORD-ALLOW"}}
+   ```
+
+   | 观察点 | 结果 |
+   | --- | --- |
+   | 进程 stdout | `HANDLER-RAN exec.hello payload={"args":{"msg":"from loader"}}` 与 `HANDLER-RAN payment_check payload={"order_id":"ORD-ALLOW"}`，两条都执行到 |
+   | `./job_queue` | 空（两个文件都被处理走） |
+   | `./job_archive` | `20260930_172650_allow_exec.json`、`20260930_172650_allow_plain.json` |
+   | `./job_errors` | 空——打开开关后 `exec.` 文件不再进错误目录 |
+   | 进程日志 | 没有 warn 行（与默认拒绝那条形成对照） |
+   | `jobs.json` | 两条记录，`allow_exec` 的 `name` 是 `exec.hello`、状态 success，`payload` 是 base64 原文 |
+
+   结论：`AllowExecJobs` 这个字段确实只决定"要不要接受"，接受之后走的就是既有那条
+   绑定 + 入队 + 执行路径，没有新增第二套逻辑。该临时程序与目录已删除，仓库里没有留下它。
+2. **池统计用例修后复验**：`go test ./api -race -count=50 -run TestAdminRuntime` 跑绿
+   （E19 §5.1 新加的那一项在本卡收尾时先跑过一轮；E19 全项目验证时按它自己写的命令再跑一次）。
+   加上此前的 `-count=200` 一轮与 `api` 包整包两次，这条用例目前没有再出现偶发失败。

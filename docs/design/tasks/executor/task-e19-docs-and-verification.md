@@ -170,7 +170,8 @@
    `api` 包的 `TestAdminRuntime_ExposesExecPool`（E13 的用例）在 TASK-E17 收尾时三次失败，
    已修：断言跑得太早，没等第二条档位任务进执行器队列，改成轮询到位再断言；
    原因、修法与修后的跑动记录见 TASK-E17 卡第 10 节"未验证与遗留"最后一条。
-   E19 全仓验证加一项 `go test ./api -race -count=50 -run TestAdminRuntime`，确认这条不再偶发。
+   E19 全仓验证加一项 `go test ./api -race -count=50 -run TestAdminRuntime`，确认这条不再偶发
+   （TASK-E17 收尾时该命令已跑过一轮并全绿，见该卡第 10 节"补充"第 2 条）。
 2. 交叉编译：`GOOS=linux`、`GOOS=darwin`、`GOOS=windows` 各 `go build ./...` 一次（平台文件多的包最容易在这里漏编译分支）。
 3. 配置守卫：`go test -run TestExampleConfigMatchesLocal ./core`；并确认本机 `configs/config.yaml`（不入库）与模板键集合一致。
 4. 前端：`cd web && npx vue-tsc --noEmit && npm run build`；随后 `go build -tags dashboard -o godelayq-console ./cmd/server` 能成功（`web/dist` 已存在）。
