@@ -317,8 +317,14 @@ func TestEventLog_DoesNotBlockPublisher(t *testing.T) {
 	}
 }
 
+// TestEventLog_DroppedIsCounted 钉住"少掉的每条都记在账上"。
+//
+// 发的条数正好等于总线给每个订阅者分配的缓冲（core.NewEventBus(100)），这样事件一律能
+// 进到转发协程，写入器这边的账才是确定的：落库 4 条、丢弃 96 条。发得更多就会先在总线
+// 那一层丢掉一部分（Publish 同样是 select/default），那部分不计进 Dropped()，
+// 等式就不成立了——它守的是写入器的账，不是总线的账。
 func TestEventLog_DroppedIsCounted(t *testing.T) {
-	const total = 400
+	const total = 100
 	log, _, bus := newTestEventLog(t, func(opts *EventLogOptions) {
 		opts.QueueCapacity = 4
 	})
@@ -347,6 +353,10 @@ func TestEventLog_DroppedIsCounted(t *testing.T) {
 	dropped := log.Dropped()
 	if int64(total)-count != dropped {
 		t.Fatalf("expected %d dropped, got %d", int64(total)-count, dropped)
+	}
+	// 丢弃的条数必须能在写入器这一侧读到，否则一张看起来完整的表实际缺页无从判断
+	if dropped == 0 {
+		t.Fatal("expected the writer to count the records it gave up")
 	}
 }
 
