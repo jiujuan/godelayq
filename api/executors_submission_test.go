@@ -403,6 +403,30 @@ func TestUpdateJob_ExecutorGuards(t *testing.T) {
 			`{"payload":{"anything":true},"timeout":"2m"}`, admin)
 		assert.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
 	})
+
+	t.Run("判档与改名排在状态检查之前", func(t *testing.T) {
+		// 已经跑完的执行器任务：档位不够的身份拿到的还是 403，
+		// 而不是"这条任务已经结束了"的 409——那等于从状态码里读出任务的进度。
+		seedExecutorJob(t, srv, "job-done-exec", "exec.callback",
+			`{"params":{"day":"2026-09-30"}}`, core.StatusSuccess, nil)
+		recorder := doJSON(t, srv, http.MethodPut, "/api/v1/jobs/job-done-exec",
+			`{"payload":{"params":{"day":"2026-10-01"}}}`, creds("operator"))
+		assert.Equal(t, http.StatusForbidden, recorder.Code, recorder.Body.String())
+
+		// 已结束的非档位任务：换名字这条请求本身就不合法，拿 400 而不是 409
+		seedExecutorJob(t, srv, "job-done-plain", "payment_check", "", core.StatusSuccess, nil)
+		recorder = doJSON(t, srv, http.MethodPut, "/api/v1/jobs/job-done-plain",
+			`{"name":"exec.callback"}`, admin)
+		assert.Equal(t, http.StatusBadRequest, recorder.Code, recorder.Body.String())
+
+		// 没传 name 的普通改动照旧按状态回答；不存在的路径照旧 404
+		recorder = doJSON(t, srv, http.MethodPut, "/api/v1/jobs/job-done-plain",
+			`{"payload":{"a":1}}`, admin)
+		assert.Equal(t, http.StatusConflict, recorder.Code, recorder.Body.String())
+		recorder = doJSON(t, srv, http.MethodPut, "/api/v1/jobs/job-never-created",
+			`{"payload":{"a":1}}`, admin)
+		assert.Equal(t, http.StatusNotFound, recorder.Code, recorder.Body.String())
+	})
 }
 
 // TestCreateJob_MachineTokenDeniedUnderDefaultRole 是配置注释里那句结论的现场：

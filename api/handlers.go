@@ -314,18 +314,42 @@ func (s *Server) UpdateJob(c *gin.Context) {
 		}
 	}
 
+	// 判档与改名放在状态检查之前：这两条说的是"这个调用本身行不行"，409 说的是
+	// "任务此刻还是不是 pending"。顺序反过来会让档位不够的身份从 409 里读出
+	// 一条执行器任务跑完了没有（同一层理由见 GetJobResult 的 resultGuard，TASK-E16 §3.2 第 2 条）。
+	snapshot, found, err := s.snapshotOf(id)
+	if err != nil {
+		c.JSON(500, ErrorResponse{
+			Code:    500,
+			Message: "failed to load jobs",
+			Details: err.Error(),
+		})
+		return
+	}
+	if !found {
+		c.JSON(404, ErrorResponse{Code: 404, Message: "job not found"})
+		return
+	}
+	if req.Name != nil && *req.Name != snapshot.Name {
+		// 本端点不能换任务类型：换了名字就换了执行体，而提交档位的判定是按档位做的。
+		// 相同值按没传处理，方便客户端把读到的对象改几个字段再 PUT 回来（见 api/dto.go）。
+		c.JSON(400, ErrorResponse{
+			Code:    400,
+			Message: "job name cannot be changed",
+			Details: fmt.Sprintf("this job is %q; PUT /jobs/:id does not switch a job to another type (%q), delete and recreate it instead",
+				snapshot.Name, *req.Name),
+		})
+		return
+	}
+	if profile, ok := s.executorProfile(snapshot.Name); ok {
+		if failure := s.gateExecutorSubmissionRole(c, profile); failure != nil {
+			c.JSON(failure.Code, *failure)
+			return
+		}
+	}
+
 	// 原地更新：不再走 Cancel→Schedule，避免两步之间失败导致任务丢失
 	job, err := s.scheduler.UpdatePending(id, func(j *core.Job) error {
-		if req.Name != nil && *req.Name != j.Name {
-			// 本端点不能换任务类型：换了名字就换了执行体，而提交档位的判定是按档位做的
-			// （TASK-E16 §3.2 第 2 条）。相同值按没传处理，见 api/dto.go 里这条注释。
-			return &submissionRejected{failure: &ErrorResponse{
-				Code:    400,
-				Message: "job name cannot be changed",
-				Details: fmt.Sprintf("this job is %q; PUT /jobs/:id does not switch a job to another type (%q), delete and recreate it instead",
-					j.Name, *req.Name),
-			}}
-		}
 		if req.TriggerAt != nil {
 			j.TriggerAt = *req.TriggerAt
 		}

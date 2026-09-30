@@ -455,6 +455,31 @@ func (s *Server) executorProfile(name string) (*executor.Profile, bool) {
 	return s.executors.Lookup(name)
 }
 
+// gateExecutorSubmissionRole 只判"这个身份能不能碰这个档位的任务"（TASK-E16 §3.1）。
+//
+// 单独拆出来是因为 PUT 需要它出现在状态检查之前：档位不够的连接不该从 409 里读出
+// "这条执行器任务跑完了没有"（与 GetJobResult 的 resultGuard 同一条口径）。
+func (s *Server) gateExecutorSubmissionRole(c *gin.Context, profile *executor.Profile) *ErrorResponse {
+	if !s.sec.authEnabled() {
+		// 没有凭据的部署里 allowRole 恒为真，所以这条判定等于没做事——
+		// 但它是"执行器默认关闭"那条告警的运行时补充：每次启动后第一次提交留一行 warn。
+		s.warnAuthDisabledOnce()
+	}
+
+	role := s.executorRole()
+	if !s.allowRole(c, role) {
+		principal, _ := PrincipalFrom(c)
+		s.logAccessRejection(principal, "executor job submission", role)
+		return &ErrorResponse{
+			Code:    http.StatusForbidden,
+			Message: "insufficient role",
+			Details: fmt.Sprintf("job type %q is an executor profile; submitting it requires role %s (executors.required_role)",
+				profile.HandlerKey(), role.String()),
+		}
+	}
+	return nil
+}
+
 // gateExecutorSubmission 把执行器任务的提交期检查集中在这一个函数里：
 // 身份档位、这台机器能不能跑、payload 合不合法、生效超时是多少。
 //
@@ -471,22 +496,8 @@ func (s *Server) gateExecutorSubmission(c *gin.Context, job *core.Job,
 	}
 	name := job.Name
 
-	if !s.sec.authEnabled() {
-		// 没有凭据的部署里 allowRole 恒为真，所以这条判定等于没做事——
-		// 但它是"执行器默认关闭"那条告警的运行时补充：每次启动后第一次提交留一行 warn。
-		s.warnAuthDisabledOnce()
-	}
-
-	role := s.executorRole()
-	if !s.allowRole(c, role) {
-		principal, _ := PrincipalFrom(c)
-		s.logAccessRejection(principal, "executor job submission", role)
-		return &ErrorResponse{
-			Code:    http.StatusForbidden,
-			Message: "insufficient role",
-			Details: fmt.Sprintf("job type %q is an executor profile; submitting it requires role %s (executors.required_role)",
-				name, role.String()),
-		}
+	if failure := s.gateExecutorSubmissionRole(c, profile); failure != nil {
+		return failure
 	}
 
 	if reason, available := s.executors.Available(name); !available {
