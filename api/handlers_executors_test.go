@@ -326,7 +326,8 @@ func TestListExecutors_ShowsProfilesSortedAndAvailability(t *testing.T) {
 	var resp ListExecutorsResponse
 	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &resp))
 	assert.True(t, resp.Enabled)
-	assert.Nil(t, resp.RequiredRole, "required_role 由 TASK-E16 给出真实取值，本卡固定为 null")
+	require.NotNil(t, resp.RequiredRole, "required_role 的真实取值由 TASK-E16 接进来")
+	assert.Equal(t, "admin", *resp.RequiredRole, "没改配置时是默认档位")
 	require.Len(t, resp.Profiles, 2)
 
 	// 按注册键字典序，而不是配置里的声明顺序
@@ -345,9 +346,11 @@ func TestListExecutors_ShowsProfilesSortedAndAvailability(t *testing.T) {
 	assert.True(t, script.Args[0].Secret)
 	assert.False(t, script.Args[0].Required)
 	assert.Empty(t, script.URL, "只有 http 档位给 URL")
+	assert.True(t, script.HasSecretArgs, "token 声明为 secret，读取接口要按这个字段收严")
 
 	httpProfile := resp.Profiles[1]
 	assert.True(t, httpProfile.RuntimeOK)
+	assert.False(t, httpProfile.HasSecretArgs, "day 没声明 secret")
 	assert.Empty(t, httpProfile.Reason)
 	assert.Equal(t, "https://api.example.com/reports/{day}", httpProfile.URL, "模板原文，占位符不渲染")
 	assert.Equal(t, "10m0s", httpProfile.Timeout)

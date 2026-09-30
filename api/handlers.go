@@ -604,7 +604,7 @@ func (s *Server) toJobResponse(job *core.Job) JobResponse {
 		Status:     job.Status.String(),
 		Group:      job.Group,
 		TriggerAt:  job.TriggerAt,
-		Payload:    job.Payload,
+		Payload:    s.payloadForResponse(job.Name, job.Payload),
 		RetryCount: job.RetryCount,
 		MaxRetries: job.MaxRetries,
 		IsRepeat:   job.IsRepeat,
@@ -618,7 +618,7 @@ func (s *Server) toJobResponse(job *core.Job) JobResponse {
 	}
 
 	if job.Exec != nil {
-		resp.Exec = s.execForResponse(job.Exec)
+		resp.Exec = s.execForResponse(job.Name, job.Payload, job.Exec)
 	}
 
 	// 计算剩余时间
@@ -634,19 +634,30 @@ func (s *Server) toJobResponse(job *core.Job) JobResponse {
 	return resp
 }
 
-// execForResponse 按配置上限再裁一次输出预览。
+// execForResponse 给出对外摘要：预览里的 secret 参数取值按掩码写法给出，长度按配置上限裁。
 //
-// 摘要生成时已经裁过，这里是重复检查：预览可能来自一份旧数据文件（当时配的是更大的值），
-// 而列表接口一次返回上百条，每条几十 KB 的文本会把响应撑到不可用。
-// 超过上限时返回副本——同一个 ExecMeta 可能同时被存储里的快照引用，改它会改到别处读到的内容。
-func (s *Server) execForResponse(meta *core.ExecMeta) *core.ExecMeta {
+// 裁剪是重复检查：摘要生成时已经裁过，而预览可能来自一份旧数据文件（当时配的是更大的值），
+// 列表接口一次返回上百条，每条几十 KB 的文本会把响应撑到不可用。
+// 掩码是同一处的第二件事：执行侧写摘要时已经按值掩过一遍（executor.Profile.MaskSecretText），
+// 这里管的是在那之前落盘的快照——旧数据里的预览可能带着凭据。响应层的掩码不改存储（§3.3 第 3 条）。
+// 超过上限或文本被改动时返回副本——同一个 ExecMeta 可能同时被存储里的快照引用，
+// 改它会改到别处读到的内容。
+func (s *Server) execForResponse(name string, payload []byte, meta *core.ExecMeta) *core.ExecMeta {
+	preview := meta.Preview
+	if profile, ok := s.executorProfile(name); ok && profile.HasSecretArgs() {
+		preview = profile.MaskSecretText(payload, preview)
+	}
+
 	limit := s.execPreviewLimit()
-	if limit <= 0 || len(meta.Preview) <= limit {
+	if limit > 0 {
+		preview = executor.TrimPreview(preview, limit)
+	}
+	if preview == meta.Preview {
 		return meta
 	}
 
 	trimmed := *meta
-	trimmed.Preview = executor.TrimPreview(meta.Preview, limit)
+	trimmed.Preview = preview
 	return &trimmed
 }
 

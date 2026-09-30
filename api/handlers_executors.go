@@ -40,14 +40,18 @@ type JobResultResponse struct {
 	Truncated     bool           `json:"truncated"`
 	Meta          *core.ExecMeta `json:"meta"`
 	Content       string         `json:"content"`
+	// RedactionNote 只在档位声明了 secret 参数时出现，提醒读的人：
+	// 正文由脚本或对端产生，框架层的参数掩码管不到它把值打印出来。
+	// 这条说明不是"已防护"的声明，卡片 §9 明确要求把它当成提醒写。
+	RedactionNote string `json:"redaction_note,omitempty"`
 }
 
 // GetJobResult GET /api/v1/jobs/:id/result
 // 读的是产物文件，不进任何内存缓冲：几十 KB 的输出一旦被事件带走，
 // 实时通道和事件历史都会按输出体积失控。
 //
-// 档位：本卡一律 reader（viewer 及以上）。TASK-E16 的判档点就在取到快照之后——
-// 那次判断要看档位是否声明了 secret 参数，而档位名在快照摘要里。
+// 档位：路由上是 reader（viewer 及以上）；档位声明了 secret 参数时，取到快照之后再升一级
+// 到 executors.required_role（TASK-E16 §3.3 第 2 条，判档函数是下面的 resultGuard）。
 func (s *Server) GetJobResult(c *gin.Context) {
 	id := c.Param("id")
 
@@ -62,6 +66,15 @@ func (s *Server) GetJobResult(c *gin.Context) {
 	}
 	if !found {
 		c.JSON(http.StatusNotFound, ErrorResponse{Code: http.StatusNotFound, Message: "job not found"})
+		return
+	}
+
+	// E07 预留的判档点在这里：档位声明了 secret 参数时，读取门槛从 reader 升到提交档位，
+	// 并给响应带一句说明（TASK-E16 §3.3 第 2 条）。判档在参数解析之前，
+	// 越权的连接不该从 400 里读出"这个任务的产物存在且文件名是什么"。
+	note, denied := s.resultGuard(c, snapshot.HandlerKey())
+	if denied != nil {
+		c.JSON(denied.Code, *denied)
 		return
 	}
 
@@ -101,12 +114,13 @@ func (s *Server) GetJobResult(c *gin.Context) {
 	// 正文读不出来时的响应：摘要照旧给出，content 为空，并把快照里的产物状态改成 purged。
 	respondMissing := func() {
 		response := JobResultResponse{
-			JobID:   id,
-			Attempt: attempt,
-			Stream:  stream,
-			Meta:    s.markArtifactPurged(snapshot),
-			Found:   false,
-			Content: "",
+			JobID:         id,
+			Attempt:       attempt,
+			Stream:        stream,
+			Meta:          s.markArtifactPurged(snapshot),
+			Found:         false,
+			Content:       "",
+			RedactionNote: note,
 		}
 		c.JSON(http.StatusOK, response)
 	}
@@ -154,8 +168,9 @@ func (s *Server) GetJobResult(c *gin.Context) {
 		SizeBytes:     size,
 		ReturnedBytes: len(content),
 		Truncated:     truncated,
-		Meta:          s.execForResponse(snapshot.Exec),
+		Meta:          s.execForResponse(snapshot.Name, snapshot.Payload, snapshot.Exec),
 		Content:       string(content),
+		RedactionNote: note,
 	})
 }
 
@@ -170,7 +185,7 @@ func (s *Server) markArtifactPurged(snapshot core.JobSnapshot) *core.ExecMeta {
 		return nil
 	}
 	if snapshot.Exec.Artifact == core.ArtifactPurged {
-		return s.execForResponse(snapshot.Exec)
+		return s.execForResponse(snapshot.Name, snapshot.Payload, snapshot.Exec)
 	}
 
 	// 复制一份再改：LoadAll 返回的快照与存储内部共用同一个摘要指针，
@@ -184,7 +199,7 @@ func (s *Server) markArtifactPurged(snapshot core.JobSnapshot) *core.ExecMeta {
 		s.logger.Warn("failed to record that the execution output is gone",
 			"job_id", snapshot.ID, "attempt", snapshot.Attempts, "error", err)
 	}
-	return s.execForResponse(&summary)
+	return s.execForResponse(snapshot.Name, snapshot.Payload, &summary)
 }
 
 // respondArtifactError 把产物存储的读取失败说成一句能用的话：
@@ -287,6 +302,10 @@ type ExecutorProfileResponse struct {
 	MaxParallel int                   `json:"max_parallel"`
 	Args        []ExecutorArgResponse `json:"args"`
 	EnvAllow    []string              `json:"env_allow"`
+	// HasSecretArgs 表示这个档位声明了至少一个 secret 参数：
+	// 它的 payload 在读取接口里会被掩码，结果端点的读取门槛也升到提交档位（TASK-E16 §3.4）。
+	// 前端据此显示"这个档位的参数不会回显"，不必自己复制一份 args[].secret 的判断。
+	HasSecretArgs bool `json:"has_secret_args"`
 	// URL 只在 http 档位出现，给的是模板原文（含 {占位符}），不是渲染后的地址。
 	URL string `json:"url,omitempty"`
 }
@@ -295,9 +314,9 @@ type ExecutorProfileResponse struct {
 type ListExecutorsResponse struct {
 	Enabled  bool                      `json:"enabled"`
 	Profiles []ExecutorProfileResponse `json:"profiles"`
-	// RequiredRole 是提交执行器任务所需的最低档位名。本卡固定为 null：
-	// 取值已经在 executor.Registry.RequiredRole() 里备好，但把它接进提交路径
-	// 属于 TASK-E16（那一卡同时要做参数校验与掩码）。在这里写明去向，避免两张卡都以为对方做了。
+	// RequiredRole 是提交执行器任务所需的最低档位名（TASK-E16 §3.4 第 1 条）。
+	// 执行器关闭时是 null：那时没有任何档位可提交，"要什么档位"这个问题不成立，
+	// 给一个配置里的取值反而会让前端以为存在这道门槛。
 	RequiredRole *string `json:"required_role"`
 }
 
@@ -316,6 +335,10 @@ func (s *Server) ListExecutors(c *gin.Context) {
 	}
 
 	response.Enabled = s.executors.Enabled()
+	if response.Enabled {
+		role := s.executors.RequiredRole()
+		response.RequiredRole = &role
+	}
 	for _, profile := range s.executors.Profiles() {
 		reason, ok := s.executors.Available(profile.HandlerKey())
 		response.Profiles = append(response.Profiles, toExecutorProfile(profile, reason, ok))
@@ -341,15 +364,16 @@ func toExecutorProfile(profile *executor.Profile, reason string, runtimeOK bool)
 	envAllow = append(envAllow, profile.EnvAllow...)
 
 	item := ExecutorProfileResponse{
-		Key:         profile.HandlerKey(),
-		Name:        profile.Name,
-		Kind:        string(profile.Kind),
-		RuntimeOK:   runtimeOK,
-		Reason:      reason,
-		Timeout:     profile.Timeout.String(),
-		MaxParallel: profile.MaxParallel,
-		Args:        args,
-		EnvAllow:    envAllow,
+		Key:           profile.HandlerKey(),
+		Name:          profile.Name,
+		Kind:          string(profile.Kind),
+		RuntimeOK:     runtimeOK,
+		Reason:        reason,
+		Timeout:       profile.Timeout.String(),
+		MaxParallel:   profile.MaxParallel,
+		Args:          args,
+		EnvAllow:      envAllow,
+		HasSecretArgs: profile.HasSecretArgs(),
 	}
 	if profile.Kind == executor.KindHTTP {
 		item.URL = profile.URLTemplate
@@ -508,3 +532,47 @@ func (s *Server) warnAuthDisabledOnce() {
 			"hint", "configure server.auth.token or server.auth.users before enabling executors")
 	})
 }
+
+// payloadForResponse 按档位声明决定要不要掩码 payload 里的凭据。
+//
+// 掩码只发生在这里（响应），不改存储也不改执行输入——卡片 §3.3 第 3 条要求把这句话
+// 写在代码里，避免后来者把响应上的 *** 当成"参数已经加密保存"。
+func (s *Server) payloadForResponse(name string, payload []byte) []byte {
+	if len(payload) == 0 {
+		return payload
+	}
+	profile, ok := s.executorProfile(name)
+	if !ok || !profile.HasSecretArgs() {
+		return payload
+	}
+	return profile.MaskPayload(payload)
+}
+
+// resultGuard 判断这次结果读取的档位够不够，并给出响应里的说明文本。
+//
+// 卡片 §3.3 第 2 条的收严只针对含 secret 参数的档位：输出正文是脚本或对端产生的，
+// 框架层掩不住它回显的凭据，所以读取门槛跟着升到提交档位，并在响应里留一句说明。
+// 返回的 denied 非 nil 时调用方直接回 403。
+func (s *Server) resultGuard(c *gin.Context, name string) (note string, denied *ErrorResponse) {
+	profile, ok := s.executorProfile(name)
+	if !ok || !profile.HasSecretArgs() {
+		return "", nil
+	}
+
+	role := s.executorRole()
+	if !s.allowRole(c, role) {
+		principal, _ := PrincipalFrom(c)
+		s.logAccessRejection(principal, "execution output of a profile with secret arguments", role)
+		return "", &ErrorResponse{
+			Code:    http.StatusForbidden,
+			Message: "insufficient role",
+			Details: fmt.Sprintf("profile %q declares secret arguments; reading its execution output requires role %s",
+				profile.Name, role.String()),
+		}
+	}
+
+	return redactionNote, nil
+}
+
+// redactionNote 是给含 secret 参数档位的读取者的一句提醒。
+const redactionNote = "output is produced by the script or the remote endpoint and may contain the values of secret arguments"

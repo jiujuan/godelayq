@@ -520,7 +520,7 @@ func TestExecForResponse_CapsPreviewWithConfiguredLimit(t *testing.T) {
 	server := &Server{executors: registry}
 	meta := &core.ExecMeta{Kind: "script", Profile: "p", Preview: strings.Repeat("x", 5000)}
 
-	resp := server.execForResponse(meta)
+	resp := server.execForResponse("exec.demo", nil, meta)
 
 	require.NotNil(t, resp)
 	assert.Len(t, resp.Preview, 32, "超过配置上限的预览要被裁到上限")
@@ -531,7 +531,7 @@ func TestExecForResponse_UsesDefaultLimitWithoutRegistry(t *testing.T) {
 	server := &Server{}
 	meta := &core.ExecMeta{Kind: "script", Profile: "p", Preview: strings.Repeat("y", core.DefaultExecInlinePreview+100)}
 
-	resp := server.execForResponse(meta)
+	resp := server.execForResponse("exec.demo", nil, meta)
 
 	assert.Len(t, resp.Preview, core.DefaultExecInlinePreview)
 }
@@ -542,10 +542,10 @@ func TestExecForResponse_KeepsShortPreviewAndSharedObject(t *testing.T) {
 	server := &Server{}
 
 	short := &core.ExecMeta{Kind: "script", Profile: "p", Preview: "done"}
-	assert.Same(t, short, server.execForResponse(short))
+	assert.Same(t, short, server.execForResponse("exec.demo", nil, short))
 
 	big := &core.ExecMeta{Kind: "script", Profile: "p", Preview: strings.Repeat("z", core.DefaultExecInlinePreview*2)}
-	trimmed := server.execForResponse(big)
+	trimmed := server.execForResponse("exec.demo", nil, big)
 
 	assert.NotSame(t, big, trimmed)
 	assert.Len(t, trimmed.Preview, core.DefaultExecInlinePreview)
