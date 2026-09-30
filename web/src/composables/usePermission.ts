@@ -56,5 +56,22 @@ export function usePermission() {
     return `需要 ${requiredRole(capability)} 及以上角色`
   }
 
-  return { can, requiredRole, blockedReason }
+  /**
+   * 提交执行器任务要不要这个身份（TASK-E18 §3.3 第 4 条）。
+   *
+   * 门槛来自 GET /executors 的 required_role，也就是配置里的 executors.required_role，
+   * 不是这张能力表里的常量：它是可以按部署改的，写死在这里就会和后端配置各说各话。
+   * null（执行器关闭）与不认识的档位名都按"不能提交"处理——后者宁严勿松，
+   * 前端表里少一档不该变成放行理由。
+   *
+   * 注意：这里只决定入口露不露，服务端才是边界。按钮藏起来之后，
+   * 直接调 POST /jobs 仍然会拿到 403（api/handlers_executors.go 的 gateExecutorSubmissionRole）。
+   */
+  function canSubmitExecutorJobs(required: string | null): boolean {
+    if (!required) return false
+    if (auth.authDisabled) return true
+    return auth.roleAtLeast(required as RoleName)
+  }
+
+  return { can, requiredRole, blockedReason, canSubmitExecutorJobs }
 }

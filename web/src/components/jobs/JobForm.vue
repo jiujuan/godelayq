@@ -5,16 +5,32 @@
  * trigger_at / payload / max_retries / timeout / group（名称与 cron 是任务身份的一部分，
  * 后端不接受修改）。把新建的表单直接搬进编辑会做出一张"填了却不生效"的假表单。
  *
- * 触发方式三选一在提交时塌缩成一个：后端看到 delay / trigger_at / cron_expr 只应有一个非空。 */
+ * 触发方式三选一在提交时塌缩成一个：后端看到 delay / trigger_at / cron_expr 只应有一个非空。
+ *
+ * 选中 exec.* 档位时（TASK-E18 §3.3）payload 不再是手写 JSON，而是按 GET /executors 给出的
+ * 档位声明生成的参数表单：必填、默认值、格式、允许的环境变量与请求头、能不能带请求体，
+ * 全部来自那个响应——前端不复制第二份规则，副本迟早和配置漂移。
+ * 只有新建走这张表单：编辑模式下执行器任务的参数值在读取响应里是掩码后的（TASK-E16），
+ * 回填进来的是一串 ***，把它当原值提交等于把凭据写成字面量，所以编辑照旧给 JSON 编辑器。 */
 import { computed, reactive, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
-import { ExternalLink } from 'lucide-vue-next'
+import { useQuery } from '@tanstack/vue-query'
+import { ExternalLink, Plus, X } from 'lucide-vue-next'
 import CronPicker from './CronPicker.vue'
 import PayloadEditor from './PayloadEditor.vue'
 import UiButton from '../ui/UiButton.vue'
 import UiInput from '../ui/UiInput.vue'
 import UiSelect from '../ui/UiSelect.vue'
-import type { CreateJobRequest, Job, UpdateJobRequest } from '../../api/types'
+import { listExecutors } from '../../api/executors'
+import { queryKeys } from '../../api/keys'
+import { usePermission } from '../../composables/usePermission'
+import type {
+  CreateJobRequest,
+  ExecutorArgSpec,
+  ExecutorProfile,
+  Job,
+  UpdateJobRequest,
+} from '../../api/types'
 
 type TriggerMode = 'delay' | 'at' | 'cron'
 type Mode = 'create' | 'edit'
@@ -56,6 +72,295 @@ const form = reactive({
 
 const quickDelays = ['1m', '10m', '1h', '24h']
 
+/* ---------------- 执行器档位模式（TASK-E18 §3.3） ---------------- */
+
+/**
+ * 档位表在表单内部取一次，不给两个宿主页面各传一层 props：
+ * 新建抽屉与详情编辑抽屉用的是同一份配置事实，5 分钟内不重取（与任务类型下拉同一口径）。
+ */
+const executorsQuery = useQuery({
+  queryKey: queryKeys.executors,
+  queryFn: listExecutors,
+  staleTime: 5 * 60_000,
+})
+const permission = usePermission()
+
+/** 执行器关闭时按"没有任何档位"处理：那时连"提交档位任务"这件事的前提都不存在 */
+const profiles = computed<ExecutorProfile[]>(() => {
+  const list = executorsQuery.data.value
+  return list?.enabled ? list.profiles : []
+})
+
+/** 全局超时上限（executors.max_timeout），后端不给就是空串 */
+const maxTimeout = computed(() => executorsQuery.data.value?.max_timeout ?? '')
+
+/** 提交执行器任务需要的档位；null 表示执行器关闭，没有这件事 */
+const executorRequiredRole = computed(() => executorsQuery.data.value?.required_role ?? null)
+
+/**
+ * 当前身份能不能提交档位任务。
+ *
+ * 只决定这些名字在不在这个下拉里：入口隐藏只是体验，服务端 403 才是边界
+ * （口径见 docs/design/web-console-design.md §5.7，判定实现是 api 的 gateExecutorSubmissionRole）。
+ */
+const canSubmitExecutor = computed(() => permission.canSubmitExecutorJobs(executorRequiredRole.value))
+
+/**
+ * 选中 exec.* 档位时的声明；普通任务与普通模式下都是 null。
+ *
+ * 判"是不是档位"用的是注册键前缀，与后端 core.ExecPrefix 同一条写法。
+ * 模式限制成 create 的理由写在文件头：编辑模式里响应给的参数值是掩码后的，
+ * 回填等于把 *** 当原值提交。
+ */
+const profile = computed<ExecutorProfile | null>(() => {
+  if (props.mode !== 'create') return null
+  const key = form.name.trim()
+  if (!key.startsWith('exec.')) return null
+  return profiles.value.find((item) => item.key === key) ?? null
+})
+
+type EntryRow = { key: string; value: string }
+
+const argValues = reactive<Record<string, string>>({})
+const positionalValues = ref<string[]>([''])
+const envRows = ref<EntryRow[]>([])
+const headerRows = ref<EntryRow[]>([])
+const bodyText = ref('')
+/**
+ * payload 里的 timeout 键。
+ *
+ * 执行器任务的生效超时来自这里（提交期由 Registry.EffectiveTimeout 合成），
+ * 请求体顶层那个 timeout 字段对档位任务只是"不得超过档位声明值"的一道检查，
+ * 所以表单把它挪到参数区里，免得填在一个不生效的地方。
+ */
+const execTimeout = ref('')
+
+watch(
+  profile,
+  (next) => {
+    // 换档位（包括切回普通任务）就把上一档的输入清空：留着会跟着提交进 payload
+    for (const key of Object.keys(argValues)) delete argValues[key]
+    positionalValues.value = ['']
+    envRows.value = []
+    headerRows.value = []
+    bodyText.value = ''
+    execTimeout.value = ''
+    if (!next) return
+    for (const spec of next.args) {
+      // secret 参数连档位声明的默认值都不预填：那也是一个凭据，不该出现在输入框和 DOM 里
+      if (spec.default && !spec.secret) argValues[spec.name] = spec.default
+    }
+  },
+)
+
+/**
+ * 用档位给的 regex 判一次取值。
+ *
+ * 正则是 Go 的 RE2 写法，字符类、锚点、量词这些在 JS 里同义；遇到 JS 编译不了的写法就放行，
+ * 让服务端按同一份声明去拒（api 的提交期校验才是边界）。前端这里只求少跑一次明显错误的提交。
+ */
+function patternMatches(pattern: string, value: string): boolean {
+  if (!pattern) return true
+  try {
+    return new RegExp(`^(?:${pattern})$`).test(value)
+  } catch {
+    return true
+  }
+}
+
+function argError(spec: ExecutorArgSpec): string | null {
+  const value = (argValues[spec.name] ?? '').trim()
+  if (value === '') return spec.required ? '这个参数是必填的' : null
+  if (!patternMatches(spec.pattern, value)) return `取值不符合档位声明的格式：${spec.pattern}`
+  return null
+}
+
+/** 与后端错误串里用的段名对齐（http 档位的同一批声明写在 params 下，其余在 args 下） */
+const valueSection = computed(() => (profile.value?.kind === 'http' ? 'params' : 'args'))
+
+const argErrors = computed(() => {
+  const spec = profile.value
+  if (!spec) return {}
+  const errors: Record<string, string | null> = {}
+  for (const arg of spec.args) errors[arg.name] = argError(arg)
+  return errors
+})
+
+const positionalError = computed(() => {
+  const spec = profile.value?.positional
+  if (!spec) return null
+  const filled = positionalValues.value.map((value) => value.trim()).filter((value) => value !== '')
+  if (filled.length > spec.max) return `最多 ${spec.max} 个位置参数，现在填了 ${filled.length} 个`
+  for (const value of filled) {
+    if (!patternMatches(spec.pattern, value)) return `位置参数「${value}」不符合档位声明的格式：${spec.pattern}`
+  }
+  return null
+})
+
+function rowsError(rows: EntryRow[], what: string): string | null {
+  const seen = new Set<string>()
+  for (const row of rows) {
+    const key = row.key.trim()
+    if (!key && row.value === '') continue
+    if (!key) return `有一${what}没选键名`
+    if (seen.has(key)) return `${what}「${key}」填了两次`
+    seen.add(key)
+  }
+  return null
+}
+
+const envError = computed(() => rowsError(envRows.value, '个环境变量'))
+const headerError = computed(() => rowsError(headerRows.value, '个请求头'))
+
+const bodyError = computed(() => {
+  const mode = profile.value?.body_mode
+  if (!mode || mode === 'none') return null
+  const text = bodyText.value.trim()
+  if (text === '') return null
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(text)
+  } catch (err) {
+    return `请求体不是合法 JSON：${(err as Error).message}`
+  }
+  if (mode === 'json' && (typeof parsed !== 'object' || parsed === null)) {
+    return '这个档位要求的请求体是 JSON 对象或数组'
+  }
+  return null
+})
+
+/** Go 的 duration 写法：一串"数字+单位"，单位只有这六种，没单位（30）不合法 */
+const GO_DURATION = /^(?:\d+(?:ns|us|ms|s|m|h))+$/
+const UNIT_MS: Record<string, number> = { ns: 1e-6, us: 1e-3, ms: 1, s: 1e3, m: 6e4, h: 3.6e6 }
+
+function durationToMs(text: string): number | null {
+  if (!GO_DURATION.test(text)) return null
+  let total = 0
+  for (const [, digits, unit] of text.matchAll(/(\d+)(ns|us|ms|s|m|h)/g)) {
+    total += Number(digits) * UNIT_MS[unit]
+  }
+  return total
+}
+
+/**
+ * 超时输入框的区间说明与拦下条件。
+ *
+ * 上限是 executors.max_timeout（响应里的 max_timeout）：超过它的请求值在执行侧会被夹到上限，
+ * 也就是说"填 1 小时、实际 30 分钟被断"，这种静默落差比报个错更难排查，所以在前端就拦下。
+ */
+const timeoutCeilingMs = computed(() => durationToMs(maxTimeout.value.trim()))
+
+const execTimeoutError = computed(() => {
+  const text = execTimeout.value.trim()
+  if (text === '') return null
+  const ms = durationToMs(text)
+  if (ms === null) return '写法如 90s、2m、1h30m：必须带单位（ns、us、ms、s、m、h）'
+  const ceiling = timeoutCeilingMs.value
+  if (ceiling !== null && ms > ceiling) {
+    return `超过 executors.max_timeout（${maxTimeout.value}）：执行时会被夹到上限，这个值不会生效`
+  }
+  return null
+})
+
+/** 档位在这台机器现在的结论：不可用时不让人提交（服务端同样会拒，见 E16 §3.2） */
+const profileUnavailable = computed(() => {
+  const spec = profile.value
+  return spec && !spec.runtime_ok ? spec.reason || '这台机器现在跑不了这个档位' : null
+})
+
+const executorErrors = computed(() => [
+  profileUnavailable.value,
+  ...Object.values(argErrors.value),
+  positionalError.value,
+  envError.value,
+  headerError.value,
+  bodyError.value,
+  execTimeoutError.value,
+])
+
+/**
+ * 后端 400 的错误按参数名落到对应输入项下面（§3.3 第 3 条）。
+ *
+ * 只补一句"这条被拒了"而不复述全文：details 的原文已经摆在表单顶部，
+ * 抄一份到每个参数后面会把能填的格子刷成一片红。
+ */
+function serverErrorFor(needle: string): string | null {
+  const text = props.serverError
+  if (!text || !needle) return null
+  return text.includes(needle) ? '后端拒了这条取值，原文见表单顶部的错误说明' : null
+}
+
+function argDisplayError(name: string): string | null {
+  const local = argErrors.value[name] ?? null
+  if (local) return local
+  return serverErrorFor(`${valueSection.value}.${name}:`)
+}
+
+/** 参数输入框下的说明：格式与"这是凭据"两件事，都取自档位声明 */
+function argHint(spec: ExecutorArgSpec): string | undefined {
+  const parts: string[] = []
+  if (spec.pattern) parts.push(`格式：${spec.pattern}`)
+  if (spec.secret) parts.push('这是凭据：不回显，读取接口里也会掩码')
+  else if (spec.default) parts.push(`已按档位默认值预填：${spec.default}`)
+  return parts.length ? parts.join(' · ') : undefined
+}
+
+function dropPositional(index: number): void {
+  positionalValues.value = positionalValues.value.filter((_, i) => i !== index)
+  if (positionalValues.value.length === 0) positionalValues.value = ['']
+}
+
+/**
+ * 编辑模式下的执行器任务：payload 里可能含有后端掩码后的值。
+ *
+ * 这里仍然给 JSON 编辑器而不是参数表单，是因为读取响应给的 secret 参数是 ***（TASK-E16），
+ * 回填进输入框再保存等于把"星号"当成凭据原文提交。给一张空白参数表会让人以为参数丢了，
+ * 也不对；所以留 JSON 原文 + 一句明确说明，改哪个键由人决定。
+ */
+const isExecutorJobEdit = computed(() => props.mode === 'edit' && form.name.trim().startsWith('exec.'))
+
+/** 档位任务的 payload 组装；调用方保证此刻没有校验错误 */
+function buildExecutorPayload(): Record<string, unknown> {
+  const spec = profile.value
+  if (!spec) return {}
+
+  const payload: Record<string, unknown> = {}
+  const values: Record<string, unknown> = {}
+  for (const arg of spec.args) {
+    const value = (argValues[arg.name] ?? '').trim()
+    if (value !== '') values[arg.name] = value
+  }
+
+  if (spec.kind === 'http') {
+    if (Object.keys(values).length > 0) payload.params = values
+
+    const headers: Record<string, string> = {}
+    for (const row of headerRows.value) {
+      const key = row.key.trim()
+      if (key && row.value !== '') headers[key] = row.value
+    }
+    if (Object.keys(headers).length > 0) payload.headers = headers
+
+    const body = bodyText.value.trim()
+    if (body !== '') payload.body = JSON.parse(body)
+  } else {
+    const positional = positionalValues.value.map((value) => value.trim()).filter((value) => value !== '')
+    if (positional.length > 0) values._positional = positional
+    if (Object.keys(values).length > 0) payload.args = values
+
+    const env: Record<string, string> = {}
+    for (const row of envRows.value) {
+      const key = row.key.trim()
+      if (key && row.value !== '') env[key] = row.value
+    }
+    if (Object.keys(env).length > 0) payload.env = env
+  }
+
+  const timeout = execTimeout.value.trim()
+  if (timeout !== '') payload.timeout = timeout
+  return payload
+}
+
 /** 空框时贴在 payload 输入区里的最小示例。textarea 的 placeholder 支持换行，
     用户照着改两个键就能提交，比在框外写一段说明更省事。 */
 const payloadPlaceholder = `{
@@ -85,6 +390,8 @@ watch(
 )
 
 const payloadError = computed(() => {
+  // 档位模式下 payload 文本框不参与提交（值由参数表单组装），那里的旧文本不该拦住提交按钮
+  if (profile.value) return null
   const text = form.payload.trim()
   if (text === '') return null
   try {
@@ -109,8 +416,43 @@ const canSubmit = computed(
     !nameMissing.value &&
     !triggerError.value &&
     !payloadError.value &&
+    executorErrors.value.every((error) => error === null) &&
     (props.mode === 'edit' || form.triggerMode !== 'cron' || form.cronExpr.trim() !== ''),
 )
+
+/**
+ * 任务类型下拉。
+ *
+ * 执行器档位按 GET /executors 的两条结论处理：
+ *   - 当前身份不够 required_role：整条不出现（入口体验，服务端 403 才是边界）；
+ *   - 档位在这台机器不可用：留着可见但选不动，标签直接写原因——
+ *     让人看见"配置里有但跑不了"比藏起来更有用，藏起来会让人以为配置没生效。
+ */
+const nameOptions = computed(() => {
+  const options: { value: string; label: string; disabled?: boolean }[] = [
+    { value: '', label: '请选择任务类型' },
+  ]
+  for (const name of props.jobTypes) {
+    const spec = profiles.value.find((item) => item.key === name)
+    if (!spec) {
+      options.push({ value: name, label: name })
+      continue
+    }
+    if (!canSubmitExecutor.value) continue
+    options.push({
+      value: name,
+      label: spec.runtime_ok ? `${name}（执行器档位）` : `${name}（不可用：${spec.reason}）`,
+      disabled: !spec.runtime_ok,
+    })
+  }
+  return options
+})
+
+const hiddenExecutorHint = computed(() => {
+  if (props.mode !== 'create') return null
+  if (!executorRequiredRole.value || canSubmitExecutor.value) return null
+  return `执行器档位（exec. 开头）需要 ${executorRequiredRole.value} 及以上才能提交，当前身份的下拉里没有它们。`
+})
 
 const groupOptions = computed(() => [
   { value: UNGROUPED, label: '未分组' },
@@ -118,9 +460,33 @@ const groupOptions = computed(() => [
 ])
 
 const parsedPayload = computed(() => {
+  if (profile.value) return buildExecutorPayload()
   const text = form.payload.trim()
   return text === '' ? undefined : (JSON.parse(text) as unknown)
 })
+
+function addEnvRow(): void {
+  envRows.value = [...envRows.value, { key: '', value: '' }]
+}
+
+function addHeaderRow(): void {
+  headerRows.value = [...headerRows.value, { key: '', value: '' }]
+}
+
+function dropRow(rows: 'env' | 'header', index: number): void {
+  if (rows === 'env') envRows.value = envRows.value.filter((_, i) => i !== index)
+  else headerRows.value = headerRows.value.filter((_, i) => i !== index)
+}
+
+// UiSelect 没有占位符参数（它自己的注释说明了为什么），所以"还没选键名"要显式给一个空值选项
+const envKeyOptions = computed(() => [
+  { value: '', label: '请选择变量名' },
+  ...(profile.value?.env_allow ?? []).map((name) => ({ value: name, label: name })),
+])
+const headerKeyOptions = computed(() => [
+  { value: '', label: '请选择头名' },
+  ...(profile.value?.header_allow ?? []).map((name) => ({ value: name, label: name })),
+])
 
 function submit(): void {
   if (!canSubmit.value) return
@@ -188,10 +554,15 @@ function createGroup(): void {
       v-if="mode === 'create'"
       label="任务名称（= 已注册的任务类型）"
       :model-value="form.name"
-      :options="[{ value: '', label: '请选择任务类型' }, ...jobTypes.map((name) => ({ value: name, label: name }))]"
+      :options="nameOptions"
       :disabled="busy"
       :error="nameMissing ? '必须选择一个任务类型' : null"
-      :hint="jobTypes.length === 0 ? '后端没有注册任何任务类型，先加载 handler 或检查 job 目录配置' : undefined"
+      :hint="
+        hiddenExecutorHint ??
+        (jobTypes.length === 0
+          ? '后端没有注册任何任务类型，先加载 handler 或检查 job 目录配置'
+          : undefined)
+      "
       @update:model-value="form.name = $event"
     />
     <div v-else class="flex flex-col gap-1.5">
@@ -268,7 +639,7 @@ function createGroup(): void {
     </fieldset>
 
     <div class="flex items-center justify-between">
-      <span class="text-sm font-medium text-[var(--color-text)]">payload 写什么</span>
+      <span class="text-sm font-medium text-[var(--color-text)]">{{ profile ? '档位参数' : 'payload 写什么' }}</span>
       <RouterLink
         :to="{ name: 'job-template' }"
         target="_blank"
@@ -279,14 +650,177 @@ function createGroup(): void {
       </RouterLink>
     </div>
 
-    <PayloadEditor
-      :model-value="form.payload"
-      :disabled="busy"
-      :error="payloadError"
-      :placeholder="payloadPlaceholder"
-      hint="合法 JSON，字段由该任务类型的 Handler 定义；留空表示不带 payload"
-      @update:model-value="form.payload = $event"
-    />
+    <!--
+      选中 exec.* 档位时，payload 的结构由档位声明决定，所以这里按 GET /executors 的规格生成输入项：
+      必填标记、默认值预填、格式提示都来自那份响应，前端不复制规则（TASK-E18 §3.3 第 1 条）。
+      组装出的 payload 顶层键固定是档位任务那几种（args / env / params / headers / body / timeout），
+      写错的键会在提交期被服务端整条拒掉，因此这里不给自由 JSON 入口。
+    -->
+    <template v-if="profile">
+      <p v-if="profileUnavailable" role="alert" class="rounded-[var(--radius-control)] border
+        border-[var(--color-status-failed)] bg-[#fef2f2] px-3 py-2 text-sm text-[var(--color-status-failed)]">
+        这台机器现在跑不了这个档位：{{ profileUnavailable }}。提交同样会被服务端拒，请先补上脚本或程序。
+      </p>
+
+      <p v-if="profile.has_secret_args" class="text-xs text-[var(--color-text-muted)]">
+        这个档位声明了 secret 参数：这类值在任务详情、列表与输出预览里都不会回显，
+        留空就表示这次不提交它（档位自己声明的默认值仍由后端使用）。
+      </p>
+
+      <div class="flex flex-col gap-3">
+        <UiInput
+          v-for="arg in profile.args"
+          :key="arg.name"
+          :label="`${arg.name}${arg.required ? '（必填）' : ''} · ${valueSection === 'params' ? 'URL 参数' : '命令行参数'}`"
+          :model-value="argValues[arg.name] ?? ''"
+          :type="arg.secret ? 'password' : 'text'"
+          :autocomplete="arg.secret ? 'new-password' : 'off'"
+          :disabled="busy"
+          :error="argDisplayError(arg.name)"
+          :hint="argHint(arg)"
+          @update:model-value="argValues[arg.name] = $event"
+        />
+        <p v-if="profile.args.length === 0" class="text-xs text-[var(--color-text-muted)]">
+          这个档位没有具名参数。
+        </p>
+      </div>
+
+      <!-- 位置参数只属于进程档位：http 的 payload 没有 args 这一层，后端会直接拒 -->
+      <fieldset v-if="profile.positional && profile.kind !== 'http'" class="flex flex-col gap-2">
+        <legend class="mb-1 text-sm font-medium text-[var(--color-text)]">
+          位置参数（最多 {{ profile.positional.max }} 个）
+        </legend>
+        <div v-for="(value, index) in positionalValues" :key="index" class="flex items-end gap-2">
+          <UiInput
+            :model-value="value"
+            :disabled="busy"
+            :placeholder="`第 ${index + 1} 个`"
+            @update:model-value="positionalValues[index] = $event"
+          />
+          <UiButton variant="ghost" size="sm" :disabled="busy" @click="dropPositional(index)">
+            <X :size="14" aria-hidden="true" />
+            移除
+          </UiButton>
+        </div>
+        <div class="self-start">
+          <UiButton
+            variant="ghost"
+            size="sm"
+            :disabled="busy || positionalValues.length >= profile.positional.max"
+            @click="positionalValues = [...positionalValues, '']"
+          >
+            <Plus :size="14" aria-hidden="true" />
+            加一个位置参数
+          </UiButton>
+        </div>
+        <p v-if="positionalError" class="text-xs text-[var(--color-status-failed)]">{{ positionalError }}</p>
+        <p v-else class="text-xs text-[var(--color-text-muted)]">
+          按顺序拼进命令行；格式：{{ profile.positional.pattern }}
+        </p>
+      </fieldset>
+
+      <fieldset v-if="profile.kind === 'http'" class="flex flex-col gap-2">
+        <legend class="mb-1 text-sm font-medium text-[var(--color-text)]">
+          请求头（只列档位允许的：{{ profile.header_allow?.length ? profile.header_allow.join('、') : '无' }}）
+        </legend>
+        <div v-for="(row, index) in headerRows" :key="`h${index}`" class="flex items-end gap-2">
+          <UiSelect
+            :model-value="row.key"
+            :options="headerKeyOptions"
+            :disabled="busy"
+            class="w-56"
+            @update:model-value="row.key = $event"
+          />
+          <UiInput
+            :model-value="row.value"
+            :disabled="busy"
+            placeholder="取值"
+            @update:model-value="row.value = $event"
+          />
+          <UiButton variant="ghost" size="sm" :disabled="busy" @click="dropRow('header', index)">
+            <X :size="14" aria-hidden="true" />
+          </UiButton>
+        </div>
+        <div class="self-start">
+          <UiButton variant="ghost" size="sm" :disabled="busy || !headerKeyOptions.length" @click="addHeaderRow">
+            <Plus :size="14" aria-hidden="true" />
+            加一个请求头
+          </UiButton>
+        </div>
+        <p v-if="headerError" class="text-xs text-[var(--color-status-failed)]">{{ headerError }}</p>
+      </fieldset>
+
+      <PayloadEditor
+        v-if="profile.kind === 'http' && profile.body_mode && profile.body_mode !== 'none'"
+        v-model="bodyText"
+        label="请求体"
+        :disabled="busy"
+        :error="bodyError"
+        :hint="
+          profile.body_mode === 'json'
+            ? '这个档位要求 JSON 对象或数组，Content-Type 会由执行器按 json 模式补上'
+            : '任意合法 JSON 值，按原样字节发送'
+        "
+      />
+
+      <fieldset v-if="profile.kind !== 'http'" class="flex flex-col gap-2">
+        <legend class="mb-1 text-sm font-medium text-[var(--color-text)]">
+          环境变量（只列档位允许的：{{ profile.env_allow.length ? profile.env_allow.join('、') : '无' }}）
+        </legend>
+        <div v-for="(row, index) in envRows" :key="`e${index}`" class="flex items-end gap-2">
+          <UiSelect
+            :model-value="row.key"
+            :options="envKeyOptions"
+            :disabled="busy"
+            class="w-56"
+            @update:model-value="row.key = $event"
+          />
+          <UiInput
+            :model-value="row.value"
+            :disabled="busy"
+            placeholder="取值"
+            @update:model-value="row.value = $event"
+          />
+          <UiButton variant="ghost" size="sm" :disabled="busy" @click="dropRow('env', index)">
+            <X :size="14" aria-hidden="true" />
+          </UiButton>
+        </div>
+        <div class="self-start">
+          <UiButton variant="ghost" size="sm" :disabled="busy || !envKeyOptions.length" @click="addEnvRow">
+            <Plus :size="14" aria-hidden="true" />
+            加一个环境变量
+          </UiButton>
+        </div>
+        <p v-if="envError" class="text-xs text-[var(--color-status-failed)]">{{ envError }}</p>
+      </fieldset>
+
+      <UiInput
+        label="单次执行超时（写进 payload）"
+        :model-value="execTimeout"
+        :disabled="busy"
+        :placeholder="`留空按档位默认 ${profile.timeout}`"
+        :error="execTimeoutError"
+        :hint="`生效区间：档位默认 ${profile.timeout}，全局上限 ${maxTimeout || '（后端没给）'}；超过上限的值会被夹到上限，所以这里直接拦住`"
+        @update:model-value="execTimeout = $event"
+      />
+    </template>
+
+    <template v-else>
+      <PayloadEditor
+        :model-value="form.payload"
+        :disabled="busy"
+        :error="payloadError"
+        :placeholder="payloadPlaceholder"
+        hint="合法 JSON，字段由该任务类型的 Handler 定义；留空表示不带 payload"
+        @update:model-value="form.payload = $event"
+      />
+
+      <p v-if="isExecutorJobEdit" class="text-xs text-[var(--color-text-muted)]">
+        这是执行器档位任务：上面里的 <code>***</code> 是后端掩码后的样子（档位声明为 secret 的那些参数），
+        不是任务原本的值。要改参数就把它改成真实取值再保存；只改时间或分组可以原样留着，
+        但保存后那份掩码会成为新的 payload。
+      </p>
+    </template>
 
     <div class="flex flex-col gap-2">
       <UiSelect
