@@ -62,6 +62,12 @@ type Server struct {
 	// 两个事件端点退回 history（即 S03 之前的行为）。
 	// 它定义在消费方而不是由 store/sqlite 传一个具体类型进来：api 包不许碰驱动。
 	events eventReader
+	// auditLog 是写操作台账的写入方；nil 表示这次部署没装配观测库（或关了审计子开关），
+	// 中间件退回只记一行结构化日志。它与 events 不同——那一个是读路径，这一个两端都用。
+	auditLog AuditRecorder
+	// auditRead 是台账的查询方，只给 GET /admin/audit 用。
+	// 它与 auditLog 分成两个字段而不是一个接口：装配方可以只给写不给读。
+	auditRead AuditReader
 	// console 是嵌入的前端产物根；nil 表示这次部署只提供 API（开发形态）。
 	// 它同时决定鉴权中间件是否豁免静态资源——登录页本身也是产物的一部分。
 	console fs.FS
@@ -206,6 +212,10 @@ func (s *Server) setupMiddleware() {
 	// 鉴权覆盖全部端点，含 /ws 与 /sse/events；预检请求已由上面的 CORS 短路。
 	// 未配置 token 时该中间件直接放行。
 	s.engine.Use(s.authMiddleware())
+
+	// 审计中间件在鉴权之后：身份是 authMiddleware 用 c.Set 放进去的，早于它就取不到 who。
+	// 代价是它自己拒掉的 401 不经过这里（那些尝试仍在访问日志里，见 api/audit.go 的注释）。
+	s.engine.Use(s.auditMiddleware())
 }
 
 func (s *Server) setupRoutes() {
@@ -286,6 +296,9 @@ func (s *Server) setupRoutes() {
 			admin.POST("/scheduler/suspend", s.SuspendScheduler)
 			admin.POST("/scheduler/unsuspend", s.UnsuspendScheduler)
 			admin.DELETE("/events", s.ClearEventHistory)
+			// 台账的读端点。档位沿用本组的 ops（行内含账号名与拒绝原因，
+			// 比运行诊断更敏感），没装配观测库时由 requireAudit 明确回 503。
+			admin.GET("/audit", s.requireAudit(), s.GetAudit)
 		}
 
 		// 统计与监控。/health 继续保持"启用鉴权则需凭据"的历史契约
