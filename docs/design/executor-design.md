@@ -46,8 +46,9 @@
 
 - D5 ⚠️ 整树终止：`executor/proc_unix.go` 的 `killTree`（`SysProcAttr{Setpgid:true}` + 进程组 TERM→宽限→KILL）与
   `executor/proc_windows.go` 的 `killTree`/`runTaskkill`。超时的生效值由 `executor/profile.go` 的 `effectiveTimeout`
-  合成（档位没写就用 `executors.default_timeout`，一律受 `max_timeout` 封顶）。**与原设计的差别**：超过
-  `max_timeout` 的请求在提交期被 `api/handlers.go` 的 `gateExecutorSubmission` 以 400 `invalid timeout` 拒掉，
+  合成（档位没写就用 `executors.default_timeout`，一律受 `max_timeout` 封顶）。**与原设计的差别**：
+  请求里带的 `timeout` 超过档位上限的，在提交期被 `api/handlers_executors.go` 的 `gateExecutorSubmission`
+  以 400 `invalid timeout` 拒掉，
   而不是"静默夹到上限后照常入队"——让调用方在提交时看到上限，比执行到一半被中止更好排查（TASK-E16）。
 - D6 ⚠️ 崩溃不重放：`cmd/server/main.go` 的 `installRestoreGuard`/`pauseRunningExecOnRestore` 决定装不装守卫
   （`enabled=false` 与 `restore_policy: replay` 都不装），改判动作在 `core/scheduler.go` 的 `SetRestoreGuard`
