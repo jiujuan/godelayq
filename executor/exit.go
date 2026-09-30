@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"strconv"
@@ -39,6 +40,20 @@ const (
 
 	// failureExitCode 进程自己以某个退出码结束（含 WaitDelay 强关管道之后拿到的退出码）。
 	failureExitCode
+
+	// failureHTTPStatus 是 http 档位拿到了响应、但状态码不在档位的 expect_status 里。
+	// 可重试与否按状态码判（见 classifyExit）：5xx 与 408/429 是对端暂时的问题，
+	// 其余 4xx 与 3xx 是请求本身或配置的问题，重跑只会拿到同一个码。
+	failureHTTPStatus
+
+	// failureAddressRefused 是拨号层按策略拒绝了解析出来的地址（回环、内网、链路本地等）。
+	// 算永久失败：策略不会自己变，重跑只会再拒一次，而且每一次都会白占一个执行名额。
+	failureAddressRefused
+
+	// failureTransport 是连接层失败：域名解析不出地址、TCP 连不上、TLS 握手不成、请求中途断开。
+	// 整类按可重试处理（卡片 §3.4）：这一层拿不到"对端明确拒绝"与"网络抖动"的区分依据，
+	// 而重试的代价只是一次新的请求，漏掉一次真实故障的代价是对端收不到回调。
+	failureTransport
 )
 
 // ExitError 是一次执行的失败结论。
@@ -148,27 +163,52 @@ func summaryPermanent(err error) bool {
 	return errors.As(err, &permanent) && permanent.Permanent()
 }
 
-// classifyExit 是卡片 §3.5 那张表的代码形式：给定失败类别与退出码，回答"重试有没有意义"。
+// classifyExit 是卡片 §3.5 那张表的代码形式：给定失败类别与那一次执行的数值结论，
+// 回答"重试有没有意义"。
 //
-// 全部执行路径的重试标记都从这里出（TASK-E12 §3.5），各分支不再手写布尔：
+// 全部执行路径的重试标记都从这里出（TASK-E12 §3.5、TASK-E15 §3.4），各分支不再手写布尔：
 // 漏写一处，"要不要重试"就取决于代码写到哪儿了，而重复执行的后果是外部副作用。
+//
+// code 的含义随类别切换，两张表共用一个函数正是 TASK-E15 §3.4 的要求（"不要两处各写一套"）：
+// failureExitCode 下它是进程退出码，failureHTTPStatus 下它是响应状态码。
+// 其余类别没有数值可言，传 0。
 //
 // 两条可重试的形：超时（含等不到并发许可）与档位显式声明过的退出码。
 // 默认不重试：非 0 退出多半是脚本自身或参数的问题，重跑只会把同样的错误再产生一遍，
 // 还可能把副作用（写数据、发请求）重复执行一次。要重试哪些退出码，由 retry_on_exit 显式列出。
+// retryOnExit 只对退出码那一支有意义：http 档位声明它属于进程类字段，配置阶段就会被拒。
 //
 // failureInterrupted 不在这张表里给出结论：取消与关停打断由调度器走 handleInterrupted，
 // 根本不读重试标记（表里那行"不适用"就是这个意思），这里的 Retryable 留假，
 // 免得同时读两个标记的代码把取消当成一次可重试的失败。
-func classifyExit(class failureClass, exitCode int, retryOnExit []int) bool {
+func classifyExit(class failureClass, code int, retryOnExit []int) bool {
 	switch class {
 	case failureTimeout, failurePermitWait:
 		return true
 	case failureExitCode:
-		return exitCodeIn(retryOnExit, exitCode)
+		return exitCodeIn(retryOnExit, code)
+	case failureHTTPStatus:
+		return httpStatusRetryable(code)
+	case failureTransport:
+		// DNS、TCP、TLS 这一层的失败没有"重试也不会变好"的依据可查，一律给一次机会
+		return true
 	default:
+		// 提交非法、档位不可用、环境不允许、地址被策略拒掉、被打断：都不重试
 		return false
 	}
+}
+
+// httpStatusRetryable 判断"这个响应状态码再试一次有没有意义"。
+//
+// 5xx 与 408/429 之外一律不重试。429 单列出来是因为它属于 4xx 却明确表示"过一会儿再来"，
+// 408 同理（请求超时）；其余 4xx 是请求本身的问题，改 payload 之前重跑不会变。
+// 3xx 不在这里放行：档位不跟随重定向（max_redirects 恒为 0，E02 已校验），
+// 重定向目标由对端决定，再试一次只会拿到同一个 3xx。
+func httpStatusRetryable(status int) bool {
+	if status == http.StatusRequestTimeout || status == http.StatusTooManyRequests {
+		return true
+	}
+	return status >= 500
 }
 
 // exitCodeIn 判断退出码是否被档位显式列入可重试。
@@ -201,6 +241,25 @@ func newFailure(p *Profile, class failureClass, exitCode int, reason string, det
 		Cancelled: class == failureInterrupted,
 	}
 	failure.Retryable = classifyExit(class, exitCode, p.RetryOnExit)
+	return failure
+}
+
+// newStatusFailure 造 http 侧的失败结论。
+//
+// 不复用 newFailure 的 exitCode 位置：那个值会进摘要的 exit_code 字段，
+// 把响应状态码 502 写成"进程退出码 502"是一条假信息（摘要里 HTTPStatus 才是它的位置）。
+// 重试标记仍然读 classifyExit 那同一张表，只是把状态码作为数值结论交进去。
+//
+// 三个 http 类别（状态码不符、地址被拒、连接层失败）都不涉及超时与取消，
+// 因此这里不填 TimedOut/Cancelled——那两条在 http 通路上走 newFailure 的
+// failureTimeout / failureInterrupted，与进程路径同一个类别。
+func newStatusFailure(p *Profile, class failureClass, status int, reason string, detail error) *ExitError {
+	failure := &ExitError{
+		Profile:   p.Name,
+		Reason:    reason,
+		Detail:    detail,
+		Retryable: classifyExit(class, status, nil),
+	}
 	return failure
 }
 
