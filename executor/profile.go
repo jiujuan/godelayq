@@ -134,6 +134,20 @@ func (p *Profile) Arg(name string) (ArgSpec, bool) {
 	return ArgSpec{}, false
 }
 
+// HasSecretArgs 判断档位是否声明了至少一个 secret 参数。
+//
+// 读取接口用它决定两件事：要不要掩码，以及结果端点要不要把档位从 reader 收严
+// （TASK-E16 §3.3）。判据只看声明，不看某一次提交有没有真的传了值——
+// 收严档位是给"这个档位可能带凭据"这一类任务用的，不该随 payload 变。
+func (p *Profile) HasSecretArgs() bool {
+	for _, a := range p.Args {
+		if a.Secret {
+			return true
+		}
+	}
+	return false
+}
+
 // ProgramDisplay 返回给接口与日志看的程序写法：相对 workspace 的路径优先，
 // 其次是 PATH 程序名。绝对路径不外露，避免把服务器目录结构透给前端。
 func (p *Profile) ProgramDisplay() string {
@@ -939,8 +953,9 @@ func relativeTo(workspace, absolute string) string {
 
 // ValidatePayloadKeys 检查 payload 里出现的顶层键是否属于该档位。
 //
-// 本方法只看键名，值本身的校验属于 E08。有了它，E16/E17 即使不接执行逻辑，
-// 也能拒掉 {"cmd":"ls"} 这类明显越界的提交。
+// 本方法只看键名，值本身的校验属于 E08，因此提交路径用的是 ValidateSubmission
+// （它内部调本方法再往下走值检查）。单列出来是给只需要键名的调用方用的：
+// 错误文案要列出"这个档位接受哪几个键"，而那与执行逻辑无关。
 func (p *Profile) ValidatePayloadKeys(keys []string) error {
 	var allowed []string
 	switch p.Kind {

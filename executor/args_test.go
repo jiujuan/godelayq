@@ -512,3 +512,102 @@ func mustJSON(t *testing.T, value any) []byte {
 	require.NoError(t, err)
 	return encoded
 }
+
+// maskScriptCommand 是一条脚本档位：参数由调用方给，渲染模板跟着参数生成，
+// 这样同一段测试可以只换参数声明而不碰档位形状。
+func maskScriptCommand(args ...core.ExecutorArg) core.ExecutorCommand {
+	render := make([]string, 0, len(args))
+	for _, arg := range args {
+		render = append(render, "--"+arg.Name+"={"+arg.Name+"}")
+	}
+	return core.ExecutorCommand{
+		Name:       "masked_report",
+		Kind:       "script",
+		Runtime:    "node",
+		Script:     "scripts/report.mjs",
+		Args:       args,
+		ArgsRender: render,
+		EnvAllow:   []string{"TOKEN", "TRACE_ID"},
+		Timeout:    time.Minute,
+	}
+}
+
+// maskHTTPCommand 是同一形状的 http 档位（探测恒为可用，本组用例不需要真实网络）。
+func maskHTTPCommand(args ...core.ExecutorArg) core.ExecutorCommand {
+	return core.ExecutorCommand{
+		Name:         "masked_hook",
+		Kind:         "http",
+		Method:       "GET",
+		Body:         "none",
+		URLTemplate:  "https://api.internal/hooks",
+		AllowedHosts: []string{"api.internal"},
+		Args:         args,
+		Timeout:      time.Minute,
+	}
+}
+
+// TestMaskPayload 是 TASK-E16 §3.3 的纯函数部分：secret 参数的值换成 ***，其余原样。
+//
+// 四个读取接口共用这一个函数，所以命中规则与两条降级都在这里判；
+// api 侧的用例只验"响应里确实没有明文"。
+func TestMaskPayload(t *testing.T) {
+	secret := core.ExecutorArg{Name: "token", Required: true, Secret: true}
+	plain := core.ExecutorArg{Name: "day", Pattern: `^\d{4}-\d{2}-\d{2}$`}
+
+	t.Run("脚本档位掩掉 args 与 env 里同名的键", func(t *testing.T) {
+		profile, _ := loadOneProfile(t, maskScriptCommand(secret, plain))
+
+		masked := profile.MaskPayload([]byte(
+			`{"args":{"token":"pa55word","day":"2026-09-30"},"env":{"ToKeN":"another","TRACE_ID":"keep"}}`))
+		text := string(masked)
+		assert.NotContains(t, text, "pa55word")
+		assert.NotContains(t, text, "another", "环境变量名与参数名大小写不同也算同一个键")
+		assert.Contains(t, text, `"day":"2026-09-30"`, "非 secret 参数原样给出")
+		assert.Contains(t, text, `"TRACE_ID":"keep"`)
+		assert.Contains(t, text, `"token":"***"`)
+	})
+
+	t.Run("http 档位掩掉 params 与 headers 里同名的键", func(t *testing.T) {
+		profile, _ := loadOneProfile(t, maskHTTPCommand(secret))
+
+		masked := profile.MaskPayload([]byte(
+			`{"params":{"token":"pa55word"},"headers":{"Token":"header-secret","X-Trace":"keep"}}`))
+		text := string(masked)
+		assert.NotContains(t, text, "pa55word")
+		assert.NotContains(t, text, "header-secret")
+		assert.Contains(t, text, `"X-Trace":"keep"`)
+		assert.Contains(t, text, `"token":"***"`)
+	})
+
+	t.Run("字段不是对象时整个字段掩码", func(t *testing.T) {
+		profile, _ := loadOneProfile(t, maskScriptCommand(secret))
+
+		// 数组与字符串里看不出哪个值是凭据，只好整段不给看（§5.6 要求的降级）
+		masked := profile.MaskPayload([]byte(`{"args":["one","two"],"timeout":"5s"}`))
+		assert.Equal(t, `{"args":"***","timeout":"5s"}`, string(masked), "键序按字典序稳定给出")
+		assert.NotContains(t, string(masked), "one")
+	})
+
+	t.Run("payload 整体读不出来时只留一句掩码", func(t *testing.T) {
+		profile, _ := loadOneProfile(t, maskScriptCommand(secret))
+
+		for _, input := range []string{`"just a string"`, `[1,2]`, `not json at all`} {
+			masked := profile.MaskPayload([]byte(input))
+			assert.JSONEq(t, `{"masked":"***"}`, string(masked), "输入 %q 必须整体降级", input)
+		}
+	})
+
+	t.Run("没命中时一个字节都不改", func(t *testing.T) {
+		withoutSecret, _ := loadOneProfile(t, maskHTTPCommand(plain))
+		raw := []byte(`{"params":{"day":"2026-09-30"},"body":{"nested":[1,2,3]}}`)
+		assert.Equal(t, raw, withoutSecret.MaskPayload(raw), "档位没声明 secret 就原样返回")
+
+		withSecret, _ := loadOneProfile(t, maskHTTPCommand(secret))
+		absent := []byte(`{"params":{"other":"value"}}`)
+		assert.Equal(t, absent, withSecret.MaskPayload(absent), "payload 里没有那个键时同样不动")
+
+		// 空 payload 与 null 没有可泄露的内容
+		assert.Empty(t, withSecret.MaskPayload(nil))
+		assert.Equal(t, []byte("null"), withSecret.MaskPayload([]byte("null")))
+	})
+}

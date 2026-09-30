@@ -662,3 +662,133 @@ func jsonKindName(raw json.RawMessage) string {
 		return "an unusable value"
 	}
 }
+
+// maskablePayloadFields 是掩码要看的四个字段。args 与 params 是同一性质的两半
+// （脚本 / 二进制档位用前者，http 档位用后者），headers 与 env 是 payload 覆盖配置的那两个入口。
+var maskablePayloadFields = []string{"args", "params", "headers", "env"}
+
+const (
+	// maskedValueText 是掩码后的取值。定长、与实际值长度无关，
+	// 读接口的人不会从"*** 有多长"猜出口令的规模。
+	maskedValueText = `"***"`
+	// maskedPayloadText 是整份 payload 结构读不出来时的替身：
+	// 那种输入本身就可能是凭据，"解析失败就原样返回"等于把默认方向设成泄露。
+	maskedPayloadText = `{"masked":"***"}`
+)
+
+var (
+	maskedValueRaw   = json.RawMessage(maskedValueText)
+	maskedPayloadRaw = json.RawMessage(maskedPayloadText)
+)
+
+// MaskPayload 把 payload 里那些属于 secret 参数的值替换成掩码文本（TASK-E16 §3.3）。
+//
+// 只给输出层用：执行侧与 jobs.json 读到的仍是原文，本函数不改动任何存储内容
+// （§3.3 第 3 条明确"掩码只在响应"，把它当成加密会误导后来者）。
+//
+// 命中规则：
+//   - args、params 按参数名命中档位里 secret 的那几个；
+//   - headers、env 只有与某个 secret 参数同名的项才掩码。同名比较不区分大小写，
+//     并把连字符与下划线视为同一个分隔符——HTTP 头名习惯写 X-Api-Key，
+//     参数名习惯写 api_key，两者指的是同一个凭据。
+//
+// 降级两条（卡片 §5.6 要求覆盖）：某个字段不是对象时整个字段值换成掩码；
+// payload 整体不是对象时换成 {"masked":"***"}。没有 secret 声明的档位原样返回。
+func (p *Profile) MaskPayload(payload []byte) []byte {
+	wanted := p.foldedSecretArgNames()
+	if len(wanted) == 0 {
+		return payload
+	}
+
+	trimmed := bytes.TrimSpace(payload)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		// 没有内容，也就没有可泄露的东西
+		return payload
+	}
+
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &fields); err != nil {
+		return maskedPayloadRaw
+	}
+
+	var masked bool
+	for _, field := range maskablePayloadFields {
+		raw, present := fields[field]
+		if !present {
+			continue
+		}
+		replacement, changed, unreadable := maskPayloadField(raw, wanted)
+		switch {
+		case unreadable:
+			fields[field] = maskedValueRaw
+			masked = true
+		case changed:
+			fields[field] = replacement
+			masked = true
+		}
+	}
+	if !masked {
+		// 一个都没命中：原样给出，免得把数字精度与键序按我们这边的规则重排一遍
+		return payload
+	}
+
+	encoded, err := json.Marshal(fields)
+	if err != nil {
+		// 只可能是"某个字段的原文不是合法 JSON"，而这种输入已经该整体降级
+		return maskedPayloadRaw
+	}
+	return encoded
+}
+
+// maskPayloadField 掩掉一个字段里命中 secret 参数名的取值。
+//
+// changed 为 false 表示这个字段里没有要掩的键；
+// unreadable 为 true 表示字段不是对象，调用方要把整个字段换成掩码——
+// 数组与字符串里的位置看不出哪个是凭据，只好整段不给看。
+func maskPayloadField(raw json.RawMessage, wanted map[string]bool) (replacement json.RawMessage, changed, unreadable bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || trimmed[0] != '{' {
+		return nil, false, true
+	}
+
+	var values map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &values); err != nil {
+		return nil, false, true
+	}
+
+	for name := range values {
+		if wanted[foldArgName(name)] {
+			values[name] = maskedValueRaw
+			changed = true
+		}
+	}
+	if !changed {
+		return nil, false, false
+	}
+
+	encoded, err := json.Marshal(values)
+	if err != nil {
+		return nil, false, true
+	}
+	return encoded, true, false
+}
+
+// foldedSecretArgNames 返回这个档位 secret 参数的归一化名集合，没有 secret 参数时为 nil。
+func (p *Profile) foldedSecretArgNames() map[string]bool {
+	var names map[string]bool
+	for _, spec := range p.Args {
+		if !spec.Secret {
+			continue
+		}
+		if names == nil {
+			names = make(map[string]bool, len(p.Args))
+		}
+		names[foldArgName(spec.Name)] = true
+	}
+	return names
+}
+
+// foldArgName 把参数名、HTTP 头名与环境变量名折成同一种写法用于比较。
+func foldArgName(name string) string {
+	return strings.ReplaceAll(strings.ToLower(name), "-", "_")
+}
