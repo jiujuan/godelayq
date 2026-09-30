@@ -105,6 +105,11 @@ type Scheduler struct {
 	// inFlight 已进入 Handler 执行、尚未返回的任务数，供统计接口读取
 	inFlight atomic.Int32
 
+	// restoreGuard 是崩溃恢复的状态改判钩子（TASK-E14），受 s.mu 保护。
+	// 放在调度器而不是调用方：判断"崩溃瞬间在跑的执行器任务要不要停住"要读注册表里的类别，
+	// 而注册表只有调度器握着。
+	restoreGuard RestoreGuard
+
 	eventBus *EventBus // 新增
 
 	// logger 结构化日志器，构造后不再变更；未注入时为 slog.Default()
@@ -271,6 +276,20 @@ func (s *Scheduler) classOfKey(key string) JobClass {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.handlerClasses[key]
+}
+
+// HandlerClass 查某个注册键声明的执行类别，第二个返回值表示这个键有没有登记过。
+//
+// 给装配方用（TASK-E14 的崩溃守卫要按类别决定"结果未知的任务停不停住"）。
+// 与内部用的 classOfKey 差在那条 bool 上：调用方必须能区分"注册过、属于普通池"
+// 与"根本没注册过"。档位被删掉之后它的历史任务就落在后者，
+// 这时候按"不知道"处理比按"普通任务"处理更诚实——恢复策略因此选择照常重排，
+// 而那次重排在 executeJob 里会因找不到处理函数直接判失败，不会真的重复产生副作用。
+func (s *Scheduler) HandlerClass(key string) (JobClass, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	class, ok := s.handlerClasses[key]
+	return class, ok
 }
 
 // LookupHandler 按 Handler 键（Type 优先，回退 Name）查找已注册的处理函数。
@@ -854,10 +873,54 @@ func (s *Scheduler) applyGroupToSnapshot(snap JobSnapshot, toGroup string) (bool
 	return true, nil
 }
 
+// RestoreGuard 在 Restore 逐个处理快照时被调用，用来改判"崩溃瞬间的状态"。
+//
+// hold 为 true 表示这条任务不进堆，按 newStatus 落盘并留在存储里等人处理；
+// 为 false 时 Restore 的行为与本钩子存在之前一字不差（复位为 pending 并重新排期）。
+//
+// 现在的用法只有一种（TASK-E14）：崩溃时状态仍是 running 的执行器任务停在 paused 上。
+// 这类快照的含义是"进程已经起来过、结果未知"——被强杀的进程来不及写任何结论，
+// 自动再跑一遍等于替用户决定"重复执行的后果可以接受"。
+//
+// 注意与优雅关闭的区别，别看名字猜：正常停服走的是 handleInterrupted，
+// 它把被打断的任务落成 pending，因此下一次 Start 会照常重跑。
+// 只有崩溃/强杀才会留下 running 快照，才会被这里停住。
+type RestoreGuard func(snap JobSnapshot) (newStatus JobStatus, hold bool)
+
+// RestoreReasonAfterCrash 是钩子改判时写进暂停事件的来源标记。
+// 控制台的时间线与暂停提示按它区分"崩溃后停住"与"人手停住"，
+// 少了这个来源，运维看到一批 paused 只会以为是系统故障。
+const RestoreReasonAfterCrash = "restore_after_crash"
+
+// SetRestoreGuard 安装崩溃恢复改判钩子，需在 Start 之前调用（Start 会立刻跑一次 Restore）。
+// Start 之后调用不生效并记录日志——这时改判时机已经过去了。
+// 传入 nil 表示撤掉钩子，恢复默认行为。
+func (s *Scheduler) SetRestoreGuard(g RestoreGuard) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.running {
+		s.logger.Warn("SetRestoreGuard ignored: scheduler already running")
+		return
+	}
+	s.restoreGuard = g
+}
+
+// restoreGuardFn 在锁里取一次钩子，返回之后再调用它：
+// 钩子自己可能回头查注册表（HandlerClass 要拿 s.mu），持锁调用会撞上自己。
+func (s *Scheduler) restoreGuardFn() RestoreGuard {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.restoreGuard
+}
+
 // Restore 从持久化存储重建调度队列（崩溃/重启恢复）。
 // 快照中仅 Pending/Running 状态的任务会被重新入队，状态重置为 Pending；
 // 终态留痕与 paused 任务都不入队——暂停是人为决定，重启不该替用户取消它。
 // Handler 在执行前按 HandlerKey 从注册表绑定。
+//
+// 装了 RestoreGuard 时，钩子可以拦住其中一部分任务不入队（见 RestoreGuard 与 TASK-E14）。
+// 复位为 pending 这条默认规则只对"崩溃时还没开始执行"与"优雅关闭被打断"成立；
+// 正常停服的重跑路径不经过这里的状态改判。
 func (s *Scheduler) Restore() error {
 	if s.store == nil {
 		return nil
@@ -868,6 +931,7 @@ func (s *Scheduler) Restore() error {
 	}
 
 	restored := 0
+	held := 0
 	for _, snap := range snapshots {
 		// 存储现在同时保存终态留痕，恢复时只关心未完成的任务
 		status := JobStatus(snap.Status)
@@ -889,6 +953,15 @@ func (s *Scheduler) Restore() error {
 		// 类别不在快照里，按注册表重新盖章：Start 之前处理函数已经注册完，
 		// 恢复出来的执行器任务因此照样落在自己的池里。
 		job.class = s.classOfKey(job.HandlerKey())
+
+		// 改判发生在入堆之前：一旦进了堆就可能被 worker 取走，那时再停它要走取消。
+		// LoadAll 给的是新切片，钩子期间没有持任何锁，因此它可以回头查注册表。
+		if newStatus, hold := s.askRestoreGuard(snap); hold {
+			s.holdRestored(job, newStatus)
+			held++
+			continue
+		}
+
 		// TriggerAt 已过期的任务直接入队，由调度循环立即补跑
 		s.heap.PushItem(job)
 		restored++
@@ -896,7 +969,73 @@ func (s *Scheduler) Restore() error {
 	if restored > 0 {
 		s.logger.Info("restored jobs from store", "count", restored)
 	}
+	if held > 0 {
+		// 数量在这里给一次汇总：逐条的 job paused 日志在几十条崩溃现场里读不出规模，
+		// 而 /stats 的 paused 计数混着人为暂停，看不出这一次重启新停了多少。
+		s.logger.Info("paused executor jobs after crash", "count", held,
+			"reason", RestoreReasonAfterCrash)
+	}
 	return nil
+}
+
+// askRestoreGuard 调用装配方装的改判钩子。
+//
+// 钩子 panic 时按"不改判"处理并记 error：Restore 正在逐个处理快照，
+// 让一条钩子把整轮恢复打断，会让排在后面的任务既不重排也不改判——
+// 那比多跑一次更难解释。
+func (s *Scheduler) askRestoreGuard(snap JobSnapshot) (status JobStatus, hold bool) {
+	guard := s.restoreGuardFn()
+	if guard == nil {
+		return 0, false
+	}
+
+	defer func() {
+		if r := recover(); r != nil {
+			s.logger.Error("restore guard panicked, job keeps the default restore result",
+				"job_id", snap.ID, "panic", r)
+			status, hold = 0, false
+		}
+	}()
+
+	return guard(snap)
+}
+
+// holdRestored 把改判后的任务落盘并发布事件，它不进堆。
+//
+// 落盘失败的后果是"下次启动再判一次"（存储里还是 running 快照），可接受，
+// 但必须留下日志：这条任务本进程已经不执行了，存储与内存此刻不一致。
+// 事件按 newStatus 分派：改判成 paused 才发 job.paused，
+// 改判成别的状态时发暂停事件就是在说谎，那种用法将来要另配事件类型。
+func (s *Scheduler) holdRestored(job *Job, newStatus JobStatus) {
+	job.Status = newStatus
+	job.UpdatedAt = time.Now()
+
+	if s.store != nil {
+		if err := s.store.Update(job.ToSnapshot()); err != nil {
+			s.logger.Error("failed to persist the restored job status",
+				"job_id", job.ID, "status", newStatus, "error", err)
+		}
+	}
+
+	if newStatus != StatusPaused {
+		s.logger.Warn("restored job held out of the queue without a matching event",
+			"job_id", job.ID, "status", newStatus)
+		return
+	}
+
+	s.eventBus.Publish(Event{
+		Type:      EventJobPaused,
+		JobID:     job.ID,
+		JobName:   job.Name,
+		Status:    StatusPaused,
+		Timestamp: time.Now(),
+		Metadata: map[string]interface{}{
+			"reason":     RestoreReasonAfterCrash,
+			"forced":     true,
+			"trigger_at": job.TriggerAt,
+			"attempts":   job.Attempts,
+		},
+	})
 }
 
 // RunningCount 返回正在执行（已进入 Handler）的任务数。

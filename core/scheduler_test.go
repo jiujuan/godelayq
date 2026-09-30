@@ -14,6 +14,7 @@ type mockStore struct {
 	jobs        map[string]JobSnapshot
 	saveErr     error
 	loadErr     error
+	updateErr   error
 	saveCalls   int
 	deleteCalls int
 }
@@ -38,6 +39,9 @@ func (m *mockStore) Save(job *Job) error {
 func (m *mockStore) Update(snapshot JobSnapshot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.updateErr != nil {
+		return m.updateErr
+	}
 	m.jobs[snapshot.ID] = snapshot
 	return nil
 }

@@ -240,6 +240,18 @@ type JobSnapshot struct {
 	Exec *ExecMeta `json:"exec,omitempty"`
 }
 
+// HandlerKey 返回这条快照对应的注册键：规则与 Job.HandlerKey 一致（Type 优先，回退 Name）。
+//
+// 钩子与恢复路径手上只有快照、没有 Job，规则却必须与入堆时那次查表完全相同，
+// 否则同一个任务在"排期时算执行器任务、恢复时算普通任务"。
+// 两份实现只差在接收者类型上，改一处要同时改另一处。
+func (sn *JobSnapshot) HandlerKey() string {
+	if sn.Type != "" {
+		return sn.Type
+	}
+	return sn.Name
+}
+
 // ToSnapshot 转换为可持久化格式
 func (j *Job) ToSnapshot() JobSnapshot {
 	return JobSnapshot{
