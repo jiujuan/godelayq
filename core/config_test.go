@@ -196,6 +196,12 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	t.Setenv("GODELAYQ_STORE_GROUPS_PATH", "./data/groups-alt.json")
 	t.Setenv("GODELAYQ_LOGGING_LEVEL", "error")
 	t.Setenv("GODELAYQ_LOGGING_FORMAT", "json")
+	// 观测层：最后一项是嵌套键，用来证明点号路径的绑定对子节同样生效——
+	// BindEnv 列表里漏一项或写错一个点号都不会让别的东西失败，只有这里会没断言到。
+	t.Setenv("GODELAYQ_OBSERVABILITY_ENABLED", "true")
+	t.Setenv("GODELAYQ_OBSERVABILITY_PATH", "./data/observe-env.sqlite")
+	t.Setenv("GODELAYQ_OBSERVABILITY_FLUSH_INTERVAL", "1s")
+	t.Setenv("GODELAYQ_OBSERVABILITY_AUDIT_RETENTION_AGE", "168h")
 
 	cfg, err := LoadConfig(path)
 	require.NoError(t, err)
@@ -209,6 +215,12 @@ func TestLoadConfig_EnvOverrides(t *testing.T) {
 	assert.Equal(t, "./data/groups-alt.json", cfg.Store.GroupsPath)
 	assert.Equal(t, "error", cfg.Logging.Level)
 	assert.Equal(t, "json", cfg.Logging.Format)
+	assert.True(t, cfg.Observability.Enabled)
+	assert.Equal(t, "./data/observe-env.sqlite", cfg.Observability.Path)
+	assert.Equal(t, time.Second, cfg.Observability.FlushInterval)
+	assert.Equal(t, 168*time.Hour, cfg.Observability.Audit.RetentionAge,
+		"observability.audit.retention_age 的嵌套键绑定")
+	assert.Equal(t, DefaultObserveEventRetentionAge, cfg.Observability.Events.RetentionAge, "未被覆盖的键保持默认值")
 }
 
 func TestConfig_Normalized(t *testing.T) {
@@ -619,4 +631,155 @@ func TestLoadConfig_RejectsUnknownExecutorsKeys(t *testing.T) {
 	_, err = LoadConfig(writeConfigFile(t, "executors:\n  commands:\n    - nmae: nightly\n"))
 	require.Error(t, err, "档位内部的未知键也必须报错")
 	assert.Contains(t, err.Error(), "nmae")
+}
+
+func TestObservabilityDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+
+	assert.False(t, cfg.Observability.Enabled, "观测层必须默认关闭：打开它才会创建库文件并订阅事件总线")
+	assert.Equal(t, DefaultObservePath, cfg.Observability.Path)
+	assert.Equal(t, DefaultFlushInterval, cfg.Observability.FlushInterval, "与任务快照的合并周期同一口径")
+	assert.Equal(t, DefaultObserveQueueCapacity, cfg.Observability.QueueCapacity)
+	assert.Equal(t, DefaultObserveBusyTimeout, cfg.Observability.BusyTimeout)
+	assert.Equal(t, "normal", cfg.Observability.Synchronous)
+	assert.True(t, cfg.Observability.Events.Enabled)
+	assert.Equal(t, DefaultObserveEventRetentionCount, cfg.Observability.Events.RetentionCount)
+	assert.Equal(t, 720*time.Hour, cfg.Observability.Events.RetentionAge)
+	assert.True(t, cfg.Observability.Artifacts.Enabled)
+	assert.True(t, cfg.Observability.Audit.Enabled)
+	assert.Equal(t, DefaultObserveAuditRetentionCount, cfg.Observability.Audit.RetentionCount)
+	assert.Equal(t, 2160*time.Hour, cfg.Observability.Audit.RetentionAge)
+
+	assert.NoError(t, cfg.Validate())
+
+	normalized := cfg.Normalized()
+	assert.Equal(t, cfg.Observability, normalized.Observability, "默认值经归一化不应发生变化")
+
+	// 零值配置补齐后，除"0 有含义"的保留时长外都应回到默认值。
+	// retention_age 的 0 表示不按时间淘汰，与 store.history_ttl、executors.output.ttl 同一读法，
+	// 因此代码里构造的零值配置不会被补成 720h/2160h——那是显式选择，不是缺省。
+	zero := Config{}.Normalized().Observability
+	assert.Equal(t, DefaultObservePath, zero.Path)
+	assert.Equal(t, DefaultObserveFlushInterval, zero.FlushInterval)
+	assert.Equal(t, DefaultObserveQueueCapacity, zero.QueueCapacity, "队列容量没有 0 这种取值，零值回到默认")
+	assert.Equal(t, DefaultObserveBusyTimeout, zero.BusyTimeout)
+	assert.Equal(t, DefaultObserveSynchronous, zero.Synchronous)
+	assert.Equal(t, DefaultObserveEventRetentionCount, zero.Events.RetentionCount)
+	assert.Zero(t, zero.Events.RetentionAge)
+	assert.Equal(t, DefaultObserveAuditRetentionCount, zero.Audit.RetentionCount)
+	assert.Zero(t, zero.Audit.RetentionAge)
+
+	// 默认值必须是"打开总开关就能直接用"的，否则默认配置本身有毛病
+	enabled := cfg
+	enabled.Observability.Enabled = true
+	assert.NoError(t, enabled.Validate())
+}
+
+func TestObservabilityValidateRejectsBadValues(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"empty path", "observability:\n  enabled: true\n  path: \"   \"\n", "observability.path must not be empty"},
+		{"bad synchronous", "observability:\n  enabled: true\n  synchronous: off\n", `observability.synchronous "off" is invalid, use normal or full`},
+		{"negative flush interval", "observability:\n  enabled: true\n  flush_interval: -1s\n", "observability.flush_interval must not be negative"},
+		{"flush interval below batch floor", "observability:\n  enabled: true\n  flush_interval: 1ms\n", "observability.flush_interval"},
+		{"negative busy timeout", "observability:\n  enabled: true\n  busy_timeout: -1s\n", "observability.busy_timeout must not be negative"},
+		{"zero queue capacity", "observability:\n  enabled: true\n  queue_capacity: 0\n", "observability.queue_capacity must be positive"},
+		{"negative queue capacity", "observability:\n  enabled: true\n  queue_capacity: -1\n", "observability.queue_capacity must be positive"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := LoadConfig(writeConfigFile(t, tc.yaml))
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.want, "错误信息里要带上被拒的键名，便于运维定位")
+		})
+	}
+
+	// 低于批量下限的取值，报错里要给出建议值，否则运维只能再去翻代码
+	_, err := LoadConfig(writeConfigFile(t, "observability:\n  enabled: true\n  flush_interval: 5ms\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "one transaction per record")
+	assert.Contains(t, err.Error(), DefaultObserveFlushInterval.String())
+}
+
+func TestObservabilityIgnoredWhenDisabled(t *testing.T) {
+	// 关闭总开关时上面每一条非法取值都不该报错：默认部署不该被要求抄一遍完整配置，
+	// 也不该因为一节不生效的取值而起不来。这是"默认关闭 = 行为零变化"的守卫。
+	cfg, err := LoadConfig(writeConfigFile(t, `
+observability:
+  enabled: false
+  path: "  "
+  synchronous: off
+  flush_interval: 1ms
+  busy_timeout: -1s
+  queue_capacity: 0
+  events:
+    enabled: true
+    retention_count: -5
+    retention_age: -1h
+  artifacts:
+    enabled: true
+  audit:
+    enabled: true
+    retention_count: -1
+    retention_age: -1h
+`))
+	require.NoError(t, err)
+	assert.False(t, cfg.Observability.Enabled)
+
+	// 子节的开关在总开关关闭时同样只是"没有读取方"，不报错
+	cfg.Observability.Events.Enabled = false
+	cfg.Observability.Artifacts.Enabled = false
+	cfg.Observability.Audit.Enabled = false
+	assert.NoError(t, cfg.Validate())
+}
+
+func TestObservabilityPartialOverride(t *testing.T) {
+	cfg, err := LoadConfig(writeConfigFile(t, `
+observability:
+  enabled: true
+  path: /var/lib/godelayq/observe.sqlite
+  audit:
+    retention_age: 30h
+`))
+	require.NoError(t, err)
+
+	assert.True(t, cfg.Observability.Enabled)
+	assert.Equal(t, "/var/lib/godelayq/observe.sqlite", cfg.Observability.Path)
+	assert.Equal(t, 30*time.Hour, cfg.Observability.Audit.RetentionAge)
+
+	assert.Equal(t, DefaultObserveFlushInterval, cfg.Observability.FlushInterval, "未配的键保持默认值")
+	assert.Equal(t, DefaultObserveQueueCapacity, cfg.Observability.QueueCapacity)
+	assert.Equal(t, DefaultObserveBusyTimeout, cfg.Observability.BusyTimeout)
+	assert.Equal(t, DefaultObserveSynchronous, cfg.Observability.Synchronous)
+	assert.Equal(t, DefaultObserveEventRetentionCount, cfg.Observability.Events.RetentionCount)
+	assert.Equal(t, DefaultObserveEventRetentionAge, cfg.Observability.Events.RetentionAge)
+	assert.True(t, cfg.Observability.Events.Enabled)
+	assert.True(t, cfg.Observability.Artifacts.Enabled)
+	assert.True(t, cfg.Observability.Audit.Enabled)
+
+	// 显式写了值的部分，归一化不能再改动
+	normalized := cfg.Normalized().Observability
+	assert.Equal(t, 30*time.Hour, normalized.Audit.RetentionAge)
+	assert.Equal(t, "/var/lib/godelayq/observe.sqlite", normalized.Path)
+
+	// retention_age 写 0 是"不按时间淘汰"的有意取值，归一化必须放过
+	off, err := LoadConfig(writeConfigFile(t, "observability:\n  enabled: true\n  events:\n    retention_age: 0s\n"))
+	require.NoError(t, err)
+	assert.Zero(t, off.Normalized().Observability.Events.RetentionAge)
+}
+
+// TestLoadConfig_RejectsUnknownObservabilityKeys 守的是拼错的键：写进来必须启动失败，
+// 而不是静默用着默认值。判据来自 LoadConfig 里的 v.UnmarshalExact（按 Config 结构体有无对应字段），
+// 与 core/config.go 里那份 BindEnv 列表无关——BindEnv 漏项不会报错，只让环境变量无效，
+// 那条由 TestLoadConfig_EnvOverrides 里的四个观测层断言守住。
+func TestLoadConfig_RejectsUnknownObservabilityKeys(t *testing.T) {
+	_, err := LoadConfig(writeConfigFile(t, "observability:\n  bogous: 1\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse config failed")
+
+	_, err = LoadConfig(writeConfigFile(t, "observability:\n  events:\n    keep_forever: true\n"))
+	require.Error(t, err, "子节里的未知键同样要被拒绝")
+	assert.Contains(t, err.Error(), "parse config failed")
 }

@@ -140,3 +140,54 @@ executors:
   #    timeout: 10m
   #    max_parallel: 1
   #    retry_on_exit: [75]           # 这些退出码才允许重试，其它非 0 视为重试无意义
+
+# SQLite 观测层：运行事件、产物索引、写操作审计三张本地表。
+# 设计依据见 docs/design/sqlite-observability-design.md，实施进度见 docs/design/tasks/sqlite/README.md。
+# 它独立于上面的 store 一节：这里不改任务快照的存放位置（jobs.json 照旧），
+# 只是新增三块观测数据；写坏的观测库删掉文件即可重建。
+observability:
+  # 总开关。false 时不创建任何文件、不订阅事件总线、不注入写入器，下面所有取值全部不生效，
+  # 进程行为与没有本节时一致。
+  # 开发环境可用环境变量临时打开：GODELAYQ_OBSERVABILITY_ENABLED=true
+  enabled: false
+  # 观测库文件路径，父目录不存在时由启动装配创建。与 store.path、executors.output.dir
+  # 同一目录树但不同文件，便于单独设权限；WAL 模式会额外产生 -wal/-shm 旁文件。
+  # 文件权限 0640、目录 0750，与产物文件同一取向。
+  path: ./data/observe.sqlite
+  # 批量写入周期：三个写入器各自攒够一个周期就开一个事务落盘。
+  # 它同时是事件端点看到最新一条的延迟上界（实时增量走 WebSocket 推送，不受影响）。
+  # 0 用默认 200ms（与上面的 store.flush_interval 同一口径）；低于 10ms 会被拒绝——
+  # 那样等价于每写一条记录开一个事务。由 S02 消费。
+  flush_interval: 200ms
+  # 每个写入器的有界队列容量：队满即丢弃新记录并累计计数（丢弃数在 /admin/runtime 可查），
+  # 绝不阻塞事件总线或请求路径。显式写 0 会被拒（enabled=true 时要求正数），
+  # 与 store.flush_interval 那类"0=用默认值"的写法不同，这是为了让"一条都不留"必须显式表态。
+  queue_capacity: 4096
+  # SQLite 锁等待上限；0 用默认 2s。单连接写入（SetMaxOpenConns(1)）已消除大部分 busy 竞争。
+  busy_timeout: 2s
+  # synchronous PRAGMA：normal（默认）| full。
+  # normal 在 WAL 下断电最多丢最后若干次已提交事务，与 JSONFileStore"崩溃最多丢一个合并周期"
+  # 同量级；需要更强保证的部署改配 full（每次提交都等磁盘同步，写入更慢）。
+  synchronous: normal
+  events:
+    # 运行事件表 job_events：把 EventBus 广播的 job.* 事件持久化，重启后详情页时间线仍有历史。
+    # 由 S03 写入、S04 读取。关掉它只建表不写入，事件端点仍读内存缓冲（即现在的行为）。
+    enabled: true
+    # 保留条数，超出按写入顺序淘汰最旧；<=0 用默认 200000（约 6 万次执行的事件量）。
+    # 需要长历史时优先调这一项，不要调 store.history_limit：两者保留的是不同东西。
+    retention_count: 200000
+    # 保留时长；0 表示不按时间淘汰。事件比终态快照留得久是有意设计（排障时更常回看历史事件）。
+    retention_age: 720h
+  artifacts:
+    # 产物索引表 artifact_index：按任务与尝试记录输出文件的尺寸、截断与清理状态。
+    # 由 S05 消费。它是"加速器"而不是账本——写失败时文件仍是权威，最终判定以文件存在为准。
+    enabled: true
+  audit:
+    # 写操作审计表 write_audit：每个 POST/PUT/DELETE 请求一行台账（谁、什么身份、做了什么、
+    # 成没成、多快），由 S06 消费；读端点不进台账，否则会被前端轮询写满。
+    # 只存封闭枚举的结论码，不存请求体、参数取值与 error 原文。
+    enabled: true
+    # 保留条数；<=0 用默认 500000。CI 里高频建任务的部署会先撞到条数上界而不是天数。
+    retention_count: 500000
+    # 保留时长；0 表示不按时间淘汰。默认 90 天：安全台账的价值在事后追溯。
+    retention_age: 2160h

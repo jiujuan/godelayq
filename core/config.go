@@ -29,6 +29,9 @@ type Config struct {
 	Logging   LoggingConfig   `mapstructure:"logging"`
 	// Executors 执行层（脚本/二进制/HTTP 任务）；默认关闭，详见 ExecutorsConfig。
 	Executors ExecutorsConfig `mapstructure:"executors"`
+	// Observability SQLite 观测层（运行事件、产物索引、写操作审计）；默认关闭，
+	// 关闭时不创建任何文件，详见 ObservabilityConfig。
+	Observability ObservabilityConfig `mapstructure:"observability"`
 }
 
 // ServerConfig HTTP 接入层配置
@@ -471,6 +474,132 @@ func checkExecNameList(field string, list []string) error {
 	return nil
 }
 
+// SQLite 观测层配置的默认值。整节默认关闭（ObservabilityConfig.Enabled），
+// 关闭时下面所有取值都不生效，进程也不创建任何文件。
+// 本节每一项都有明确的读取方（见各字段注释里的卡片编号），卡片顺序见
+// docs/design/tasks/sqlite/README.md；执行到 S02 之前还没有读取方是阶段安排，
+// 不是未生效项，不要按 api/history.go 的惯例删掉。
+const (
+	// DefaultObservePath 观测库文件位置。与 store.path、executors.output.dir 同一目录树但不同文件。
+	DefaultObservePath = "./data/observe.sqlite"
+	// DefaultObserveFlushInterval 批量写入周期，与任务快照的 DefaultFlushInterval 同一口径，
+	// 同时是事件读取端点的可见性延迟上界（设计文档 D5）。
+	DefaultObserveFlushInterval = DefaultFlushInterval
+	// DefaultObserveQueueCapacity 写入队列容量：队满即丢弃新记录并累计计数，不阻塞调用方。
+	DefaultObserveQueueCapacity = 4096
+	// DefaultObserveBusyTimeout SQLite busy 等待上限。
+	DefaultObserveBusyTimeout = 2 * time.Second
+	// DefaultObserveSynchronous SQLite synchronous PRAGMA 取值。
+	DefaultObserveSynchronous = "normal"
+
+	// DefaultObserveEventRetentionCount job_events 保留条数，超出按 seq 淘汰最旧。
+	DefaultObserveEventRetentionCount = 200000
+	// DefaultObserveEventRetentionAge job_events 保留时长，0 表示不按时间淘汰。
+	DefaultObserveEventRetentionAge = 720 * time.Hour
+
+	// DefaultObserveAuditRetentionCount write_audit 保留条数。
+	DefaultObserveAuditRetentionCount = 500000
+	// DefaultObserveAuditRetentionAge write_audit 保留时长（90 天）：安全台账的价值在事后追溯。
+	DefaultObserveAuditRetentionAge = 2160 * time.Hour
+)
+
+// minObserveFlushInterval 批量写入周期的下限。低于它的取值等价于"每写一条记录开一个事务"，
+// 观测层不该以这种形态运行，因此由 Validate 直接拒绝而不是悄悄抬到下限。
+const minObserveFlushInterval = 10 * time.Millisecond
+
+// ObservabilityConfig 是 SQLite 观测层：运行事件、产物索引、写操作审计。
+// 默认关闭，关闭时下面所有取值都不生效，进程不创建任何文件。
+// 设计依据见 docs/design/sqlite-observability-design.md；它独立于 store 一节，
+// 因为这里不改任务快照的存放位置，放近会让人以为它与 store.type 有关。
+type ObservabilityConfig struct {
+	// Enabled 观测层总开关。false 时不建库文件、不订阅事件总线、不注入任何写入器。
+	// 由 S02 消费（cmd/server 的装配分支）。
+	Enabled bool `mapstructure:"enabled"`
+	// Path 库文件路径；空表示 DefaultObservePath，父目录不存在时由 S02 创建。
+	Path string `mapstructure:"path"`
+	// FlushInterval 批量写入周期，也是事件端点看到最新一条的延迟上界；0 表示 DefaultObserveFlushInterval。
+	FlushInterval time.Duration `mapstructure:"flush_interval"`
+	// QueueCapacity 三个写入器各自的有界队列容量；满则丢弃并计数，绝不回压 EventBus。
+	// 与 executors.queue_capacity 的"0 表示用默认值"不同：这里显式写 0 等于"一条都不留"，
+	// 由 Validate 拒绝。Normalized 的补默认只服务代码里直接构造的配置。
+	QueueCapacity int `mapstructure:"queue_capacity"`
+	// BusyTimeout SQLite busy 等待上限；0 表示 DefaultObserveBusyTimeout。
+	BusyTimeout time.Duration `mapstructure:"busy_timeout"`
+	// Synchronous SQLite synchronous PRAGMA：normal|full，空表示 DefaultObserveSynchronous。
+	// normal 在 WAL 下断电最多丢最后若干次已提交事务，与 JSONFileStore 的"最多丢一个合并周期"同量级。
+	Synchronous string `mapstructure:"synchronous"`
+
+	// Events 运行事件（job_events）的开关与保留策略。
+	Events ObservabilityEventsConfig `mapstructure:"events"`
+	// Artifacts 产物索引（artifact_index）的开关。
+	Artifacts ObservabilityArtifactsConfig `mapstructure:"artifacts"`
+	// Audit 写操作审计（write_audit）的开关与保留策略。
+	Audit ObservabilityAuditConfig `mapstructure:"audit"`
+}
+
+// ObservabilityEventsConfig 运行事件表。enabled 与保留条数/时长由 S03 消费。
+type ObservabilityEventsConfig struct {
+	// Enabled 总开关打开时是否写入事件。关掉它只建表不写入，读端点仍按未装配处理。
+	Enabled bool `mapstructure:"enabled"`
+	// RetentionCount 保留条数，超出按 seq 淘汰最旧；<=0 表示 DefaultObserveEventRetentionCount。
+	RetentionCount int `mapstructure:"retention_count"`
+	// RetentionAge 保留时长，如 720h；0 表示不按时间淘汰，负值归一化为默认时长。
+	RetentionAge time.Duration `mapstructure:"retention_age"`
+}
+
+// ObservabilityArtifactsConfig 产物索引表，由 S05 消费。
+type ObservabilityArtifactsConfig struct {
+	// Enabled 是否在产物写入与清理时同步维护 artifact_index。
+	Enabled bool `mapstructure:"enabled"`
+}
+
+// ObservabilityAuditConfig 写操作审计表，由 S06 消费。
+type ObservabilityAuditConfig struct {
+	// Enabled 是否记录 POST/PUT/DELETE 的审计行。
+	Enabled bool `mapstructure:"enabled"`
+	// RetentionCount 保留条数；<=0 表示 DefaultObserveAuditRetentionCount。
+	RetentionCount int `mapstructure:"retention_count"`
+	// RetentionAge 保留时长；0 表示不按时间淘汰，负值归一化为默认时长。
+	RetentionAge time.Duration `mapstructure:"retention_age"`
+}
+
+// Validate 校验观测层自身的取值。
+//
+// 与 ExecutorsConfig.Validate 同一口径：Enabled 为 false 时本节全部取值不生效，
+// 一个都没启用观测层的部署不该因为这里写了非法值而起不来，也不该被要求抄一遍完整配置。
+func (o ObservabilityConfig) Validate() error {
+	if !o.Enabled {
+		return nil
+	}
+
+	if strings.TrimSpace(o.Path) == "" {
+		return fmt.Errorf("observability.path must not be empty when observability.enabled is true")
+	}
+	switch strings.TrimSpace(o.Synchronous) {
+	case "", "normal", "full":
+	default:
+		return fmt.Errorf("observability.synchronous %q is invalid, use normal or full", o.Synchronous)
+	}
+	if o.FlushInterval < 0 {
+		return fmt.Errorf("observability.flush_interval must not be negative, got %v", o.FlushInterval)
+	}
+	if o.FlushInterval > 0 && o.FlushInterval < minObserveFlushInterval {
+		return fmt.Errorf("observability.flush_interval %v is too small, a batch window below %v means one transaction per record (omit the key to use %v)",
+			o.FlushInterval, minObserveFlushInterval, DefaultObserveFlushInterval)
+	}
+	if o.BusyTimeout < 0 {
+		return fmt.Errorf("observability.busy_timeout must not be negative, got %v", o.BusyTimeout)
+	}
+	if o.QueueCapacity <= 0 {
+		return fmt.Errorf("observability.queue_capacity must be positive when observability.enabled is true, got %d (omit the key to use %d)",
+			o.QueueCapacity, DefaultObserveQueueCapacity)
+	}
+	// 三个子节的 enabled 在总开关关闭时没有意义，这里不报错：保持"关闭即惰性"的读法。
+	// 保留条数与时长也没有非法值可拦——0 与负数都被 Normalized 解释成默认值。
+
+	return nil
+}
+
 // DefaultConfig 返回与代码内置默认值一致的配置
 func DefaultConfig() Config {
 	return Config{
@@ -528,6 +657,29 @@ func DefaultConfig() Config {
 				TTL:           DefaultExecOutputTTL,
 			},
 			Commands: nil,
+		},
+		Observability: ObservabilityConfig{
+			// 默认关闭：观测层是可选的排障与追溯能力，打开它才会创建库文件，
+			// 关闭时下面所有取值都不生效（子节的 enabled 保持"打开总开关即用"的默认）。
+			Enabled:       false,
+			Path:          DefaultObservePath,
+			FlushInterval: DefaultObserveFlushInterval,
+			QueueCapacity: DefaultObserveQueueCapacity,
+			BusyTimeout:   DefaultObserveBusyTimeout,
+			Synchronous:   DefaultObserveSynchronous,
+			Events: ObservabilityEventsConfig{
+				Enabled:        true,
+				RetentionCount: DefaultObserveEventRetentionCount,
+				RetentionAge:   DefaultObserveEventRetentionAge,
+			},
+			Artifacts: ObservabilityArtifactsConfig{
+				Enabled: true,
+			},
+			Audit: ObservabilityAuditConfig{
+				Enabled:        true,
+				RetentionCount: DefaultObserveAuditRetentionCount,
+				RetentionAge:   DefaultObserveAuditRetentionAge,
+			},
 		},
 	}
 }
@@ -590,6 +742,24 @@ func LoadConfig(path string) (Config, error) {
 		"executors.output.max_bytes",
 		"executors.output.dir",
 		"executors.output.ttl",
+		// SQLite 观测层：全部是标量，逐项绑定。这里漏一项不会让任何东西失败——配置照常读、
+		// 值照常生效，只有环境变量悄悄无效。反向的"YAML 里写 observability.* 能被接受"
+		// 来自 UnmarshalExact 按结构体字段判断，与下面这份列表无关。
+		// 路径不是凭据，所以 observability.path 也绑定（对照故意不绑的 server.auth.users、
+		// executors.commands：那是嵌套列表，且内容本身不该出现在环境变量里）。
+		"observability.enabled",
+		"observability.path",
+		"observability.flush_interval",
+		"observability.queue_capacity",
+		"observability.busy_timeout",
+		"observability.synchronous",
+		"observability.events.enabled",
+		"observability.events.retention_count",
+		"observability.events.retention_age",
+		"observability.artifacts.enabled",
+		"observability.audit.enabled",
+		"observability.audit.retention_count",
+		"observability.audit.retention_age",
 	} {
 		if err := v.BindEnv(key, "GODELAYQ_"+strings.ToUpper(strings.ReplaceAll(key, ".", "_"))); err != nil {
 			return cfg, fmt.Errorf("bind env for %q failed: %w", key, err)
@@ -672,6 +842,10 @@ func (c Config) Validate() error {
 	}
 
 	if err := c.Executors.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.Observability.Validate(); err != nil {
 		return err
 	}
 
@@ -777,5 +951,37 @@ func (c Config) Normalized() Config {
 	if c.Executors.Output.Dir == "" {
 		c.Executors.Output.Dir = defaults.Executors.Output.Dir
 	}
+
+	// SQLite 观测层：Enabled 为 false 时这些取值本身不生效，但归一化后传给 store/sqlite
+	// 就不必再各自判空补默认（Validate 已拦下 enabled 时的显式 0 值，这里的补齐只服务
+	// 代码里直接构造的配置）。retention_age 的 0 是"不按时间淘汰"的有意取值，保持原样。
+	if c.Observability.Path == "" {
+		c.Observability.Path = defaults.Observability.Path
+	}
+	if c.Observability.FlushInterval <= 0 {
+		c.Observability.FlushInterval = defaults.Observability.FlushInterval
+	}
+	if c.Observability.QueueCapacity <= 0 {
+		c.Observability.QueueCapacity = defaults.Observability.QueueCapacity
+	}
+	if c.Observability.BusyTimeout <= 0 {
+		c.Observability.BusyTimeout = defaults.Observability.BusyTimeout
+	}
+	if c.Observability.Synchronous == "" {
+		c.Observability.Synchronous = defaults.Observability.Synchronous
+	}
+	if c.Observability.Events.RetentionCount <= 0 {
+		c.Observability.Events.RetentionCount = defaults.Observability.Events.RetentionCount
+	}
+	if c.Observability.Events.RetentionAge < 0 {
+		c.Observability.Events.RetentionAge = defaults.Observability.Events.RetentionAge
+	}
+	if c.Observability.Audit.RetentionCount <= 0 {
+		c.Observability.Audit.RetentionCount = defaults.Observability.Audit.RetentionCount
+	}
+	if c.Observability.Audit.RetentionAge < 0 {
+		c.Observability.Audit.RetentionAge = defaults.Observability.Audit.RetentionAge
+	}
+
 	return c
 }
