@@ -506,8 +506,8 @@ func (s *Server) GetStats(c *gin.Context) {
 	}
 
 	// Running 取两池之和：对看数字的人来说"正在执行"就是总数，
-	// 拆分维度在 /admin/runtime 里读（core 的 RuntimeStats.Running 只含普通池，
-	// 这条措辞变更同时登记在 E19 的文档收口清单里）。
+	// 拆分维度在 /admin/runtime 里读（core 的 RuntimeStats.Running 只含普通池）。
+	// 这条口径写在 docs/api.md 的统计一节。
 	stats.Running = sched.Running + sched.ExecRunning
 	stats.HeapSize = sched.HeapSize
 	stats.SchedulingSuspended = sched.Suspended

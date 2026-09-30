@@ -160,7 +160,7 @@ func identityRole(t *testing.T, who string) core.Role {
 // TestCreateJob_ExecutorRequiredRole 是这张卡的核心产出：
 // required_role 的三个取值 × 五种身份，共 15 组，结论只由 core.Role.AtLeast 决定
 // （machine 与 operator 同级，所以默认 admin 档下脚本凭据提交不了）。
-// E19 的 docs/api.md 权限矩阵直接引用这张表。
+// docs/api.md 的权限矩阵引用这张表。
 func TestCreateJob_ExecutorRequiredRole(t *testing.T) {
 	for _, required := range []string{"operator", "admin", "ops"} {
 		t.Run("required_"+required, func(t *testing.T) {

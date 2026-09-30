@@ -1419,7 +1419,6 @@ func (s *Scheduler) executeJob(job *Job) {
 	// permanent 只在"重试没有意义"时加上（TASK-E12 §3.4）。
 	// 只加真值不加假值是为了让既有事件的 JSON 形状一字不变；
 	// api/history.go 与前端把这个键当透传字段，不解析。
-	// 待补：docs/api.md 里 job.failed 事件的 metadata 说明还没有这一项，归 TASK-E19 统一补文档。
 	failureMetadata := map[string]interface{}{
 		"retry_count": job.RetryCount,
 		"max_retries": job.MaxRetries,

@@ -26,8 +26,9 @@ const killGrace = 2 * time.Second
 // os/exec 的拷贝协程还在等一个再也没人写的 EOF。没有这条上限，Handler 会一直不返回，
 // 表现为"任务 timed out 了但 worker 名额没还回来"，比杀掉进程更难排查。
 //
-// 与 killGrace 相加是 Handler 最晚返回的时长（约 6 秒）；E19 的部署文档要把
-// scheduler.shutdown_timeout 的推荐值写到 10s 以上，否则关停会先于收尾被运维打断。
+// 与 killGrace 相加是 Handler 最晚返回的时长（约 6 秒），所以部署时
+// scheduler.shutdown_timeout 要给到 10 秒以上，否则关停会先于收尾被运维打断
+// （这条取值建议写在 docs/deployment.md 的"开启执行器"一节）。
 const processWaitDelay = 4 * time.Second
 
 // Runner 是一个档位的执行主体：把 payload 变成一次真实的进程执行，
