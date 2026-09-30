@@ -214,4 +214,5 @@ GODELAYQ_OBSERVABILITY_FLUSH_INTERVAL=50ms  GODELAYQ_SERVER_AUTH_TOKEN=<本机�
 - **优雅停服这一步在本机做不到**：Windows 下无法从外部给控制台进程发 SIGTERM（`taskkill` 不带 `/F` 对该进程无效），所以手工验收的停止是强制结束。这意味着"重启后历史仍在"是用最硬的停法验的（那三行当时已经在 WAL 里），而"干净关闭会检查点 WAL""关闭顺序是先写入库→观测库→任务存储"两条仍只由 Go 用例覆盖（`TestCloseCheckpointsWAL`、`TestRun_ObservabilityClosedBeforeStore`），没有真进程响应可引。
 - **`data` 列的失败原文没有真跑过**：手工那两条任务都成功。`{"error":…}` 那段的原文入库由 `TestEventLog_PreservesDataAndMetadata` 覆盖。
 - **恢复阶段那批 `job.scheduled` 是否进库没有手工证据**：装配顺序的注释与 `TestRun_EventLogClosureIsMandatoryWhenEnabled`、`TestRun_ObservabilityEnabledOpensAndClosesForReal` 守住了"写入器在 `Start` 之前挂上"，但用例走的是替身调度器，没有真的从 `jobs.json` 恢复一条任务再读库。留待 S04 有读端点后一并补。
+- **设计文档的代码草图与本卡不一致，S07 要对齐**：`sqlite-observability-design.md` §9 第 293 行写的是 `NewEventLog(bus, db, opts)`，没有 `logger` 形参，也没有 S04 要加的 `Events`/`Recent` 两个读方法。实现按本卡 §3.1 走（带 logger，因为元数据序列化失败与批次被放弃都要有地方记）。
 
