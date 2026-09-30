@@ -116,13 +116,13 @@
 
 ## 6. 完成标准（DoD）
 
-- [ ] 三个开关任一关闭时不注入索引，`executor` 与 `api` 的产物路径行为与本卡之前逐字一致（§5 第 6 条守住 executor 侧）。
-- [ ] 索引写失败绝不改变执行结果，也不让任务失败；这条有专门用例（§5 第 2 条）。
-- [ ] 目录删除与索引行删除的先后顺序固定为"先删目录、再删行"，删除目录失败时行保留。
-- [ ] `GET /jobs/:id/artifacts` 的四种情形都覆盖：未装配 503、无记录 200 空列表、正常 200、越权 401。
-- [ ] 索引里的 `out_bytes` 与产物文件实际大小一致（用真实执行 + 一次 `os.Stat` 对照，不能只信单元测试里的假数据）。
-- [ ] `ArtifactInfo` 结构未新增字段（`Kind`/`Profile` 走 `IndexRecord`，不污染写进 `meta.json` 的那份）。
-- [ ] `docs/api.md` 新增该端点；`docs/design/executor-design.md` §6.4 的"产物与快照分工"处补一句索引表的存在。
+- [x] 三个开关任一关闭时不注入索引，`executor` 与 `api` 的产物路径行为与本卡之前逐字一致（§5 第 6 条守住 executor 侧；装配侧另有 `TestRun_ArtifactIndexOffByEachSwitch` 的三个子例，见 §10.2 第 7 条）。
+- [x] 索引写失败绝不改变执行结果，也不让任务失败；这条有专门用例（§5 第 2 条 `TestRunner_IndexFailureDoesNotAffectResult`：任务成功、`Exec.Artifact` 仍是 `available`、文件读得到、只多一条 warn）。
+- [x] 目录删除与索引行删除的先后顺序固定为"先删目录、再删行"，删除目录失败时行保留。（`TestPurgeExpired_DeletesIndexRowsAfterDirectory` 由替身回看删行那一刻目录已不在；`TestPurgeExpired_KeepsRowsWhenRemovalFails` 守反面；`TestConcurrent_ExecuteWhilePurging` 在并发下复查同一条顺序，见 §10.2 第 8 条）
+- [x] `GET /jobs/:id/artifacts` 的四种情形都覆盖：未装配 503、无记录 200 空列表、正常 200、越权 401。（另加了"没挂产物存储也回 503"、"库读失败回 500"、"ID 不成目录名回 400"三条，见 §10.2 第 5、6 条）
+- [x] 索引里的 `out_bytes` 与产物文件实际大小一致（用真实执行 + 一次 `os.Stat` 对照，不能只信单元测试里的假数据）。（`TestRunner_RecordsIndex` 里对 `OutPath` 做一次 `os.Stat`；`TestArtifactIndex_RealWriterBytesMatchDisk` 用真产物存储写文件 + 真库往返三方对照；手工验收第一轮 `a1.out` 34 B = 表里 34，见 §10.4）
+- [x] `ArtifactInfo` 结构未新增字段（`Kind`/`Profile` 走 `IndexRecord`，不污染写进 `meta.json` 的那份）。（仍是 `JobID/Attempt/OutPath/ErrPath/OutBytes/ErrBytes/Truncated` 七个；`meta.json` 的实测内容见 §10.4）
+- [x] `docs/api.md` 新增该端点；`docs/design/executor-design.md` §6.4 的"产物与快照分工"处补一句索引表的存在。（api.md 是新的小节"列出各次尝试的输出"，另在 `/result` 末尾加了指向它的交叉引用；executor-design.md 是在 §6.4 的要点列表里加一条，位置紧挨"清扫"那条，见 §10.5 的 D-0501/D-0502 两句文档口径）
 
 ## 7. 验收方式
 
@@ -157,3 +157,162 @@ go test ./api -run 'Artifacts|ArtifactPurged' -v
 - 回滚：`observability.artifacts.enabled: false` 即停止全部索引读写（表与既有行留着不影响任何东西）；接口是可选依赖，回滚代码不影响产物路径本身。
 
 ## 10. 实现记录（执行时补写）
+
+### 10.1 落点
+
+| 能力 | 位置 |
+| --- | --- |
+| `IndexRecord` / `ArtifactIndexer` / `IndexReconciler` / `SetIndex` / `Index` | `executor/artifact_index.go`（接口在 44 行，对账接口在 68 行，访问器 75/78） |
+| 写侧三个内部助手 | 同文件：`recordIndex`（90）、`deleteIndexRows`（111）、`reconcileIndex`（124）、`dirExists`（146） |
+| 写入点 | `executor/proc.go:174`（用 `r.profile.Kind`/`Name` + `writer.Close()` 那份 `info`）、`executor/http.go:193`（`KindHTTP`） |
+| 删除点 | `executor/artifact.go:554`（`PurgeExpired`）、`:595`（`PurgeOrphans`），都在 `os.RemoveAll` 成功之后，ID 取 `filepath.Base(dir)` |
+| 启动对账 | `executor/artifact.go:675`，在 `runStartup` 的孤儿清理 + TTL 清理之后 |
+| ID 校验的复用 | `executor.CheckArtifactJobID`（`executor/artifact.go:131`），库实现六处读写全走它，不另写规则 |
+| 真库实现 | `store/sqlite/artifacts.go`：`NewArtifactIndex`（43）、`insertArtifact` 的 upsert（63）、`Record`（79）、`relative`（113）、`markPurged`（132）、`List`（193）、`ReconcileMissing`（286） |
+| 读端点 | `api/handlers_artifacts.go`：`requireIndex`（45）、`ListJobArtifacts`（67）、`markArtifactIndexed`（107）；路由在 `api/server.go:237` 的 `reader` 组 |
+| purged 标注 | `api/handlers_executors.go:187` 的 `markArtifactPurged` 两条路径各调一次 `markArtifactIndexed`（早退分支 `:192`、写快照之后 `:208`） |
+| 装配 | `cmd/server/main.go`：字段 110、默认闭包 164、依赖完整性检查 253、构造与 `SetIndex` 389/393、启动日志 403 |
+
+### 10.2 偏离了卡片的地方
+
+1. **`IndexRecord` 多了四个只读字段**（`State`/`CreatedAt`/`OutRel`/`ErrRel`，卡片 §3.1 只有五个字段）。
+   理由：`List` 要还原本行的状态与时间，而接口定义在 `executor` 侧——不另造一个"读回来的结构"就让实现无处放这些列。
+   字段注释写明"写入时被忽略"，`Record` 也确实不读它们（状态恒为 `available`、时间取实现自己的时间源）。
+2. **对账拆成可选接口 `IndexReconciler`**（卡片 §3.6 只说"启动期对账"，没规定形状）。
+   对账需要"目录在不在"的判断，只有产物存储懂目录布局；把它塞进必需方法会逼每个实现（包括测试替身）都带一个用不上的 `ReconcileMissing`。
+   `reconcileIndex` 用类型断言取它，实现没有这个能力时什么都不做也不报错。
+3. **绝对路径折成相对写法的落点在库实现里**（卡片 §3.1 已经这么定），但 `relative()` 多做了一件事：
+   落在产物根目录**之外**的路径直接报错，而不是折成 `../` 开头。折径失败意味着这条登记项本身就不可信。
+4. **purged 标注落在新函数 `markArtifactIndexed`**，由 `markArtifactPurged` 调（卡片 §3.4 说"在写快照之后补一次"）。
+   比卡片多标一处：快照**已经**是 `purged` 的早退分支也标一次——快照与索引可能来自不同部署（索引是这次重启才挂上的），
+   那一支不标就留下"快照说 purged、索引说 available"。
+5. **对不成目录名的任务 ID 回 400**（卡片没提）。真库的 `List` 会拒绝这种 ID（它必须是合法目录名），
+   原样透出就是 500——把客户端写错报成服务器坏了。`ListJobArtifacts` 进门先走一次 `executor.CheckArtifactJobID`，
+   用 `respondBadParam` 与 `stream`/`attempt` 那几条同形。
+6. **端点不查任务是否存在**，所以对一个不存在的 ID 是 200 空列表（卡片 §3.5 只规定"没有任何索引行 → 200 空列表"）。
+   查一次任务存储要引入 `store` 读取，与这张表无关，写在 api.md 里免得被读成"这个任务没有产物"。
+7. **没有新增 `newServer` 参数**：索引挂在 `ArtifactStore` 上（`SetIndex`），api 侧走既有的 `WithArtifacts` 那条注入通道，
+   `runtimeDeps.newServer` 仍是 S04 之后的六个参数。S06 若要注审计写入器，仍不必动这个签名。
+8. **`artifacts.Start` 从执行器装配处挪到观测层那段之后**（`cmd/server/main.go`，连带它的收尾 defer 一起挪）。
+   卡片 §3.6 要求对账在"Start 的第一轮扫描里"，而第一轮在 `Start` 内同步跑，起早了那份索引还不在。
+   关停顺序跟着变：先停清理协程 → 撤事件订阅 → 关观测库 → 关任务存储。
+9. **测试用例比卡片 §5 列的 15 条多**：`executor/artifact_index_test.go` 13 条、`store/sqlite/artifacts_test.go` 14 条、
+   `api/handlers_artifacts_test.go` 8 条、`cmd/server/main_integration_test.go` 新增 4 条（共 39 条）。
+   多出来的都是本卡自己踩到的分支：删行失败只记日志、对账失败只记日志、实现不支持对账、nil 存储的访问器、
+   相对路径折径越界、`attempt=0`、`List` 不返回 nil、分隔符折成正斜杠、四个开关组合的装配、并发下的删除顺序。
+
+### 10.3 验证证据
+
+```
+go build ./...                → 通过
+go vet ./...                  → 通过
+go test ./... -race           → 全绿（api 62.3s / cmd/server 5.6s / core cached / executor 21.7s / store/sqlite 3.0s）
+go test ./executor -run 'Index|Purge' -v          → 13 条 PASS + 1 条 SKIP（skip 的那条见 §10.6）
+go test ./store/sqlite -run ArtifactIndex -v      → 14 条 PASS
+go test ./api -run 'Artifacts|ArtifactPurged' -v  → 8 条 PASS
+go test ./cmd/server -run TestRun_ArtifactIndex   → 4 条 PASS（其中 OffByEachSwitch 三个子例）
+go list -deps ./api | grep -i sqlite              → 空
+go list -deps ./executor | grep -i sqlite         → 空
+gofmt -l -s（剥 CRLF 的临时副本，13 个文件）        → 无输出
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./cmd/server   → 通过
+CGO_ENABLED=0 GOOS=windows GOARCH=386 go build ./cmd/server   → 通过
+go build -tags dashboard ./...                   → 通过
+```
+
+依赖边界那条在本卡多了一层含义：`store/sqlite` 现在 import `executor`（接口定义在消费方，实现方去引它），
+方向是 `store/sqlite → executor`，所以"executor 不依赖观测库"这条仍然成立，反过来不成立。
+
+### 10.4 手工验收（本卡 §7）
+
+临时目录里独立二进制 + 自己写的 412 B 配置（`configs/config.example.yaml` 的键全部走默认，只写必要项），
+路径全在临时目录内，仓库的 `configs/config.yaml` 与 `data/` 未写。端口 8142，静态 token 作 `machine`，
+`executors.required_role` 降到 `operator`（否则 machine 提交不了执行任务），档位 `exec.fail3` 是
+`kind: script` + `runtime: node` + `retry_on_exit: [3]`，脚本写 34 B stdout、41 B stderr 后 `exit 3`。
+
+**第一轮**（`observability.enabled: true`）提交一条 `max_retries: 1` 的 `exec.fail3`，启动日志即证据：
+
+```
+msg="observability enabled" path=./data/observe.sqlite schema_version=1 journal_mode=wal events_writer=true artifact_index=true
+```
+
+跑完（`GET /jobs/<id>` 是 `failed`、`retry_count 1`）之后：
+
+```
+GET /api/v1/jobs/01a0f3e9-…2012/artifacts
+{"job_id":"01a0f3e9-…2012","count":1,"items":[{"attempt":1,"kind":"script","profile":"fail3",
+ "out_bytes":34,"err_bytes":41,"truncated":false,"state":"available","created_at":"2026-10-01T04:03:14+08:00"}]}
+```
+
+与磁盘三方对照：`a1.out` 实际 34 B、`a1.err` 41 B，`a1.meta.json` 里的 `out_bytes`/`err_bytes` 也是 34/41，
+即"索引 = 摘要 = 文件"。响应里没有任何路径列（`out_rel`/`err_rel` 不在体外）。
+
+卡片 §7 说这里"应返回两行、attempt 分别是 1 和 2"——**当前构建不可能**：`CloneForRetry` 不搬 `Attempts`
+（`docs/design/executor-design.md` §11 第 7 条、§6.4 那条 ⚠️，`docs/api.md` 也已按现状写明），
+两次执行都写 `a1.*`。实测到的因此是 upsert 路径：`GET .../events` 有 7 条事件（第二次 `job.started` 在
+`04:04:16`），同一时刻 `created_at` 从 `04:03:14` 变成 `04:04:16`、行仍是一条、`count` 仍是 1。
+这是本卡 §3.3 那条 upsert 设计的真实取证，只是卡片把它写成了"两行"（见 §10.5 的 D-0501）。
+
+**第二轮**：手工删掉第一个任务的整个产物目录后重启，索引侧的启动对账立刻给出结论：
+
+```
+msg="observability enabled" ... artifact_index=true
+msg="artifact index rows marked as purged" count=1 reason="the output directory is gone"
+```
+
+`GET /jobs/<被删目录的任务>/artifacts` 的 `state` 已是 `purged`，而另一个任务的行仍 `available`。
+这一步**没有读过一次 `/result`**——对账自己把两侧对齐了，正是 §3.6 的用途。
+
+**第三轮**：对第二个任务只删 `a1.out`（留着 `a1.err`），走一次读取失败路径：
+
+```
+GET /jobs/<id>/result?attempt=1            → found=false, meta.artifact=purged
+GET /jobs/<id>/result?attempt=1&stream=err → found=true,  size_bytes=41（正文照样给）
+GET /jobs/<id>/artifacts                   → state=purged
+```
+
+一行盖两路输出，所以单独删一路会把整行标成 purged，而另一路仍读得到（见 §10.5 的 D-0502）。
+
+**第四轮**（TTL 与回滚）：`GODELAYQ_EXECUTORS_OUTPUT_TTL=1s` 重启 → 启动扫描把剩下的目录删掉
+（`msg="artifact expired directories purged" count=1 ttl=1s`），`GET /jobs/<id>/artifacts` 回
+`{"count":0,"items":[]}`——先删目录、再删行，列表变短而不是变成一堆 `purged`。
+再 `GODELAYQ_OBSERVABILITY_ARTIFACTS_ENABLED=false` 重启：启动日志 `artifact_index=false`，
+新提交的 `exec.fail3` 仍正常写出 `a1.out`/`a1.err`/`a1.meta.json`、`GET /jobs/<id>/result` 回 `found=true`，
+而 `GET /jobs/<id>/artifacts` 回 503 原文：
+
+```
+{"code":503,"message":"artifact index is not configured","details":"start the server with executors.enabled and observability.artifacts.enabled to enable /api/v1/jobs/:id/artifacts"}
+```
+
+顺带取到 400 那条（§10.2 第 5 条）的原文：
+
+```
+GET /api/v1/jobs/..escape/artifacts
+{"code":400,"message":"invalid id","details":"got \"..escape\": artifact: job id \"..escape\" contains an unusable character '.'"} [400]
+```
+
+进程一律 `taskkill //F` 结束（Windows 上外部发不出优雅 SIGTERM，README 第 4 条口径）。
+
+### 10.5 缺陷处置
+
+| 编号 | 严重度 | 事实 | 处置 |
+| --- | --- | --- | --- |
+| D-0501 | 中 | 本卡 §7 的手工步骤前提不成立：`max_retries: 1` 的任务在列表里**不会**出现 attempt 1 与 2 两行。根因是 `CloneForRetry` 不搬 `Attempts`，重试仍写 `a1.*`（§11 第 7 条已登记、本卡 §8 明确不在范围内） | **已按现状记录**：本节写明实测拿到的是同一行被覆盖（`created_at` 移动、`count` 仍是 1），`docs/api.md` 的新小节与 `docs/design/executor-design.md` §6.4 新增那条各写了一句"重试过的任务在列表里仍是一行"。根因留给 E15 那条，修好之后本节与 api.md 的措辞要一起回改 |
+| D-0502 | 低 | 一行覆盖一次尝试的**两路**输出，所以手工删掉 `a1.out` 会让整行变 `purged`，而 `a1.err` 还在、`/result?stream=err` 仍回 `found=true`（第三轮实测） | **已文档化 + 功能登记不修**：`docs/api.md` 的 `state` 段落明写"删掉某一路文件会让整行变成 purged"。要按流分开就得改表主键（`(job_id, attempt, stream)`），那是 S07 之后的话题，本卡 §3.1 的表结构来自 S01 的迁移 |
+| D-0503 | 低 | `MarkAllPurged` 在真实现里对账走的是同类型的内部 `markPurged(jobID, nil)`，接口上这个公开方法当前**没有生产调用点**（只有 `TestArtifactIndex_MarkAllPurged` 与 `TestListJobArtifacts_*` 的替身路径覆盖它） | **登记不修**：卡片 §3.1 点名要它，删掉会让接口比承诺的窄，而"标注整个任务"仍是清理之外的合理入口（比如将来手工清库）。留着并在 §3.1 的注释里指明用途 |
+| D-0504 | 低 | 列表端点不查任务是否存在：一个不存在的 ID 与一个"有任务但没有产物"的 ID 回答一样（200 空列表），排障时容易读成后者 | **已文档化**（`docs/api.md` 的新小节最后一段）。要区分就得在端点里读任务存储，卡片 §3.5 未含；等真有人把它当"这个任务不存在"的判据再改 |
+| D-0505 | 低 | 启动对账只标注、不删除，反向（文件被手工放回 → 该纠正回 `available`）本期不做，所以放回文件后列表会说"已清理" | **卡片即如此**（§3.6 的限制、§8 明确排除），非缺陷；`docs/api.md` 的 `state` 两条来历一段已把"purged 从哪来"写清 |
+
+### 10.6 未覆盖与已知边界
+
+- `TestPurgeExpired_KeepsRowsWhenRemovalFails` 在本机（Windows）**跳过**：`os.RemoveAll` 无论如何都成功，
+  造不出"目录删不掉"的现场。"先删目录、再删行"的失败分支因此只在 Linux 上真跑得通，
+  本轮没有 Linux 环境（与执行器系列同一限制）。正向顺序由另两条用例与第四轮手工取证。
+- 没有覆盖"存量产物 + 新索引混在同一个 `data/exec/` 里"的升级现场（§9 第一条风险）。
+  手工环境是新建的临时目录，造不出"升级前就有产物"；api.md 里那句"索引从启用它的那个版本开始记"是文档侧的兜底。
+- 索引与 `parseResultAttempt` 的默认选取没有打通（§8 排除），所以 `/result` 仍靠 `snapshot.Attempts` 猜 attempt，
+  列表端点已经知道有哪些尝试——两份信息现在并存，合并是另一张卡。
+- 并发用例（`TestConcurrent_ExecuteWhilePurging`）覆盖的是"执行侧写 + 清理侧删"两个 goroutine，
+  装配里清理只有一个 goroutine，因此没有"两轮清理并发"的用例。`store/sqlite` 侧仍靠 `SetMaxOpenConns(1)` 串行化。
+- 前端不消费这个端点（卡片未要求，控制台审计页在 S08），`web/` 与 `vue-tsc` 本卡未动。
+- 观测库被外部改坏 / 表被删的情况只测到"读失败回 500"，没有测"写失败之后文件仍是权威"的真库版本
+  （executor 侧用的是替身索引）。
