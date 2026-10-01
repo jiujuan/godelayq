@@ -461,6 +461,9 @@ func TestExecutorsDefaults(t *testing.T) {
 	assert.Equal(t, DefaultExecMaxTimeout, cfg.Executors.MaxTimeout)
 	assert.Equal(t, "pause", cfg.Executors.RestorePolicy)
 	assert.False(t, cfg.Executors.LoaderAllow)
+	assert.False(t, cfg.Executors.WebEnabled,
+		"档位的在线修改必须默认关闭：打开它等于把\"能执行什么\"的修改权限交给一个 ops 档 JWT")
+	assert.Equal(t, DefaultExecProfilesPath, cfg.Executors.ProfilesPath)
 	assert.Equal(t, DefaultExecInlinePreview, cfg.Executors.Output.InlinePreview)
 	assert.Equal(t, DefaultExecMaxOutputBytes, cfg.Executors.Output.MaxBytes)
 	assert.Equal(t, DefaultExecOutputDir, cfg.Executors.Output.Dir)
@@ -507,6 +510,8 @@ func TestExecutorsValidate_Rejects(t *testing.T) {
 		{"negative max bytes", "executors:\n  output:\n    max_bytes: -1\n", "max_bytes must not be negative"},
 		{"negative ttl", "executors:\n  output:\n    ttl: -1h\n", "ttl must not be negative"},
 		{"loader allow without enabled", "executors:\n  loader_allow: true\n", "requires executors.enabled to be true"},
+		{"web enabled without executors", "executors:\n  web_enabled: true\n", "executors.web_enabled requires executors.enabled to be true"},
+		{"profiles path is whitespace", "executors:\n  enabled: true\n  profiles_path: \"  \"\n", "profiles_path must not be whitespace"},
 		{"concurrency zero while enabled", "executors:\n  enabled: true\n  concurrency: 0\n", "concurrency must be at least 1"},
 		{"default timeout zero while enabled", "executors:\n  enabled: true\n  default_timeout: 0s\n", "default_timeout must be positive"},
 		{"max timeout zero while enabled", "executors:\n  enabled: true\n  max_timeout: 0s\n", "max_timeout must be positive"},
@@ -536,6 +541,9 @@ func TestExecutorsValidate_AllowsUnsetWhenDisabled(t *testing.T) {
 	assert.Equal(t, DefaultExecMaxOutputBytes, normalized.Executors.Output.MaxBytes)
 	assert.Equal(t, DefaultExecOutputTTL, normalized.Executors.Output.TTL,
 		"ttl 的 0 表示不按时间清理，是有意的取值，不能被补成默认时长")
+	assert.False(t, normalized.Executors.WebEnabled,
+		"web_enabled 的 false 同样是有意取值：归一化不该把\"没打开\"补成打开")
+	assert.Equal(t, DefaultExecProfilesPath, normalized.Executors.ProfilesPath)
 
 	// 归一化之后的配置必须是"打开开关就能直接用"的，否则默认值本身有毛病
 	normalized.Executors.Enabled = true
@@ -613,6 +621,25 @@ func TestLoadConfig_ExecutorsEnvOverrides(t *testing.T) {
 	assert.Equal(t, 24*time.Hour, cfg.Executors.Output.TTL)
 	assert.Equal(t, "operator", cfg.Executors.RequiredRole)
 	assert.Equal(t, DefaultExecMaxOutputBytes, cfg.Executors.Output.MaxBytes, "未被覆盖的键保持默认值")
+}
+
+// 档位在线管理的两个键都是标量，所以必须能被环境变量覆盖。
+// 漏进 BindEnv 列表不会让任何东西失败——配置照常读、值照常生效，只有环境变量悄悄无效。
+func TestLoadConfig_WebProfileEnvOverrides(t *testing.T) {
+	path := writeConfigFile(t, "executors:\n  enabled: true\n  web_enabled: true\n  profiles_path: ./from-file.json\n")
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.Executors.WebEnabled)
+	assert.Equal(t, "./from-file.json", cfg.Executors.ProfilesPath)
+
+	t.Setenv("GODELAYQ_EXECUTORS_WEB_ENABLED", "false")
+	t.Setenv("GODELAYQ_EXECUTORS_PROFILES_PATH", "./from-env.json")
+
+	cfg, err = LoadConfig(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Executors.WebEnabled, "布尔键同样可覆盖：用来在单台机器上临时关掉在线管理")
+	assert.Equal(t, "./from-env.json", cfg.Executors.ProfilesPath)
 }
 
 func TestLoadConfig_RejectsUnknownExecutorsKeys(t *testing.T) {

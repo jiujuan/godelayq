@@ -110,6 +110,22 @@ executors:
   # 能往监控目录写文件不等于能执行命令。注意服务端二进制当前并不启用加载器，
   # 本项约束的是自行接入 core.DirectoryLoader 的程序。
   loader_allow: false
+  # 档位在线管理：打开后可以在 Web 控制台与 REST 写端点上增删改档位（改完立即生效、重启仍在）。
+  # 这条边界比"改配置重启"宽得多——它把"能执行什么"的修改权限交给了 ops 档 JWT，
+  # 所以默认 false。打开它必须同时 executors.enabled: true，否则启动即报（与 loader_allow
+  # 同一条：没有执行能力却允许在线改档位，只能是配置写错）。
+  # 设计依据见 docs/design/web-profile-design.md §2（D2）。
+  # 环境变量：GODELAYQ_EXECUTORS_WEB_ENABLED=true
+  web_enabled: false
+  # 页面建的档位存放处。它只是 executors.commands 之外的第二份来源：启动时两份合并，
+  # 同名以本节 commands 为准，文件里那一条会被标记为未生效。
+  # 留空用默认 ./data/exec-profiles.json。文件不存在是正常状态（还没人在页面上建过档位）；
+  # 内容损坏会导致启动失败——静默当成空文件会抹掉已建好的档位，
+  # 删掉或修好该文件即可退回"只由 executors.commands 决定"的形态。
+  # 它是"这台机器能执行什么"的一部分：备份 data/ 时请一起带上；
+  # 档位里的本机路径换一台机器会探测失败，那是预期而不是故障。
+  # 环境变量：GODELAYQ_EXECUTORS_PROFILES_PATH=/srv/godelayq/exec-profiles.json
+  profiles_path: ./data/exec-profiles.json
   output:
     # 事件与任务详情里携带的输出尾部预览字节数；完整输出在下面的产物目录。0 用默认 2048
     inline_preview: 2048

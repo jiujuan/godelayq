@@ -191,6 +191,9 @@ const (
 	DefaultExecRestorePolicy  = "pause"
 	DefaultExecDefaultTimeout = 5 * time.Minute
 	DefaultExecMaxTimeout     = 30 * time.Minute
+	// DefaultExecProfilesPath 是页面建的档位的约定存放处。与 store.path 分开放：
+	// 档位是低频实体，不该被 jobs.json 的高频合并写盘带着一起重写（同 store.groups_path 的理由）。
+	DefaultExecProfilesPath = "./data/exec-profiles.json"
 )
 
 // ExecutorsConfig 是执行层（脚本 / 二进制 / HTTP 任务）的配置。
@@ -247,6 +250,20 @@ type ExecutorsConfig struct {
 
 	// Output 执行输出的截断与保留策略
 	Output ExecutorOutputConfig `mapstructure:"output"`
+
+	// WebEnabled 是否允许通过 Web 控制台与 REST 写端点增删改档位，默认 false。
+	// 打开它等于把"能改配置文件并重启的人才有可能执行命令"这条边界改成
+	// "能拿到 ops 档 JWT 的人也可以"，所以与 Enabled 一样必须由部署方显式表态。
+	// 关闭时不构造档位存储、不读 profiles_path 指向的文件，三个写端点一律 503。
+	// 设计依据见 docs/design/web-profile-design.md §2（D2），开发环境可用环境变量临时打开：
+	// GODELAYQ_EXECUTORS_WEB_ENABLED=true
+	WebEnabled bool `mapstructure:"web_enabled"`
+
+	// ProfilesPath 页面建的档位存放处；留空用 DefaultExecProfilesPath。
+	// 只有 WebEnabled 为 true 时才会被读。文件不存在是正常状态（还没人在页面上建过档位），
+	// 内容损坏则启动失败——把坏文件当成空文件会静默抹掉已经建好的档位。
+	// 本项不能替代 executors.commands：两份来源在启动时合并，同名以配置为准。
+	ProfilesPath string `mapstructure:"profiles_path"`
 
 	// Commands 档位列表：能执行什么完全由这里决定。
 	// 校验规则在 executor.LoadProfiles（启动时执行，任一条不过即启动失败），
@@ -389,6 +406,9 @@ func (e ExecutorsConfig) Validate() error {
 	if e.Output.Dir != "" && strings.TrimSpace(e.Output.Dir) == "" {
 		return fmt.Errorf("executors.output.dir must not be whitespace")
 	}
+	if e.ProfilesPath != "" && strings.TrimSpace(e.ProfilesPath) == "" {
+		return fmt.Errorf("executors.profiles_path must not be whitespace")
+	}
 
 	if err := checkExecNameList("runtime_allow", e.RuntimeAllow); err != nil {
 		return err
@@ -432,6 +452,11 @@ func (e ExecutorsConfig) Validate() error {
 	if !e.Enabled {
 		if e.LoaderAllow {
 			return fmt.Errorf("executors.loader_allow requires executors.enabled to be true")
+		}
+		if e.WebEnabled {
+			// 与 loader_allow 同一条：没有执行能力却打开了档位的在线修改，只能是配置写错。
+			// 报错比让人以为"页面上已经能改档位"好——那时三个写端点只会回 503。
+			return fmt.Errorf("executors.web_enabled requires executors.enabled to be true")
 		}
 		return nil
 	}
@@ -650,6 +675,8 @@ func DefaultConfig() Config {
 			MaxTimeout:     DefaultExecMaxTimeout,
 			RestorePolicy:  DefaultExecRestorePolicy,
 			LoaderAllow:    false,
+			WebEnabled:     false,
+			ProfilesPath:   DefaultExecProfilesPath,
 			Output: ExecutorOutputConfig{
 				InlinePreview: DefaultExecInlinePreview,
 				MaxBytes:      DefaultExecMaxOutputBytes,
@@ -738,6 +765,10 @@ func LoadConfig(path string) (Config, error) {
 		"executors.max_timeout",
 		"executors.restore_policy",
 		"executors.loader_allow",
+		// 在线管理档位：两个都是标量，所以能绑。真正的档位列表在文件里（executors.profiles_path
+		// 指向它），而那份文件的内容与 executors.commands 一样故意不绑环境变量。
+		"executors.web_enabled",
+		"executors.profiles_path",
 		"executors.output.inline_preview",
 		"executors.output.max_bytes",
 		"executors.output.dir",
@@ -941,6 +972,9 @@ func (c Config) Normalized() Config {
 	}
 	if c.Executors.RestorePolicy == "" {
 		c.Executors.RestorePolicy = defaults.Executors.RestorePolicy
+	}
+	if c.Executors.ProfilesPath == "" {
+		c.Executors.ProfilesPath = defaults.Executors.ProfilesPath
 	}
 	if c.Executors.Output.InlinePreview == 0 {
 		c.Executors.Output.InlinePreview = defaults.Executors.Output.InlinePreview
