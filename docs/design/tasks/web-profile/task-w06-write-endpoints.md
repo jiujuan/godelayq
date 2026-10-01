@@ -247,8 +247,10 @@ go build ./... && go vet ./...
 
 ### 10.3 验证证据
 
-- `go test ./api -run TestExecutorProfiles -count=1 -race` 绿；`go test ./api -count=1 -race` 绿（234s）。
+- `go test ./api -run TestExecutorProfiles -count=1 -race` 绿；`go test ./api -count=1 -race` 绿（234s，
+  此后只重排过一次用例的空格，重跑 `-run TestExecutorProfiles -race` 复绿）。
 - 全仓 `go test ./... -count=1 -race` 绿：api 234.355s / cmd/server 5.944s / core 13.100s / executor 25.230s / store/sqlite 4.143s。
+- 提交后在 `git archive` 出的临时副本里逐个 commit 验过 `go build ./...` + `go vet ./...`（feat 三个都独立可编译）。
 - `go build ./...`、`go vet ./...`、`go build -tags dashboard ./cmd/server` 全过。
 
 **变异反向验证三处**（各自变红后原样恢复并复跑）：
