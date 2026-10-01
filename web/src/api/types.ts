@@ -347,3 +347,120 @@ export interface ListJobsQuery {
   limit?: number
   offset?: number
 }
+
+/**
+ * 写操作台账的一行（GET /admin/audit 的 AuditItem）。字段与列名逐一对应，
+ * 前端不重新解释后端语义：verdict 由状态码派生、route 存的是路由模板。
+ */
+export interface AuditEntry {
+  time: string
+  /** 账号名；machine 与匿名请求这里是空串，区分看 actor_kind */
+  actor: string
+  actor_kind: string
+  /** 档位名，含 machine；未启用鉴权时是空串 */
+  role: string
+  action: string
+  method: string
+  /** gin 的路由模板（/api/v1/jobs/:id），不是原始 URL */
+  route: string
+  status: number
+  /** 微秒整数；快请求可能是 0（时钟粒度），是量级参考不是精确计时 */
+  latency_us: number
+  verdict: AuditVerdict
+  exec_verdict?: AuditExecVerdict
+  /** 结论码；role_denied 那行存的是要求达到的档位名 */
+  exec_reason_code?: string
+  handler_key?: string
+  profile?: string
+  job_id?: string
+  remote_ip?: string
+  user_agent?: string
+}
+
+/** 后端由状态码折出的封闭集（api/audit.go 的 auditVerdict*），九个取值一个不少 */
+export type AuditVerdict =
+  | 'ok'
+  | 'bad_request'
+  | 'denied'
+  | 'not_found'
+  | 'conflict'
+  | 'partial'
+  | 'throttled'
+  | 'error'
+  | 'other'
+
+export type AuditExecVerdict =
+  | 'accepted'
+  | 'role_denied'
+  | 'profile_unavailable'
+  | 'payload_rejected'
+  | 'timeout_rejected'
+
+/**
+ * action 的全部合法取值 = 19 个动作 + 两个兜底（unmatched / other）。
+ *
+ * 与 api/audit.go 的 auditActions 映射表对照维护：那张表没有透出到任何端点，
+ * 而下拉需要完整候选项，所以这是全项目唯一一份前端复制后端枚举的地方。
+ * 两边不同步的后果是"下拉里少一个选项"或"选了之后恒 400"，
+ * 改后端映射表时要同时改这里（后端侧的校验列表是 AuditActions()）。
+ */
+export const AUDIT_ACTIONS = [
+  'auth.login',
+  'auth.refresh',
+  'auth.logout',
+  'auth.ws_ticket',
+  'job.create',
+  'job.update',
+  'job.cancel',
+  'job.retry',
+  'job.pause',
+  'job.resume',
+  'job.force_pause',
+  'job.batch_create',
+  'job.batch_op',
+  'group.create',
+  'group.update',
+  'group.delete',
+  'admin.scheduler_suspend',
+  'admin.scheduler_unsuspend',
+  'admin.events_clear',
+  'unmatched',
+  'other',
+] as const
+
+export type AuditAction = (typeof AUDIT_ACTIONS)[number]
+
+/** AUDIT_VERDICTS 与后端 api.AuditVerdicts 同一份取值，顺序也照抄（校验用的就是它） */
+export const AUDIT_VERDICTS: AuditVerdict[] = [
+  'ok',
+  'bad_request',
+  'denied',
+  'not_found',
+  'conflict',
+  'partial',
+  'throttled',
+  'error',
+  'other',
+]
+
+/** GET /admin/audit 的查询参数，省略即取后端默认值（limit 50、offset 0、不过滤） */
+export interface AuditQuery {
+  actor?: string
+  action?: AuditAction | ''
+  verdict?: AuditVerdict | ''
+  /** RFC3339，两端都含 */
+  since?: string
+  until?: string
+  limit?: number
+  offset?: number
+}
+
+/** GET /admin/audit（AuditResponse）：total 是匹配条件的总行数，count 是本次行数 */
+export interface AuditListResponse {
+  count: number
+  total: number
+  limit: number
+  offset: number
+  items: AuditEntry[]
+}
+

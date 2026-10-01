@@ -1,6 +1,6 @@
 /* Query 键的唯一出处（§4.7）。失效管线与页面必须用同一套键，
    否则 invalidate 打不中缓存，表现为"推了事件但列表不动"。 */
-import type { ListJobsQuery } from './types'
+import type { AuditQuery, ListJobsQuery } from './types'
 
 export const queryKeys = {
   stats: ['stats'] as const,
@@ -15,6 +15,12 @@ export const queryKeys = {
   runtime: ['admin', 'runtime'] as const,
   /** 档位列表：只有启动期配置会改它，页面自己不带轮询 */
   executors: ['executors'] as const,
+  /**
+   * 写操作台账按筛选条件分页：整体失效用 auditAll。
+   * 与 jobs 同一形状（filters + offset），不发明第二套分页键。
+   */
+  audit: (filters: AuditQuery, offset: number) => ['audit', filters, offset] as const,
+  auditAll: ['audit'] as const,
   /**
    * 某次尝试的输出正文。
    * attempt / stream / from / maxBytes 都要进键：结果面板的四个控件改的就是这四元组，
