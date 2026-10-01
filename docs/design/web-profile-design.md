@@ -1,6 +1,8 @@
 # 档位在线管理设计（Web 上增删改执行器档位）
 
-> 状态：设计定稿，等待拆卡实施（卡片在 `tasks/web-profile/`，编号 TASK-W01…W09）。
+> 状态：**已实施（TASK-W01…W08 落地，W09 收口）**。本文保留规划时的原始说法，
+> 每条决策的落地位置与差异补在 §2 末尾的"落地位置"段；§3 是规划时的基线盘点（行号是当时的位置），
+> §7.1 的偏离表已按代码现状复核。
 > 冲突处理：本文与 `executor-design.md` 冲突时，那份的**执行侧语义**（payload 校验、argv 直传、超时上限、
 > 产物与恢复）仍然有效，只有"档位从哪来、能不能改"这一条被本文改写；§7 逐条列出偏离。
 > 引用约定：正文只写 `文件`、`文件:行号` 与既有文档的 `§`，不写"上面那段"这类无法定位的指代。
@@ -37,6 +39,42 @@
 | D8 | **改动只影响之后触发的执行，不回溯已在堆里的任务** | `job.class` 在入堆时按注册表盖章（`core/scheduler.go:266-267` 的注释已经把这条说死）。热注册只换注册表里的条目与 handler 闭包，堆与快照都不动 |
 | D9 | **`executor.Registry` 改为可变，整表原子替换** | 现在的承诺是"构造之后不再变化，因此读方法不需要加锁"（`executor/registry.go:23`，字段 33-34），而它的读方法全在请求路径上（`api/handlers_executors.go:509、560、594`，`api/handlers.go:697`）。整表 `atomic.Pointer` 替换比逐方法加锁改动面小，且保住"读者永远看到一份自洽的表"这条 |
 | D10 | **本期写端点一律 `ops` 档，审计只进既有 `auditActions` 映射** | 门槛取自现成阶梯：删组是 admin（`api/server.go:288`），运维端点是 ops（`:293`）。往执行面注入命令比删组危险，所以取 ops 起步而不是 admin。细粒度授权与"改前改后值"的专门台账列属于 §11 的后续卡，本期不做，但**动作词必须现在登记**——漏配只会落进 `other`（`api/audit.go:260-270`），台账中间件本身零改动（`api/audit.go:239-254`） |
+
+**落地位置**（TASK-W01…W08 实施后补写，方便按决策找代码）：
+
+- D1 档位文件：`core/executor_profile_store.go`（`ExecutorProfileStore` 接口 +
+  `JSONFileExecutorProfileStore`，`NewJSONFileExecutorProfileStore` 在 `:274`、全量原子重写 `Save` 在 `:350`），
+  配置键 `executors.profiles_path`（`core/config.go`）。存储形状是独立的一份
+  `ExecutorProfileRecord`（`:60`），不给 `ExecutorCommand` 加 json 标签——理由写在那段的注释里。
+- D2 开关：`executors.web_enabled` 与 `profiles_path` 由 W01 加进 `core/config.go`，
+  配套那条"`web_enabled` 必须同时 `enabled`"落在 `core/config.go:459`
+  （原文说"实施时按 `loader_allow` 先例补上"，补的就是这一条，方向因此与本文 §2 初稿相反）。
+  503 守卫在 `api/handlers_executor_profiles.go` 的 `requireExecutorProfiles`，两种 503 文案可区分。
+- D3 一条校验路径：单条入口是 `executor.BuildProfile(cmd, ec, mode)`（`executor/profile.go:257`），
+  写端点经 `executor.Applier.Validate`（`executor/applier.go:98`）调它，没有第二份校验函数。
+- D4 全局唯一：合并与撞名判定只在 `executor.MergeStoreProfiles`（`executor/merge_profiles.go:39`），
+  端点侧的 409 出口是 `respondKeyTaken`（`api/handlers_executor_profiles.go:530`）。
+- D5 ⚠️ 越界只对配置侧保留：`PathMode`（`executor/profile.go:46`）与 `resolveAnywhere`（`:959`），
+  配置侧的 `resolveInside`（`:993`）逐字未改。展示写法在 `Profile.PathDisplay()`（`:195`），
+  判越界用 `withinDirectory`（`:1054`）而不是 `relativeTo` 返回的形状（W02 抓到的 D-0201）。
+- D6 删除语义：`core.Scheduler.PauseByHandlerKey`（`core/scheduler.go:924`）只钉 pending；
+  端点侧三步顺序是"钉任务 → 删文件 → 生效摘 handler"（`DeleteExecutorProfile`，
+  与本文 §6.6 初稿的"钉 → 摘 → 删"不同，理由见 TASK-W06 §10.2）。
+- D7 三条不可变：`immutableFieldChange`（`api/handlers_executor_profiles.go:514`），
+  比的是写法原文，界面侧对应把三个单选锁住并写明"改类型请删除后重建"。
+- D8 不回溯在堆里的任务：热生效只换 `Registry` 的快照与 handler 闭包，堆与快照都不动
+  （`executor/applier.go:115` 的 `Apply` 是唯一的生效入口）。
+- D9 可变登记表：`atomic.Pointer[snapshot]`（`executor/registry.go:85`）、
+  运行期整表替换 `ApplyStore`（`:154`）、一次读表拿齐展示字段 `List()`（`:364`）。
+- D10 门禁与审计：四个端点一律 `RequireRole(core.RoleOps)`（`api/server.go:301-306`），
+  三个动作词在 `api/audit.go:117-119`，前端下拉那份常量同步在
+  `web/src/api/types.ts` 的 `AUDIT_ACTIONS`（TASK-W08 补的三项）。
+- 界面（§6.9）落点取 P3 的独立视图：`web/src/views/ProfilesView.vue` +
+  `web/src/components/executors/ProfileForm.vue` + `web/src/api/executor-profiles.ts`，
+  路由 `/profiles` 的 `meta.minimumRole` 是 `ops`。
+- 与本文的两处补充差异（都是实施时才发现的）：定义另有一个读口
+  `GET /executors/profiles/:name`（本文 §6.8 只写了 `GET /executors`，TASK-W07 登记为 D-0702），
+  以及 `PUT` 的"请求体没带 `env` = 不改"（本文 §6.6 没写这条，没有它就会在改超时时抹掉固定凭据）。
 
 ## 3. 现状盘点（规划时基线，已核实）
 
@@ -278,7 +316,9 @@ http.MethodDelete + " /api/v1/executors/profiles/:name":     "executor.profile_d
   改一条没生效的档位等于让人去编辑一份不会被读到的记录，页面上不该给这个入口）。
   这条判断只在 `executor.Registry.List` 里有一份，api 与前端都只读结果。
 - `degraded`: bool（§5.2 的冲突条目）；
-- `path_display`: 脚本/产物的展示写法（workspace 内是相对路径，越界的是绝对路径原样）。
+- `path_display`: 脚本/产物的展示写法（workspace 内是相对路径，越界的是绝对路径）。
+  ⚠️ 给的是解析后的路径而不是请求体里的原文：分隔符按本机归一、多余段收掉，
+  所以 Windows 上写 `C:/a/b.py`，读回的是反斜杠形式的 `C:\a\b.py`（TASK-W09 场景 5 实测）。
   ⚠️ W02 实施时核实：**判"在不在 workspace 内"不能看 `ScriptRel` 的形状** ——
   `relativeTo` 只在 `filepath.Rel` 失败（Windows 跨盘符）时兜底成文件名，
   同盘越界会老实给出 `..\..\srv\report\main.py` 这种上跳形式。
@@ -322,30 +362,36 @@ PUT 的请求体形状，只有 `env` 换成键名列表 `env_keys`——取值�
 
 | 项 | 原口径 | 本设计 | 依据 |
 | --- | --- | --- | --- |
-| `executors.commands` 的 script/program | 必须相对 workspace 且解析后落在其内 | **不变** | `executor/profile.go:867-888` |
-| 页面建的档位 | 不存在 | 允许任意本机路径 | 评审拍板（D5） |
+| `executors.commands` 的 script/program | 必须相对 workspace 且解析后落在其内 | **不变** | `executor/profile.go` 的 `resolveInside`（现 `:993`；规划时写的 `:867-888` 已随 W02/W03 的下文增补而后移） |
+| 页面建的档位 | 不存在 | 允许任意本机路径 | 评审拍板（D5）；落地是 `PathMode`（`:46`）+ `resolveAnywhere`（`:959`），由 `BuildProfile` 的第三个入参选 |
 | 内联源码 | 拒绝 | **仍然拒绝** | 页面只能引用已存在的文件，不接受脚本正文 |
-| 解释器白名单 | `runtime_allow` | **不变**（两种来源共用） | `executor/profile.go:303-313` |
+| 解释器白名单 | `runtime_allow` | **不变**（两种来源共用） | `executor/profile.go:389-391`（名单来自 `core.Config.Normalized()`，缺省值 `core/config.go:670`） |
+
+⚠️ 本表在 TASK-W09 按代码现状复核过：四条口径与实现一致，只有行号需要更新（已在上表标注）。
+其中"越界只对 store 侧放开"这一条同时体现在 `docs/design/executor-design.md` 的 §2 落地位置
+（D1/D2 两条 ⚠️）与 §7 的"路径逃逸"那一行——三份文档说的是同一件事，改代码时三处都要跟上。
 
 风险从此由"能改配置并重启的人"扩大到"能拿到一个 ops 档 JWT 的人"。具体新增的攻击面：
 
 1. 指到任意可读文件并用白名单解释器执行（例如 `runtime: bash` + `/etc/crontab`）。仍然受解释器语法与
-   `Probe` 的"存在且是普通文件"约束（`executor/probe.go:69-78`），但不是受路径约束。
+   `Probe` 的"存在且是普通文件"约束（`executor/probe.go:44、70-78`），但不是受路径约束。
 2. 路径存在性探测：400 的具体原因（不存在 / 是目录 / 无权限）会告诉调用者本机文件系统的情况。
    本期统一成一句"文件不存在或不可用"，但保存成功本身就是一次确认。
 3. 绝对路径会出现在 `GET /api/v1/executors` 里，而该端点的路由档位是 reader
-   （`api/server.go:275`）——viewer 档因此能读到本机目录结构。这是本设计**已知的泄露面**，见 §7.2 S-3。
+   （`api/server.go:294`）——viewer 档因此能读到本机目录结构。这是本设计**已知的泄露面**，见 §7.2 S-3。
+   ⚠️ TASK-W08 之后它多了一个出口：`GET /executors/profiles/:name` 把脚本路径、固定参数与请求头
+   原样给回，但那一条与写端点同档（ops），**没有扩大 reader 能看到的范围**。
 4. 越界档位不进 git，也就没有任何评审痕迹。唯一的留痕是 `write_audit` 里那一行动作记录（不含值，§6.7）。
 
 ### 7.2 收口清单（后续卡，本期只登记不动）
 
-| 编号 | 内容 | 触发条件 |
-| --- | --- | --- |
-| S-1 | `executors.path_roots` 目录白名单：store 档位的 script/program 必须落在其一（默认只有 workspace） | 生产部署前必须补 |
-| S-2 | 细粒度授权（谁能建、谁能删）与档位改动的专门审计列（改前/改后摘要，不含 secret 取值） | 接入真实多租户前 |
-| S-3 | `GET /executors` 的绝对路径对 viewer 遮蔽（只给文件名或提到 admin 档才给全路径） | 与 §7.1 第 3 条配对 |
-| S-4 | workspace 与 `path_roots` 内的脚本文件管理（上传/编辑/只读预览） | 用户提出时 |
-| S-5 | 页面上编辑 `env` 固定取值（本期只列键名，值不可回显也不入库） | 与 D6 的 secret 口径一起判 |
+| 编号 | 内容 | 触发条件 | 状态（TASK-W09 复核） |
+| --- | --- | --- | --- |
+| S-1 | `executors.path_roots` 目录白名单：store 档位的 script/program 必须落在其一（默认只有 workspace） | 生产部署前必须补 | **未实施**，配置键也不存在；已写进 `docs/deployment.md` "开启执行器"第 13 条的警告里 |
+| S-2 | 细粒度授权（谁能建、谁能删）与档位改动的专门审计列（改前/改后摘要，不含 secret 取值） | 接入真实多租户前 | **未实施**；本期只有 ops 一档 + 三个动作词（`api/audit.go:117-119`），台账没有改前/改后列 |
+| S-3 | `GET /executors` 的绝对路径对 viewer 遮蔽（只给文件名或提到 admin 档才给全路径） | 与 §7.1 第 3 条配对 | **未实施**；TASK-W07 冒烟实测 viewer 与 ops 看到完全相同的行（`path_display` 含绝对路径） |
+| S-4 | workspace 与 `path_roots` 内的脚本文件管理（上传/编辑/只读预览） | 用户提出时 | **未实施**；控制台只引用已存在的文件，没有任何写脚本的入口 |
+| S-5 | 页面上编辑 `env` 固定取值（本期只列键名，值不可回显也不入库） | 与 D6 的 secret 口径一起判 | **未实施**；TASK-W08 的表单只给键名与"新增/清空整组"，取值不回显这条由 `GetExecutorProfile` 保证（有 canary 用例守着） |
 
 ## 8. 明确不做（本期）
 
@@ -405,3 +451,9 @@ W08 需要 W06、W07；W09 需要全部。
 | P1 | store 文件里某条与 yaml 同名（人后来改了 yaml）：启动失败还是条目降级？ | **降级**（§5.2，config 赢） | 选启动失败更"响亮"，但页面上的一次保存之后改 yaml 能让人把整个队列停摆 |
 | P2 | `exec-profiles.json` 损坏：拒启动还是忽略该文件继续起？ | **拒启动**（§6.5，照分组先例 `core/group_store.go:110-130`） | 忽略能保命，但会出现"页面上见过的档位凭空消失"的现场，且此后每次写盘都把损坏抹平 |
 | P3 | 界面落点：独立视图还是把设置页那段只读区块改造成可编辑？ | **独立视图 `ProfilesView.vue`**（W08 §3.1），设置页保留只读概览 + 一个入口 | 内改造少一个路由与导航项，但档位表单有 12 组字段加一张 `args` 表，塞进设置页会把设置页变成第二个编辑页，还要维护第二套表单 |
+
+三条在实施中都没有翻案（TASK-W09 复核）：P1 的降级路径有真实进程证据（启动日志 `degraded=1`、
+`GET /executors` 同一个键两行并存，见 W07 §10.4 与 W08 §10.4）；P2 的拒启动有 W05 的冒烟证据
+（error 日志含路径与 `delete it` 指引）；P3 按独立视图落地（`web/src/views/ProfilesView.vue`）。
+P3 那句"12 组字段"落地时多了两样没算进去的东西：一张可增删行的 `args` 表之外还有 `env` 的
+键名列表与 http 那一组的 11 个字段——这正是它不进设置页的理由，实施记录见 W08 卡 §10.2。
