@@ -44,6 +44,12 @@ type Server struct {
 	// /api/v1/groups 各端点据此返回 503（任务的 group 标签不受影响，
 	// 它本来就存在任务快照里）。
 	groups core.GroupStore
+	// profileStore 是档位文件（executors.profiles_path）的读写口；profiles 是
+	// "文件 → 登记表 → 调度器"的同步器。两个字段成对注入，缺任何一个都意味着
+	// 写端点没法守住"落盘先于生效"的顺序，因此一起判、一起 503（见 requireExecutorProfiles）。
+	// 未注入是默认状态：executors.web_enabled 默认 false。
+	profileStore executorProfileStore
+	profiles     executorProfileApplier
 	// executors 是执行器档位登记表；nil 表示这次部署没装配执行器（开关关闭，
 	// 或测试直接构造 Server）。读它的是 GET /executors 与结果端点的预览上限，
 	// 未注入时不报错：登记表在开关关闭时也是非 nil 的空表，"没装配"是默认状态。
@@ -88,6 +94,19 @@ type Option func(*Server)
 // 但任务上的 group 标签照常读写——两者是两份数据，不要混用。
 func WithGroupStore(store core.GroupStore) Option {
 	return func(s *Server) { s.groups = store }
+}
+
+// WithExecutorProfileStore 注入档位文件的读写口，与 WithExecutorProfileApplier 成对使用：
+// 三个写端点需要两者齐备（store 落盘、applier 生效），少给一个就是 503（设计文档 §6.6）。
+// 单独注入它没有意义——写路径的每一端都要同时在场。
+func WithExecutorProfileStore(store executorProfileStore) Option {
+	return func(s *Server) { s.profileStore = store }
+}
+
+// WithExecutorProfileApplier 注入"把档位文件重新生效"的那一步（*executor.Applier）。
+// 未注入时 /api/v1/executors/profiles 各端点返回 503，读端点 GET /executors 不受影响。
+func WithExecutorProfileApplier(applier executorProfileApplier) Option {
+	return func(s *Server) { s.profiles = applier }
 }
 
 // WithExecutorRegistry 注入执行器档位登记表。传 nil 与不注入等价：
@@ -273,6 +292,18 @@ func (s *Server) setupRoutes() {
 		// 执行器档位列表。未注入登记表时它回 {"enabled":false,"profiles":[]}：
 		// 执行器默认关闭，那是默认状态而不是错误状态，所以这里没有 503 守卫。
 		api.GET("/executors", reader, s.ListExecutors)
+
+		// 档位的在线管理（增删改）。两道门槛叠在一起：
+		//   - 路由分组上的 requireExecutorProfiles 管"这台让不让在线改"；
+		//   - RequireRole(ops) 管"这个身份够不够"——比删组（admin）更高一档，
+		//     因为它改的是"这台机器能执行什么"（设计文档 D10）。
+		// 提交 exec.* 任务的门槛是另一件事（executors.required_role，全局一份），两条判定互不替代。
+		profiles := api.Group("/executors/profiles", s.requireExecutorProfiles())
+		{
+			profiles.POST("", s.RequireRole(core.RoleOps), s.CreateExecutorProfile)
+			profiles.PUT("/:name", s.RequireRole(core.RoleOps), s.UpdateExecutorProfile)
+			profiles.DELETE("/:name", s.RequireRole(core.RoleOps), s.DeleteExecutorProfile)
+		}
 
 		// 全局最近事件：Dashboard 刷新后补历史用
 		api.GET("/events", reader, s.ListRecentEvents)
