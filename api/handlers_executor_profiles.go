@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -65,6 +66,69 @@ type ExecutorProfileDeleteResponse struct {
 	RunningJobs int `json:"running_jobs"`
 	// AlreadyPausedJobs 是删除之前就已经在 paused 上的条数，它们不在上面的计数里。
 	AlreadyPausedJobs int `json:"already_paused_jobs"`
+}
+
+// ExecutorProfileRecordResponse 是档位文件里那条记录本身（TASK-W08 的编辑表单取数口）。
+//
+// 为什么要有它：`GET /executors` 的每一行说的是"这条档位现在的处境"（来源、能不能改、
+// 这台机器跑不跑得动），档位的**定义**字段一个都不在里面——于是页面做不出"编辑一条已有档位"，
+// 只能新建（TASK-W07 §10.5 登记的 D-0702）。这里把定义给回来，边界与写端点同档：
+// web_enabled 打开 + ops 身份（记录里有脚本路径、固定参数、请求头这些配置内容）。
+//
+// env 的固定取值仍然不外露，只给键名（EnvKeys）：表单拿不到值，保存时自然就不会带 env 这个键，
+// 而 PUT 把"没带 env"解释成"不改"（见 UpdateExecutorProfile），两段合起来才守得住
+// "页面上的编辑不会悄悄抹掉配置里的凭据"。
+type ExecutorProfileRecordResponse struct {
+	core.ExecutorProfileRecord
+
+	// EnvKeys 是这条档位固定的环境变量名，按字典序。值一律不外露。
+	EnvKeys []string `json:"env_keys"`
+}
+
+// GetExecutorProfile GET /api/v1/executors/profiles/:name
+//
+// 只有档位文件里的那条记录有这个端点：配置侧档位没有存储记录，
+// 它在这个端点上是 409（与 PUT/DELETE 同一条判据与文案，界面上只需要认一种情况）。
+// 读请求不进写操作台账（api/audit.go 的中间件只记 POST/PUT/DELETE），这里不需要动作词。
+func (s *Server) GetExecutorProfile(c *gin.Context) {
+	name := strings.TrimSpace(c.Param("name"))
+	if err := core.ValidateProfileName(name); err != nil {
+		c.JSON(http.StatusBadRequest, ErrorResponse{
+			Code: 400, Message: "invalid profile name", Details: err.Error(),
+		})
+		return
+	}
+
+	record, found, err := s.profileStore.Get(name)
+	if err != nil {
+		s.respondProfileStoreError(c, err, name)
+		return
+	}
+	if !found {
+		if _, ok := s.executors.Lookup(profileKey(name)); ok {
+			s.respondKeyTaken(c, profileKey(name))
+			return
+		}
+		c.JSON(http.StatusNotFound, ErrorResponse{
+			Code:    http.StatusNotFound,
+			Message: "profile not found",
+			Details: fmt.Sprintf("no stored profile %q", name),
+		})
+		return
+	}
+
+	keys := make([]string, 0, len(record.Env))
+	for key := range record.Env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	// 值不外露，键名走 EnvKeys：置空之后这个键在 JSON 里整个消失（omitempty）
+	record.Env = nil
+
+	c.JSON(http.StatusOK, ExecutorProfileRecordResponse{
+		ExecutorProfileRecord: record,
+		EnvKeys:               keys,
+	})
 }
 
 // jobTallyByHandlerKey 数出某个注册键下的任务分布。
@@ -247,6 +311,14 @@ func (s *Server) UpdateExecutorProfile(c *gin.Context) {
 				failure, name),
 		})
 		return
+	}
+
+	// env 的固定取值不回显（见 ExecutorProfileRecordResponse），所以页面保存时通常不带这个键。
+	// 不带就解释成"不改"：存着的取值原样留着；显式写 "env": {} 才是清空。
+	// 没有这条规则的话，一次只想改超时的编辑会把档位里的固定环境变量抹掉——
+	// 而那件事在界面上看不见、在响应里也不可见，是最难被发现的一类数据丢失。
+	if record.Env == nil {
+		record.Env = existing.Env
 	}
 
 	cmd, ok := s.profileCommand(c, record)

@@ -293,13 +293,14 @@ func (s *Server) setupRoutes() {
 		// 执行器默认关闭，那是默认状态而不是错误状态，所以这里没有 503 守卫。
 		api.GET("/executors", reader, s.ListExecutors)
 
-		// 档位的在线管理（增删改）。两道门槛叠在一起：
+		// 档位的在线管理（查增改删）。两道门槛叠在一起：
 		//   - 路由分组上的 requireExecutorProfiles 管"这台让不让在线改"；
 		//   - RequireRole(ops) 管"这个身份够不够"——比删组（admin）更高一档，
 		//     因为它改的是"这台机器能执行什么"（设计文档 D10）。
 		// 提交 exec.* 任务的门槛是另一件事（executors.required_role，全局一份），两条判定互不替代。
 		profiles := api.Group("/executors/profiles", s.requireExecutorProfiles())
 		{
+			profiles.GET("/:name", s.RequireRole(core.RoleOps), s.GetExecutorProfile)
 			profiles.POST("", s.RequireRole(core.RoleOps), s.CreateExecutorProfile)
 			profiles.PUT("/:name", s.RequireRole(core.RoleOps), s.UpdateExecutorProfile)
 			profiles.DELETE("/:name", s.RequireRole(core.RoleOps), s.DeleteExecutorProfile)
