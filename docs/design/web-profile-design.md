@@ -248,6 +248,11 @@ http.MethodDelete + " /api/v1/executors/profiles/:name":     "executor.profile_d
 - `editable`: `web_enabled && source==store`；
 - `degraded`: bool（§5.2 的冲突条目）；
 - `path_display`: 脚本/产物的展示写法（workspace 内是相对路径，越界的是绝对路径原样）。
+  ⚠️ W02 实施时核实：**判"在不在 workspace 内"不能看 `ScriptRel` 的形状** ——
+  `relativeTo` 只在 `filepath.Rel` 失败（Windows 跨盘符）时兜底成文件名，
+  同盘越界会老实给出 `..\..\srv\report\main.py` 这种上跳形式。
+  判据只能是 `withinDirectory(workspace, 绝对路径)`，而它目前是 `executor` 包内的函数，
+  W07 要在包里给一个只读访问器（例如 `Profile.PathDisplay()`），别让 api 层自己拼。
 
 顶层加 `web_enabled`: bool 与 `runtime_allow`: []string（`executors.runtime_allow` 原样透出）。
 后者是给 W08 的"解释器"下拉用的：不透明的文本框会让拼错的解释器一路走到保存之后才由 400 暴露，

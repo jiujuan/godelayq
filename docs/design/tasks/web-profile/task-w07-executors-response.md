@@ -32,6 +32,10 @@ W05 之后表里同时存在两份来源的条目，且可能有降级条目（�
    - `degraded`: bool；为真时 `available=false`，`reason` 必须指名"与 `executors.commands` 的同名档位冲突，未注册"。
    - `path_display`: 脚本/产物的展示写法。workspace 内给相对写法（沿用 `ScriptRel`/`ProgramRel`），
      越界给绝对路径原样；两者都没有（http 档位）时该键**省略而不是空串**。
+     **W02 §3.5 已核实**：判"有没有越界"不能看 `ScriptRel` 的形状（同盘越界它会给 `..\..\` 上跳形式，
+     只有 Windows 跨盘符才兜底成文件名），只能用 `withinDirectory(workspace, 绝对路径)`；
+     该函数在 `executor` 包内，所以展示逻辑要落在 `executor` 侧的一个只读方法上
+     （建议 `(*Profile).PathDisplay() string`），api 层只透传，不自己拼路径。
      ⚠️ 这条会把本机目录结构暴露给 reader 档——设计文档 §7.1 第 3 条已登记为 S-3，
      本卡照现状实现，并在 §8 明确"遮蔽方案不在本卡"。
 2. 顶层新增 `web_enabled`: bool（与既有的 `enabled` 并列；`enabled` 仍是 `executors.enabled`）。
