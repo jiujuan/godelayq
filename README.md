@@ -18,7 +18,8 @@
 - 📊 **数据处理**：定时报表生成、数据同步、日志清理
 - 🔄 **工作流引擎**：状态机流转、审批超时提醒(* 暂时没实现)
 - ⏰ **定时任务**：Cron 表达式支持的周期性任务
-- 🛠️ **运维自动化**：定时清理、报表脚本、部署钩子——由配置声明的执行器档位执行，见核心特性第 3 条
+- 🛠️ **运维自动化**：定时清理、报表脚本、部署钩子——由配置声明的执行器档位执行，见核心特性第 3 条；
+  执行过什么、输出多大、谁提交的，启用观测层后都可以查（见核心特性第 4 条）
 
 
 ## 架构设计
@@ -86,9 +87,24 @@
 │  │  • 崩溃恢复      │  │  • 集群支持      │  │  • 复杂查询      │  │
 │  └─────────────────┘  └─────────────────┘  └─────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
+│
+▼
+┌─────────────────────────────────────────────────────────────────┐
+│        Observation Layer (观测层，可选：observability.enabled)   │
+│  ┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐  │
+│  │   job_events    │  │ artifact_index  │  │   write_audit   │  │
+│  │  (事件时间线)    │  │ (输出文件索引)   │  │  (写操作台账)    │  │
+│  │  • 跨重启留存   │  │  • 尺寸/截断/状态 │  │  • 谁·做了什么·结论│  │
+│  └─────────────────┘  └─────────────────┘  └─────────────────┘  │
+│  一个 SQLite 文件（modernc 纯 Go 驱动，只出现在 store/sqlite）；  │
+│  定位是加速器不是账本：不搬任务快照，写失败不改变执行结果与响应    │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
 > * 暂时没有实现，持久化层的 可扩展: Redis 与 可扩展: MySQL 还没实现
+>
+> 观测层默认关闭（`observability.enabled: false`）：关着时不建文件、不订阅事件总线，
+> 上面三个端点回到本图之前的行为。开启方式与代价见 [部署文档](./docs/deployment.md) 的"启用观测层"。
 
 ### 数据流图
 
@@ -99,11 +115,16 @@
 │                │                  ▼              ▼
 │                │           [持久化存储]    [事件总线] ──► [WebSocket推送]
 │                │                  │              │
+│                │                  │              ├──────► [SSE 备选通道]
+│                │                  │              └──────► [事件库 job_events]（可选，observability）
 │                └──────────────────┘              ▼
 │                                         [重试/Cron/归档]
 ▼
 [立即返回任务ID]
 ```
+
+> 事件总线的下游是并列的订阅者：实时推送与 SSE 之外，启用观测层时多一个把 `job.*` 写进 SQLite 的写入器。
+> 每一路都是非阻塞投递，任一路取不到都不影响其它两路（见 [部署文档](./docs/deployment.md) 的"启用观测层"第 7 条）。
 
 ### 核心文件详解
 
@@ -119,6 +140,7 @@
 | `load.go` | 文件任务加载 | fsnotify 监控 + 100ms 静默窗口合并写入事件，加载后删除/归档，非法文件可隔离到 `error_dir` |
 | `config.go` | 运行配置 | viper 读 yaml + `GODELAYQ_*` 环境变量，未知键与非法取值启动即报错 |
 | `logging.go` | 日志装配 | 标准库 `log/slog`，`NewLogger` 按级别/格式构造，组件经 `WithLogger` 注入 |
+| `store/sqlite/` | 观测层存储（可选，独立于 `core.Store`） | 一个 SQLite 文件里三张表（`job_events` / `artifact_index` / `write_audit`）；全仓唯一 import 驱动（`modernc.org/sqlite`，纯 Go）的包，`core`/`api`/`executor` 都不认识 SQLite。三个写入器共用一个有界批量器：非阻塞入队、按 `flush_interval` 合并成一次事务、失败的一批重试一次后丢弃并计数，所以记不住观测数据永远不会反过来拖慢调度或请求 |
 
 
 ## 目录结构
@@ -158,10 +180,12 @@ godelayq/
 │   ├── handlers_auth.go      # 登录、刷新、登出、身份、实时票据
 │   ├── handlers_lifecycle.go # 暂停/强制暂停/恢复 + batch-ops 批量操作
 │   ├── handlers_groups.go    # 分组注册表 CRUD（改名连带改写任务标签）
-│   ├── handlers_events.go    # 任务时间线与全局最近事件
+│   ├── handlers_events.go    # 任务时间线与全局最近事件（装配了事件库时改读库）
+│   ├── handlers_artifacts.go # GET /jobs/:id/artifacts：按尝试列出输出尺寸与清理状态
 │   ├── handlers_executors.go # 档位清单、执行输出读取、提交期判定与凭据掩码
-│   ├── handlers_admin.go     # ops 档：运行时诊断、调度总开关、清缓冲
-│   ├── history.go            # 事件内存环形缓冲（订阅事件总线，重启即清空）
+│   ├── handlers_admin.go     # ops 档：运行时诊断、调度总开关、清缓冲、写操作台账查询
+│   ├── audit.go              # 写操作台账：中间件、action/verdict 封闭词表、读写窄接口（观测层）
+│   ├── history.go            # 事件内存环形缓冲（订阅事件总线，重启即清空；启用事件库后它是兜底）
 │   ├── authenticator.go      # 账号校验与 JWT 签发/验签
 │   ├── authstore.go          # refresh 表、登出拒绝表、一次性 ticket
 │   ├── ratelimit.go          # 登录失败限流（IP+账号 与 IP 双维度）
@@ -186,7 +210,18 @@ godelayq/
 │   ├── http.go               # HTTP 档位：拨号层禁内网与元数据地址、请求渲染、响应与头的落盘
 │   ├── result.go             # 一次执行的内存形态：结论摘要 + 两条输出流 + 预览裁剪
 │   ├── artifact.go           # 产物文件存储（a<n>.out / a<n>.err / meta.json）与 TTL、孤儿清理
+│   ├── artifact_index.go     # 产物索引的可选依赖接口（ArtifactIndexer）：登记、标清理、启动对账
 │   └── *_test.go             # 与上述文件一一对应的单元测试（含真实进程与跨平台夹具）
+│
+├── store/sqlite/             # 观测层存储（可选，一个 SQLite 文件；全仓唯一 import SQLite 驱动的包）
+│   ├── db.go                 # 打开与迁移、WAL/busy_timeout/synchronous 三个 PRAGMA、SetMaxOpenConns(1)
+│   ├── schema.go             # version 1 迁移：三张表与八个索引，逐字对齐设计文档 §6
+│   ├── batch.go              # 三个写入器共用的有界批量器（非阻塞入队、合并事务、重试一次后丢弃计数）
+│   ├── events.go             # job_events：事件写入器，同时是两个事件端点的读取方
+│   ├── artifacts.go          # artifact_index：产物索引实现（写失败只记日志，文件仍是权威）
+│   ├── audit.go              # write_audit：写操作台账的写入与查询（含两条保留淘汰）
+│   ├── doc.go                # 包说明与依赖边界
+│   └── *_test.go             # 往返、过滤分页、保留淘汰、队满丢弃与关闭幂等
 │
 ├── examples/                 # 独立可运行示例
 │   ├── demo1/                # 编程式提交与崩溃恢复
@@ -219,9 +254,14 @@ godelayq/
 │
 └── docs/
     ├── api.md                # API 详细文档
-    ├── deployment.md         # 部署与安全配置指南
+    ├── deployment.md         # 部署与安全配置指南（含"启用观测层"一节）
     ├── example.md            # 用法示例
-    └── core-scheduler-heap-event-load-analysis.md  # 核心模块设计分析
+    ├── core-scheduler-heap-event-load-analysis.md  # 核心模块设计分析
+    └── design/
+        ├── web-console-design.md            # Web 控制台设计与权限矩阵
+        ├── executor-design.md               # 执行层设计（档位、结果与产物）
+        └── sqlite-observability-design.md   # 观测层设计（三张表、批量写入与端点）
+            └── tasks/            # 按卡实施：executor/ 19 张（E01…E19）、sqlite/ 8 张（S01…S08）
 ```
 
 仓库不提供 Makefile、Dockerfile、docker-compose.yml 与运维脚本；构建直接用
@@ -264,8 +304,13 @@ godelayq/
 - **REST API 查询**：完整的任务生命周期管理接口，支持 `POST /jobs/batch` 单请求最多 100 条的批量提交（逐条独立，混合结果以 207 返回）
 - **暂停与分组**：`POST /jobs/:id/pause|resume|force-pause` 三个动作，`GET /jobs?group=` 按分组过滤（空值=未分组），
   分组注册表走 `/api/v1/groups` 增删改查；改名/detach 由调度器连堆内条目一起改写，任务跑完不会把旧组名写回去
-- **事件时间线**：`GET /jobs/:id/events` 与 `GET /events` 读进程内的环形缓冲（每任务 100 条、全局 500 条），
-  补"打开页面之前"的历史；重启即清空，长期留痕请接外部日志
+- **事件时间线**：`GET /jobs/:id/events` 与 `GET /events`。默认读进程内的环形缓冲（每任务 100 条、全局 500 条，
+  重启即清空）；启用观测层的事件库后改读持久化的 `job_events`，重启后时间线仍有历史、一次响应最多 1000 条。
+  响应里的 `note` 字段会说清这次读的是哪一路，最新一条最多晚一个 `flush_interval`（默认 200ms）
+- **观测层（默认关闭）**：`observability.enabled` 打开后多写一个 SQLite 文件，把运行事件、执行输出索引与
+  写操作台账落盘——事件跨重启留存、`GET /jobs/:id/artifacts` 按尝试列出输出尺寸与清理状态、
+  `GET /admin/audit` 查"谁在什么时候改了什么"。它是加速器不是账本：不搬任务快照，写失败只记日志，
+  关掉开关即回到只有日志与内存缓冲的原状。容量、备份与丢弃计数怎么看见 [部署文档](./docs/deployment.md) 的"启用观测层"
 - **运维端点**：`GET /admin/runtime` 读 worker/队列/堆/缓冲占用，`POST /admin/scheduler/suspend|unsuspend`
   是维护窗口的调度总开关（进程内状态，重启自动解除）
 - **控制台**：`web/` 的 Vue 控制台共八个页面（概览、任务列表、任务详情、分组、实时、运维、设置、登录）；
@@ -291,7 +336,9 @@ godelayq/
 - **静态产物免鉴权，也只到产物为止**：带前端的二进制里 `GET`/`HEAD` 的 `/`、`/assets/*`
   与 SPA 深链不需要凭据（登录页本身就在产物里）；`/api`、`/ws`、`/sse` 三个名字空间与
   一切写方法照旧要凭据，未知路径也不会被兜底成页面
-- **边界**：无 HTTPS、无在线账号管理、无审计落盘（写操作只进结构化日志），需前置反代
+- **边界**：无 HTTPS、无在线账号管理，需前置反代。写操作台账分两条出口：未启用观测层时只有结构化日志
+  （`msg="write operation audited"`），启用后同时落 `write_audit` 表并可用 `GET /admin/audit` 查；
+  两种出口都不记请求体与参数取值
 
 ### 6. 扩展能力
 
@@ -429,7 +476,27 @@ executors:
   # 档位列表：脚本 / 已编译产物 / HTTP 三种，字段见模板注释与设计文档 §5。
   # 与 server.auth.users 同理，这里不写 []（解开示例即可启用；写 [] 再挂列表项会让 YAML 报错）。
   commands:
+observability:
+  enabled: false              # 总开关；false 时不建库文件、不订阅事件总线、三个注入全部为空，行为与本节之前一致
+  path: ./data/observe.sqlite # 观测库文件；父目录不存在时由启动装配创建，WAL 会另生 -wal/-shm 旁文件
+  flush_interval: 200ms       # 三个写入器共用的合并落盘周期；同时是事件端点看到最新一条的延迟上界
+  queue_capacity: 4096        # 每个写入器的有界队列容量；队满丢弃新记录并计数，绝不阻塞调度或请求
+  busy_timeout: 2s            # SQLite 锁等待上限
+  synchronous: normal         # normal（默认，断电最多丢最后几个已提交事务）| full（每次提交等磁盘同步）
+  events:
+    enabled: true             # job_events 表：把 job.* 事件持久化，重启后时间线仍有历史
+    retention_count: 200000   # 保留条数，超出按写入顺序淘汰最旧
+    retention_age: 720h       # 保留时长；0 表示不按时间淘汰
+  artifacts:
+    enabled: true             # artifact_index 表：按任务与尝试记录输出尺寸、截断与清理状态
+  audit:
+    enabled: true             # write_audit 表：每个写请求一行台账（谁、什么身份、做了什么、成没成、多快）
+    retention_count: 500000   # 保留条数；高频建任务的部署会先撞到条数上界而不是天数
+    retention_age: 2160h      # 保留时长（默认 90 天）；0 表示不按时间淘汰
 ```
+
+> 观测层的三个子开关只在总开关为真时生效，代价与备份口径见 [部署文档](./docs/deployment.md) 的"启用观测层"，
+> 表结构与读端点见 [观测层设计文档](./docs/design/sqlite-observability-design.md)。
 
 配置 `server.auth.token` 或 `server.auth.users` 任一后，除两个登录入口
 （`POST /api/v1/auth/login`、`POST /api/v1/auth/refresh`）外全部端点都要凭据，
@@ -459,3 +526,5 @@ executors:
 - [Web 控制台设计文档](./docs/design/web-console-design.md)（`web/` 的技术选型、页面与后端改造方案，含里程碑进度）
 - [执行器设计文档](./docs/design/executor-design.md)（shell/脚本/HTTP 执行层的白名单档位、结果通道与权限模型；**已实现（M0–M5），与实现的偏差在该文正文的 ⚠️ 标注里**）
   - 实施拆分：[执行器任务卡 TASK-E01 … E19](./docs/design/tasks/executor/README.md)
+- [观测层设计文档](./docs/design/sqlite-observability-design.md)（可选的 SQLite 观测层：运行事件、产物索引与写操作审计三张表；**已实现，与设计不同处逐条标在该文 §15**）
+  - 实施拆分：[观测层任务卡 TASK-S01 … S08](./docs/design/tasks/sqlite/README.md)
