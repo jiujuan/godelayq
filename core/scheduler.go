@@ -263,13 +263,40 @@ func (s *Scheduler) RegisterHandler(jobType string, handler Handler) {
 // RegisterHandlerClass 注册处理函数并声明它的执行类别（TASK-E13）。
 //
 // 执行器档位用 JobClassExec：这类任务单次执行按分钟计，共享池会让普通任务的准时性失效。
-// 类别在注册时定下，入堆时按注册表盖章，之后改注册不会影响已经在堆里的任务——
-// 注册本来就发生在启动阶段，运行期没有人重新注册同一键。
+// 类别在注册时定下、入堆时盖章到任务对象上，之后改注册不会影响已经在堆里的任务
+// （docs/design/web-profile-design.md D8）——这一点与"谁来注册"无关：
+// 注册既可能发生在启动阶段（装配 executors.commands），也可能发生在运行期
+// （档位的在线管理，`executors.web_enabled` 打开后由 api 层触发）。
+// 运行期的注册与摘除走的是下面这对方法，共用 s.mu，不需要新增锁。
 func (s *Scheduler) RegisterHandlerClass(jobType string, handler Handler, class JobClass) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.handlers[jobType] = handler
 	s.handlerClasses[jobType] = class
+}
+
+// UnregisterHandler 摘除一个注册键，返回它此前是否注册着。
+//
+// 两张表必须成对删：只删 handlers 会留下 handlerClasses 里的孤儿，HandlerClass
+// 依旧回 (JobClassExec, true)，崩溃恢复守卫据此认为"这个键还注册着、属于执行池"，
+// 把一条其实已经没有处理函数的 running 任务钉成 paused（判据见 cmd/server/main.go
+// 的 pauseRunningExecOnRestore）。它本该在 executeJob 里找不到处理函数直接判失败，
+// 就此变成永远等不到档位的僵尸任务。
+//
+// 它不停任何在跑的任务，也不动 cancelMap：中止执行属于 ForcePause（admin 档），
+// 摘除注册键不该附带"替人中止一次已经发生的副作用"。
+//
+// 调用方负责顺序：先落盘再生效。反过来（先摘 handler 再写文件失败）会留下
+// "档位文件里有这条、进程里跑不了"的半状态，重启之后自己就好了，
+// 但那一刻接口与真实能力不一致。见 docs/design/web-profile-design.md §4 的 I2。
+func (s *Scheduler) UnregisterHandler(jobType string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, ok := s.handlers[jobType]
+	delete(s.handlers, jobType)
+	delete(s.handlerClasses, jobType)
+	return ok
 }
 
 // classOfKey 查注册表里声明的执行类别；没登记过的键按默认池处理（零值即 JobClassDefault）。
@@ -872,6 +899,60 @@ func (s *Scheduler) applyGroupToSnapshot(snap JobSnapshot, toGroup string) (bool
 		return false, err
 	}
 	return true, nil
+}
+
+// PauseByHandlerKey 把某个任务类型下所有待执行的任务置为 paused，返回受影响的条数。
+//
+// 形状抄 RetagGroup：遍历存储快照 → 按键匹配 → 逐条处置 → 返回条数；
+// 非原子、幂等，中途单条失败记日志后继续，调用方重试即可。
+// 差别有两处：匹配的是 HandlerKey()（分组是用户标签，这里是注册键），
+// 且它只处理待执行的那批——正在执行的任务一条都不动。
+//
+// 不动运行中任务是刻意的（docs/design/web-profile-design.md D6）：删除档位不该附带
+// "替用户中止一次已经发生的副作用"，中止走 ForcePause（admin 档）。
+// 因此返回值里不含它们，调用方不能把条数当成"这个类型的任务都停了"。
+//
+// 逐条处置复用 Pause，因而与页面单个暂停同一条路径：从堆里摘出、落成 paused、
+// 唤醒调度循环、发 EventJobPaused。Pause 的两个哨兵错误在这里都是正常分支——
+// ErrJobNotPending 表示那条正在执行，ErrJobNotFound 表示它已不在堆里也不在暂停名单上
+// （通常是刚被调度循环弹出进入执行，或已经被别的调用送走），两者都不计入条数、
+// 也不记错误日志。
+//
+// 只认存储：store 为 nil（纯内存部署）返回 (0, nil)，与 RetagGroup 同一条。
+// 档位在线管理本来就要求落盘（web_enabled 的写入侧全部先写文件），
+// 没有存储时这个动作没有可遍历的对象，也就没有意义。
+func (s *Scheduler) PauseByHandlerKey(handlerKey string) (int, error) {
+	if s.store == nil || strings.TrimSpace(handlerKey) == "" {
+		return 0, nil
+	}
+	snapshots, err := s.store.LoadAll()
+	if err != nil {
+		return 0, fmt.Errorf("load jobs for handler key pause failed: %w", err)
+	}
+
+	paused := 0
+	for _, snap := range snapshots {
+		if snap.HandlerKey() != handlerKey {
+			continue
+		}
+		// paused 与终态先跳过，重复调用因此返回 0；running 不在这里拦，
+		// 交给 Pause 按当前堆与 worker 的实际状态判定。
+		switch JobStatus(snap.Status) {
+		case StatusPaused, StatusSuccess, StatusFailed, StatusCancelled:
+			continue
+		}
+
+		if _, err := s.Pause(snap.ID); err != nil {
+			if errors.Is(err, ErrJobNotPending) || errors.Is(err, ErrJobNotFound) {
+				continue
+			}
+			s.logger.Error("failed to pause job for handler key",
+				"job_id", snap.ID, "handler_key", handlerKey, "error", err)
+			continue
+		}
+		paused++
+	}
+	return paused, nil
 }
 
 // RestoreGuard 在 Restore 逐个处理快照时被调用，用来改判"崩溃瞬间的状态"。
