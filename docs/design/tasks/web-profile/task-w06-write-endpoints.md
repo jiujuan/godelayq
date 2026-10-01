@@ -47,12 +47,26 @@ profiles := api.Group("/executors/profiles", s.requireExecutorProfiles())
 
 | 接口 | 方法 | 实现方 |
 | --- | --- | --- |
-| `profileStoreAPI` | `List`/`Get`/`Save`/`Delete` | `core.JSONFileProfileStore` |
+| `profileStoreAPI` | `List`/`Get`/`Save`/`Delete` | `core.JSONFileExecutorProfileStore`（W01 落地的名字，比本卡原写的 `JSONFileProfileStore` 多一段 `Executor`） |
 | `profileApplier` | `ApplyStore([]executor.StoreEntry) error` | `*executor.Registry`（W03） |
-| `profileRegistrar` | `RegisterHandlerClass`/`UnregisterHandler`/`PauseByHandlerKey` | `*core.Scheduler` |
+| `profileRegistrar` | `RegisterHandlerClass`/`UnregisterHandler`/`PauseByHandlerKey` | `*core.Scheduler`（后两个是 W04） |
 
 未注入任一个 → `requireExecutorProfiles()` 回 503，文案与 `requireGroupStore` 同一体例
 （"未装配"与"没打开"要在响应里可区分，但两者都拒绝，不返回半套结果）。
+
+**W05 交接过来的两件事实（本卡必须自己补上）**：
+
+1. W05 只把"读档位文件"接进了启动路径——`runtimeDeps.newExecutorProfiles` 交回的是
+   `[]core.ExecutorProfileRecord`，**没有交回存储实例**，`api` 侧也还没有任何
+   `WithExecutorProfileStore`/`WithExecutorProfileApplier`（W05 卡 §3.6 的那步执行时判定为
+   "没有读取方就不先注入"，记在 W05 §10.2）。所以写端点要自己把存储实例建到 `run()` 里、
+   并把 Option 一路传进 `newServer`。
+2. 页面写入后的"重建整张 store 侧表"直接用 `executor.MergeStoreProfiles(cfg, records)`：
+   它与启动路径共用同一个函数、同一份校验（I1），返回的 `[]StoreEntry` 已经带好
+   `Source=store` 与撞名的 `Degraded` 标记，直接喂 `ApplyStore` 即可。
+   撞名判定只看 config 侧声明过哪些名字，不看那一条合不合法（W05 的
+   `TestMergeStoreProfiles_CollisionChecksNameOnly`），所以 `Degraded` 只能由这个函数给，
+   不要在外面自己判（W03 也提醒过：没标 Degraded 的撞名会被 `ApplyStore` 当编程错误拒掉）。
 
 ### 3.3 每个写请求的固定五步（顺序即 DoD）
 

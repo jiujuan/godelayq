@@ -154,9 +154,9 @@
 
 新增 `core/executor_profile_store.go`，形态照 `core/group_store.go`：
 
-- `ExecutorProfileRecord`（§5.1）+ `Command()`。
-- `ProfileStore` 接口：`List` / `Get` / `Save` / `Delete`，**不含 Flush/Close**（同分组的理由：低频实体每次改动同步落盘）。
-- `JSONFileProfileStore`：`sync.Mutex` + `map[string]ExecutorProfileRecord`（键为档位名小写）+
+- `ExecutorProfileRecord`（§5.1）+ `Command() (ExecutorCommand, error)`。
+- `ExecutorProfileStore` 接口：`List` / `Get` / `Save` / `Delete`，**不含 Flush/Close**（同分组的理由：低频实体每次改动同步落盘）。
+- `JSONFileExecutorProfileStore`：`sync.Mutex` + `map[string]ExecutorProfileRecord`（键为档位名小写）+
   `flushLocked`（排序 → MarshalIndent → `.tmp` 0644 → rename）。
 - 只校验文件级不变量：名字符合 `profileNamePattern` 同源规则、数组内不重名。
   **字段组合的合法性不在这里判**，那属于 `LoadProfiles`（I1）。
@@ -213,18 +213,31 @@ func BuildProfile(cmd core.ExecutorCommand, ec core.ExecutorsConfig, mode PathMo
   `SetEventPreviewLimit`/`SetRestoreGuard` 的 running-即-忽略（`:249-252`）保持不动：
   它们改的是全局执行参数，不是注册表，与本设计是两回事。
 
-### 6.5 装配
+### 6.5 装配（W05 已落地）
 
-`cmd/server/main.go`：
+`cmd/server/main.go` 的实际形状：
 
-1. `executors.web_enabled=true` 时构造 `core.JSONFileExecutorProfileStore`（失败即启动失败，与分组同口径：
-   `main.go:233-239` 读不到分组文件就不起服务）。错误文案要带自救指引
-   （"删掉或修好该文件可退回只有 `executors.commands` 的形态"）。
-2. 合并：yaml 严格 → store 宽松 → 同名按 §5.2 降级 → 逐条 `Probe` → 构造可变 Registry
-   （`NewRegistry` 只装 config 侧，文件侧随后调 `ApplyStore` 合进来）。
-3. `executor.Register`（`executor/register.go:49-100`）不需要"跳过 degraded"的分支：
-   降级条目从不进 `Keys()`，因此天然不会被注册；启动日志多一个 `degraded` 计数（`Registration.Degraded`）。
-4. 注入 api：`WithExecutorProfileStore(store)`（照 `WithGroupStore`，`api/server.go:89-91`）。
+1. 档位文件走一个独立的依赖闭包 `runtimeDeps.newExecutorProfiles(cfg) ([]core.ExecutorProfileRecord, error)`，
+   默认实现打开 `core.NewJSONFileExecutorProfileStore(cfg.Executors.ProfilesPath)` 再 `List()`。
+   它与登记表构造分成两个闭包：文件读不出来与档位写错是两种后果（前者挡启动、后者单条跳过）。
+   损坏文件的错误文案已落地为"路径 + `fix that file or delete it to fall back to profiles
+   declared only in executors.commands`"（路径由存储那层的 `parse executor profile file %q` 带出）。
+   `web_enabled=false` 时这个闭包一次都不被调用：不建目录、不建文件，档位文件损坏也与本进程无关
+   （用例 `TestRun_WebDisabledNeverTouchesTheProfilesPath`，真实冒烟同口径验过）。
+2. 顺序：读文件 → `NewRegistry`（config 侧，一条非法即启动失败）→ `executor.MergeStoreProfiles(cfg, records)`
+   → `Registry.ApplyStore(entries)` → `registerHandlers` → `installRestoreGuard` → `Start`。
+   合并函数在 `executor` 包里（`executor/merge_profiles.go`），`main.go` 里没有档位规则；
+   它只管 store 侧（config 侧仍由 `NewRegistry` 加载），因此 W06 的运行期写入用的是同一个函数。
+   注册早于守卫由用例钉住（`TestRun_StoredProfilesAreRegisteredBeforeTheRestoreGuard`
+   断言 `register:<键>` < `restore_guard` < `start` 的调用次序，并喂守卫一条 store 档位的 running 快照）。
+   `ApplyStore` 返回错误时启动失败：那是"文件里两条记录占同一个注册键"或编程错误。
+3. `executor.Register` 确实不需要"跳过 degraded"的分支：降级条目从不进 `Keys()`（W03 的
+   `snapshot.degraded`），启动日志因此带出 `degraded=N`（真实进程实测 `total=3 registered=3
+   unavailable=1 degraded=1`）。
+4. **api 注入留给 W06**：本卡没有任何读取方，提前注入只会多一个没人看的字段与一条没法断言的 503 分支。
+   ⚠️ **W06 注意**：本卡的闭包只交回记录、没有交回存储实例，写端点要的是活的
+   `core.ExecutorProfileStore`（`Save`/`Delete`）与 `Registry.ApplyStore`，
+   因此那一步要把依赖闭包的返回值改成存储本身（或再加一个闭包），别指望这里已有的形状能直接写盘。
    `WithExecutorRegistry` 保持原样（`api/server.go:96-98`）。
 
 ### 6.6 写端点与鉴权
