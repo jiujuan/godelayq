@@ -650,7 +650,7 @@ GET /api/v1/executors
 | `preferred_result_direction` | 读这个档位输出时的建议起点：`head` 或 `tail`（`http` 给 `head`，进程档位给 `tail`），与下面 `/result` 的 `from` 参数同一套词 |
 | `source` | `config`（来自配置的 `executors.commands`，在这里只读）或 `store`（来自档位文件 `executors.profiles_path`，由上面那三个写端点管） |
 | `editable` | 能不能在页面上改它：`web_enabled && source == "store" && !degraded`，**由后端一次算好**，前端只读这个布尔决定按钮显不显示。写请求的边界仍是 ops 档判定——隐藏按钮从来不是安全边界 |
-| `degraded` | 为真表示这条档位与 `executors.commands` 里的同名档位撞上了：**看得见但没生效**（见[档位的在线管理](#档位的在线管理写端点)）。此时 `runtime_ok` 恒 `false`、`reason` 给的是那句撞名说明 |
+| `degraded` | 为真表示这条档位与 `executors.commands` 里的同名档位撞上了：**看得见但没生效**（见[档位的在线管理](#档位的在线管理)）。此时 `runtime_ok` 恒 `false`、`reason` 给的是那句撞名说明 |
 | `path_display` | 这个档位指向的本机文件写法：`executors.workspace` 之内给相对写法、之外给**绝对路径原样**（决策 D5）。`http` 档位与"`program` 写成 `runtime_allow` 里的程序名"的 binary 档位没有文件可指，**整个键省略**。⚠️  reader 档也读得到这个键，目录结构的遮蔽方案登记为待做项 S-3，不在本节 |
 | `method` / `body_mode` / `url` / `header_allow` | 只出现在 `http` 档位上。`body_mode` 是 `json` / `raw` / `none` 之一（配置里没写 `body` 的档位在这里归一成 `none`）；`url` 给的是模板原文（含 `{占位符}`），不是渲染后的地址；`header_allow` 是 payload 可覆盖的请求头名，**空表时整个键省略**（与 `env_allow` 的口径不同，别当成"没返回"） |
 
@@ -663,11 +663,12 @@ GET /api/v1/executors
 即便它指向的脚本其实存在——两条事实同时成立时，"为什么这条没生效"是更要紧的那一件。
 
 这份响应**不是请求体**：它多出 `key`、`runtime_ok`、`source` 这些只给展示看的键，
-而写端点把多余字段一律按未知键拒掉（见上面那节的解码口径）。
+而写端点把多余字段一律按未知键拒掉（见下面那一节的解码口径）。
 因此编辑一条档位时要把手上的**定义**发回去，不能拿 `GET` 的结果直接 `PUT` 回来——
 响应里本来也没有 `runtime` / `script` / `program` / `args_render` / `env` 这些定义字段。
+定义另有读口：[`GET /api/v1/executors/profiles/:name`](#读取档位定义get-apiv1executorsprofilesname)。
 
-### 档位的在线管理（写端点）
+### 档位的在线管理
 
 档位有两份来源：配置里的 `executors.commands`（这一组端点读得到、改不了），以及
 `executors.profiles_path` 指向的 JSON 文件（默认 `./data/exec-profiles.json`，这一组端点写它）。
@@ -675,7 +676,8 @@ GET /api/v1/executors
 
 这一组端点改的是"这台机器能执行什么"，门槛比删组更高：
 
-- **只接受 `ops` 档 JWT**（决策 D10）。静态 token 的身份是 `machine`（档位等同 operator），一样 403。
+- **只接受 `ops` 档 JWT**（决策 D10），读定义那一个也一样——记录里有脚本路径、固定参数与请求头。
+  静态 token 的身份是 `machine`（档位等同 operator），一样 403。
   它与"谁能提交 `exec.*` 任务"（`executors.required_role`，全局一份）是两条互不替代的判定。
 - **前提是** `executors.enabled: true` 且 `executors.web_enabled: true`（决策 D2，默认 false）。
   关闭时这一组一律 503 且 `message` 含 `not enabled`；打开了却没装配依赖时也是 503，
@@ -712,6 +714,32 @@ GET /api/v1/executors
 写文件一定在生效之前（不变量 I2）；生效失败会立刻把文件退回请求之前的状态，
 所以"文件里有这条、进程里跑不了"不会留在系统里。回滚本身也失败时记 error 日志，
 响应里直说"文件与进程不一致，重启可对齐"。
+
+### 读取档位定义：`GET /api/v1/executors/profiles/:name`
+
+`GET /api/v1/executors` 的每一行说的是**处境**（来源、能不能改、这台机器跑不跑得动），
+档位的定义字段一个都不在里面（上一节末尾那句就是这件事）。页面上要"编辑一条已有档位"，
+就得有一个把定义给回来的口——这一条就是它，也是 PUT 请求体的合法回填来源。
+
+```json
+GET /api/v1/executors/profiles/doc_py        # ops
+
+{"name":"doc_py","kind":"script","runtime":"python","script":"scripts/py_hello.py",
+ "args":[{"name":"day","required":true,"pattern":"^(yesterday|today)$"}],
+ "args_render":["--day={day}"],"env_allow":["TRACE_ID"],
+ "env_keys":["LANG_PACK","REPORT_HOME"],
+ "timeout":"2m","max_parallel":2,"retry_on_exit":[75],
+ "created_at":"2026-10-02T00:18:07.2119685+08:00","updated_at":"2026-10-02T00:18:07.2119685+08:00"}
+```
+
+（2026-10-02 本机冒烟原文，键序按响应原文。）返回的是档位文件里那条记录本身，
+键名与 PUT 的请求体一字不差，因此把这份响应去掉 `env_keys` 再发回 PUT 就是一次有效的修改。
+
+- **`env` 只有键名**：`env_keys` 按字典序列出这条档位固定的环境变量名，取值一律不外露
+  （与 `GET /executors` 只给 `env_allow` 键名同一条口径，`details` 与台账里也不会有）。
+- 配置侧的档位没有存储记录 → 409，`details` 点名 `executors.commands`（与 PUT/DELETE 同一条判据与文案）。
+- 文件里没有这个名字 → 404；名字非法 → 400；`web_enabled=false` 或没装配依赖 → 503，两条文案可区分。
+- **读请求不进写操作台账**（`api/audit.go` 的中间件只记 POST/PUT/DELETE），所以这里没有新的动作词。
 
 ### 新建档位：`POST /api/v1/executors/profiles`
 
@@ -767,6 +795,16 @@ Content-Type: application/json
 
 其余判定、五步顺序与状态码与 POST 相同，两处差别：路径上的名字在文件里没有 → 404
 （它属于配置侧档位时是 409，`details` 说明它是只读的）；生效失败时文件退回到**改之前的值**。
+
+**`env` 这个键不带就是"不改"**：请求体里没有 `env` 时，文件里原有的那一组原样留着；
+显式写 `"env": {}` 才是清空它。这条规则存在的前提是定义读口不回显取值——
+一次只想改超时的编辑如果把 `env` 整组抹掉，界面上看不见、响应里也不可见。
+带非空 `env` 时是**整组替换**（不是逐键合并），页面上因此把这件事写在输入框下面。
+本机冒烟（2026-10-02）：不带 `env` 的 PUT 之后文件里仍是
+`{"LANG_PACK":"zh","REPORT_HOME":"/srv/report"}`，`"env": {}` 的 PUT 之后这个键整个消失。
+
+PUT 是整条覆盖，不是补丁：请求体没写的其它字段都会落成零值，所以编辑表单要先把
+[档位定义](#读取档位定义get-apiv1executorsprofilesname)读回来再改。
 
 改动只影响之后的执行：已经在跑的那一次用的还是它启动时拿到的那份定义。
 
@@ -1571,7 +1609,7 @@ GET /job-types
 
 档位来自配置的 `executors.commands` 与 `executors.profiles_path` 那份文件，两份都在进程启动时注册，
 改前者要重启；后者在 `executors.web_enabled: true` 时可以用接口改，立即生效并在这里立刻出现
-（见[档位的在线管理](#档位的在线管理写端点)）。
+（见[档位的在线管理](#档位的在线管理)）。
 
 ## WebSocket 实时通信
 
