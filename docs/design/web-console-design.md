@@ -151,6 +151,7 @@ web/
 │  │  ├─ ui/ (Button, Input, Select, Table, Modal, Drawer, Badge, Toast, EmptyState, Skeleton)
 │  │  ├─ jobs/ (JobTable, JobStatusBadge, JobForm, JobFilterBar, CronPicker, PayloadEditor)
 │  │  ├─ groups/ (GroupList, GroupForm)
+│  │  ├─ executors/ (ProfileForm)
 │  │  └─ dashboard/ (StatCard, EventFeed)
 │  ├─ views/
 │  │  ├─ LoginView.vue
@@ -158,6 +159,7 @@ web/
 │  │  ├─ JobsView.vue
 │  │  ├─ JobDetailView.vue
 │  │  ├─ GroupsView.vue
+│  │  ├─ ProfilesView.vue     # 档位在线管理：列表 + 建改删（仅 ops，TASK-W08）
 │  │  ├─ MonitorView.vue     # 全屏实时事件流（承接旧 dashboard）
 │  │  ├─ AdminView.vue       # 运维：调度总开关/运行时诊断/清缓冲（仅 ops）
 │  │  └─ SettingsView.vue    # 当前账号与角色、token 有效期、后端 health/version
@@ -186,7 +188,8 @@ Select 之外的 Table/Modal/Drawer 类通用组件没有预先抽出来：表�
 │ 📊 概览  │  筛选条: 状态 | 分组 | 名称 | +新建任务 │
 │ 📋 任务  │ ┌────────────────────────────────────┐ │
 │ 🗂 分组  │ │ 表格列表（分页 / 行内操作按钮）     │ │
-│ 📡 实时  │ └────────────────────────────────────┘ │
+│ 📦 档位* │ └────────────────────────────────────┘ │
+│ 📡 实时  │                                        │
 │ 🛠 运维* │                                        │
 │ ⚙ 设置  │  * 仅 ops 角色可见                      │
 └──────────┴────────────────────────────────────────┘
@@ -343,6 +346,25 @@ Select 之外的 Table/Modal/Drawer 类通用组件没有预先抽出来：表�
   无需输入 `?strategy=detach`。
 - 未分组虚拟项：`group=` 空值过滤入口。
 
+#### ProfilesView（档位管理，仅 ops 角色）
+`docs/design/tasks/web-profile/task-w08-console-ui.md` 落地，设计依据
+`docs/design/web-profile-design.md` §6.9 与决策 D10。独立视图而不是设置页内改造（那份文档的 P3）：
+档位表单有十几组字段加一张 `args` 表，塞进设置页会把设置页变成第二个编辑页。
+
+- 左侧列表沿用 `GET /executors`（TASK-W07 扩过的那一份），页面只读后端算好的结论：
+  `source`（来自配置 / 在线档位）、`editable`（决定编辑与删除按钮露不露）、
+  `degraded`（"与配置同名，未生效"，并把撞名说明摊开）、`path_display`、`runtime_ok` + `reason`。
+  同一个注册键可能占两行，`:key` 因此要带上 `degraded`。
+- 右侧表单编辑的是档位的**定义**，数据源是 `GET /executors/profiles/:name`（ops 档）；
+  只有 `editable` 的行会去开那扇门，配置侧的档位在那里是 409，界面上退化成一段说明。
+- `env` 的固定取值前后端都不回显，读口只给 `env_keys`：表单因此把"没带这个键"当成"不改"，
+  新增则是整组替换——这句话写在输入框下面，不让人事后猜。
+- 探测失败不阻止保存：表单底部固定一行说明，保存后的 `runtime_ok`/`reason` 回显到列表那一行。
+- 删除弹窗写清三件事（钉住待执行、不中止正在执行的那条、之后恢复会因找不到处理函数而失败），
+  并把 `?jobs=pause` 与 `?jobs=block` 做成两个单选项而不是隐藏其中一个（决策 D6）。
+- 低档位既看不到侧边栏入口（路由 `meta.minimumRole: 'ops'`），设置页也没有"去档位管理"链接；
+  这两处都只是体验，服务端那四个端点的 ops 判定才是边界。
+
 #### MonitorView（实时事件流）
 即旧 dashboard 能力：WS 状态、事件类型复选过滤、事件卡片流（限 100 条 DOM）。
 过滤是服务端订阅级的，机制与两条配套规则（视图二次判定、筛选变化作废回填）见 §4.5。
@@ -365,6 +387,8 @@ M3 那一版只渲染前端缓冲，重载后是空的，页头却写着"由后�
 #### SettingsView
 当前账号与角色展示、access token 剩余有效期、后端 health/version、
 凭据与 CORS 的边界说明（引用 `docs/api.md`：WS/SSE 走 ticket 而非把凭据写进 URL）。
+另有执行器档位的只读一览（TASK-E18 §3.5 第 3 条）：每一行给来源徽章与降级标记，
+末尾一个"去档位管理"入口——**只对 ops 露出**，这一页本身不做第二套档位表单。
 
 ### 4.7 Query 键约定
 
@@ -376,6 +400,8 @@ M3 那一版只渲染前端缓冲，重载后是空的，页头却写着"由后�
 | `['job-events', id]` | GET /jobs/:id/events | 打开详情页拉一次；此后由 WS append，不轮询 |
 | `['groups']` | GET /groups | 组 CRUD 后 |
 | `['job-types']` | GET /job-types | 启动时拉一次，缓存 5min |
+| `['executors']` | GET /executors | 档位写操作后（TASK-W08），并连带失效 `['job-types']`、`['jobs']`、`['stats']` |
+| `['executor-profile', name]` | GET /executors/profiles/:name | 按名字取一条档位的定义，只在编辑那条时启用 |
 
 实现落在 `api/keys.ts`（唯一出处，失效管线与页面共用一套键，否则 invalidate 打不中缓存）。
 与上表的差异只有两处：分页参数用 `offset`（后端列表就是 limit/offset，见 `docs/api.md`），

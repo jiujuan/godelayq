@@ -292,8 +292,17 @@ http.MethodDelete + " /api/v1/executors/profiles/:name":     "executor.profile_d
 
 ### 6.9 前端
 
-设置页的只读档位区块（`web/src/views/SettingsView.vue:113-117`）改成"列表 + 新建/编辑/删除"，
-新增 `web/src/api/executor-profiles.ts` 与 `components/executors/ProfileForm.vue`。
+按 §12 的 P3 取**独立视图**：新增 `web/src/views/ProfilesView.vue`（左列表右编辑）、
+`web/src/components/executors/ProfileForm.vue` 与 `web/src/api/executor-profiles.ts`，
+路由 `/profiles` 的 `meta.minimumRole` 是 `ops`。设置页那段只读区块保留，
+改成带来源徽章的一览 + 一个"去档位管理"入口（低档位不可见），**不做第二套表单**。
+
+列表的数据源仍是 `GET /executors`（§6.8 扩过的那一份），页面只读 `source`/`editable`/`degraded`
+三个结论，不再自己判"这条能不能改"。表单编辑的是档位的**定义**，另有一个 ops 档的读口
+`GET /executors/profiles/:name`（TASK-W07 登记的 D-0702 由它收掉）：那份响应给的就是
+PUT 的请求体形状，只有 `env` 换成键名列表 `env_keys`——取值不外露这条与 §6.8 一致，
+配套的是 PUT 把"没带 `env` 这个键"解释成"不改"。
+
 任务创建表单不用改数据源（它已经在读 `GET /executors`，`web/src/components/jobs/JobForm.vue:89`），
 但要把"改档位要重启进程"那句文案换掉（`SettingsView.vue:100-104`、`web/src/content/job-template.md:272`）。
 
