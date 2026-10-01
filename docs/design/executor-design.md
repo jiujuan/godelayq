@@ -22,7 +22,8 @@
 
 以及它们必然要求的三样配套：**执行结果的回传通道**、**进程树级别的取消与强制超时**、**远程代码执行的安全边界**。
 
-非目标（本期不做，见 §8）：容器/沙箱级隔离、CPU 与内存配额、分布式 worker、凭据托管与参数加密、审计落盘。
+非目标（本期不做，见 §8）：容器/沙箱级隔离、CPU 与内存配额、分布式 worker、凭据托管与参数加密、审计落盘
+（这一项后来的处置见 §8 末尾与 `sqlite-observability-design.md`；产物索引与写操作台账由观测层承担，不在执行器本期范围内）。
 
 ---
 
@@ -454,7 +455,13 @@ executors:
 
 ## 8. 明确不做（本期）
 
-容器/gVisor/seccomp 级沙箱；CPU、内存、fd、进程数配额（`ulimit`/cgroup）；`go run`/编译型语言的构建步骤；凭据托管与参数加密；执行结果的长期审计（产物按 TTL 删除，长期留痕请接外部日志）；跨实例的 exec 去重与分布式 worker；写操作审计落盘（沿用 README 已声明的边界：只有结构化日志）。
+容器/gVisor/seccomp 级沙箱；CPU、内存、fd、进程数配额（`ulimit`/cgroup）；`go run`/编译型语言的构建步骤；凭据托管与参数加密；跨实例的 exec 去重与分布式 worker。
+
+两条与"审计与长期留痕"有关的边界已在其后的独立设计里落地，本节不再声明：
+执行结果的长期留痕与产物索引（`GET /jobs/:id/artifacts`，产物按 TTL 删除的规则不变）、
+以及写操作审计落盘（`write_audit` 表 + `GET /admin/audit`；未启用观测层时仍只有结构化日志）。
+两者都属于可选的 SQLite 观测层，见 `sqlite-observability-design.md`（§6.2 与 §6.3）与
+`docs/design/tasks/sqlite/README.md`，实现范围不在执行器这套文档里。
 
 ---
 

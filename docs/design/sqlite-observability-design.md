@@ -1,7 +1,9 @@
 # SQLite 观测层设计：运行事件、产物索引与写操作审计
 
-- 状态：待实施（卡片见 `tasks/sqlite/`）
-- 日期：2026-09-30
+- 状态：**已实现**（TASK-S01 … S06 全部落地，2026-10-01；S07 做过一轮全仓验证与文档收口）。
+  本文与设计不同处**逐条标注在 §15**，正文各节保留设计当时的原文，只加"⚠️ 实现如此"一行。
+  实现细节与实测证据见 `tasks/sqlite/README.md` 的状态表与各卡第 10 节。
+- 日期：2026-09-30（设计）/ 2026-10-01（收口）
 - 关联文档：`executor-design.md`（执行层，已实现）、`web-console-design.md` §5.6 与 §5.7.6（本文实现它登记的两处"二期"）
 - 前置事实：任务快照与分组仍存 JSON 文件，本设计不改动 `core.Store` 与 `JSONFileStore` 的任何行为
 
@@ -38,6 +40,10 @@
 | D9 | 保留策略各自独立，不复用 `store.history_limit` | `store.history_limit: -1` 的部署不留终态快照，同一份配置已经造成过产物被误判为孤儿（`executor/artifact.go:558-560`），事件保留不能再绑上去 |
 
 ## 3. 现状盘点（规划时基线，已核实）
+
+> 本节记录的是**设计当时**（2026-09-30）的事实，S01…S06 落地后其中若干条已经过时
+> （"重启即清空""不可查询""属于二期"这几处正是本设计要消掉的缺口）。收口时特意不回改，
+> 留着当基线凭证；现在的行为以 §5–§10 与 `docs/api.md`、`docs/deployment.md` 为准。
 
 - `EventBus` 的订阅能力是公开的：`SubscribeAll()`（`core/event.go:109`）返回 `(subID, <-chan Event)`；`Scheduler.GetEventBus()`（`core/scheduler.go:1641`）是拿到总线的入口。`api.NewServer` 已经用这个组合挂了第一个订阅者（`api/server.go:142`）。**新增一个订阅者不需要改 `core` 的任何一行。**
 - 内存缓冲的三档上限是常量：每任务 100 条、LRU 2000 个任务、全局 500 条（`api/history.go:12-19`）。注释说明"先用常量，真有人抱怨再开配置项"。
@@ -99,6 +105,12 @@ api.Server（新增三个窄接口，都在 api 侧定义）
   ├ eventRecorder / eventReader  ← Option 注入；nil = 走内存路径
   └ auditRecorder                ← gin 中间件写入；nil = 只记 slog（即现状）
 
+⚠️ 实现如此：审计这边是**两个**接口（`AuditRecorder` 写 + `AuditReader` 读，同由
+`api.WithAuditLog(w, r)` 注入），设计原文只列了写面——查询端点在 §8.3 里才要求读能力，
+接口按"装配方可以只给写不给读"分成两个（与 `eventRecorder`/`eventReader` 同形）。
+`auditMiddleware` 也做成了 `(*Server)` 的方法而不是自由函数（它要读 `s.auditLog` 与 `s.logger`）。
+见 §15 第 6 条。
+
 executor.ArtifactStore
   └ ArtifactIndexer（可选）      ← Runner 在 Close 之后 Record 一行；Purge* 删行；nil = 只扫目录（现状）
 
@@ -106,6 +118,10 @@ cmd/server/main.go（唯一装配点）
   observability.enabled ─▶ store/sqlite.DB ─▶ EventLog / ArtifactIndex / AuditLog
                                                 └─ api.WithEventLog / WithAuditLog
                                                 └─ artifacts.SetIndex
+
+⚠️ 实现如此：`WithEventLog` 与 `WithAuditLog` 都在，但事件写入器与台账写入器是**合并成一个
+`observabilityAPI{events, audit}` 参数**交给 `newServer` 的（第六位），不是各占一位。
+见 §15 第 7 条。
 
 依赖边界（单向）
   core            ：不新增任何依赖，不认识 SQLite
@@ -117,6 +133,15 @@ cmd/server/main.go（唯一装配点）
 ## 6. 数据模型
 
 三张表各自带一个自增主键 `seq`：它既是分页游标，也是 `Timestamp` 精度之外的定序依据（一次执行会在同一毫秒内连发 `job.scheduled` 与 `job.started`，只按时间排不出因果）。
+
+**本节三段 DDL 与 `store/sqlite/schema.go` 的 version 1 迁移逐字对齐**（2026-10-01 S07 核对，
+列名、列序、注释文本、索引名与索引列都一致）。落到代码时只多了两件事，都不改变表形状：
+
+1. 每条 `CREATE TABLE` / `CREATE INDEX` 都带 `IF NOT EXISTS`：迁移在同一个事务里按版本号顺序跑，
+   语句本身要能被重复执行（版本号缺失时整批重来，见 §15 第 2 条）。
+2. 库里实际是**四张表**：另有 `observe_schema_migrations`（`version` + `applied_at`）作为迁移版本表，
+   命名按 §13 第 6 条避开未来 `core` 后端。索引合计 **8 个**（事件 3 + 产物 1 + 台账 4），
+   不是设计讨论时口算的 6 个——`write_audit` 那四条在 §6.3 的 DDL 里本来就写着。
 
 ### 6.1 `job_events`
 
@@ -196,6 +221,12 @@ CREATE INDEX idx_audit_verdict ON write_audit(verdict, ts_us);
 - **一行对应一个 HTTP 请求**，不对应一个条目：`POST /jobs/batch` 与 `/jobs/batch-ops` 各记一行，`exec_verdict` 只在单条创建路径上有值。批量里的逐条结果继续走响应体与 slog。
 - 只审计 `POST/PUT/DELETE`。读端点不进台账：否则这张表会被前端轮询写满，而它记录的内容没有任何权限含义。
 
+⚠️ 实现如此：`verdict` 的取值比上面 DDL 注释里那六个多三项——`partial`（207，批量端点即使全成功也回 207，
+所以两个批量动作的行恒为 `partial`）、`throttled`（429，`loginLimiter` 真的会给）、`other`（兜底）。
+`exec_reason_code` 在 `role_denied` 那一行存的是**要求达到的档位名**（`operator|admin|ops`），
+与另外三个取值（`payload_invalid` 等）不是一套词——两组都是封闭集，都不含用户输入，D7 的约束仍然成立。
+列注释保持与 `schema.go` 一字不差，所以没跟着改。见 §15 第 8、9 条。
+
 ## 7. 写入路径与并发
 
 ### 7.1 批量事务
@@ -210,6 +241,11 @@ Close(ctx)        → 撤订阅 → 最后一次 Flush → 关连接；幂等
 ```
 
 - 队列容量默认 4096 条。丢弃时记一条 warn 并把累计值挂到 `/admin/runtime` 的观测输出里——**丢了多少必须是可查的**，否则这张表看起来完整、实则缺页。
+  ⚠️ 实现只做到了后半句的一半：**累计值不在 `/admin/runtime` 里，也不在 `DB.Stats()` 里**（`Stats()` 只有三张表行数与
+  `SchemaVersion`，S02 当时明确不预留 dropped 字段）。实现的是 `Dropped()` 方法 + **关停时**的一次汇总 WARN
+  （`cmd/server/main.go` 在撤订阅之后读 `events.Dropped()` / `audit.Dropped()`，大于 0 才记）。
+  队满的那一刻没有任何日志。后果：长期不重启的进程可以持续缺页而在线读不到数——本条在设计里是硬要求，
+  登记为缺陷交给后续卡补一个在线出口（`docs/deployment.md` 的"启用观测层"一节按现状写明怎么看，见 §15 第 10 条）。
 - 事务失败（含 `SQLITE_BUSY`）时整批重新入队一次，二次失败则丢弃并记 error。不无限重试：磁盘满这类故障下无限重试会把队列变成内存泄漏点。
 - `dropped` 只记写入器自己这一段的丢弃数。总线给每个订阅者的通道同样是非阻塞投递（`core/event.go` 的 `select/default`，缓冲 `core.NewEventBus` 的 `bufferSize`），到不了写入器的事件不计在这里：`dropped` 加落库条数因此小于等于发布条数，差额属于总线自身的过载，与 `api.EventHistory` 那一份内存缓冲看到的是同一件事。写用例时要么把发布条数控制在一个订阅缓冲以内，要么只断言下界。
 - 每条语句都是 `INSERT`，`artifact_index` 用 `INSERT ... ON CONFLICT(job_id,attempt) DO UPDATE`（清理与重复读结果会二次触达同一行）。
@@ -322,8 +358,31 @@ type AuditLog struct{ ... }        // 实现 api 侧的 auditRecorder
 - `api/audit.go`（新增）：`auditMiddleware(s *Server) gin.HandlerFunc`，注册在 `setupMiddleware` 的鉴权之后（`api/server.go:184` 之后，Principal 必须已知），只处理 `POST/PUT/DELETE`。
 - `route` 与 `status` 都在 `c.Next()` **之后**读，取路由匹配与状态码的最终值。
 - `action` 由路由模板映射到封闭集：`/api/v1/jobs` + POST → `job.create`；`/api/v1/jobs/:id/pause` → `job.pause`；`/api/v1/groups/:name` + DELETE → `group.delete`；`/api/v1/admin/*` → `admin.*`；未匹配（`c.FullPath()` 为空）→ `unmatched`。映射表写在 `api/audit.go` 的一个 `map[string]string` 里，与 `setupRoutes` 一处对照维护。
+
+  实现后的完整映射（`api/audit.go:97` 的 `auditActions`，键是"方法 + 空格 + 路由模板"，共 21 项）：
+
+  | 写路由 | `action` |
+  | --- | --- |
+  | `POST /api/v1/auth/login` / `refresh` / `logout` / `ws-ticket` | `auth.login` / `auth.refresh` / `auth.logout` / `auth.ws_ticket` |
+  | `POST /api/v1/jobs` | `job.create` |
+  | `PUT /api/v1/jobs/:id` | `job.update` |
+  | `DELETE /api/v1/jobs/:id`、`POST /api/v1/jobs/:id/cancel` | `job.cancel`（同一动作两种写法） |
+  | `POST /api/v1/jobs/:id/retry` / `pause` / `resume` / `force-pause` | `job.retry` / `job.pause` / `job.resume` / `job.force_pause` |
+  | `POST /api/v1/jobs/batch`、`POST /api/v1/jobs/batch-ops` | `job.batch_create`、`job.batch_op` |
+  | `POST /api/v1/groups`、`PUT /api/v1/groups/:name`、`DELETE /api/v1/groups/:name` | `group.create` / `group.update` / `group.delete` |
+  | `POST /api/v1/admin/scheduler/suspend` / `unsuspend`、`DELETE /api/v1/admin/events` | `admin.scheduler_suspend` / `admin.scheduler_unsuspend` / `admin.events_clear` |
+  | 未匹配到任何路由 | `unmatched` |
+  | 匹配到写路由但表里没配 | `other`（同时记一条 debug：映射表与 `setupRoutes` 不同步了） |
+
+  双向对照由用例守住：`TestAuditMiddleware_MappedActionCoversWriteRoutes` 用 `engine.Routes()` 正反各比一遍，
+  `TestAuditMiddleware_UnmappedRouteFallsBackToOther` 现造一条写路由证明兜底会触发。
+
 - `api/handlers_executors.go`：`gateExecutorSubmission`（`:537`）在各 return 点用 `c.Set(auditKey, ...)` 落结论，中间件在 `c.Next()` 之后读出并填入 `exec_*` 三列。改动是每处一行，判定顺序与逻辑不变。
 - `api/security.go`：`logAccessRejection`（`:308`）同时 stash 一个 `role_denied` 结论，让 slog 与表同源。
+  ⚠️ 实现如此：函数本身一字未改，`role_denied` 挂在**它的调用点**（`api/handlers_executors.go:529`，紧挨既有那句
+  `s.logAccessRejection`）。原因是这个 helper 没有 `c` 参数（签名是 `(p Principal, why string, required core.Role)`），
+  而且它同时被路由档位与结果端点共用——在函数内部 stash 会让"读 `/result` 被挡"也带上执行器列。
+  代价：另外两处档位拒绝不写 `exec_verdict`，那些行只有 `verdict=denied` 与 `action`。卡片 §3.5 预先允许了这种落法，见 §15 第 5 条。
 - `api/handlers_admin.go`：新增 `GetAudit` handler 与路由。
 
 ### 9.6 装配（`cmd/server/main.go`）
@@ -352,14 +411,18 @@ type AuditLog struct{ ... }        // 实现 api 侧的 auditRecorder
 
 ## 12. 验收清单
 
-1. `enabled: false` 时启动，`data/` 下不出现任何 `.sqlite*` 文件，`GET /jobs/:id/events` 响应与改动前逐字段一致。
-2. 跑一个任务、看时间线、`Ctrl-C` 停服、重启、再查同一任务的时间线：事件仍在，且顺序与重启前一致（升序）。
-3. 队列容量临时配成 2，提交 500 条批量任务：进程不崩、有 warn、`Stats()` 报告 `dropped > 0`、调度吞吐不受影响（这条是"不回压 EventBus"的证据）。
-4. 执行一次 `exec.hello`：`artifact_index` 出现一行、`GET /jobs/:id/artifacts` 报出的 `out_bytes` 与产物文件实际大小一致；按 TTL 清理后该行消失；`GET /jobs/:id/result` 触发 purged 时索引状态同步。
-5. 用 viewer 账号提交 `exec.*`（默认 `required_role: admin` 会拒）：`write_audit` 出现一行 `verdict=denied`、`exec_verdict=role_denied`，且表内任何列不含参数取值。
-6. `POST /jobs/batch` 混合权限：一条 HTTP 请求一行审计，不是 N 行。
-7. 优雅关闭：`stopObservability` 在 `store.Close` 之前完成；反复 `Stop` 不 panic、不重复 Flush；`-race` 干净。
-8. 全仓：`go build ./...`、`go vet ./...`、`go test ./... -race`、`go test -run TestExampleConfigMatchesLocal ./core`、linux/darwin 交叉编译、`-tags dashboard` 构建。
+S07（2026-10-01）逐条跑过，右列是实测出处（端到端场景编号见 `tasks/sqlite/task-s07-docs-and-verification.md` §10.4）：
+
+| # | 条目 | 实测状态 |
+| --- | --- | --- |
+| 1 | `enabled: false` 时启动，`data/` 下不出现任何 `.sqlite*`，`GET /jobs/:id/events` 与改动前逐字段一致 | ✅ 场景 1：与 S03 之前的基线二进制（`c971f81`）并排跑同一份配置，两份响应归一化后逐字段相等，旁文件为空 |
+| 2 | 跑任务 → `Ctrl-C` 停服 → 重启 → 时间线仍在且升序 | ✅ 场景 3（3 条事件跨重启、`note` 变成库那句）；Windows 上 `Ctrl-C` 可以用"子进程独立进程组 + `CTRL_BREAK_EVENT`"送达，进程走完整关停路径后以码 0 退出——本系列此前记的"Windows 做不到优雅停服"因此升级为可测，见 §15 第 12 条 |
+| 3 | 队列容量配 2、提交 500 条批量：不崩、有 warn、`Stats()` 报告 `dropped > 0`、吞吐不受影响 | ⚠️ 前半与后半 ✅（场景 4 跑 5 轮：批量仍 207、500 条总耗时 0.05-0.08s、一条 `delay=2s` 的普通任务仍 2.04-2.14s 完成、退出码 0），**`Stats()` 报 dropped 这一项不成立**：`DB.Stats()` 没有该字段，丢弃数只出现在关停 WARN（实测 `dropped=495/497/499`），见 §15 第 10 条 |
+| 4 | 执行一次 `exec.hello`：索引一行、`out_bytes` 与文件一致、TTL 后该行消失、purged 同步 | ✅ TASK-S05 §10.4 四轮（含 `os.Stat` 三方对照）+ 场景 3 的重启后列表 |
+| 5 | viewer 提交 `exec.*` 被拒：台账一行 `denied`/`role_denied`，且不含参数取值 | ✅ 场景 5 + TASK-S06 §10.4 第一轮（三处 canary 在 `write_audit` 全列 0 命中） |
+| 6 | 混合权限的批量：一条 HTTP 一行，不是 N 行 | ✅ 场景 4 的 5×100 批量 → 每个请求一行；用例 `TestAuditMiddleware_BatchIsOneRow` |
+| 7 | 优雅关闭：`stopObservability` 早于 `store.Close`；反复 `Stop` 不 panic；`-race` 干净 | ✅ 用例断言关停顺序 `[audit_log, event_log, observability, store]`；场景 6 五轮硬杀 + 重启后优雅停服，无 panic、无"向已关闭连接写入"字样；`-race -count=5` 三个包全绿 |
+| 8 | 全仓：build / vet / `-race` / 配置守卫 / linux+darwin 交叉 / `-tags dashboard` | ✅ S07 卡 §10.3 全部通过（`api` 的 `-race` 182s；`-count=5` 复跑另计） |
 
 ## 13. 风险与后续演进
 
@@ -367,7 +430,7 @@ type AuditLog struct{ ... }        // 实现 api 侧的 auditRecorder
 | --- | --- | --- |
 | 1 | 二进制约 +8~10MB、`go.sum` 新增一条重依赖树（实测：S02 落地为 **+5.5 MiB / +17.7%**，`windows/amd64` 的 32,773,120 B → 38,583,808 B；驱动取 `modernc.org/sqlite v1.46.0`，因为 v1.47.0 起要求 `go 1.25`、v1.60.x 要求 `go 1.26`，抬版本会连带抬高整仓最低工具链与 `examples` 的 `go run` 门槛） | 记进 `docs/deployment.md`；驱动只在 `store/sqlite` 出现，删掉该包即可完全回到现状 |
 | 2 | 备份口径变化：WAL 模式带 `-wal`/`-shm` 旁文件 | `docs/deployment.md` 明确"运行中备份用 `VACUUM INTO` 而不是拷单文件" |
-| 3 | 表可能缺页（队满丢弃 / 事务二次失败） | `dropped` 计数公开在 `/admin/runtime`；读端点的 `Note` 说明写入延迟。**不做"绝不丢"承诺** |
+| 3 | 表可能缺页（队满丢弃 / 事务二次失败） | ⚠️ 实现只做到一半：`dropped` **不在 `/admin/runtime`**，是写入器上的 `Dropped()` 方法 + 关停时一条汇总 WARN（设计原文承诺的在线出口没落，登记为缺陷，见 §15 第 10 条）。读端点的 `Note` 说明写入延迟这条做了。**不做"绝不丢"承诺**仍然成立 |
 | 4 | `write_audit` 随写请求量线性增长 | 默认 90 天 + 条数上限；部署方按吞吐调低。本期不做按列裁剪配置（未生效的选项不进配置） |
 | 5 | 事件保留与快照留痕不同步：快照被淘汰后时间线还在 | 明确定为特性（历史事件比快照留得久对排障有利），写进 §6.1 注释与文档 |
 | 6 | 后续做"快照换 SQLite"时可能与本包的迁移表撞名 | 迁移版本表命名 `observe_schema_migrations`，与未来的 `core` 后端无关 |
@@ -377,3 +440,28 @@ type AuditLog struct{ ... }        // 实现 api 侧的 auditRecorder
 ## 14. 实施计划
 
 卡片见 `tasks/sqlite/README.md`。顺序：S01 配置 → S02 包与装配 → S03 事件写入 → S04 事件读取 → S05 产物索引 → S06 写审计 → S07 文档与全仓验证 →（独立排期）S08 控制台审计页。
+
+实际执行结果与本节的差别只有一处：S01…S06 全部落地于 2026-10-01，S07 同日跑完验证与文档收口；
+S08 仍是独立排期、未开始。
+
+## 15. 实现与设计的差异（S07 收口时逐条标注）
+
+设计原文保留在正文各节不动，这里说明"实现如此 / 设计原本如何 / 为什么这样选"。
+正文相应位置都有一行 `⚠️ 实现如此` 指回本节。
+
+| # | 设计原本如何 | 实现如此 | 为什么 | 出处 |
+| --- | --- | --- | --- | --- |
+| 1 | §7.1 草图写 `Close(ctx)`、§9.2 写 `NewEventLog(bus, db, opts)` | `Close() error`（不带 context）、`NewEventLog(bus, db, cfg, logger)` | 关停路径上根本没有可用的 context（`cmd/server` 是顺序收尾）；元数据序列化失败与批次被放弃都要有地方记，所以带 logger | S03 卡 §10.6 |
+| 2 | §6 三段 DDL 就是建表语句 | 每条都带 `IF NOT EXISTS`，库里另有第四张 `observe_schema_migrations`；索引合计 8 个（讨论时口算成 6 个） | 迁移在同一事务里按版本号顺序跑，版本号写入失败要能整批重来，语句必须可重复执行 | S02 卡 §10.2 |
+| 3 | 未规定批量写入器的实现形状 | 三张表共用一个未导出的泛型 `batcher[T]`，`queued()` 包内可见只为测试 | 用泛型省掉一层运行期断言，也排除"把审计行喂进事件表"这类错接法 | S02 卡 §10.2 |
+| 4 | §9.3 只说事件端点改读库 | 事件写入器的**读取面**（`Events`/`Recent`）挂在同一个 `EventLog` 上，`cmd/server` 的 `eventLogAPI` 四方法，api 侧只声明 `eventReader` | 写入器与读取方是同一个句柄，拆成两个注入会出现"一边写了另一边读不到" | S04 卡 §10.2 |
+| 5 | §9.5 要求 `logAccessRejection` 内部 stash `role_denied` | 该函数一字未改，stash 在它的调用点 | 函数没有 `c` 参数，且被路由档位与结果端点共用——放进去会让"读 `/result` 被挡"也带执行器列 | S06 卡 §10.2 第 3 条 |
+| 6 | §5 架构图只列 `auditRecorder` | 审计有两个接口：`AuditRecorder` 写 + `AuditReader` 读，`WithAuditLog(w, r)` 一起注入；中间件是 `(*Server)` 方法而非自由函数 | 与事件侧同形（装配方可以只给写不给读）；中间件要读 `s.auditLog` 与 `s.logger` | S06 卡 §10.2 第 2 条 |
+| 7 | §9.6 说 `newServer` 的签名"扩到传事件与审计依赖" | 第六位从"事件读取方"换成一个观测层参数 `observabilityAPI{events, audit}` | 每加一个写入器就多一位参数，而每一位都要重排 `cmd/server` 的 23 处装配字面量；合并后"整体没装配"仍然是一个 nil | S06 卡 §10.2 第 1 条 |
+| 8 | §6.3 的 `verdict` 注释是六个取值 | 实现为九个：多 `partial`（207）、`throttled`（429）、`other`（兜底） | 207 与 429 都是真会给的状态码；把 429 记成 `error` 会把"被限流"写成"服务器坏了" | S06 卡 §10.2 第 5 条 |
+| 9 | `exec_reason_code` 是"哪一道判定给的理由码" | `role_denied` 那一行存的是**要求达到的档位名**（`operator|admin|ops`） | 它是封闭集、不含用户输入（D7 成立），而"被要求到哪一档"正是这条拒绝唯一有用的信息；代价是这一列在同一行里混了两套词，已在 `docs/api.md` 与本节写明 | S06 卡 §10.5 D-0606 |
+| 10 | §7.1 与 §13 第 3 条承诺 `dropped` 挂在 `/admin/runtime`；`configs/config.example.yaml` 的注释也跟着写"丢弃数在 /admin/runtime 可查" | 没有在线出口：只有写入器的 `Dropped()` 方法与**关停时**一条汇总 WARN；队满那一刻不记任何日志 | 三个写入器共用窄接口，`observabilityDB.Stats()` 当时明确不预留 dropped 字段（S02 第 7 条口径），补在线出口要动 `RuntimeResponse` 与装配，超出各卡范围 | 本卡缺陷 D-0701（待另立卡片）；`docs/deployment.md` 的"启用观测层"按现状写 |
+| 11 | §4.1 说产物索引让"清理变成条件删除" | `artifact_index` 定位成**加速器而不是账本**（D8）：TTL 清理成功后整行删除，列表变短而不是变成一堆 `purged`；所有索引失败只记日志 | 文件仍是权威；留一行"已清理"的索引对排障没有价值，反而会让列表越积越长 | S05 卡 §10.2 第 4 条、`docs/api.md` 的 state 段 |
+| 12 | §12 第 2 条要求 `Ctrl-C` 验证优雅停服；本系列此前在 Windows 上一律记"外部发不出 SIGTERM，只能靠 Go 用例" | 做到了：子进程用独立进程组起、再送 `CTRL_BREAK_EVENT`，Go 侧 `signal.Notify(SIGINT)` 收到同一次中断，进程走完关停后以码 0 退出 | 之前用 `taskkill`（无 `/F`）发的是 `WM_CLOSE`，控制台应用不接；换进程组信号即可 | S07 卡 §10.4 场景 4/6 |
+| 13 | §10 第 1 条"不进表的内容：……参数取值"字面覆盖三张表 | `write_audit` 守住了；`job_events` 守不住：脚本把入参打印到 stdout 时，`job.completed` 事件的 `result.preview`（输出尾部预览）会把取值带进库 | 预览是执行结论的一部分（`/result` 与控制台时间线都在用它），截掉会改变现有表现；登记后待判断 | S06 卡 §10.5 D-0605；S07 场景 5 实测 `write_audit` 0 命中、`job_events` 1 命中 |
+

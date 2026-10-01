@@ -30,7 +30,10 @@
 - 用户账号的在线增删改（账号在 `configs/config.yaml` 声明，改动需重启）
 - 运行时调整 worker 数 / 队列容量（现有 `SetConcurrency`/`SetQueueCapacity`
   在 Start 后被忽略并告警，`core/scheduler.go 的 SetConcurrency/SetQueueCapacity`；需要 worker 池 resize 能力，列为二期）
-- 运行历史的持久化审计（重启即清空，终态快照留痕仍由 `store.history_limit` 负责）
+- 运行历史的持久化审计：**本文写作时不做，现已由观测层落地**——事件持久化在 `TASK-S03`/`TASK-S04`
+  （`job_events`，重启后时间线仍有历史），写操作台账在 `TASK-S06`（`write_audit` + `GET /admin/audit`）。
+  两者都是 `observability.enabled` 打开后可选，默认仍只有内存缓冲与结构化日志；
+  终态快照留痕仍由 `store.history_limit` 负责（三处保留的是不同东西，见 `sqlite-observability-design.md` D9）
 - 集群 / 多实例管理
 
 ---
@@ -390,6 +393,9 @@ M3 那一版只渲染前端缓冲，重载后是空的，页头却写着"由后�
   **admin/ops 可强制暂停运行中的 job（中止当前 attempt，不计失败、不消耗重试）**（§5.2）。
 - **D3 分组**：完整分组——Job 加 `group` 字段 + `/api/v1/groups` CRUD + 过滤 + 聚合。
 - **D4 运行历史**：api 层内存环形缓冲 + `GET /jobs/:id/events`，不入库。
+  ⚠️ 实现如此：默认仍是不入库（`observability.enabled: false`）；打开总开关与 `events.enabled` 后
+  事件写入 SQLite 观测库的 `job_events`，两个事件端点改读库、内存缓冲退成兜底（`TASK-S03`/`TASK-S04`，
+  设计文档 `sqlite-observability-design.md` §6.1 与 §8.1）。
 - **D5 删组策略**：operator 不可删组；admin/ops **删除组无需显式 `?strategy=detach`
   即默认解绑**，组内 job 归入未分组，**任何角色都不会级联删除 job**（§5.5）。
 
@@ -675,8 +681,8 @@ func (h *EventHistory) Recent(limit int) []Event
   `note` 换成持久化那句。写入侧见 `TASK-S03`（`docs/design/tasks/sqlite/task-s03-job-events-writer.md`），
   读取侧与 `note`/`limit` 的分岔见 `TASK-S04`（`task-s04-events-endpoints-db-first.md`），
   口径落在 `docs/api.md` 的"运行事件 API"一节。
-  本卡当年登记的两处"二期"里，**运行历史的持久化已经落地**；写操作审计（`/admin/audit`）
-  仍在其后的 `TASK-S06`。
+  本卡当年登记的两处"二期"里，**运行历史的持久化与写操作审计都已落地**：前者是 `TASK-S03`/`TASK-S04`，
+  后者是 `TASK-S06`（`write_audit` 表 + `GET /api/v1/admin/audit`，口径在 §5.7.6 与 `docs/api.md` 的运维一节）。
 - 反压问题已在实现里核实（`core/event.go 的 Publish`）：总线的发送是
   `select { case ch <- event: default: }`，缓冲区满就丢，所以 drain 协程不可能阻塞总线；
   丢掉的是记录而不是调度事实。`api/history_test.go` 的窗口裁剪用例因此直接调 `record`，
