@@ -83,11 +83,11 @@ POST /api/v1/auth/login
 
 | 角色 | 能做什么 |
 | --- | --- |
-| `viewer` | 只读：任务列表/详情、`/stats`、`/job-types`、实时事件流 |
+| `viewer` | 只读：任务列表/详情、`/stats`、`/job-types`、实时事件流、任务的时间线端点与输出列表（`GET /jobs/:id/artifacts`） |
 | `operator` | + 创建、编辑、取消、重试任务，建组与改名 |
 | `admin` | + 强制暂停执行中的任务、删除分组 |
-| `ops` | + 调度总开关、清空事件缓冲、运行时诊断 |
-| `machine` | 静态 token 的身份：等同于 `operator` 的读写，但**没有** admin/ops 的任何能力 |
+| `ops` | + 调度总开关、清空事件缓冲、运行时诊断、写操作台账查询（`GET /admin/audit`） |
+| `machine` | 静态 token 的身份：等同于 `operator` 的读写，但**没有** admin/ops 的任何能力（因此也读不到台账） |
 
 完整矩阵见 `docs/design/web-console-design.md` §5.7.3。
 
@@ -932,8 +932,9 @@ GET /api/v1/jobs/01a0f3eb-7670-78bf-bdf4-605434827d4b/artifacts
 ```
 
 `reason: "restore_after_crash"` 表示这条暂停来自重启时的崩溃恢复，不是人在控制台点的；没有 `reason`
-的才是用户操作。这条标记必须写在事件里：事件历史在进程内存里，重启之后崩溃前那几轮 `job.started`
-已经不在，时间线上只剩这一条 `job.paused`。
+的才是用户操作。这条标记必须写在事件里：未启用观测层时事件历史只在进程内存里，重启之后崩溃前那几轮
+`job.started` 已经不在，时间线上只剩这一条 `job.paused`（启用 `observability.events.enabled` 后
+重启前的轮次仍查得到，但这一条标记本身仍然只有事件能表达——它说的是"当初为什么暂停"）。
 
 ### 敏感参数（`secret`）出现在哪些地方
 
