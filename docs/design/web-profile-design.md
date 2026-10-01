@@ -75,9 +75,9 @@
                              ↑
               ┌── 运行期 ────────────────────────────────────────┐
    POST/PUT/DELETE /api/v1/executors/profiles   （ops 档 + 审计）
-        ① 结构校验 ② LoadProfiles(单条, 宽松) ③ Probe ④ 冲突检查
+        ① 结构校验 ② BuildProfile(单条, 宽松路径模式) ③ Probe ④ 冲突检查
         → ProfileStore.Save/Delete（落盘）→ Registry.Apply → Scheduler 注册/摘除
-        →（删除时）PauseByHandlerKey 把该类型未终态任务置 paused
+        →（删除时）PauseByHandlerKey 把该类型的**待执行**任务置 paused，运行中的那条不动
               └──────────────────────────────────────────────────┘
 ```
 
@@ -195,14 +195,21 @@ func BuildProfile(cmd core.ExecutorCommand, ec core.ExecutorsConfig, mode PathMo
 
 ### 6.4 `core`：调度器的热注册与按类型暂停
 
-- `UnregisterHandler(jobType string) bool`：写锁内同时删 `handlers` 与 `handlerClasses`
-  （成对写已在 `core/scheduler.go:271-272`，成对删是同一处的对称动作）。
-- `PauseByHandlerKey(handlerKey string) (int, error)`：照 `RetagGroup`（`core/scheduler.go:812-836`）的形状——
-  遍历快照、按 `HandlerKey()` 匹配、把 pending/running 的摘出堆并落成 `paused`；
-  正在执行的 attempt **不强杀**（D6，与 `ForcePause` 划清界限），运行中的那条保持 `running` 直到自然结束。
-  返回受影响条数。非原子与幂等口径同 `RetagGroup` 的注释。
-- `RegisterHandlerClass` 的运行期使用**不新增锁**，但 `core/scheduler.go:266-267` 那句
-  "运行期没有人重新注册同一键"的注释必须改写，否则下一个读者会照它推理。
+- `UnregisterHandler(jobType string) bool`（已落地，`core/scheduler.go:292-300`）：写锁内同时删
+  `handlers` 与 `handlerClasses`（成对写已在 `:274-275`，成对删是同一处的对称动作）。
+  只删一张表的后果写进了方法注释：`HandlerClass` 会回 `(JobClassExec, true)`，
+  崩溃恢复守卫据此把一条已经没有处理函数的任务钉成 `paused`，变成永远等不到档位的僵尸任务。
+- `PauseByHandlerKey(handlerKey string) (int, error)`（已落地，`core/scheduler.go:924-956`）：
+  照 `RetagGroup` 的形状——遍历存储快照、按 `HandlerKey()` 匹配、逐条处置、返回条数。
+  处置只覆盖 pending：逐条走 `Pause`（因此复用 `pausePendingJob`，与页面单个暂停同一条路径）。
+  正在执行的 attempt **不强杀**（D6，与 `ForcePause` 划清界限）——`Pause` 回 `ErrJobNotPending`
+  时跳过、不计入条数，因此调用方不能把返回数当成"这个类型的任务都停了"。
+  `paused` 与终态快照先跳过，重复调用返回 0（幂等）。
+  `store == nil` 或空白键 → `(0, nil)`，与 `RetagGroup:840-842` 同一条。
+  非原子与幂等口径同 `RetagGroup` 的注释。
+- `RegisterHandlerClass` 的运行期使用**不新增锁**；`core/scheduler.go:266-267` 那句
+  "运行期没有人重新注册同一键"的注释已按事实改写（W04）：运行期确实会重注册与摘除，
+  但类别盖章仍只发生在入堆时，堆里的任务不受影响（D8）。
   `SetEventPreviewLimit`/`SetRestoreGuard` 的 running-即-忽略（`:249-252`）保持不动：
   它们改的是全局执行参数，不是注册表，与本设计是两回事。
 

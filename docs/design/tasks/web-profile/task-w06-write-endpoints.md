@@ -72,6 +72,9 @@ profiles := api.Group("/executors/profiles", s.requireExecutorProfiles())
      PUT 前先用 `Registry.Lookup(key)` 确认它是 `SourceStore`，改 config 档位 → 409 并说明它来自配置。
    - DELETE：`?jobs=pause|block`，白名单外取值 → 400（照删组的策略白名单）；
      默认 `pause`：先 `PauseByHandlerKey` 再摘 handler 再删记录；`block` 时若还有未终态任务 → 409。
+     **`PauseByHandlerKey` 的返回值不含正在执行的那条**（W04 落地口径，用例见其 §10.4 第三行变异），
+     所以 `block` 的判定要自己按存储数未终态条数，不能把这个返回值当"还有几个没跑完"；
+     响应里给出的条数也要说明它是"本次新钉住的待执行任务数"。
    - **落盘先于生效（I2）**：`Save`/`Delete` 失败 → 500 且注册表与调度器**一行不动**；
      生效失败（`ApplyStore` 返回错误）→ 500 并回滚文件（把记录写回原值，或删掉刚写入的那条）。
      回滚失败要记 Error 日志并在响应里说"文件与内存不一致，重启可对齐"。
