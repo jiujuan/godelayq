@@ -125,4 +125,114 @@ cd web && npx vue-tsc --noEmit
 
 ## 10. 实现记录（执行时补写）
 
-（待补：落地的接口 / 与本卡写法的差异 / 验证证据 / 手工验收 / 缺陷 / 未覆盖项）
+完成日期：2026-10-01。
+
+### 10.1 落地的接口与位置
+
+| 位置 | 内容 |
+| --- | --- |
+| `executor/profile.go:195` | `(*Profile).PathDisplay() string`：workspace 内给相对写法、之外给绝对路径、没有文件可指给空串 |
+| `executor/registry.go:342` | `ListedProfile{Profile, Probe, Source, Degraded, Reason, Editable}` |
+| `executor/registry.go:364` | `(*Registry).List()`：一次读表，生效 + 降级合并成一份按注册键字典序的列表，同键时生效那条在前，`editable` 在这里算好 |
+| `executor/registry.go:405` | `(*Registry).RuntimeAllow()`（Normalized 补齐之后的那份名单，返回副本） |
+| `api/handlers_executors.go:345-355` | `source` / `editable` / `degraded` / `path_display` 四个字段 |
+| `api/handlers_executors.go:374,379` | 顶层 `web_enabled` / `runtime_allow` |
+| `api/handlers_executors.go:389,420` | `ListExecutors` 改读 `List()`；`toExecutorProfile(view executor.ListedProfile)` |
+| `api/handlers_executor_profiles.go` | `respondProfile` 也改读 `List()` 的那一行（写响应与列表行同一个来源） |
+| `web/src/api/types.ts` | `ExecutorProfile` 四个字段、`ExecutorListResponse` 两个字段，注释写明"响应不是请求体" |
+| `web/src/views/SettingsView.vue` | 档位一览那段文案改成两份来源；列表 `:key` 带上 `degraded`（同一注册键现在会有两行） |
+
+用例：`api/executors_response_test.go` 8 条、`executor/registry_view_test.go` 6 条。
+
+### 10.2 与本卡写法的差异
+
+1. **`toExecutorProfile` 换成收一个 `ListedProfile`**，不是卡 §4.2 说的"多收来源与降级两个入参"。
+   按卡面写法 `ListExecutors` 要对每一行连调 `Profiles()` + `Available()` + `SourceOf()`，
+   而登记表每个方法各做 `Load()` 一次——W06 之后运行期真的会整表替换，
+   三次读就可能读到三张表（"这条的来源查不到、那条的探测来自上一张表"）。
+   于是新增一次读表的 `Registry.List()`，`Profiles()` / `Degraded()` 原样保留。
+2. **`editable` 的规则落在 `executor` 侧**（`List()` 里算），api 与前端都只是搬运，
+   DoD 的"只在后端一处计算"由这个位置保证。顺带得到一条更强的判据：
+   写端点的 201 响应与列表行是同一个结构体，可以直接比较（有用例守）。
+3. **降级那条的 `reason` 用冲突说明、`runtime_ok` 恒 `false`**，即便它指向的脚本其实存在
+   （`ListedProfile.Probe` 里那条"能跑"的结论同时存在，接口不说）。
+   取舍理由：两条事实同时成立时，"为什么这条没生效"是读者更要紧的那一件。
+4. 卡 §5.1 要"降级那个键 `LookupHandler` 查不到"：api 层看不到调度器的处理函数表
+   （这里的 `core.Scheduler` 没注册任何 exec 处理函数），改成两条等价判据——
+   `Registry.SourceOf(key)` 仍是 `config`、`Lookup(key)` 给出的仍是配置那条的 `url`。
+   "没注册处理函数"本身由 W05/W06 的 `cmd/server` 用例守住（启动日志的 `degraded=1` 与不注册）。
+5. **卡 §5.4 的"把响应体去掉四个新字段当 PUT 请求体发回去"落不了地**，因为它的前提不成立：
+   响应体从来不是请求体的子集——`key` / `runtime_ok` / `reason` / `has_secret_args` /
+   `preferred_result_direction` 在本卡之前就是只给展示用的键，而 `runtime` / `script` /
+   `args_render` / `env` 这些**定义字段一个都不在响应里**；
+   写端点（W06）又按 `DisallowUnknownFields` 把多余键一律拒掉，那种发回必定 400。
+   本卡改成本条真正要防的三件事：新键不与请求体键名撞（反射比键名）、
+   写响应与列表行逐字段相等、把列表行当请求体发回去必须 400（并留下文案说明为什么）。
+   由此给 W08 留了一条 D-0702。
+6. **既有断言动了一处**：`TestListExecutors_DefaultStateIsNotAnError` 的整对象 `JSONEq`。
+   本卡 §3.2 与 §3.4 要求 `web_enabled` / `runtime_allow` 在关闭时也给出，
+   整对象比较的期望值只能跟着长；断言用意（关闭不是错误、两种装配形态都返回 200）没变。
+   两行期望值之间现在多出的唯一差别是 `runtime_allow`——没装配登记表就没有一份配置可读，给 `[]`。
+7. 设计文档 §6.8 的 `editable` 公式少了 `!degraded`（与本卡 §3.1 不一致），已在文档里补齐。
+8. `path_display` 的省略情形比卡面多一种：`program` 写成 `runtime_allow` 里的程序名时也没有路径可指。
+
+### 10.3 验证证据
+
+- `go test ./api -run 'TestExecutorsResponse|TestListExecutors' -count=1` 绿（本卡 8 条 + 既有 4 条）。
+- `go test ./executor -run 'TestPathDisplay|TestRegistryList|TestRegistryRuntimeAllow' -count=1 -race` 绿。
+- 全仓 `go test ./... -count=1 -race` 绿：api 213.310s / cmd/server 5.832s / core 12.557s / executor 24.298s / store/sqlite 3.494s。
+- `go build ./...`、`go vet ./...`、`cd web && npx vue-tsc --noEmit`（exit 0）、`npm run build` 全过。
+- `List()` 的"一次读表"有一条并发用例（20 轮 `List()` 与 `ApplyStore` 交错，`-race` 下无竞争报告）。
+
+**变异反向验证四处**（各自变红后原样恢复并复跑）：
+
+| 变异 | 变红的用例 |
+| --- | --- |
+| `Editable` 不再看 `web_enabled`（只看来源） | `TestRegistryList_EditableFollowsWebEnabled` + `TestExecutorsResponse_WebDisabledKeepsEverythingButEditable` |
+| `PathDisplay` 直接信 `ScriptRel` 的形状（去掉 `withinDirectory`） | `TestPathDisplay_Kinds` 的两条越界用例 + `TestExecutorsResponse_PathDisplay`（越界那条给出 `../elsewhere/...`） |
+| `List()` 不把降级条目合进来 | `TestExecutorsResponse_TwoSourcesAndDegradation` + `TestRegistryList_MergesSourcesAndOrders` |
+| 降级那条改用探测结论而不是冲突说明 | `TestExecutorsResponse_TwoSourcesAndDegradation`（`runtime_ok` 变 true、`reason` 变空） |
+
+### 10.4 真实进程冒烟（`%TEMP%\w07smoke`，跑完已删）
+
+配置：执行器与在线管理都开，`workspace` 指向仓库 `exec-workspace`，`runtime_allow: [python, node]`，
+配置侧两条（`py_hello`、`cfg_health`），档位文件手写三条（`store_report` 相对、`py_hello` 与配置撞名、
+`store_outside` 指向临时目录里的 python 脚本）；store / 产物 / 档位文件全在临时目录，端口 18914，
+账号 `w07_ops`(ops) 与 `w07_viewer`(viewer)。用 `-tags dashboard` 的内嵌形态起，顺带给界面走查用。
+
+1. 启动日志 `msg="executor handlers registered" total=4 registered=4 unavailable=0 degraded=1`
+   ——撞名那一条按预期只进展示面。
+2. `GET /executors`（ops）逐条核对五种状态：`cfg_health` 是 `config` + `editable:false` 且
+   **没有 `path_display` 这个键**；`store_report` 是 `store` + `editable:true` +
+   `path_display:"scripts/py_hello.py"`；`store_outside` 的 `path_display` 是绝对路径
+   `C:\Users\...\Temp\w07smoke\outside\outside_report.py` 且 `runtime_ok:true`；
+   `exec.py_hello` 出现两行——配置那行 `runtime_ok:true`，文件那行 `degraded:true` +
+   `runtime_ok:false` + `reason:"profile \"py_hello\" is already declared in executors.commands, the stored one is not registered"`。
+   顶层 `web_enabled:true`、`runtime_allow:["python","node"]`、`required_role:"admin"`。
+3. 档位文件里 `store_report` 写了 `env: {W07_FIXED: canary-w07-value}`，整个响应正文搜不到
+   `canary-w07-value`（文件里那条仍在，值不外露）。
+4. `viewer` 档读同一个端点：行数、顺序、每行的 `source/degraded/editable/path_display` 与 ops 看到的完全相同
+   （越界的绝对路径对 reader 也可见——这正是 §8 登记的 S-3 现状，本卡把它如实记在文档里）。
+5. 往返一致：`POST` 一条 `smoke_new` → 201 响应体与随后 `GET /executors` 里那一行**逐字段相等**。
+6. 重启一次（换 embedded 前端产物）：`total=5 ... degraded=1`，页面上 `exec.py_hello` 两行并存。
+7. 界面：`/settings` 的"执行器档位"一节渲染 6 行（含撞名的两行），文案已换成两份来源的说法，
+   控制台无任何消息。⚠️ 产物是 `vite build` 的生产构建，Vue 的重复键警告本来就被剥掉，
+   所以"无消息"不构成 `:key` 修复的证据；结构性证据是同一注册键的两行都独立渲染出来了。
+
+### 10.5 缺陷与处置
+
+| 编号 | 内容 | 处置 |
+| --- | --- | --- |
+| D-0701 | 设计文档 §6.8 的 `editable` 公式缺 `!degraded`，与本卡 §3.1 不一致 | 已修（文档补齐，并写明这条判断只在 `Registry.List` 有一份） |
+| D-0702 | `GET /executors` 说不出档位的**定义**字段（`runtime` / `script` / `program` / `fixed_args` / `args_render` / `cwd` / `env` 的键名 / `retry_on_exit` / http 细则），因此这份响应不能当编辑表单的回填来源 | 登记，归 W08：要么页面自己留一份记录，要么补一个"单条档位详情"读端点。本卡不扩字段——§3.3 要求既有形状零改动，而新增定义字段会把 D5 的路径与配置内容透得更开 |
+| D-0703 | 前端产物是生产构建，Vue 的开发期警告被剥掉，`list_console_messages` 为空不能证明 `:key` 唯一性 | 记为验证口径限制（不修）；真正的判据是用例与页面上两行并存 |
+
+### 10.6 未覆盖项
+
+- 没有登记表（`executors` 为 nil）时 `runtime_allow` 给 `[]`：只有单元用例，未冒烟（那种装配形态只出现在测试里）。
+- binary 档位的 `path_display` 只有单元用例：配置侧写不出"workspace 之外的产物路径"（严格模式会拒），
+  只有页面那侧能建出这种档位，端到端要等 W08 的管理页。
+- Linux / macOS 未实跑：`PathDisplay` 的越界判定依赖 `withinDirectory` 的平台分支
+  （Windows 不区分大小写），跨盘符与符号链接两种写法都没在真机上验过。
+- 绝对路径的遮蔽（S-3）不在本卡，§8 已明确；本卡只把暴露面写进 `docs/api.md` 与冒烟证据。
+- 前端只改了类型定义与设置页两处文案 + 一处 `:key`；管理页归 W08。
