@@ -23,13 +23,16 @@ type Registrar interface {
 // Registration 是一次注册的计数，直接进启动日志：
 // 运维看一行就知道"声明了几个、注册了几个、其中几个当前跑不了"。
 type Registration struct {
-	// Total 是登记表里的档位数量
+	// Total 是登记表里生效档位的数量（不含被降级的条目，那些从来没进注册表）
 	Total int
 	// Registered 是成功写进调度器的数量；键冲突时因为没有任何写入，这个值仍是 0
 	Registered int
 	// Unavailable 是已注册但探测失败的档位数量。提交期会被 api 拒掉（TASK-E16 §3.2 第 1 条），
 	// 因此正常情况下不会有这类任务进到执行侧；真进来了也只是起进程失败，没有第二道拒绝
 	Unavailable int
+	// Degraded 是因与 executors.commands 撞名而没被注册的档位数量（TASK-W03、设计文档 §5.2）。
+	// 它们不进注册表，所以不占上面三个计数；这一条只负责让启动日志说出"有几条白写在文件里"
+	Degraded int
 }
 
 // Register 把登记表里的每个档位注册成 exec.<name> 处理函数。
@@ -89,10 +92,15 @@ func Register(registrar Registrar, reg *Registry, cfg core.Config, artifacts *Ar
 		}
 	}
 
+	// 被降条目从不进注册表，所以这一句只取计数：它们不需要"跳过"的逻辑，
+	// Keys() 里本来就没有它们（ApplyStore 只把未降级的条目放进表）。
+	result.Degraded = len(reg.Degraded())
+
 	logger.Info("executor handlers registered",
 		"total", result.Total,
 		"registered", result.Registered,
-		"unavailable", result.Unavailable)
+		"unavailable", result.Unavailable,
+		"degraded", result.Degraded)
 
 	warnRelaxedAddressPolicy(reg, keys, logger)
 
