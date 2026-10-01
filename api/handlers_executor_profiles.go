@@ -492,19 +492,24 @@ func (s *Server) respondProfileStoreError(c *gin.Context, err error, name string
 // respondProfile 从登记表里读出这条档位现在的样子并回出去。
 //
 // 探测结论取登记表而不是请求体：生效之后那张表才是"这台机器现在能不能跑"的权威。
+// 来源/可编辑/路径这几项也从同一张表取，而且只读一次（TASK-W07 的 Registry.List）：
+// 写响应与列表端点说的必须是同一份处境，分几个访问器读就可能读到换表前后的两份内容。
+// 降级那一条跳过：刚存进去的档位要么生效要么整个请求已经失败，
+// 同一个键出现两行只在"与 executors.commands 撞名"时才有，而那种写入在落盘前就被 409 挡住了。
 // 查不到属于不该发生的组合（刚 Apply 完就没了），按 500 报出来而不是回一个空对象。
 func (s *Server) respondProfile(c *gin.Context, status int, key string) {
-	profile, ok := s.executors.Lookup(key)
-	if !ok {
-		c.JSON(http.StatusInternalServerError, ErrorResponse{
-			Code:    http.StatusInternalServerError,
-			Message: "profile applied but missing from the registry",
-			Details: fmt.Sprintf("handler key %q is not in the registry after applying the profile store", key),
-		})
+	for _, item := range s.executors.List() {
+		if item.Profile.HandlerKey() != key || item.Degraded {
+			continue
+		}
+		c.JSON(status, toExecutorProfile(item))
 		return
 	}
-	reason, runtimeOK := s.executors.Available(key)
-	c.JSON(status, toExecutorProfile(profile, reason, runtimeOK))
+	c.JSON(http.StatusInternalServerError, ErrorResponse{
+		Code:    http.StatusInternalServerError,
+		Message: "profile applied but missing from the registry",
+		Details: fmt.Sprintf("handler key %q is not in the registry after applying the profile store", key),
+	})
 }
 
 // logProfileWarnings 把"文件里有、没能进表"的记录逐条记进日志。

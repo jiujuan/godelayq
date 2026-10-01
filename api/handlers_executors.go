@@ -301,8 +301,10 @@ type ExecutorPositionalResponse struct {
 
 // ExecutorProfileResponse 是一个档位的对外形状。
 //
-// 刻意不含的东西：env 的固定值（那是配置里的凭据）、脚本与产物的绝对路径
-// （只给相对 workspace 的写法）、以及任何解释器的安装路径。
+// 刻意不含的东西：env 的固定值（那是配置里的凭据）、以及任何解释器的安装路径。
+// 路径一项在 TASK-W07 之后改了口径：workspace 之内的档位仍然只给相对写法，
+// 而页面建的档位可以指向 workspace 之外（设计文档 D5），那一条的绝对路径会原样出现在
+// path_display 里——reader 档也读得到，遮蔽方案登记为 S-3，不在本卡。
 type ExecutorProfileResponse struct {
 	Key  string `json:"key"`
 	Name string `json:"name"`
@@ -336,6 +338,21 @@ type ExecutorProfileResponse struct {
 	BodyMode string `json:"body_mode,omitempty"`
 	// URL 只在 http 档位出现，给的是模板原文（含 {占位符}），不是渲染后的地址。
 	URL string `json:"url,omitempty"`
+
+	// 下面四项是 TASK-W07 加的"这条档位的处境"，全部由 executor.Registry 算好后透传，
+	// api 层不再判一遍（同一份规则长两处是这个系列一直在防的事）。
+	// Source 是来源：config 来自 executors.commands（这里只读），store 来自档位文件。
+	Source string `json:"source"`
+	// Editable 是"能不能在页面上改它"：web_enabled 且来源是 store 且它没被降级。
+	// 它只决定按钮显不显示，写请求的边界仍是 ops 档判定（隐藏按钮从来不是安全边界）。
+	Editable bool `json:"editable"`
+	// Degraded 为真表示这条档位与 executors.commands 里的同名档位撞上了：
+	// 它看得见但没生效，reason 给的是那句冲突说明（不是"文件不在"那种探测结论）。
+	// 同一个 key 因此可能出现在两行里——生效那条与降级那条，靠这个字段区分。
+	Degraded bool `json:"degraded"`
+	// PathDisplay 是这个档位指向的本机文件写法：workspace 内给相对写法、之外给绝对路径，
+	// http 档位与"program 写成 PATH 程序名"的 binary 档位没有路径可给，整个键省略。
+	PathDisplay string `json:"path_display,omitempty"`
 }
 
 // ListExecutorsResponse GET /api/v1/executors。
@@ -351,16 +368,29 @@ type ListExecutorsResponse struct {
 	// （TASK-E16 §3.2 第 2 条），不该让人填出注定失败的取值；而"能不能提交执行器任务"这个问题
 	// 只在执行器开着的时候成立，所以关闭时不给这个键，前端也不会去显示一个没人用的区间。
 	MaxTimeout string `json:"max_timeout,omitempty"`
+	// WebEnabled 是 executors.web_enabled（档位的在线管理开没开）。
+	// 关闭时这个键照样给出并回 false（TASK-W07 §3.2）：它是前端"能不能改档位"的唯一判据，
+	// 省略就等于让前端去猜"没这个键"是"关着"还是"这份后端还不认识档位管理"。
+	WebEnabled bool `json:"web_enabled"`
+	// RuntimeAllow 是 executors.runtime_allow 实际生效的那份名单，给 W08 的"解释器"下拉用。
+	// 它与上面 required_role / max_timeout 的"关闭时不给"故意不一致：那两项说的是
+	// "现在能不能提交执行任务"，这一项是一份配置事实。enabled=false 时它照样给出。
+	// 没装配登记表的部署给 []。
+	RuntimeAllow []string `json:"runtime_allow"`
 }
 
 // ListExecutors GET /api/v1/executors
 //
 // 没有 503 守卫：执行器默认关闭，"没装配登记表"是默认状态而不是错误状态
 // （口径见 docs/design/executor-design.md §6.1）。
+//
+// profiles 里同时有生效与降级两批（TASK-W07 §3.1）：撞名的那条档位看得见但跑不了，
+// 静默丢掉只会让"页面上明明建过、重启后不见了"变成无解之谜。
 func (s *Server) ListExecutors(c *gin.Context) {
 	response := ListExecutorsResponse{
-		Enabled:  false,
-		Profiles: []ExecutorProfileResponse{},
+		Enabled:      false,
+		Profiles:     []ExecutorProfileResponse{},
+		RuntimeAllow: []string{},
 	}
 	if s.executors == nil {
 		c.JSON(http.StatusOK, response)
@@ -368,19 +398,32 @@ func (s *Server) ListExecutors(c *gin.Context) {
 	}
 
 	response.Enabled = s.executors.Enabled()
+	response.WebEnabled = s.executors.WebEnabled()
+	response.RuntimeAllow = s.executors.RuntimeAllow()
 	if response.Enabled {
 		role := s.executors.RequiredRole()
 		response.RequiredRole = &role
 		response.MaxTimeout = s.executors.MaxTimeout().String()
 	}
-	for _, profile := range s.executors.Profiles() {
-		reason, ok := s.executors.Available(profile.HandlerKey())
-		response.Profiles = append(response.Profiles, toExecutorProfile(profile, reason, ok))
+	for _, item := range s.executors.List() {
+		response.Profiles = append(response.Profiles, toExecutorProfile(item))
 	}
 	c.JSON(http.StatusOK, response)
 }
 
-func toExecutorProfile(profile *executor.Profile, reason string, runtimeOK bool) ExecutorProfileResponse {
+// toExecutorProfile 把登记表的一行换成对外形状。
+//
+// 可用性结论在这里分两种来源（同一条 "runtime_ok + reason" 的形状）：
+// 降级那条给的是"与 executors.commands 撞名、没注册"那句冲突说明（RuntimeOK 恒 false，
+// 它确实跑不了），其余条目给它自己的探测结论。两条各自成立的事实里，
+// "为什么这条没生效"是读者更要紧的那一件。
+func toExecutorProfile(view executor.ListedProfile) ExecutorProfileResponse {
+	profile := view.Profile
+	reason, runtimeOK := view.Probe.Reason, view.Probe.Available
+	if view.Degraded {
+		reason, runtimeOK = view.Reason, false
+	}
+
 	args := make([]ExecutorArgResponse, 0, len(profile.Args))
 	for _, arg := range profile.Args {
 		args = append(args, ExecutorArgResponse{
@@ -411,6 +454,12 @@ func toExecutorProfile(profile *executor.Profile, reason string, runtimeOK bool)
 		// 起点建议由执行器包给出（http 读开头、进程读末尾），前端只照它设置初始标签页，
 		// 于是"两处各判一次导致默认读取方向不一致"这种漂移没有机会出现（TASK-E18 §3.2 第 2 条）。
 		PreferredResultDirection: executor.PreferredResultDirection(profile),
+		// 四项"这条档位的处境"全部照抄登记表：来源、能不能改、有没有被降级、指向的文件写法。
+		// api 层不重算 editable 的规则，那份判断只在 executor.Registry.List 里有一份。
+		Source:      string(view.Source),
+		Editable:    view.Editable,
+		Degraded:    view.Degraded,
+		PathDisplay: profile.PathDisplay(),
 	}
 	if profile.Positional != nil {
 		item.Positional = &ExecutorPositionalResponse{

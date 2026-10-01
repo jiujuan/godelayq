@@ -370,15 +370,20 @@ func TestListExecutors_DefaultStateIsNotAnError(t *testing.T) {
 	require.NoError(t, err)
 	srv := newSecurityServer(t, Security{}, WithExecutorRegistry(closedRegistry))
 
+	// TASK-W07 之后顶层多了 web_enabled 与 runtime_allow 两个键（关闭时也给出），
+	// 这条整对象比较的期望值跟着长；断言的本来用意没变：关闭不是错误。
 	recorder := doGet(t, srv, "/api/v1/executors", nil)
 	require.Equal(t, http.StatusOK, recorder.Code, recorder.Body.String())
-	assert.JSONEq(t, `{"enabled":false,"required_role":null,"profiles":[]}`, recorder.Body.String())
+	assert.JSONEq(t, `{"enabled":false,"required_role":null,"profiles":[],"web_enabled":false,
+		"runtime_allow":["bash","sh","cmd","pwsh","node","php","python","java"]}`, recorder.Body.String())
 
-	// 压根没注入登记表（测试里直接构造 Server 的形态）：同一个答案，同样不是 503
+	// 压根没注入登记表（测试里直接构造 Server 的形态）：同样不是 503，档位列表也是空的。
+	// 与上面的唯一差别是 runtime_allow——没有登记表就没有一份配置可读，给空表而不是编一份。
 	plain := newSecurityServer(t, Security{})
 	recorder = doGet(t, plain, "/api/v1/executors", nil)
 	require.Equal(t, http.StatusOK, recorder.Code)
-	assert.JSONEq(t, `{"enabled":false,"required_role":null,"profiles":[]}`, recorder.Body.String())
+	assert.JSONEq(t, `{"enabled":false,"required_role":null,"profiles":[],"web_enabled":false,
+		"runtime_allow":[]}`, recorder.Body.String())
 }
 
 func TestListExecutors_RequiresAuth(t *testing.T) {
