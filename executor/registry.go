@@ -335,6 +335,79 @@ func (r *Registry) Degraded() []DegradedProfile {
 	return items
 }
 
+// ListedProfile 是展示面上的一行：档位本身，加上登记表对它的四项判断。
+//
+// 这四项不放在 Profile 上（同 SourceOf 的理由）：那是"登记表怎么看这条档位"，
+// 不是档位定义的一部分。接口一次读表就要拿齐它们。
+type ListedProfile struct {
+	Profile *Profile
+	Probe   ProbeResult
+	Source  Source
+	// Degraded 为真表示这条来自档位文件、与 executors.commands 的同名档位撞上，因此没注册处理函数。
+	// 此时 Probe 仍然是它对自己那台机器的结论（降级与"跑不了"是两件事，可以同时为真），
+	// 但展示时给出的 reason 用 Reason 那一句冲突说明——"为什么它没生效"比"文件在不在"更要紧。
+	Degraded bool
+	Reason   string
+	// Editable 由登记表一次算好：web_enabled && 来源是 store && 未降级。
+	// 这条规则只在这里有一份，前端只读这个布尔决定要不要显示入口；
+	// 真正的边界仍是写端点的 ops 档判定，隐藏按钮从来不是安全边界。
+	Editable bool
+}
+
+// List 一次读表给出展示面要的全部条目：生效那批与降级那批合在一份按注册键字典序的列表里，
+// 同名冲突时降级那条排在它撞上的那条之后（两行的注册键相同，靠 Degraded 区分）。
+//
+// 只做一次 Load，是整表替换那条不变量的要求：接口需要档位、探测、来源、降级四样东西，
+// 分四次走各自的访问器就可能读到四张不同的表——W06 之后运行期真的会换表，
+// "这条的来源查不到、这条的探测来自上一张表"就不再只是理论问题。
+// Profiles() 与 Degraded() 保留原样，它们各自是完整的一次读表。
+func (r *Registry) List() []ListedProfile {
+	snap := r.data.Load()
+	webEnabled := r.executors.WebEnabled
+
+	listed := make([]ListedProfile, 0, len(snap.keys)+len(snap.degraded))
+	for _, key := range snap.keys {
+		item := snap.entries[key]
+		listed = append(listed, ListedProfile{
+			Profile:  item.profile,
+			Probe:    item.probe,
+			Source:   item.source,
+			Editable: webEnabled && item.source == SourceStore,
+		})
+	}
+	for _, item := range snap.degraded {
+		listed = append(listed, ListedProfile{
+			Profile:  item.Profile,
+			Probe:    item.Probe,
+			Source:   SourceStore,
+			Degraded: true,
+			Reason:   item.Reason,
+		})
+	}
+
+	sort.SliceStable(listed, func(i, j int) bool {
+		keyI, keyJ := listed[i].Profile.HandlerKey(), listed[j].Profile.HandlerKey()
+		if keyI != keyJ {
+			return keyI < keyJ
+		}
+		// 生效那条在前：同一个键的两行里，"能提交的那条"是读者先要看到的
+		return !listed[i].Degraded && listed[j].Degraded
+	})
+	return listed
+}
+
+// RuntimeAllow 返回 executors.runtime_allow 实际生效的那份名单（Normalized 补齐默认值之后）。
+//
+// 它服务 W08 的"解释器"下拉：拼错的解释器名不该等到保存之后才由 400 暴露。
+// 与 RequiredRole / MaxTimeout 那两项不同，executors.enabled=false 时这个值照样给得出——
+// 它是一份配置事实，不是"这台机器现在能不能执行"的运行状态。
+// 后来人别把两者当成不一致而顺手"修平"（TASK-W07 §3.4 写明了这条差别）。
+func (r *Registry) RuntimeAllow() []string {
+	values := make([]string, len(r.executors.RuntimeAllow))
+	copy(values, r.executors.RuntimeAllow)
+	return values
+}
+
 // snapshot 是一张不可变的登记表。entries 与 keys 必须成对构造：
 // 分两次换会让读侧在两个时刻之间拿到"键在、档位不在"的自相矛盾结果。
 type snapshot struct {

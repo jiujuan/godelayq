@@ -180,6 +180,37 @@ func (p *Profile) ProgramDisplay() string {
 	}
 }
 
+// PathDisplay 返回这个档位指向的本机文件的展示写法（TASK-W07 的 path_display）。三种取值：
+// workspace 之内给相对写法、之外给绝对路径原样、没有文件可指时给空串（接口那边是省略这个键）。
+//
+// "有没有越界"只能用 withinDirectory 判，不能看 ScriptRel/ProgramRel 的形状：
+// relativeTo 只在 Windows 跨盘符时才兜底成文件名，同盘的越界写法它给出的是 ..\..\ 上跳形式
+// （D-0201，W02 落地时核实）。
+//
+// binary 档位把 program 写成 runtime_allow 里的程序名时没有路径可言，那是 PATH 查找而不是文件；
+// 这条与 http 档位一样返回空串，程序名本身由 ProgramDisplay 表达。
+//
+// ⚠️ 绝对路径会把本机目录结构透给读得到这个响应的任何人（reader 档在内）。
+// 设计文档 §7.1 第 3 条把遮蔽方案登记为 S-3，本期按 D5 的现状如实给出。
+func (p *Profile) PathDisplay() string {
+	var absolute, relative string
+	switch p.Kind {
+	case KindScript:
+		absolute, relative = p.ScriptPath, p.ScriptRel
+	case KindBinary:
+		absolute, relative = p.ProgramPath, p.ProgramRel
+	default:
+		return ""
+	}
+	if absolute == "" {
+		return ""
+	}
+	if relative != "" && withinDirectory(p.Workspace, absolute) {
+		return relative
+	}
+	return absolute
+}
+
 // LoadProfiles 校验 core 配置里的全部档位。
 // 任一条不过即返回错误，错误信息以 executors.commands[i] 开头并带上档位名，
 // 让运维能直接定位到是哪一条哪一项写错。档位列表为空是合法的（返回空切片）。
