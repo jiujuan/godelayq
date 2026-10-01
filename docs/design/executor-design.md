@@ -45,6 +45,22 @@
 
 **落地位置**（实现之后补写，方便按决策找代码）：
 
+- D1 ⚠️ **白名单从"一处"变成"两处"**：`executors.commands`（本文原样，改完仍要重启）之外，
+  `executors.web_enabled: true` 时还有一份档位文件 `executors.profiles_path`
+  （`core/executor_profile_store.go`），ops 档可以在控制台/REST 增删改它，**立即生效、活过重启**，
+  同名以配置为准（合并与降级判定在 `executor/merge_profiles.go`）。
+  "加一条命令要改配置重启"这句代价因此只对配置侧成立；D2（不接受内联源码）**没有松动**——
+  页面只能引用已存在的文件，请求体里没有放脚本正文的键。
+  收窄条件也跟着变了：原话是"收窄到能改配置文件并重启的人"，现在等价于
+  "能改配置文件并重启的人 + **拿到一个 ops 档 JWT 的人**"。
+  全套决策、风险与本期刻意留下的口子见 [web-profile-design.md](./web-profile-design.md)（D5、§7）。
+- D2 ⚠️ **"工作目录内"这半边只对配置侧保留**：`executors.commands` 的 script/program/cwd
+  仍必须解析在 `executors.workspace` 之内（`executor/profile.go` 的 `resolveInside`，逐字未改）；
+  档位文件走 `PathAnywhere`（`resolveAnywhere`），允许绝对路径与 workspace 之外的相对路径
+  （`executor/profile.go` 的 `BuildProfile(cmd, ec, mode)`）。
+  判越界只能用 `withinDirectory`，不能用 `relativeTo` 返回的形状（同盘越界会老实给出 `..\..\` 上跳形式）。
+  这是评审拍板的主动偏离，安全收口五条 S-1…S-5 只登记未实施，见那份文档 §7.2 与
+  `docs/deployment.md` "开启执行器"第 13 条的警告。
 - D5 ⚠️ 整树终止：`executor/proc_unix.go` 的 `killTree`（`SysProcAttr{Setpgid:true}` + 进程组 TERM→宽限→KILL）与
   `executor/proc_windows.go` 的 `killTree`/`runTaskkill`。超时的生效值由 `executor/profile.go` 的 `effectiveTimeout`
   合成（档位没写就用 `executors.default_timeout`，一律受 `max_timeout` 封顶）。**与原设计的差别**：
@@ -442,7 +458,7 @@ executors:
 | CI token 泄漏即 RCE | 静态 token 身份 `machine` = operator 档 | `required_role: admin` 默认把 machine 挡在外面（比较逻辑无需新代码） |
 | shell 元字符注入 | — | D3 不经 shell，无字符串拼接 |
 | argv 伪装选项（`--` 前缀） | — | 参数 `pattern` 白名单 + `args_render` 模板只允许具名占位符；位置参数需显式声明 `positional` 并给 `max` |
-| 路径逃逸（脚本/cwd 指向任意文件） | — | 启动期 `Abs` + workspace 前缀校验；拒符号链接解析后的逃逸；payload 不能指定路径 |
+| 路径逃逸（脚本/cwd 指向任意文件） | ⚠️ 档位在线管理打开后，档位文件里的路径**可以**在 workspace 之外（决策 D5，收口项 S-1 未做） | 启动期 `Abs` + workspace 前缀校验（**只对 `executors.commands` 保留**）；拒符号链接解析后的逃逸；payload 不能指定路径 |
 | 内联源码执行 | — | D2 明确不支持 |
 | 环境变量泄漏（JWT secret、token 在进程 env） | viper `GODELAYQ_*` 覆盖机制 | 子进程 env 重建 + `env_allow` 白名单 |
 | SSRF / 内网扫描 / 云元数据 | HTTP 执行器天然是一个代理 | URL 模板写死 + `allowed_hosts` + **拨号层** IP 校验（含 `deny_private_ranges`、`169.254.169.254`）+ `max_redirects: 0` |
