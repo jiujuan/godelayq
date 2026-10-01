@@ -134,6 +134,7 @@
 | `job.go` | 任务模型 | 状态含 `paused`（追加在枚举末尾，兼容已落盘的 int）；`group` 只是标签，落盘省略空值；快照与重试副本四处搬运同一字段 |
 | `scheduler.go` | 调度器引擎 | 堆顶定时器唤醒（非忙等待），有界 worker 池 + 队列背压，优雅关闭与崩溃恢复；`Pause`/`ForcePause`/`Resume` 暂停语义（收尾守卫保证不复活），`Suspend` 调度总开关，`SetGroup`/`RetagGroup` 连堆内条目一起改分组，`RuntimeStats` 供运维端点读占用 |
 | `group_store.go` | 分组元数据 | 单 JSON 文件同步原子重写（低频实体不复制 jobs 的合并落盘协程）；组名规则、损坏文件报错而非当空集 |
+| `executor_profile_store.go` | 档位文件（页面建的档位） | 与分组同一形态：单 JSON 数组、同步原子重写、损坏即报错而不是当空集合；`ExecutorProfileRecord` 是存储面形状，与配置面 `ExecutorCommand` 分两份，免得加一个存储字段就多一个"配置里能写但没意义"的键。`env` 的固定取值只落在这里，不出现在任何读口 |
 | `auth.go` | 角色模型 | `viewer < operator < admin < ops` 单阶梯比较；`machine` 等同 operator 档，因而天然拿不到 admin 能力 |
 | `event.go` | 事件驱动架构 | 发布-订阅；订阅缓冲满时丢弃事件而非阻塞调度主流程 |
 | `websocket.go` | 实时通信 | 心跳保活、按事件类型/任务名过滤订阅；只依赖 `WSConn`/`WSUpgrader` 接口，协议库由上层注入（重连属客户端能力） |
@@ -163,6 +164,7 @@ godelayq/
 │   ├── job.go                # 任务定义、状态（含 paused）、分组标签、快照与 CloneForRetry
 │   ├── scheduler.go          # 调度器：堆 + worker 池 + 取消表 + 暂停/强制暂停 + 调度总开关 + 事件总线
 │   ├── group_store.go        # 分组元数据存储（单 JSON 文件，同步原子落盘）
+│   ├── executor_profile_store.go # 档位文件（executors.profiles_path）：页面建的档位存这里，形态照 group_store
 │   ├── auth.go               # 控制台角色档位与权限比较
 │   ├── store.go              # 存储接口与 JSON 实现（合并落盘、终态留痕）
 │   ├── retry.go              # 指数退避重试策略（抖动 + 延迟上限）
@@ -183,6 +185,7 @@ godelayq/
 │   ├── handlers_events.go    # 任务时间线与全局最近事件（装配了事件库时改读库）
 │   ├── handlers_artifacts.go # GET /jobs/:id/artifacts：按尝试列出输出尺寸与清理状态
 │   ├── handlers_executors.go # 档位清单、执行输出读取、提交期判定与凭据掩码
+│   ├── handlers_executor_profiles.go # 档位的在线管理：定义读口 + 增改删（ops 档，落盘先于生效）
 │   ├── handlers_admin.go     # ops 档：运行时诊断、调度总开关、清缓冲、写操作台账查询
 │   ├── audit.go              # 写操作台账：中间件、action/verdict 封闭词表、读写窄接口（观测层）
 │   ├── history.go            # 事件内存环形缓冲（订阅事件总线，重启即清空；启用事件库后它是兜底）
@@ -196,9 +199,11 @@ godelayq/
 │   ├── sse.go                # Server-Sent Events
 │   └── *_test.go             # 契约、鉴权、关闭与流式测试
 │
-├── executor/                 # 执行层（把配置里的档位变成可注册的执行任务；默认不启用）
-│   ├── profile.go            # 档位加载与校验：workspace 边界、解释器白名单、参数与超时声明
-│   ├── registry.go           # "档位 + 可用性"的只读登记表（配置项 executors.* 的唯一读取方）
+├── executor/                 # 执行层（把档位变成可注册的执行任务；默认不启用）
+│   ├── profile.go            # 档位加载与校验：两种路径模式（workspace 内 / 本机任意路径）、解释器白名单、参数与超时声明
+│   ├── registry.go           # "档位 + 可用性 + 来源"的登记表（配置项 executors.* 的唯一读取方，运行期可整表替换）
+│   ├── merge_profiles.go     # 把档位文件那份合进 store 侧（只管 store：config 侧仍由 NewRegistry 加载，同名以 config 为准）
+│   ├── applier.go            # "校验+探测"与"整份文件生效"的入口（api 的写端点只经这一个口子改执行面）
 │   ├── register.go           # 把档位注册进调度器（Registrar 由调用方提供，不依赖具体实现）
 │   ├── probe.go              # 可用性探测：程序在不在 PATH、脚本在不在，不启动任何进程
 │   ├── args.go               # payload 解码、参数校验与命令行/URL 渲染（没有 shell，也没有内联源码）
@@ -290,9 +295,11 @@ godelayq/
 
 - **多种触发方式**：延迟执行（Duration）、定时执行（Time）、周期执行（Cron，5 或 6 段）
 - **三种提交入口**：REST API、任务文件目录、代码内直接 `Schedule`
-- **执行器档位（默认关闭）**：`executors.commands` 里声明的档位注册成 `exec.<档位名>` 任务类型，
-  到点直接跑脚本、跑已编译产物或发一个 HTTP 请求，不需要改代码；能执行什么完全由这份白名单决定，
-  **不提供自由命令行，也不接受任务里内联源码**。参数声明（必填、正则、`secret`）、可用性探测、
+- **执行器档位（默认关闭）**：档位注册成 `exec.<档位名>` 任务类型，到点直接跑脚本、跑已编译产物
+  或发一个 HTTP 请求，不需要改代码；能执行什么由两份来源决定——配置的 `executors.commands`
+  （改完要重启）与档位文件 `executors.profiles_path`（`executors.web_enabled` 打开后由 ops 档在
+  控制台"档位"页增删改，**立即生效、活过重启**），两份合并时同名以配置为准。无论来自哪份，
+  **都不提供自由命令行，也不接受任务里内联源码**。参数声明（必填、正则、`secret`）、可用性探测、
   独立执行池与输出产物存储都在 `executor/` 包里；开关与部署前提见 [部署文档](./docs/deployment.md) 的"开启执行器"。
 - **上下文传递**：Handler 收到带 cancellation 与 timeout 的 `context.Context`
 - **标识**：任务 ID 为 UUIDv7（毫秒时间戳前缀 + 随机后缀，可按字典序粗略排序）
@@ -468,6 +475,8 @@ executors:
   max_timeout: 30m            # 超时上限：档位或任务请求超过它直接被拒
   restore_policy: pause       # 崩溃后正在跑的执行器任务：pause 等人确认 / replay 重跑
   loader_allow: false         # 目录加载器是否接受 exec.* 任务文件（服务端不启用加载器，详见部署文档）
+  web_enabled: false          # 档位的在线管理：打开后 ops 档可在控制台增删改档位文件（必须同时 enabled: true）
+  profiles_path: ./data/exec-profiles.json  # 页面建的档位存这里；与 executors.commands 是两份来源，同名以配置为准
   output:
     inline_preview: 2048      # 事件与任务详情里带的尾部预览字节数
     max_bytes: 262144         # 单条流的落盘上限，达到即标记截断
@@ -526,5 +535,7 @@ observability:
 - [Web 控制台设计文档](./docs/design/web-console-design.md)（`web/` 的技术选型、页面与后端改造方案，含里程碑进度）
 - [执行器设计文档](./docs/design/executor-design.md)（shell/脚本/HTTP 执行层的白名单档位、结果通道与权限模型；**已实现（M0–M5），与实现的偏差在该文正文的 ⚠️ 标注里**）
   - 实施拆分：[执行器任务卡 TASK-E01 … E19](./docs/design/tasks/executor/README.md)
+- [档位在线管理设计文档](./docs/design/web-profile-design.md)（把"改档位要重启"改成"控制台可增删改、立即生效、活过重启"：第二份档位来源、运行期可变的登记表、ops 档写端与控制台页面；**已实现（W01–W08）**，安全收口五条 S-1…S-5 只登记未实施）
+  - 实施拆分：[档位在线管理任务卡 TASK-W01 … W09](./docs/design/tasks/web-profile/README.md)
 - [观测层设计文档](./docs/design/sqlite-observability-design.md)（可选的 SQLite 观测层：运行事件、产物索引与写操作审计三张表；**已实现，与设计不同处逐条标在该文 §15**）
   - 实施拆分：[观测层任务卡 TASK-S01 … S08](./docs/design/tasks/sqlite/README.md)
