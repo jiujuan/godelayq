@@ -83,7 +83,8 @@ type Scheduler struct {
 	execSlotFreed chan struct{}
 
 	// eventPreviewLimit 是完成/失败事件里输出预览的字节上限（executors.output.inline_preview）。
-	// 事件会广播给全部 WS/SSE 订阅者，并在 api 的内存缓冲里留下最近若干条，
+	// 事件会广播给全部 WS/SSE 订阅者，并在 api 的内存缓冲里留下最近若干条
+	//（启用观测层的事件库时还会被持久化，见 docs/design/sqlite-observability-design.md §6.1），
 	// 因此事件只带结论，输出正文留在产物文件里。受 s.mu 保护：装配期写入，执行协程读取。
 	eventPreviewLimit int
 

@@ -23,6 +23,10 @@ import (
 //
 // 与 core.Store 是松耦合的：这里不认识任务，任务侧也不同步删除产物。
 // 取消与终态淘汰留下的目录由启动时的孤儿清理回收（取舍写在 PurgeOrphans）。
+//
+// 启用观测层时本类型还顺带维护产物索引（SetIndex 挂上 ArtifactIndexer）：
+// 每次执行记一行、清理时删行、启动时对账。文件仍然是权威，索引只是加速器，
+// 写不进索引不改变任何执行结论（见 docs/design/sqlite-observability-design.md D8）。
 type ArtifactStore struct {
 	dir      string
 	maxBytes int

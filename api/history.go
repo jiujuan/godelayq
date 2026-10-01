@@ -22,7 +22,9 @@ const (
 //
 // 语义要说清楚：它跟着进程走，重启即清空，不是审计日志。
 // 任务详情页的时间线、Dashboard 的事件流都读它；
-// 需要持久化的运行历史属于二期（见 docs/design/web-console-design.md §5.6）。
+// 需要持久化的运行历史在观测层里（`observability.events.enabled`，
+// 见 docs/design/sqlite-observability-design.md §6.1 与 TASK-S03/S04）：
+// 装配了事件库时两个事件端点改读库，这里退成兜底数据源，本类型自身的行为不变。
 type EventHistory struct {
 	bus   *core.EventBus
 	subID string
