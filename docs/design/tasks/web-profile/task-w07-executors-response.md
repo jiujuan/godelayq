@@ -224,7 +224,7 @@ cd web && npx vue-tsc --noEmit
 | 编号 | 内容 | 处置 |
 | --- | --- | --- |
 | D-0701 | 设计文档 §6.8 的 `editable` 公式缺 `!degraded`，与本卡 §3.1 不一致 | 已修（文档补齐，并写明这条判断只在 `Registry.List` 有一份） |
-| D-0702 | `GET /executors` 说不出档位的**定义**字段（`runtime` / `script` / `program` / `fixed_args` / `args_render` / `cwd` / `env` 的键名 / `retry_on_exit` / http 细则），因此这份响应不能当编辑表单的回填来源 | 登记，归 W08：要么页面自己留一份记录，要么补一个"单条档位详情"读端点。本卡不扩字段——§3.3 要求既有形状零改动，而新增定义字段会把 D5 的路径与配置内容透得更开 |
+| D-0702 | `GET /executors` 说不出档位的**定义**字段（`runtime` / `script` / `program` / `fixed_args` / `args_render` / `cwd` / `env` 的键名 / `retry_on_exit` / http 细则），因此这份响应不能当编辑表单的回填来源 | 登记，归 W08：要么页面自己留一份记录，要么补一个"单条档位详情"读端点。本卡不扩字段——§3.3 要求既有形状零改动，而新增定义字段会把 D5 的路径与配置内容透得更开。**W08 已收**：取"补读端点"那一支，`GET /executors/profiles/:name`（ops 档，`env` 只给键名）+ `PUT` 的"没带 `env` = 不改"规则，见 W08 卡 §10.1 |
 | D-0703 | 前端产物是生产构建，Vue 的开发期警告被剥掉，`list_console_messages` 为空不能证明 `:key` 唯一性 | 记为验证口径限制（不修）；真正的判据是用例与页面上两行并存 |
 
 ### 10.6 未覆盖项
