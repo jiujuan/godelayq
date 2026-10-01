@@ -38,6 +38,23 @@ const (
 	KindHTTP   Kind = "http"   // 配置里固定下来的 HTTP 请求
 )
 
+// PathMode 决定档位里的路径字段（script / program / cwd）按哪套规则解析。
+//
+// 两种模式只差在"路径能在哪儿"这一件事上，其余校验完全共用同一条代码路径：
+// 页面上保存的档位与 yaml 里声明的档位必须被同一套规则检验，
+// 否则迟早分叉，而分叉的表现是"页面上存得进去、重启后启动失败"。
+type PathMode int
+
+const (
+	// PathWithinWorkspace 是既有口径：相对 executors.workspace，且解析后仍落在它之内。
+	// config.yaml 里的档位永远走这一条（executor-design.md §7 的越界拒绝）。
+	PathWithinWorkspace PathMode = iota
+	// PathAnywhere 允许本机任意路径（含绝对路径与 ".."），只要求"能算出绝对路径"。
+	// 它服务的是 Web 上建出来的档位——这是对设计文档 §7 的主动偏离，
+	// 依据与收口方案见 docs/design/web-profile-design.md D5 与 §7。
+	PathAnywhere
+)
+
 // DefaultArgPattern 是参数未声明 pattern 时套用的字符集：字母、数字与 . _ : / = , -，
 // 长度 1..256，不含空格、换行与任何 shell 元字符。路径类参数够用，
 // 但档位应为路径型参数写更窄的 pattern（见设计文档 §9 风险 3）。
@@ -179,15 +196,12 @@ func LoadProfiles(cfg core.Config) ([]*Profile, error) {
 		return nil, fmt.Errorf("executors.workspace %q is unusable as a profile root: %w", ec.Workspace, err)
 	}
 
-	runtimes := make(map[string]bool, len(ec.RuntimeAllow))
-	for _, name := range ec.RuntimeAllow {
-		runtimes[name] = true
-	}
+	runtimes := runtimeSet(ec.RuntimeAllow)
 
 	profiles := make([]*Profile, 0, len(ec.Commands))
 	declared := make(map[string]int, len(ec.Commands))
 	for i := range ec.Commands {
-		profile, err := buildProfile(&ec.Commands[i], i, workspace, runtimes, ec)
+		profile, err := buildProfile(&ec.Commands[i], i, workspace, runtimes, ec, PathWithinWorkspace)
 		if err != nil {
 			return nil, err
 		}
@@ -201,8 +215,44 @@ func LoadProfiles(cfg core.Config) ([]*Profile, error) {
 	return profiles, nil
 }
 
+// BuildProfile 校验**单条**档位定义，用它自己的路径模式。
+//
+// 存在的理由只有一条：Web 上保存档位之前必须先判一遍，而那次判断与启动时的
+// `LoadProfiles` 必须是同一套规则（设计文档 I1）。它不查配置里的那份列表，
+// 也不做重名检查——"这条名字有没有被占用"是调用方的事（两份来源各查一次）。
+//
+// ec 传归一化过的 `executors` 那一节即可：workspace 留空、runtime_allow 留空
+// 都会在这里补成代码默认值，与 `Config.Normalized()` 用的是同一份默认表。
+func BuildProfile(cmd core.ExecutorCommand, ec core.ExecutorsConfig, mode PathMode) (*Profile, error) {
+	normalized := core.Config{Executors: ec}.Normalized().Executors
+
+	workspace, err := resolveWorkspace(normalized.Workspace)
+	if err != nil {
+		return nil, fmt.Errorf("executors.workspace %q is unusable as a profile root: %w", normalized.Workspace, err)
+	}
+
+	return buildProfile(&cmd, singleProfileIndex, workspace, runtimeSet(normalized.RuntimeAllow), normalized, mode)
+}
+
+// singleProfileIndex 是"这条档位不来自 executors.commands 列表"的记号：
+// 错误文案因此不带列表下标，免得页面上回显出 `executors.commands[0]` 这种
+// 与调用方毫无关系的位置（那条前缀只属于配置文件里的那份列表）。
+const singleProfileIndex = -1
+
+// runtimeSet 把解释器白名单折成集合。
+func runtimeSet(allow []string) map[string]bool {
+	runtimes := make(map[string]bool, len(allow))
+	for _, name := range allow {
+		runtimes[name] = true
+	}
+	return runtimes
+}
+
 // buildProfile 按第 3.4 节的规则校验单条档位。
-func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtimes map[string]bool, ec core.ExecutorsConfig) (*Profile, error) {
+//
+// index 是这条档位在 executors.commands 里的位置，只用于错误定位：
+// 不属于那份列表的单条校验（BuildProfile）传 -1，错误文案因此不含列表下标。
+func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtimes map[string]bool, ec core.ExecutorsConfig, mode PathMode) (*Profile, error) {
 	if err := checkProfileName(cmd.Name, index); err != nil {
 		return nil, err
 	}
@@ -289,7 +339,7 @@ func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtim
 		return nil, err
 	}
 
-	cwd, err := resolveInside(workspace, cmd.Cwd, "cwd", index, name)
+	cwd, err := resolveProfilePath(mode, workspace, cmd.Cwd, "cwd", index, name)
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +360,7 @@ func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtim
 				"runtime %q is not in executors.runtime_allow", cmd.Runtime)
 		}
 		profile.Runtime = cmd.Runtime
-		script, err := resolveInside(workspace, cmd.Script, "script", index, name)
+		script, err := resolveProfilePath(mode, workspace, cmd.Script, "script", index, name)
 		if err != nil {
 			return nil, err
 		}
@@ -324,7 +374,7 @@ func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtim
 		if runtimes[cmd.Program] {
 			profile.ProgramName = cmd.Program
 		} else {
-			program, err := resolveInside(workspace, cmd.Program, "program", index, name)
+			program, err := resolveProfilePath(mode, workspace, cmd.Program, "program", index, name)
 			if err != nil {
 				return nil, err
 			}
@@ -406,10 +456,10 @@ func fillHTTPProfile(profile *Profile, cmd *core.ExecutorCommand, ec core.Execut
 func checkProfileName(raw string, index int) error {
 	name := strings.TrimSpace(raw)
 	if name == "" {
-		return fmt.Errorf("executors.commands[%d]: name must not be empty", index)
+		return profileError(index, "", "name must not be empty")
 	}
 	if !profileNamePattern.MatchString(name) {
-		return fmt.Errorf("executors.commands[%d] %q: name must be 1-64 characters of letters, digits, underscore or hyphen", index, name)
+		return profileError(index, name, "name must be 1-64 characters of letters, digits, underscore or hyphen")
 	}
 	return nil
 }
@@ -857,6 +907,51 @@ var evalSymlinks = filepath.EvalSymlinks
 // statPath 同样是为了让测试能模拟"链接存在且指向外部"的文件系统状态。
 var statPath = os.Lstat
 
+// resolveProfilePath 按模式把路径字段解析成绝对路径。
+//
+// 两种模式的差别只有"允许落在哪儿"：严格模式的全部拒绝分支都在 resolveInside 里，
+// 一条也不因为宽松模式的存在而减少。宽松模式只是不再要求结果落在 workspace 之内。
+func resolveProfilePath(mode PathMode, workspace, value, field string, index int, name string) (string, error) {
+	if mode == PathAnywhere {
+		return resolveAnywhere(workspace, value, field, index, name)
+	}
+	return resolveInside(workspace, value, field, index, name)
+}
+
+// resolveAnywhere 允许本机任意路径：仍然要求非空（cwd 例外）且能算出绝对路径。
+//
+// 相对写法**仍然以 workspace 为基准**：模式只放宽"能在哪儿"，不重新定义"相对谁"，
+// 否则同一条 `scripts/x.py` 在两种来源下会指向两个地方。
+// 这里不做越界判断，也不做符号链接复核——没有根目录可比。
+// 文件是否存在、是不是普通文件、能不能执行，全部是探测的结论（Probe），
+// 不参与"这条档位合不合法"。
+func resolveAnywhere(workspace, value, field string, index int, name string) (string, error) {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		if field == "cwd" {
+			return workspace, nil
+		}
+		return "", profileError(index, name, "%s must not be empty", field)
+	}
+
+	cleaned := filepath.FromSlash(trimmed)
+	// 与 resolveInside 同一条"根写法"判定：Windows 的 IsAbs 要求盘符或 UNC，
+	// "/tmp/x" 与 "\tmp\x" 在那边不算绝对路径，但调用方写的显然是"从根开始"。
+	rooted := filepath.IsAbs(cleaned) ||
+		strings.HasPrefix(cleaned, string(filepath.Separator)) ||
+		strings.HasPrefix(trimmed, "/") || strings.HasPrefix(trimmed, "\\")
+
+	target := cleaned
+	if !rooted {
+		target = filepath.Join(workspace, cleaned)
+	}
+	absolute, err := filepath.Abs(target)
+	if err != nil {
+		return "", profileError(index, name, "%s %q cannot be resolved: %v", field, value, err)
+	}
+	return filepath.Clean(absolute), nil
+}
+
 // resolveInside 把一个相对路径解析到 workspace 内，并保证写法与解析结果都不越界。
 //
 // 两层检查：
@@ -985,10 +1080,18 @@ func (p *Profile) ValidatePayloadKeys(keys []string) error {
 
 // profileError 统一错误前缀，让每条信息都能定位到 executors.commands 的哪一项。
 func profileError(index int, name, format string, args ...any) error {
-	if name == "" {
-		return fmt.Errorf("executors.commands[%d]: %s", index, fmt.Sprintf(format, args...))
+	reason := fmt.Sprintf(format, args...)
+	if index < 0 {
+		// 单条校验（BuildProfile）走的这一支：没有列表位置可指，只报档位名。
+		if name == "" {
+			return fmt.Errorf("profile: %s", reason)
+		}
+		return fmt.Errorf("profile %q: %s", name, reason)
 	}
-	return fmt.Errorf("executors.commands[%d] %q: %s", index, name, fmt.Sprintf(format, args...))
+	if name == "" {
+		return fmt.Errorf("executors.commands[%d]: %s", index, reason)
+	}
+	return fmt.Errorf("executors.commands[%d] %q: %s", index, name, reason)
 }
 
 // firstShellSpecial 返回字符串里出现的第一个 shell 元字符，没有则返回空串。
