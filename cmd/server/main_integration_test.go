@@ -79,7 +79,7 @@ func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
 			return nil, nil
 		},
 		newObservabilityDB: unopenedObservabilityDB(t),
-		newServer: func(gotScheduler schedulerAPI, gotStore core.Store, port string, gotExecutors *executor.Registry, gotArtifacts *executor.ArtifactStore, gotObs *observabilityAPI) (serverAPI, error) {
+		newServer: func(gotScheduler schedulerAPI, gotStore core.Store, port string, gotExecutors *executor.Registry, gotArtifacts *executor.ArtifactStore, gotObs *observabilityAPI, _ *profileStoreAPI) (serverAPI, error) {
 			if gotScheduler != scheduler {
 				t.Fatalf("expected server to receive scheduler stub, got %T", gotScheduler)
 			}
@@ -200,7 +200,7 @@ func TestRun_ServerStartFailureStopsScheduler(t *testing.T) {
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {},
@@ -240,7 +240,7 @@ func TestRun_StoreCreationFailure(t *testing.T) {
 			return nil, nil
 		},
 		newObservabilityDB: unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			t.Fatal("server should not be created when store creation fails")
 			return nil, nil
 		},
@@ -272,7 +272,7 @@ func TestRun_ExecutorRegistryError(t *testing.T) {
 			return nil, nil
 		},
 		newObservabilityDB: unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			t.Fatal("server should not be created when the registry fails")
 			return nil, nil
 		},
@@ -315,7 +315,7 @@ func TestRun_LogsErrorWhenAuthDisabled(t *testing.T) {
 		newExecutorRegistry: executor.NewRegistry,
 		newArtifactStore:    artifactStoreFromConfig,
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -383,7 +383,7 @@ func runWithExecutorConfig(t *testing.T, tune func(*core.Config)) (*spyScheduler
 		newExecutorRegistry: func(core.Config, *slog.Logger) (*executor.Registry, error) { return executors, nil },
 		newArtifactStore:    artifactStoreFromConfig,
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -484,7 +484,7 @@ func TestRun_ExecPoolSizingReachesScheduler(t *testing.T) {
 		newExecutorRegistry: executor.NewRegistry,
 		newArtifactStore:    artifactStoreFromConfig,
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -515,7 +515,7 @@ func TestRun_WithIncompleteDependencies(t *testing.T) {
 	err = run(runtimeDeps{
 		newStore:     func() (core.Store, error) { return newStubStore(), nil },
 		newScheduler: func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			return newFakeServer(), nil
 		},
 		notifySignals: func(chan<- os.Signal, ...os.Signal) {},
@@ -530,7 +530,7 @@ func TestRun_WithIncompleteDependencies(t *testing.T) {
 		newStore:            func() (core.Store, error) { return newStubStore(), nil },
 		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			return newFakeServer(), nil
 		},
 		notifySignals: func(chan<- os.Signal, ...os.Signal) {},
@@ -557,7 +557,7 @@ func TestRun_ArtifactStoreErrorStopsStartup(t *testing.T) {
 		newExecutorRegistry: executor.NewRegistry,
 		newArtifactStore:    staticArtifactStore(nil, wantErr),
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			t.Fatal("server should not be created when the artifact store fails")
 			return nil, nil
 		},
@@ -604,7 +604,7 @@ func TestRun_ArtifactCleanerStopsWithRun(t *testing.T) {
 			return artifacts, nil
 		},
 		newObservabilityDB: unopenedObservabilityDB(t),
-		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry, gotArtifacts *executor.ArtifactStore, _ *observabilityAPI) (serverAPI, error) {
+		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry, gotArtifacts *executor.ArtifactStore, _ *observabilityAPI, _ *profileStoreAPI) (serverAPI, error) {
 			// 接口拿到的必须就是 run 里那一份：换成新建的存储会读不到刚写出的产物
 			if len(stores) != 1 || gotArtifacts != stores[0] {
 				t.Errorf("expected the server to receive the built artifact store, got %p of %v", gotArtifacts, stores)
@@ -787,7 +787,7 @@ func runWithObservability(t *testing.T, tc observabilityCase) (*observabilityStu
 		newObservabilityDB:  newDB,
 		newEventLog:         newLog,
 		newAuditLog:         newAudit,
-		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry, _ *executor.ArtifactStore, gotObs *observabilityAPI) (serverAPI, error) {
+		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry, _ *executor.ArtifactStore, gotObs *observabilityAPI, _ *profileStoreAPI) (serverAPI, error) {
 			// 装配已经走到"观测层挂好、服务还没起"这一步，总线此刻可用
 			if tc.onServer != nil {
 				tc.onServer(scheduler.GetEventBus())
@@ -846,7 +846,7 @@ func TestRun_ObservabilityDisabledOpensNothing(t *testing.T) {
 			calls++
 			return nil, nil
 		},
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			return newFakeServer(), nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -903,7 +903,7 @@ func TestRun_ObservabilityOpenFailureStopsStartup(t *testing.T) {
 			t.Fatal("the event writer should not be constructed when the database is unavailable")
 			return nil, nil
 		},
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			t.Fatal("the server should not be created when the observability database fails")
 			return nil, nil
 		},
@@ -949,7 +949,7 @@ func TestRun_ObservabilityStatsFailureStopsStartup(t *testing.T) {
 			t.Fatal("the event writer should not be constructed when the database is unusable")
 			return nil, nil
 		},
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			t.Fatal("the server should not be created when the observability database is unusable")
 			return nil, nil
 		},
@@ -1145,7 +1145,7 @@ func TestRun_EventLogOpenFailureStopsStartup(t *testing.T) {
 		newEventLog: func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error) {
 			return nil, wantErr
 		},
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			t.Fatal("the server should not be created when the event writer fails")
 			return nil, nil
 		},
@@ -1185,7 +1185,7 @@ func TestRun_EventLogClosureIsMandatoryWhenEnabled(t *testing.T) {
 			newAuditLog: func(observabilityDB, core.ObservabilityConfig, *slog.Logger) (auditLogAPI, error) {
 				return &auditLogStub{}, nil
 			},
-			newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+			newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 				return newFakeServer(), nil
 			},
 			notifySignals: func(chan<- os.Signal, ...os.Signal) {},
@@ -1325,7 +1325,7 @@ func runWithArtifactIndexFlags(t *testing.T, tune func(*core.Config),
 		},
 		newArtifactIndex: newIndex,
 		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry,
-			artifacts *executor.ArtifactStore, _ *observabilityAPI) (serverAPI, error) {
+			artifacts *executor.ArtifactStore, _ *observabilityAPI, _ *profileStoreAPI) (serverAPI, error) {
 			result.serverCalls++
 			result.store = artifacts
 			return newFakeServer(), nil
@@ -1614,7 +1614,7 @@ func TestRun_AuditLogClosureIsMandatoryWhenEnabled(t *testing.T) {
 			newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
 				return &observabilityStub{stats: sqlite.Stats{SchemaVersion: 1}}, nil
 			},
-			newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+			newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 				return newFakeServer(), nil
 			},
 			notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -1663,7 +1663,7 @@ func TestRun_AuditLogOpenFailureStopsStartup(t *testing.T) {
 		newAuditLog: func(observabilityDB, core.ObservabilityConfig, *slog.Logger) (auditLogAPI, error) {
 			return nil, wantErr
 		},
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			serverCalls++
 			return newFakeServer(), nil
 		},
@@ -1718,7 +1718,7 @@ func TestRun_ServerStopErrorIsLoggedAndIgnored(t *testing.T) {
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -1752,7 +1752,7 @@ func TestRun_UsesDefaultTimeoutAndLoggerWhenUnset(t *testing.T) {
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -1790,7 +1790,7 @@ func TestRun_ServerFactoryError(t *testing.T) {
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
 		newObservabilityDB:  unopenedObservabilityDB(t),
-		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			return nil, wantErr
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {},
@@ -1942,6 +1942,22 @@ func (s *spyScheduler) LookupHandler(jobType string) (core.Handler, bool) {
 	defer s.mu.Unlock()
 	handler, ok := s.registered[jobType]
 	return handler, ok
+}
+
+// UnregisterHandler 与真实调度器一样成对删两张表，并记一次调用流水。
+func (s *spyScheduler) UnregisterHandler(jobType string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	_, ok := s.registered[jobType]
+	delete(s.registered, jobType)
+	delete(s.classes, jobType)
+	s.calls = append(s.calls, "unregister:"+jobType)
+	return ok
+}
+
+// HandlerNames 是档位同步器用来枚举现有键的入口，替身直接复用 registeredKeys 的有序输出。
+func (s *spyScheduler) HandlerNames() []string {
+	return s.registeredKeys()
 }
 
 // registeredKeys 按字典序返回已注册的键，让失败信息能直接读出注册表内容。

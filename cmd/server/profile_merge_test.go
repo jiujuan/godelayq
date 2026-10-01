@@ -66,25 +66,42 @@ func declareStoredCommand(t *testing.T, workspace, name string) core.ExecutorCom
 	return cmd
 }
 
-// runWithProfileRecords 跑一次完整装配，档位文件由 records 那个闭包顶替（不碰真文件）。
-func runWithProfileRecords(t *testing.T, cfg core.Config, records func(core.Config) ([]core.ExecutorProfileRecord, error)) (*spyScheduler, string, error) {
+// profileStoreWith 交回一个"装着这些记录"的真实档位文件存储，
+// 让 run() 走的是生产那条 List() 路径而不是凭空构造的切片。
+func profileStoreWith(t *testing.T, records ...core.ExecutorProfileRecord) func(core.Config) (core.ExecutorProfileStore, error) {
+	return func(core.Config) (core.ExecutorProfileStore, error) {
+		store, err := core.NewJSONFileExecutorProfileStore(filepath.Join(t.TempDir(), "exec-profiles.json"))
+		if err != nil {
+			t.Fatalf("open profile store: %v", err)
+		}
+		for _, record := range records {
+			if err := store.Save(record); err != nil {
+				t.Fatalf("save profile %q: %v", record.Name, err)
+			}
+		}
+		return store, nil
+	}
+}
+
+// runWithProfileStore 跑一次完整装配，档位文件由 store 那个闭包顶替（不碰配置文件里的路径）。
+func runWithProfileStore(t *testing.T, cfg core.Config, store func(core.Config) (core.ExecutorProfileStore, error)) (*spyScheduler, string, error) {
 	t.Helper()
 
-	store := newStubStore()
+	stub := newStubStore()
 	scheduler := newSpyScheduler()
 	server := newFakeServer()
 	var logs strings.Builder
 
 	err := run(runtimeDeps{
-		config:              cfg,
-		newStore:            func() (core.Store, error) { return store, nil },
-		newScheduler:        func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
-		newExecutorRegistry: executor.NewRegistry,
-		newExecutorProfiles: records,
-		newArtifactStore:    artifactStoreFromConfig,
-		newObservabilityDB:  unopenedObservabilityDB(t),
+		config:                  cfg,
+		newStore:                func() (core.Store, error) { return stub, nil },
+		newScheduler:            func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
+		newExecutorRegistry:     executor.NewRegistry,
+		newExecutorProfileStore: store,
+		newArtifactStore:        artifactStoreFromConfig,
+		newObservabilityDB:      unopenedObservabilityDB(t),
 		newServer: func(schedulerAPI, core.Store, string, *executor.Registry,
-			*executor.ArtifactStore, *observabilityAPI) (serverAPI, error) {
+			*executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 			return server, nil
 		},
 		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
@@ -102,12 +119,10 @@ func TestRun_MergesStoredProfilesIntoTheScheduler(t *testing.T) {
 	// config 侧声明 alpha，文件里也有一条 alpha 加一条 beta：alpha 以配置为准
 	cfg.Executors.Commands = []core.ExecutorCommand{declareStoredCommand(t, workspace, "alpha")}
 
-	scheduler, logs, err := runWithProfileRecords(t, cfg, func(core.Config) ([]core.ExecutorProfileRecord, error) {
-		return []core.ExecutorProfileRecord{
-			declareStoredRecord(t, workspace, "alpha"),
-			declareStoredRecord(t, workspace, "beta"),
-		}, nil
-	})
+	scheduler, logs, err := runWithProfileStore(t, cfg, profileStoreWith(t,
+		declareStoredRecord(t, workspace, "alpha"),
+		declareStoredRecord(t, workspace, "beta"),
+	))
 	require.NoError(t, err)
 
 	keys := scheduler.registeredKeys()
@@ -125,9 +140,8 @@ func TestRun_StoredProfilesAreRegisteredBeforeTheRestoreGuard(t *testing.T) {
 	cfg, workspace := profileRunConfig(t)
 	cfg.Executors.RestorePolicy = "pause"
 
-	scheduler, _, err := runWithProfileRecords(t, cfg, func(core.Config) ([]core.ExecutorProfileRecord, error) {
-		return []core.ExecutorProfileRecord{declareStoredRecord(t, workspace, "beta")}, nil
-	})
+	scheduler, _, err := runWithProfileStore(t, cfg, profileStoreWith(t,
+		declareStoredRecord(t, workspace, "beta")))
 	require.NoError(t, err)
 
 	registerAt := scheduler.callIndex("register:exec.beta")
@@ -158,9 +172,8 @@ func TestRun_InvalidStoredRecordIsSkippedAndLogged(t *testing.T) {
 		Script: "scripts/broken.mjs",
 	})
 
-	scheduler, logs, err := runWithProfileRecords(t, cfg, func(core.Config) ([]core.ExecutorProfileRecord, error) {
-		return []core.ExecutorProfileRecord{broken, declareStoredRecord(t, workspace, "survivor")}, nil
-	})
+	scheduler, logs, err := runWithProfileStore(t, cfg, profileStoreWith(t,
+		broken, declareStoredRecord(t, workspace, "survivor")))
 
 	require.NoError(t, err, "一条手改坏的记录不该让整个进程起不来")
 	keys := scheduler.registeredKeys()
@@ -180,8 +193,8 @@ func TestRun_CorruptProfileFileStopsStartupWithSelfHelp(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("{ this is not json"), 0o600))
 	cfg.Executors.ProfilesPath = path
 
-	profiles := defaultRuntimeDeps(cfg, quietLogger()).newExecutorProfiles
-	scheduler, _, err := runWithProfileRecords(t, cfg, profiles)
+	profiles := defaultRuntimeDeps(cfg, quietLogger()).newExecutorProfileStore
+	scheduler, _, err := runWithProfileStore(t, cfg, profiles)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), filepath.Base(path), "错误要指出是哪个文件")
@@ -198,8 +211,10 @@ func TestRun_RealProfileClosureToleratesMissingFile(t *testing.T) {
 	path := filepath.Join(dir, "nested", "exec-profiles.json")
 	cfg.Executors.ProfilesPath = path
 
-	records, err := defaultRuntimeDeps(cfg, quietLogger()).newExecutorProfiles(cfg)
+	store, err := defaultRuntimeDeps(cfg, quietLogger()).newExecutorProfileStore(cfg)
 	require.NoError(t, err, "还没人在页面上建过档位是正常状态")
+	records, err := store.List()
+	require.NoError(t, err)
 	assert.Empty(t, records)
 
 	_, statErr := os.Stat(path)
@@ -217,8 +232,8 @@ func TestRun_WebDisabledNeverTouchesTheProfilesPath(t *testing.T) {
 
 	// 用真实的生产闭包而不是替身：本卡要断言的是"它一次都没被调用到"，
 	// 而闭包一旦被调用就会把 nested 目录建出来。
-	profiles := defaultRuntimeDeps(cfg, quietLogger()).newExecutorProfiles
-	scheduler, _, err := runWithProfileRecords(t, cfg, profiles)
+	profiles := defaultRuntimeDeps(cfg, quietLogger()).newExecutorProfileStore
+	scheduler, _, err := runWithProfileStore(t, cfg, profiles)
 	require.NoError(t, err)
 
 	_, statErr := os.Stat(filepath.Dir(cfg.Executors.ProfilesPath))
@@ -230,7 +245,7 @@ func TestRun_WebDisabledNeverTouchesTheProfilesPath(t *testing.T) {
 func TestRun_MissingProfileDependencyIsRejected(t *testing.T) {
 	cfg, _ := profileRunConfig(t)
 
-	scheduler, _, err := runWithProfileRecords(t, cfg, nil)
+	scheduler, _, err := runWithProfileStore(t, cfg, nil)
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "runtime dependencies are incomplete")
@@ -245,10 +260,70 @@ func TestRun_StoredProfilesCannotBeAppliedWhileExecutorsAreDisabled(t *testing.T
 	cfg.Executors.Enabled = false
 	cfg.Executors.Output.Dir = ""
 
-	_, _, err := runWithProfileRecords(t, cfg, func(core.Config) ([]core.ExecutorProfileRecord, error) {
-		return []core.ExecutorProfileRecord{declareStoredRecord(t, workspace, "beta")}, nil
-	})
+	_, _, err := runWithProfileStore(t, cfg, profileStoreWith(t,
+		declareStoredRecord(t, workspace, "beta")))
 
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "executors are disabled")
+}
+
+// 装配方交给服务的两面必须同时在场：api 侧的 requireExecutorProfiles 判的是"两个都非 nil"，
+// 只给一个的话写端点会 503，而 503 的文案要说的是"没装配"——那比"少给了一半"更难查。
+func TestRun_ProfileDependenciesReachTheServerTogether(t *testing.T) {
+	cfg, workspace := profileRunConfig(t)
+
+	var got *profileStoreAPI
+	records := profileStoreWith(t, declareStoredRecord(t, workspace, "beta"))
+	err := runWithCapturingServer(t, cfg, records, func(profiles *profileStoreAPI) { got = profiles })
+	require.NoError(t, err)
+
+	require.NotNil(t, got, "web_enabled=true 的部署要把档位存储与同步器一起交给服务")
+	require.NotNil(t, got.store)
+	require.NotNil(t, got.applier)
+}
+
+func TestRun_ProfileDependenciesAreAbsentWhenDisabled(t *testing.T) {
+	cfg, workspace := profileRunConfig(t)
+	cfg.Executors.WebEnabled = false
+	cfg.Executors.Commands = []core.ExecutorCommand{declareStoredCommand(t, workspace, "alpha")}
+
+	var got *profileStoreAPI
+	called := false
+	err := runWithCapturingServer(t, cfg, func(core.Config) (core.ExecutorProfileStore, error) {
+		called = true
+		return nil, errors.New("must not be called")
+	}, func(profiles *profileStoreAPI) { got = profiles })
+	require.NoError(t, err)
+
+	assert.False(t, called, "关闭状态下不该打开档位文件")
+	assert.Nil(t, got, "关闭状态下服务侧不该拿到任何档位写依赖")
+}
+
+// runWithCapturingServer 与 runWithProfileStore 同一套替身，只是把 newServer 收到的
+// 档位依赖交给回调。
+func runWithCapturingServer(t *testing.T, cfg core.Config,
+	store func(core.Config) (core.ExecutorProfileStore, error),
+	capture func(*profileStoreAPI)) error {
+	t.Helper()
+
+	err := run(runtimeDeps{
+		config:                  cfg,
+		newStore:                func() (core.Store, error) { return newStubStore(), nil },
+		newScheduler:            func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
+		newExecutorRegistry:     executor.NewRegistry,
+		newExecutorProfileStore: store,
+		newArtifactStore:        artifactStoreFromConfig,
+		newObservabilityDB:      unopenedObservabilityDB(t),
+		newServer: func(_ schedulerAPI, _ core.Store, _ string, _ *executor.Registry,
+			_ *executor.ArtifactStore, _ *observabilityAPI, profiles *profileStoreAPI) (serverAPI, error) {
+			capture(profiles)
+			return newFakeServer(), nil
+		},
+		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
+			go func() { ch <- syscall.SIGTERM }()
+		},
+		timeout: 20 * time.Millisecond,
+		logger:  quietLogger(),
+	})
+	return err
 }

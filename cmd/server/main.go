@@ -46,6 +46,11 @@ type schedulerAPI interface {
 	// GetEventBus 取调度器持有的事件总线，观测层的事件写入器要往上挂第二个订阅者。
 	// api.Server 走的是同一个入口（api/server.go 里给内存缓冲挂订阅），本卡不改 core。
 	GetEventBus() *core.EventBus
+	// UnregisterHandler 与 HandlerNames 是档位在线管理的两个入口（TASK-W04、W06）：
+	// 同步器要能枚举现有键才知道哪几个该摘掉，并调用成对删除把档位摘干净。
+	// PauseByHandlerKey 不在这里：删除档位时是 api.Server 直接调调度器，装配方不中转。
+	UnregisterHandler(jobType string) bool
+	HandlerNames() []string
 }
 
 type serverAPI interface {
@@ -109,6 +114,17 @@ type observabilityAPI struct {
 	audit  auditLogAPI
 }
 
+// profileStoreAPI 是档位在线管理的两面：档位文件的读写口，与"把文件重新生效"的同步器。
+//
+// 合成一个参数而不是两位，理由与 observabilityAPI 相同：位置参数每加一位
+// 都要重排一批 newServer 字面量，而这两件东西本来就同生同灭
+// （api 侧的 requireExecutorProfiles 也是两个都为非 nil 才放行）。
+// 整体为 nil 就是 executors.web_enabled=false：默认状态。
+type profileStoreAPI struct {
+	store   core.ExecutorProfileStore
+	applier *executor.Applier
+}
+
 type runtimeDeps struct {
 	config       core.Config
 	newStore     func() (core.Store, error)
@@ -116,14 +132,17 @@ type runtimeDeps struct {
 	// newExecutorRegistry 建档位登记表（加载 + 探测）。它必须显式提供：
 	// 缺了它执行器会静默不注册，开关打开也看不出问题。
 	newExecutorRegistry func(core.Config, *slog.Logger) (*executor.Registry, error)
-	// newExecutorProfiles 读档位文件（executors.profiles_path）里的全部记录，
+	// newExecutorProfileStore 打开档位文件（executors.profiles_path）并交回存储实例，
 	// 只在 executors.web_enabled=true 时调用。
 	//
 	// 它与登记表构造分成两个闭包，是因为这两种失败的后果不同：
 	// 文件读不出来是"这台机器的档位状态不可信"，必须挡住启动；
 	// 档位本身写错则是 config 侧连坐、文件侧单条跳过（executor.MergeStoreProfiles 的注释）。
 	// 合成一个闭包的话，这两种脸色只能给同一种。
-	newExecutorProfiles func(core.Config) ([]core.ExecutorProfileRecord, error)
+	//
+	// 交回的是**实例**而不是记录：同一个文件在进程里有两份内存视图
+	// （启动合并读的那一份、页面写入用的那一份）会让"刚建的档位"与"下一次生效"看到不同的内容。
+	newExecutorProfileStore func(core.Config) (core.ExecutorProfileStore, error)
 	// newArtifactStore 建输出产物的文件存储与清理协程，只在 executors.enabled=true 时调用。
 	// 与登记表一样列入依赖完整性检查：少了它输出会静默无处安放。
 	newArtifactStore func(core.Config, *slog.Logger) (*executor.ArtifactStore, error)
@@ -147,7 +166,7 @@ type runtimeDeps struct {
 	// 而 /admin/audit 看起来"没有符合条件的记录"，与真的没有分不清。
 	newAuditLog func(db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (auditLogAPI, error)
 	newServer   func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry,
-		artifacts *executor.ArtifactStore, obs *observabilityAPI) (serverAPI, error)
+		artifacts *executor.ArtifactStore, obs *observabilityAPI, profiles *profileStoreAPI) (serverAPI, error)
 	notifySignals signalNotifier
 	timeout       time.Duration
 	logger        *slog.Logger
@@ -169,7 +188,7 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 			return core.NewScheduler(store, retryPolicy, eventBus, core.WithLogger(logger))
 		},
 		newExecutorRegistry: executor.NewRegistry,
-		newExecutorProfiles: func(cfg core.Config) ([]core.ExecutorProfileRecord, error) {
+		newExecutorProfileStore: func(cfg core.Config) (core.ExecutorProfileStore, error) {
 			normalized := cfg.Normalized()
 			profiles, err := core.NewJSONFileExecutorProfileStore(normalized.Executors.ProfilesPath)
 			if err != nil {
@@ -179,12 +198,7 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 				return nil, fmt.Errorf("load executor profile store failed: %w; "+
 					"fix that file or delete it to fall back to profiles declared only in executors.commands", err)
 			}
-			records, err := profiles.List()
-			if err != nil {
-				return nil, fmt.Errorf("list executor profiles failed: %w; "+
-					"delete the file to fall back to profiles declared only in executors.commands", err)
-			}
-			return records, nil
+			return profiles, nil
 		},
 		newArtifactStore: func(cfg core.Config, logger *slog.Logger) (*executor.ArtifactStore, error) {
 			return executor.NewArtifactStore(executor.ArtifactOptions{
@@ -243,7 +257,7 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 			}, logger)
 		},
 		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry,
-			artifacts *executor.ArtifactStore, obs *observabilityAPI) (serverAPI, error) {
+			artifacts *executor.ArtifactStore, obs *observabilityAPI, profiles *profileStoreAPI) (serverAPI, error) {
 			coreScheduler, ok := scheduler.(*core.Scheduler)
 			if !ok {
 				return nil, fmt.Errorf("default server requires *core.Scheduler, got %T", scheduler)
@@ -279,6 +293,14 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 					// 读写两面是同一个句柄：台账的写入方就是查询方
 					opts = append(opts, api.WithAuditLog(obs.audit, obs.audit))
 				}
+			}
+			// 档位的在线管理两面同生同灭：web_enabled=false 时 profiles 整体是 nil，
+			// 三个写端点因此走到 503 那条明确分支，而不是"能建但建完不生效"。
+			if profiles != nil {
+				opts = append(opts,
+					api.WithExecutorProfileStore(profiles.store),
+					api.WithExecutorProfileApplier(profiles.applier),
+				)
 			}
 			return api.NewServer(coreScheduler, store, port, security, logger, opts...), nil
 		},
@@ -339,7 +361,7 @@ func run(deps runtimeDeps) error {
 	}
 	// 档位文件只在 web_enabled 时才是必需依赖：默认关闭的部署一个文件都不碰，
 	// 少配这个闭包不该改变行为（DoD 的"行为与本卡之前一致"）。
-	if deps.config.Executors.WebEnabled && deps.newExecutorProfiles == nil {
+	if deps.config.Executors.WebEnabled && deps.newExecutorProfileStore == nil {
 		return fmt.Errorf("runtime dependencies are incomplete")
 	}
 
@@ -381,14 +403,22 @@ func run(deps runtimeDeps) error {
 	scheduler.SetEventPreviewLimit(cfg.Executors.Output.InlinePreview)
 
 	// 档位文件在登记表之前读、在注册之前合。两个时点都有理由：
-	//   - 读不出来就没有"这一批档位"可合，那种状态不该带着起服务（见 newExecutorProfiles）；
+	//   - 读不出来就没有"这一批档位"可合，那种状态不该带着起服务（见 newExecutorProfileStore）；
 	//   - 合批必须早于 registerHandlers，因为崩溃恢复守卫按注册表里的类别改判
 	//     （installRestoreGuard 与 Start 第一步的 Restore 都晚于注册）。
 	//     晚一步注册的那批档位，它的崩溃现场会查不到类别、跳过 paused 改判直接重排。
 	//     这条顺序由 TestRun_StoredProfilesAreRegisteredBeforeTheRestoreGuard 钉住。
+	//
+	// 存储实例只建这一份：启动合并与页面写入共用同一个内存视图，
+	// 否则"页面上刚存的档位"与"下一次 Apply 读到的内容"会各看一份文件状态。
+	var profileStore core.ExecutorProfileStore
 	var storedProfiles []core.ExecutorProfileRecord
 	if cfg.Executors.WebEnabled {
-		storedProfiles, err = deps.newExecutorProfiles(cfg)
+		profileStore, err = deps.newExecutorProfileStore(cfg)
+		if err != nil {
+			return err
+		}
+		storedProfiles, err = profileStore.List()
 		if err != nil {
 			return err
 		}
@@ -563,7 +593,21 @@ func run(deps runtimeDeps) error {
 		obs = &observabilityAPI{events: events, audit: audit}
 	}
 
-	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts, obs)
+	// 档位在线管理的两面也合成一个参数：web_enabled=false 时整体是 nil，
+	// 三个写端点走到 requireExecutorProfiles 那条明确的 503，
+	// 不会出现"能建档位、建完不生效"这种半套部署。
+	// 同步器在这里建而不是在服务里建：它要同时握调度器、登记表、存储与产物存储，
+	// 这四样都在装配方手里，服务只该拿到已经接好的东西。
+	var profiles *profileStoreAPI
+	if cfg.Executors.WebEnabled {
+		applier, err := executor.NewApplier(profileStore, scheduler, executors, artifacts, deps.logger)
+		if err != nil {
+			return err
+		}
+		profiles = &profileStoreAPI{store: profileStore, applier: applier}
+	}
+
+	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts, obs, profiles)
 	if err != nil {
 		return err
 	}
