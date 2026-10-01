@@ -12,6 +12,7 @@ import {
   ClipboardList,
   FolderOpen,
   LayoutDashboard,
+  ScrollText,
   Settings,
   Wrench,
   type LucideIcon,
@@ -82,6 +83,13 @@ const routes: RouteRecordRaw[] = [
     component: () => import('../views/AdminView.vue'),
     // 运维页改的是整个进程的行为，只有 ops 档能进（后端 /admin/* 同档位）
     meta: { title: '运维', icon: Wrench, minimumRole: 'ops' },
+  },
+  {
+    path: '/audit',
+    name: 'audit',
+    component: () => import('../views/AuditView.vue'),
+    // 台账行含账号名与拒绝原因，档位与后端 GET /admin/audit 的 ops 对齐
+    meta: { title: '审计', icon: ScrollText, minimumRole: 'ops' },
   },
   {
     path: '/settings',
