@@ -37,7 +37,13 @@ type ProfileWarning struct {
 //
 // cfg 里 executors 一节的取值以归一化后为准（workspace、runtime_allow 都会参与校验）。
 func MergeStoreProfiles(cfg core.Config, stored []core.ExecutorProfileRecord) ([]StoreEntry, []ProfileWarning) {
-	executors := cfg.Normalized().Executors
+	return mergeStoreProfiles(cfg.Normalized().Executors, stored)
+}
+
+// mergeStoreProfiles 是合并规则唯一的那一份：入参已经是归一化过的 executors 一节。
+// 导出的那一层只负责把整份配置归一化，Applier 则直接用它所持登记表里的那一份，
+// 两条路径因此不可能读到不同的 workspace 或 runtime_allow。
+func mergeStoreProfiles(executors core.ExecutorsConfig, stored []core.ExecutorProfileRecord) ([]StoreEntry, []ProfileWarning) {
 
 	// 判撞名只需要 config 侧声明了哪些名字，不需要把它们校验一遍——
 	// 校验是 LoadProfiles/NewRegistry 的事，这里再跑一遍等于把 config 侧的连坐规则

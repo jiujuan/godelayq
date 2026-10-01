@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -21,10 +22,18 @@ func quietLogger() *slog.Logger {
 
 // 装配方传进来的对象必须满足这个接口，编译期固定住，避免改了方法名要到 cmd 里才发现。
 var _ Registrar = (*core.Scheduler)(nil)
+var _ HandlerSync = (*core.Scheduler)(nil)
 
+// fakeRegistrar 同时充当 Registrar（注册链路的替身）与 HandlerSync（同步器的替身）：
+// 后者多出的两个方法就是 W04 给调度器加的那对入口。
+// 带锁是因为同步器那条链路会在 -race 用例里被并发调用。
 type fakeRegistrar struct {
+	mu       sync.Mutex
 	handlers map[string]core.Handler
 	classes  map[string]core.JobClass
+	// writes 按顺序记下每一次 RegisterHandlerClass 的键：
+	// "配置侧的处理函数一次都不重建"这种断言只看最终表面对不出来，得看见有没有写过。
+	writes []string
 }
 
 func newFakeRegistrar(keys ...string) *fakeRegistrar {
@@ -45,17 +54,53 @@ func (f *fakeRegistrar) RegisterHandler(jobType string, handler core.Handler) {
 // RegisterHandlerClass 把类别一起记下来：E13 的分池接线靠这个值，
 // 注册链路只调用 RegisterHandler 的话，档位就会退回共享池。
 func (f *fakeRegistrar) RegisterHandlerClass(jobType string, handler core.Handler, class core.JobClass) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.handlers[jobType] = handler
 	f.classes[jobType] = class
+	f.writes = append(f.writes, jobType)
+}
+
+// writeLog 返回每次写入的键，按调用顺序。
+func (f *fakeRegistrar) writeLog() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.writes...)
 }
 
 func (f *fakeRegistrar) LookupHandler(jobType string) (core.Handler, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	handler, ok := f.handlers[jobType]
 	return handler, ok
 }
 
+// UnregisterHandler 与真实调度器一样成对删两张表。
+func (f *fakeRegistrar) UnregisterHandler(jobType string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	_, ok := f.handlers[jobType]
+	delete(f.handlers, jobType)
+	delete(f.classes, jobType)
+	return ok
+}
+
+func (f *fakeRegistrar) HandlerNames() []string {
+	return f.registeredKeys()
+}
+
+// classOf 读某个键登记到的执行类别，测试断言用。
+func (f *fakeRegistrar) classOf(jobType string) (core.JobClass, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	class, ok := f.classes[jobType]
+	return class, ok
+}
+
 // registeredKeys 返回假注册表里的键，按字典序，便于与登记表的输出顺序直接比较。
 func (f *fakeRegistrar) registeredKeys() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	keys := make([]string, 0, len(f.handlers))
 	for key := range f.handlers {
 		keys = append(keys, key)

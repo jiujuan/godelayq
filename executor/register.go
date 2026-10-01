@@ -84,7 +84,7 @@ func Register(registrar Registrar, reg *Registry, cfg core.Config, artifacts *Ar
 		// 按 kind 分流：进程档位由 Runner 起进程，http 档位由 HTTPRunner 发请求（TASK-E15）。
 		// 两条都是真实的执行主体，共用校验、许可、产物与失败分类那一套；
 		// 分流只在这一处，Runner 自己不再解释 http 档位（它会按"档位类型不符"报永久失败）。
-		registrar.RegisterHandlerClass(key, handlerFor(profile, artifacts, executors, logger).Handler(),
+		registrar.RegisterHandlerClass(key, Handler(profile, artifacts, executors, logger),
 			core.JobClassExec)
 		result.Registered++
 		if probe, ok := reg.ProbeOf(key); ok && !probe.Available {
@@ -130,6 +130,14 @@ func warnRelaxedAddressPolicy(reg *Registry, keys []string, logger *slog.Logger)
 		"profiles", strings.Join(relaxed, ","),
 		"reason", "deny_private_ranges is false",
 		"hint", "intended for reaching a service on the same development machine; remove it from production configs")
+}
+
+// Handler 交出一个可注册进调度器的档位处理函数：按 kind 分流到进程执行器或 HTTP 执行主体。
+//
+// 它是注册链路（Register）与运行期同步（Applier）共用的那一个构造口，
+// 两条路径因此不可能建出两种处理函数。
+func Handler(p *Profile, artifacts *ArtifactStore, cfg core.ExecutorsConfig, logger *slog.Logger) core.Handler {
+	return handlerFor(p, artifacts, cfg, logger).Handler()
 }
 
 // profileHandler 是两种执行主体共同的最小形状：交出一个能给调度器的处理函数。

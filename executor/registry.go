@@ -213,6 +213,13 @@ func (r *Registry) ApplyStore(items []StoreEntry) error {
 // Enabled 返回执行器总开关，供接口区分"没开"与"开了但没有档位"。
 func (r *Registry) Enabled() bool { return r.enabled }
 
+// WebEnabled 返回档位的在线管理是否打开（executors.web_enabled）。
+//
+// 写端点用它做第一道判定：没打开的部署不该从状态码里泄露"这台装配了什么"。
+// 配置校验已经保证它为真时 Enabled 也为真，所以这里不需要再判总开关。
+// 这个方法只读构造期定下的配置，不读表，因此与整表替换的时序无关。
+func (r *Registry) WebEnabled() bool { return r.executors.WebEnabled }
+
 // RequiredRole 返回提交执行器任务所需的最低档位名（executors.required_role）。
 // 它属于登记表而不是调度器：只有这里知道执行能力存在。
 func (r *Registry) RequiredRole() string { return r.requiredRole }
