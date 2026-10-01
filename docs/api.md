@@ -537,60 +537,16 @@ GET /api/v1/executors
 ```
 
 档位声明是公开信息（不含脚本内容与参数取值），`viewer` 及以上可读；执行器关闭时这不是错误，
-返回 `enabled: false` 与空列表。真实响应（本机六个档位里挑四个，含一个不可用的与一个 HTTP 的）：
+返回 `enabled: false` 与空列表。真实响应（2026-10-01 本机冒烟：配置侧两个档位，档位文件三条，
+其中一条与配置的 `py_hello` 撞名，另一条指向 workspace 之外的脚本；为篇幅省掉一条同形的）：
 
 ```json
 {
   "enabled": true,
-  "required_role": "admin",
-  "max_timeout": "5m0s",
   "profiles": [
     {
-      "key": "exec.fail3",
-      "name": "fail3",
-      "kind": "script",
-      "runtime_ok": true,
-      "reason": "",
-      "timeout": "30s",
-      "max_parallel": 1,
-      "args": [
-        { "name": "day", "required": true, "default": "", "pattern": "^[a-z0-9-]{1,32}$", "secret": false }
-      ],
-      "env_allow": [],
-      "has_secret_args": false,
-      "preferred_result_direction": "tail"
-    },
-    {
-      "key": "exec.not_deployed",
-      "name": "not_deployed",
-      "kind": "script",
-      "runtime_ok": false,
-      "reason": "script file \"scripts/not-deployed.sh\" does not exist",
-      "timeout": "30s",
-      "max_parallel": 1,
-      "args": [],
-      "env_allow": [],
-      "has_secret_args": false,
-      "preferred_result_direction": "tail"
-    },
-    {
-      "key": "exec.show_token",
-      "name": "show_token",
-      "kind": "script",
-      "runtime_ok": true,
-      "reason": "",
-      "timeout": "30s",
-      "max_parallel": 1,
-      "args": [
-        { "name": "token", "required": true, "default": "", "pattern": "^[A-Za-z0-9._:/=,-]{1,256}$", "secret": true }
-      ],
-      "env_allow": [],
-      "has_secret_args": true,
-      "preferred_result_direction": "tail"
-    },
-    {
-      "key": "exec.local_health",
-      "name": "local_health",
+      "key": "exec.cfg_health",
+      "name": "cfg_health",
       "kind": "http",
       "runtime_ok": true,
       "reason": "",
@@ -602,11 +558,75 @@ GET /api/v1/executors
       "preferred_result_direction": "head",
       "method": "GET",
       "body_mode": "none",
-      "url": "http://127.0.0.1:18090/api/v1/health"
+      "url": "https://api.example.com/health",
+      "source": "config",
+      "editable": false,
+      "degraded": false
+    },
+    {
+      "key": "exec.py_hello",
+      "name": "py_hello",
+      "kind": "script",
+      "runtime_ok": true,
+      "reason": "",
+      "timeout": "1m0s",
+      "max_parallel": 1,
+      "args": [
+        { "name": "day", "required": true, "default": "", "pattern": "^(yesterday|today)$", "secret": false }
+      ],
+      "env_allow": [],
+      "has_secret_args": false,
+      "preferred_result_direction": "tail",
+      "source": "config",
+      "editable": false,
+      "degraded": false,
+      "path_display": "scripts/py_hello.py"
+    },
+    {
+      "key": "exec.py_hello",
+      "name": "py_hello",
+      "kind": "script",
+      "runtime_ok": false,
+      "reason": "profile \"py_hello\" is already declared in executors.commands, the stored one is not registered",
+      "timeout": "1m0s",
+      "max_parallel": 1,
+      "args": [],
+      "env_allow": [],
+      "has_secret_args": false,
+      "preferred_result_direction": "tail",
+      "source": "store",
+      "editable": false,
+      "degraded": true,
+      "path_display": "scripts/py_hello.py"
+    },
+    {
+      "key": "exec.store_outside",
+      "name": "store_outside",
+      "kind": "script",
+      "runtime_ok": true,
+      "reason": "",
+      "timeout": "1m0s",
+      "max_parallel": 1,
+      "args": [],
+      "env_allow": [],
+      "has_secret_args": false,
+      "preferred_result_direction": "tail",
+      "source": "store",
+      "editable": true,
+      "degraded": false,
+      "path_display": "C:\\Users\\xing\\AppData\\Local\\Temp\\w07smoke\\outside\\outside_report.py"
     }
-  ]
+  ],
+  "required_role": "admin",
+  "max_timeout": "30m0s",
+  "web_enabled": true,
+  "runtime_allow": ["python", "node"]
 }
 ```
+
+上面那份响应里的四行是同一次读取里连着的：第三条与第二条 `key` 相同（撞名的本义），
+它指向的脚本其实存在，但作为没注册的那一条仍然报 `runtime_ok: false`。
+第四条那种越界写法只有页面那一侧能建出来，绝对路径对 `viewer` 也可见（待做项 S-3）。
 
 字段口径：
 
@@ -615,6 +635,8 @@ GET /api/v1/executors
 | `enabled` | `executors.enabled` 的当前值 |
 | `required_role` | 提交 `exec.*` 任务所需的最低角色；**执行器关闭时是 `null`**（那时"要什么档位"这个问题不成立） |
 | `max_timeout` | `executors.max_timeout`，payload 里 `timeout` 的上限；只在 `enabled: true` 时出现，关闭时整个键省略 |
+| `web_enabled` | `executors.web_enabled`，也就是档位的在线管理开没开。**关闭时这个键照样给出并回 `false`**（TASK-W07）：它是前端判断"能不能改档位"的唯一判据，缺键等于让人猜后端认不认识这套管理 |
+| `runtime_allow` | `executors.runtime_allow` 实际生效的那份名单（配置留空时给的是代码补齐的默认名单），给档位表单的"解释器"下拉用。与上面两项故意不同：**`enabled: false` 时也给出**——那两项说的是"现在能不能提交执行任务"，这一项是一份配置事实 |
 | `profiles[].key` | 提交任务时 `name` 要写的值（`exec.<档位名>`） |
 | `kind` | `script` / `binary` / `http` |
 | `runtime_ok` | **这台机器现在能不能跑**：解释器或程序在不在 PATH、脚本文件在不在。false 时提交被拒 |
@@ -626,7 +648,24 @@ GET /api/v1/executors
 | `env_allow` | payload 可以注入的环境变量**键名**白名单（取值不外露）；空表给 `[]` |
 | `has_secret_args` | 档位是否声明了至少一个 `secret` 参数。true 时 payload 与输出预览会掩码，读取产物正文的门槛也升到 `required_role` |
 | `preferred_result_direction` | 读这个档位输出时的建议起点：`head` 或 `tail`（`http` 给 `head`，进程档位给 `tail`），与下面 `/result` 的 `from` 参数同一套词 |
+| `source` | `config`（来自配置的 `executors.commands`，在这里只读）或 `store`（来自档位文件 `executors.profiles_path`，由上面那三个写端点管） |
+| `editable` | 能不能在页面上改它：`web_enabled && source == "store" && !degraded`，**由后端一次算好**，前端只读这个布尔决定按钮显不显示。写请求的边界仍是 ops 档判定——隐藏按钮从来不是安全边界 |
+| `degraded` | 为真表示这条档位与 `executors.commands` 里的同名档位撞上了：**看得见但没生效**（见[启动合并](#档位的在线管理写端点)）。此时 `runtime_ok` 恒 `false`、`reason` 给的是那句撞名说明 |
+| `path_display` | 这个档位指向的本机文件写法：`executors.workspace` 之内给相对写法、之外给**绝对路径原样**（决策 D5）。`http` 档位与"`program` 写成 `runtime_allow` 里的程序名"的 binary 档位没有文件可指，**整个键省略**。⚠️  reader 档也读得到这个键，目录结构的遮蔽方案登记为待做项 S-3，不在本节 |
 | `method` / `body_mode` / `url` / `header_allow` | 只出现在 `http` 档位上。`body_mode` 是 `json` / `raw` / `none` 之一（配置里没写 `body` 的档位在这里归一成 `none`）；`url` 给的是模板原文（含 `{占位符}`），不是渲染后的地址；`header_allow` 是 payload 可覆盖的请求头名，**空表时整个键省略**（与 `env_allow` 的口径不同，别当成"没返回"） |
+
+一个注册键在 `profiles` 里最多出现两行（TASK-W07）：`executors.commands` 与档位文件写了同一个名字时，
+生效那条与降级那条都在这份列表里，`key` 相同、靠 `degraded` 区分，降级那条排在它后面。
+静默丢掉那一条会让"页面上明明建过、重启后却不见了"变成无解之谜，所以宁可多给一行说明。
+
+`runtime_ok` 只代表**当前这台机器**：同一份档位在另一台机器上可能因为解释器没装而不可用，
+而探测既不访问网络也不启动进程。降级那条的 `runtime_ok` 一律是 `false`（它确实跑不了），
+即便它指向的脚本其实存在——两条事实同时成立时，"为什么这条没生效"是更要紧的那一件。
+
+这份响应**不是请求体**：它多出 `key`、`runtime_ok`、`source` 这些只给展示看的键，
+而写端点把多余字段一律按未知键拒掉（见上面那节的解码口径）。
+因此编辑一条档位时要把手上的**定义**发回去，不能拿 `GET` 的结果直接 `PUT` 回来——
+响应里本来也没有 `runtime` / `script` / `program` / `args_render` / `env` 这些定义字段。
 
 ### 档位的在线管理（写端点）
 

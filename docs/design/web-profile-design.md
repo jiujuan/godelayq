@@ -274,7 +274,9 @@ http.MethodDelete + " /api/v1/executors/profiles/:name":     "executor.profile_d
 `ListExecutorsResponse`（`api/handlers_executors.go:341-354`）每条 profile 加：
 
 - `source`: `config` | `store`；
-- `editable`: `web_enabled && source==store`；
+- `editable`: `web_enabled && source==store && !degraded`（W07 实施时补上最后一项：
+  改一条没生效的档位等于让人去编辑一份不会被读到的记录，页面上不该给这个入口）。
+  这条判断只在 `executor.Registry.List` 里有一份，api 与前端都只读结果。
 - `degraded`: bool（§5.2 的冲突条目）；
 - `path_display`: 脚本/产物的展示写法（workspace 内是相对路径，越界的是绝对路径原样）。
   ⚠️ W02 实施时核实：**判"在不在 workspace 内"不能看 `ScriptRel` 的形状** ——
