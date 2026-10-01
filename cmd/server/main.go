@@ -116,6 +116,14 @@ type runtimeDeps struct {
 	// newExecutorRegistry 建档位登记表（加载 + 探测）。它必须显式提供：
 	// 缺了它执行器会静默不注册，开关打开也看不出问题。
 	newExecutorRegistry func(core.Config, *slog.Logger) (*executor.Registry, error)
+	// newExecutorProfiles 读档位文件（executors.profiles_path）里的全部记录，
+	// 只在 executors.web_enabled=true 时调用。
+	//
+	// 它与登记表构造分成两个闭包，是因为这两种失败的后果不同：
+	// 文件读不出来是"这台机器的档位状态不可信"，必须挡住启动；
+	// 档位本身写错则是 config 侧连坐、文件侧单条跳过（executor.MergeStoreProfiles 的注释）。
+	// 合成一个闭包的话，这两种脸色只能给同一种。
+	newExecutorProfiles func(core.Config) ([]core.ExecutorProfileRecord, error)
 	// newArtifactStore 建输出产物的文件存储与清理协程，只在 executors.enabled=true 时调用。
 	// 与登记表一样列入依赖完整性检查：少了它输出会静默无处安放。
 	newArtifactStore func(core.Config, *slog.Logger) (*executor.ArtifactStore, error)
@@ -161,6 +169,23 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 			return core.NewScheduler(store, retryPolicy, eventBus, core.WithLogger(logger))
 		},
 		newExecutorRegistry: executor.NewRegistry,
+		newExecutorProfiles: func(cfg core.Config) ([]core.ExecutorProfileRecord, error) {
+			normalized := cfg.Normalized()
+			profiles, err := core.NewJSONFileExecutorProfileStore(normalized.Executors.ProfilesPath)
+			if err != nil {
+				// 这条失败会拦住整个进程，所以文案必须给出自救路径：拦住它的那份文件
+				// 多半是人手改坏或从别的机器拷来的，"删掉它"就是退回只由
+				// executors.commands 决定档位的形态。文件路径由存储那一层带出来。
+				return nil, fmt.Errorf("load executor profile store failed: %w; "+
+					"fix that file or delete it to fall back to profiles declared only in executors.commands", err)
+			}
+			records, err := profiles.List()
+			if err != nil {
+				return nil, fmt.Errorf("list executor profiles failed: %w; "+
+					"delete the file to fall back to profiles declared only in executors.commands", err)
+			}
+			return records, nil
+		},
 		newArtifactStore: func(cfg core.Config, logger *slog.Logger) (*executor.ArtifactStore, error) {
 			return executor.NewArtifactStore(executor.ArtifactOptions{
 				Dir:      cfg.Executors.Output.Dir,
@@ -312,6 +337,11 @@ func run(deps runtimeDeps) error {
 		deps.newAuditLog == nil {
 		return fmt.Errorf("runtime dependencies are incomplete")
 	}
+	// 档位文件只在 web_enabled 时才是必需依赖：默认关闭的部署一个文件都不碰，
+	// 少配这个闭包不该改变行为（DoD 的"行为与本卡之前一致"）。
+	if deps.config.Executors.WebEnabled && deps.newExecutorProfiles == nil {
+		return fmt.Errorf("runtime dependencies are incomplete")
+	}
 
 	cfg := deps.config.Normalized()
 	if deps.timeout <= 0 {
@@ -350,11 +380,38 @@ func run(deps runtimeDeps) error {
 	// 事件里输出预览的字节上限：取值已在 Normalized 里补齐，非法值的兜底由调度器负责。
 	scheduler.SetEventPreviewLimit(cfg.Executors.Output.InlinePreview)
 
+	// 档位文件在登记表之前读、在注册之前合。两个时点都有理由：
+	//   - 读不出来就没有"这一批档位"可合，那种状态不该带着起服务（见 newExecutorProfiles）；
+	//   - 合批必须早于 registerHandlers，因为崩溃恢复守卫按注册表里的类别改判
+	//     （installRestoreGuard 与 Start 第一步的 Restore 都晚于注册）。
+	//     晚一步注册的那批档位，它的崩溃现场会查不到类别、跳过 paused 改判直接重排。
+	//     这条顺序由 TestRun_StoredProfilesAreRegisteredBeforeTheRestoreGuard 钉住。
+	var storedProfiles []core.ExecutorProfileRecord
+	if cfg.Executors.WebEnabled {
+		storedProfiles, err = deps.newExecutorProfiles(cfg)
+		if err != nil {
+			return err
+		}
+	}
+
 	executors, err := deps.newExecutorRegistry(cfg, deps.logger)
 	if err != nil {
 		// 档位配置非法（越界路径、引用未声明的参数等）属于装配期错误：
 		// 带着半套配置启动，任务会在触发时才失败，那时已经看不出是哪一条配置的问题。
 		return err
+	}
+	if cfg.Executors.WebEnabled {
+		// 合并规则全在 executor 包里（一份校验、单条不连坐、撞名降级），这里只做接线。
+		entries, warnings := executor.MergeStoreProfiles(cfg, storedProfiles)
+		for _, warning := range warnings {
+			deps.logger.Warn("stored executor profile not registered",
+				"profile", warning.Name, "reason", warning.Reason)
+		}
+		if err := executors.ApplyStore(entries); err != nil {
+			// 走到这里是"文件里两条记录占同一个注册键"或编程错误：
+			// 那种表面对不上的登记表会让接口与调度器各说一套，不让它带着起服务。
+			return err
+		}
 	}
 	if cfg.Executors.Enabled && !cfg.Server.Auth.Enabled() {
 		// 只记日志不阻止启动：测试环境需要能在没有凭据的情况下打开执行器，

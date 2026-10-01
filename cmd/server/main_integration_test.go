@@ -1823,6 +1823,10 @@ type spyScheduler struct {
 	restoreGuard core.RestoreGuard
 	// guardSetBeforeStart 记录装钩子时 Start 还没被调用过（装配顺序断言，见 SetRestoreGuard）
 	guardSetBeforeStart bool
+	// calls 按发生顺序记下三类关键调用（register:<键> / restore_guard / start），
+	// 用于断言"注册早于守卫、守卫早于 Start"这条硬顺序——TASK-W05 的档位合并按它把关。
+	// guardSetBeforeStart 只能说钩子早于 Start，说不出 handler 是不是在钩子之前登记的。
+	calls []string
 	// eventBus 是替身调度器自带的总线：观测层的事件写入器从这里取订阅入口，
 	// 用例也可以在装配完成之后往它上头发事件，看写入链路是不是真的通了。
 	eventBus *core.EventBus
@@ -1864,6 +1868,7 @@ func (s *spyScheduler) SetRestoreGuard(g core.RestoreGuard) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.restoreGuard = g
+	s.calls = append(s.calls, "restore_guard")
 	// 钩子必须在 Start 之前装上：Start 的第一步就是 Restore。
 	// 真实调度器在运行后收到这个调用只记日志并忽略，替身跟着忽略就会把装配顺序写错
 	// 这件事咽下去，所以这里额外记一笔，由用例断言。
@@ -1895,6 +1900,7 @@ func (s *spyScheduler) Start() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.startCalls++
+	s.calls = append(s.calls, "start")
 }
 
 func (s *spyScheduler) Stop() {
@@ -1914,6 +1920,21 @@ func (s *spyScheduler) RegisterHandlerClass(jobType string, handler core.Handler
 	defer s.mu.Unlock()
 	s.registered[jobType] = handler
 	s.classes[jobType] = class
+	s.calls = append(s.calls, "register:"+jobType)
+}
+
+// callIndex 返回某个关键调用第一次出现的位置，没发生过返回 -1。
+// 顺序断言用它：register 与 restore_guard、start 之间的先后是档位合并能不能
+// 改判崩溃现场的唯一凭据，只看最终注册表内容读不出这个。
+func (s *spyScheduler) callIndex(call string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for i, item := range s.calls {
+		if item == call {
+			return i
+		}
+	}
+	return -1
 }
 
 func (s *spyScheduler) LookupHandler(jobType string) (core.Handler, bool) {
