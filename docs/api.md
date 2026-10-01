@@ -650,7 +650,7 @@ GET /api/v1/executors
 | `preferred_result_direction` | 读这个档位输出时的建议起点：`head` 或 `tail`（`http` 给 `head`，进程档位给 `tail`），与下面 `/result` 的 `from` 参数同一套词 |
 | `source` | `config`（来自配置的 `executors.commands`，在这里只读）或 `store`（来自档位文件 `executors.profiles_path`，由上面那三个写端点管） |
 | `editable` | 能不能在页面上改它：`web_enabled && source == "store" && !degraded`，**由后端一次算好**，前端只读这个布尔决定按钮显不显示。写请求的边界仍是 ops 档判定——隐藏按钮从来不是安全边界 |
-| `degraded` | 为真表示这条档位与 `executors.commands` 里的同名档位撞上了：**看得见但没生效**（见[启动合并](#档位的在线管理写端点)）。此时 `runtime_ok` 恒 `false`、`reason` 给的是那句撞名说明 |
+| `degraded` | 为真表示这条档位与 `executors.commands` 里的同名档位撞上了：**看得见但没生效**（见[档位的在线管理](#档位的在线管理写端点)）。此时 `runtime_ok` 恒 `false`、`reason` 给的是那句撞名说明 |
 | `path_display` | 这个档位指向的本机文件写法：`executors.workspace` 之内给相对写法、之外给**绝对路径原样**（决策 D5）。`http` 档位与"`program` 写成 `runtime_allow` 里的程序名"的 binary 档位没有文件可指，**整个键省略**。⚠️  reader 档也读得到这个键，目录结构的遮蔽方案登记为待做项 S-3，不在本节 |
 | `method` / `body_mode` / `url` / `header_allow` | 只出现在 `http` 档位上。`body_mode` 是 `json` / `raw` / `none` 之一（配置里没写 `body` 的档位在这里归一成 `none`）；`url` 给的是模板原文（含 `{占位符}`），不是渲染后的地址；`header_allow` 是 payload 可覆盖的请求头名，**空表时整个键省略**（与 `env_allow` 的口径不同，别当成"没返回"） |
 
@@ -1571,7 +1571,7 @@ GET /job-types
 
 档位来自配置的 `executors.commands` 与 `executors.profiles_path` 那份文件，两份都在进程启动时注册，
 改前者要重启；后者在 `executors.web_enabled: true` 时可以用接口改，立即生效并在这里立刻出现
-（见[档位的在线管理](#档位的在线管理post--put--delete-apiv1executorprofiles)）。
+（见[档位的在线管理](#档位的在线管理写端点)）。
 
 ## WebSocket 实时通信
 
