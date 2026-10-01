@@ -4,7 +4,10 @@
 import { request } from './client'
 import type { ExecutorListResponse, JobResultQuery, JobResultResponse } from './types'
 
-/** 档位列表。执行器关闭时后端回 { enabled: false, profiles: [] }，不是错误 */
+/**
+ * 档位列表。执行器关闭时后端回 { enabled: false, web_enabled: false, profiles: [] }，不是错误；
+ * 每一行带着来源与可编辑标记（TASK-W07），页面上要不要给编辑入口只看 editable 这一个布尔。
+ */
 export function listExecutors(): Promise<ExecutorListResponse> {
   return request<ExecutorListResponse>('/executors')
 }

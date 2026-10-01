@@ -98,7 +98,9 @@ const profiles = computed(() => executorsQuery.data.value?.profiles ?? [])
       </div>
 
       <p class="mb-3 text-xs leading-relaxed text-[var(--color-text-muted)]">
-        档位写在配置的 <code>executors.commands</code> 里，改完要重启进程；这一节只是把"这台机器现在能执行什么"
+        档位有两份来源：配置的 <code>executors.commands</code>（改完要重启进程），以及档位文件
+        <code>executors.profiles_path</code>（<code>executors.web_enabled</code> 打开时由 ops 在页面上增删改，
+        改完立即生效、重启后仍在）。这一节只是把"这台机器现在能执行什么"
         说清楚。<em class="font-medium text-[var(--color-text)]">"现在能不能跑"是探测结论</em>，
         看的是程序在不在 PATH、脚本文件在不在，与配置是否合法是两件事。
       </p>
@@ -107,11 +109,13 @@ const profiles = computed(() => executorsQuery.data.value?.profiles ?? [])
         <code>executors.enabled</code> 是关闭的：没有任何档位可提交，任务列表里的 exec.* 类型也不会被接受。
       </p>
       <p v-else-if="executorState === 'empty'" class="text-sm text-[var(--color-text-muted)]">
-        执行器已启用，但 <code>executors.commands</code> 是空的——先声明至少一个档位才能提交执行器任务。
+        执行器已启用，但两份来源里都还没有档位（配置的 <code>executors.commands</code> 与档位文件
+        <code>executors.profiles_path</code>）——先声明至少一个档位才能提交执行器任务。
       </p>
 
       <ul v-else-if="executorState === 'ready'" class="flex flex-col divide-y divide-[var(--color-border)]">
-        <li v-for="profile in profiles" :key="profile.key" class="flex flex-col gap-2 py-3 text-sm">
+        <li v-for="profile in profiles" :key="profile.key + (profile.degraded ? '#degraded' : '')"
+            class="flex flex-col gap-2 py-3 text-sm">
           <div class="flex flex-wrap items-center gap-2">
             <code class="font-mono text-xs">{{ profile.key }}</code>
             <UiBadge :tone="profile.runtime_ok ? 'success' : 'danger'">

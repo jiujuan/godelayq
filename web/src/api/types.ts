@@ -119,6 +119,27 @@ export interface ExecutorProfile {
   body_mode?: 'json' | 'raw' | 'none' | string
   /** 仅 http 档位有，给的是模板原文（含 {占位符}） */
   url?: string
+  /**
+   * 这条档位的来源：config 来自配置的 executors.commands（在页面上只读），
+   * store 来自档位文件 executors.profiles_path（TASK-W06 那三个写端点管它）。
+   */
+  source: 'config' | 'store' | string
+  /**
+   * 能不能在页面上改它：web_enabled 且来源是 store 且它没被降级，三件事由后端一次算好。
+   * 它只决定按钮显不显示——写请求的边界仍是服务端的 ops 档判定，隐藏按钮不是安全边界。
+   */
+  editable: boolean
+  /**
+   * 为真表示这条档位与 executors.commands 里的同名档位撞上了：看得见但没生效。
+   * 同一个 key 因此可能在列表里出现两行（生效那条 + 降级这条），必须靠这个字段区分，
+   * 渲染时的 :key 也要带上它，不然 Vue 会报重复键。
+   */
+  degraded: boolean
+  /**
+   * 这个档位指向的本机文件写法：workspace 内给相对写法，之外给绝对路径（D5）。
+   * http 档位与"program 写成 PATH 程序名"的 binary 档位没有这个键。
+   */
+  path_display?: string
 }
 
 /** 档位的位置参数规则（ExecutorPositionalResponse） */
@@ -147,6 +168,17 @@ export interface ExecutorListResponse {
    * 只在 enabled=true 时给出，缺键表示这份部署没有可提交的档位。
    */
   max_timeout?: string
+  /**
+   * 档位的在线管理开没开（executors.web_enabled）。关闭时这个键也在并回 false：
+   * 它是页面判断"能不能改档位"的唯一判据，缺键就等于让人猜后端认不认识这套管理。
+   */
+  web_enabled: boolean
+  /**
+   * 解释器名单（executors.runtime_allow，归一化补齐默认值之后的那一份），
+   * 给档位表单的"解释器"下拉用。它与上面两项不同，执行器关闭时也给出——
+   * 那两项说的是"现在能不能提交执行任务"，这一项是一份配置事实。
+   */
+  runtime_allow: string[]
 }
 
 export interface ListJobsResponse {
