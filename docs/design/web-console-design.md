@@ -817,6 +817,11 @@ server:
   SQLite 观测库，`GET /api/v1/admin/audit` 按账号/动作/结论/时间区间查询，两端都取 ops 档。
   开关是 `observability.enabled` 与 `observability.audit.enabled`，任一为假时端点返回 503、
   台账退回只落日志。
+- **界面**（`docs/design/tasks/sqlite/task-s08-console-audit-page.md` 落地）：侧边栏 `审计` 页
+  （`web/src/views/AuditView.vue`，路由 `meta.minimumRole: 'ops'`）读的就是上面那个端点——
+  按身份/动作/结论/时间窗筛选、上一页下一页翻页、点开一行看全部列（含 `route` 模板、`remote_ip`、
+  `user_agent`）。503 呈现为"这次部署没有启用写操作台账"的说明态而不是错误弹窗；
+  这一页不轮询、不接 WebSocket 失效，只有"重新查询"按钮。
 
 两条都不记请求体、参数取值与校验错误原文（设计文档 D7）；`route` 记路由模板而非原始 URL。
 访问日志 `requestLogger` 那行（`msg="http request"`）继续存在且覆盖读请求，
