@@ -9,6 +9,7 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 import {
   Activity,
   BookOpen,
+  Boxes,
   ClipboardList,
   FolderOpen,
   LayoutDashboard,
@@ -63,6 +64,13 @@ const routes: RouteRecordRaw[] = [
     name: 'groups',
     component: () => import('../views/GroupsView.vue'),
     meta: { title: '分组', icon: FolderOpen },
+  },
+  {
+    path: '/profiles',
+    name: 'profiles',
+    component: () => import('../views/ProfilesView.vue'),
+    // 档位改的是"这台机器能执行什么"，四个管理端点都是 ops 档（设计文档 D10）
+    meta: { title: '档位', icon: Boxes, minimumRole: 'ops' },
   },
   {
     path: '/template',

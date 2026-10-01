@@ -19,6 +19,9 @@ export type Capability =
   | 'group.read'
   | 'group.write'
   | 'group.delete'
+  | 'executor.profile_create'
+  | 'executor.profile_update'
+  | 'executor.profile_delete'
   | 'admin.access'
 
 /** 与 api/server.go 的 setupRoutes 对齐：改后端档位必须改这张表 */
@@ -36,6 +39,12 @@ const REQUIRED_ROLE: Record<Capability, RoleName> = {
   'group.read': 'viewer',
   'group.write': 'operator',
   'group.delete': 'admin',
+  // 档位的在线管理（TASK-W08 对过 api/server.go 的 profiles 分组）：四个端点一律 RequireRole(ops)，
+  // 包括读定义那一个（记录里有脚本路径、固定参数与请求头）。
+  // 表里不给它单列一项，是因为界面只在"要编辑"时才去读定义——那时必然已经过了上面三项之一。
+  'executor.profile_create': 'ops',
+  'executor.profile_update': 'ops',
+  'executor.profile_delete': 'ops',
   'admin.access': 'ops',
 }
 
