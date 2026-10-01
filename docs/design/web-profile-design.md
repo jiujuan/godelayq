@@ -137,7 +137,7 @@
 
 | 端点 | 方法 | 档位 | 语义 |
 | --- | --- | --- | --- |
-| `/api/v1/executors/profiles` | POST | ops | 新建；重名（任一侧）409；校验或探测不过 400 |
+| `/api/v1/executors/profiles` | POST | ops | 新建；重名（任一侧）409；校验不过 400（探测不可用不拒，见下面第 2 条） |
 | `/api/v1/executors/profiles/:name` | PUT | ops | 修改；`:name` 与体内 `name` 不一致 400；改 `kind`/`script`/`program` 400（D7）；键不存在 404 |
 | `/api/v1/executors/profiles/:name` | DELETE | ops | 删除；`?jobs=pause\|block`，默认 pause（D6），其它取值 400（照抄删组的策略白名单） |
 

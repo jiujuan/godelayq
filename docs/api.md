@@ -512,7 +512,8 @@ Content-Type: application/json
 用什么程序、跑哪个脚本、发哪个 HTTP 请求、允许哪些参数。注册之后它的任务类型名就是 `exec.<档位名>`。
 
 能执行什么完全由 `executors.commands` 决定：**没有自由命令行**，任务里也不能内联源码、不能要求现场编译。
-档位改动要重启进程。开关、白名单与部署前提见 [部署文档](./deployment.md) 的"开启执行器"一节。
+档位有两份来源：配置里的 `executors.commands` 改动要重启进程，`executors.web_enabled: true` 时
+还可以在下面"档位的在线管理"一节那三个写端点上增删改，写完立即生效。开关、白名单与部署前提见 [部署文档](./deployment.md) 的"开启执行器"一节。
 
 ### 与 `/job-types` 的关系
 
@@ -626,6 +627,142 @@ GET /api/v1/executors
 | `has_secret_args` | 档位是否声明了至少一个 `secret` 参数。true 时 payload 与输出预览会掩码，读取产物正文的门槛也升到 `required_role` |
 | `preferred_result_direction` | 读这个档位输出时的建议起点：`head` 或 `tail`（`http` 给 `head`，进程档位给 `tail`），与下面 `/result` 的 `from` 参数同一套词 |
 | `method` / `body_mode` / `url` / `header_allow` | 只出现在 `http` 档位上。`body_mode` 是 `json` / `raw` / `none` 之一（配置里没写 `body` 的档位在这里归一成 `none`）；`url` 给的是模板原文（含 `{占位符}`），不是渲染后的地址；`header_allow` 是 payload 可覆盖的请求头名，**空表时整个键省略**（与 `env_allow` 的口径不同，别当成"没返回"） |
+
+### 档位的在线管理（写端点）
+
+档位有两份来源：配置里的 `executors.commands`（这一组端点读得到、改不了），以及
+`executors.profiles_path` 指向的 JSON 文件（默认 `./data/exec-profiles.json`，这一组端点写它）。
+启动时两份合并，同名以配置为准、文件里那一条标记为未生效；页面写入**立即生效、不必重启**，重启之后仍在。
+
+这一组端点改的是"这台机器能执行什么"，门槛比删组更高：
+
+- **只接受 `ops` 档 JWT**（决策 D10）。静态 token 的身份是 `machine`（档位等同 operator），一样 403。
+  它与"谁能提交 `exec.*` 任务"（`executors.required_role`，全局一份）是两条互不替代的判定。
+- **前提是** `executors.enabled: true` 且 `executors.web_enabled: true`（决策 D2，默认 false）。
+  关闭时这一组一律 503 且 `message` 含 `not enabled`；打开了却没装配依赖时也是 503，
+  `message` 含 `not configured` 并在 `details` 里点名 `api.WithExecutorProfileStore`。
+  两条文案刻意可区分：一个要改配置重启，一个是部署漏了接线。
+- 每次写请求都进[写操作台账](#写操作台账get-apiv1adminaudit)一行，动作词是
+  `executor.profile_create` / `executor.profile_update` / `executor.profile_delete`。
+  台账里只有身份、方法、路由、状态码与结论，**没有请求体，也没有 `env` 的固定取值**。
+
+请求体的键名与档位文件里的记录一字不差，也就是 `executors.commands` 那批键再加两个时间戳
+（`created_at` / `updated_at` 由服务端写，传进来也会被覆盖）：
+
+| 键 | 适用 `kind` | 说明 |
+| --- | --- | --- |
+| `name` | 全部 | 必填，`[A-Za-z0-9_-]{1,64}`；注册后的任务类型名是 `exec.<name>`，**主键忽略大小写** |
+| `kind` | 全部 | 必填，`script` / `binary` / `http` |
+| `runtime` / `script` | script | 解释器名（必须在 `executors.runtime_allow` 里）与脚本路径 |
+| `program` / `fixed_args` | binary | 程序名与固定参数 |
+| `args` / `args_render` / `positional` | script、binary | 参数声明与命令行模板，规则与配置侧同一份 |
+| `cwd` | script、binary | 工作目录 |
+| `env` / `env_allow` | script、binary | 固定注入的环境变量、payload 可注入的键名白名单 |
+| `timeout` / `max_parallel` / `retry_on_exit` | 全部 | 单次超时、并发上限、可重试的退出码 |
+| `method` / `url_template` / `allowed_hosts` / `headers` / `header_allow` / `body` / `expect_status` / `capture_response` / `max_body_bytes` / `max_redirects` / `deny_private_ranges` | http | HTTP 档位的字段，含义与配置侧一致 |
+
+字段组合与取值的校验走的是启动时那一份规则（同一个函数），所以"页面上存得下的"与
+"配置文件里写得的"不会长出第三种判定。未知键一律 400（与配置侧解码同一口径），
+`details` 给校验原文——里面只有字段名与路径写法，不含参数取值。
+
+**路径写法与配置侧不同**（决策 D5）：这一组端点接受绝对路径与 `executors.workspace` 之外的相对路径，
+配置文件里那一条仍然越界即拒。这是本期有意留的口子，理由与配套的安全加固待做项见
+[设计文档](./design/web-profile-design.md) §7.2。
+
+三个端点共同的固定顺序：**校验 → 探测 → 冲突判定 → 写文件 → 生效 → 响应**。
+写文件一定在生效之前（不变量 I2）；生效失败会立刻把文件退回请求之前的状态，
+所以"文件里有这条、进程里跑不了"不会留在系统里。回滚本身也失败时记 error 日志，
+响应里直说"文件与进程不一致，重启可对齐"。
+
+### 新建档位：`POST /api/v1/executors/profiles`
+
+```json
+POST /api/v1/executors/profiles        # ops
+Content-Type: application/json
+
+{
+  "name": "smoke_py",
+  "kind": "script",
+  "runtime": "python",
+  "script": "scripts/py_hello.py",
+  "args_render": ["--day=today"],
+  "env": {"SMOKE_FIXED": "只写进档位文件，不出现在任何响应里"},
+  "env_allow": ["LANG"],
+  "timeout": "2m"
+}
+```
+
+201 的响应就是这个档位在登记表里的当前形状，与 `GET /api/v1/executors` 的单项**完全相同**
+（字段口径见上一节），因此带着探测结论。真实响应（2026-10-01 本机冒烟）：
+
+```json
+{"key":"exec.smoke_py","name":"smoke_py","kind":"script","runtime_ok":true,"reason":"",
+ "timeout":"2m0s","max_parallel":1,"args":[],"env_allow":["LANG"],"has_secret_args":false,
+ "preferred_result_direction":"tail"}
+```
+
+**探测失败不拒绝保存**：`runtime_ok: false` 也照样 201、照样进登记表。一条指向还没部署的脚本的档位
+是运维要留着的东西，把它拒在门外只会逼人回去改 yaml、绕过这套审计。它会以不可用的样子出现在
+`GET /executors` 里，提交它仍然被拒（400 `executor profile is not available on this server`）。
+
+| 码 | 条件 |
+| --- | --- |
+| 201 | 已落盘并已生效 |
+| 400 | 名字非法 / 出现未知键 / 字段组合不合法（`details` 给校验原文） |
+| 403 | 身份不足 ops |
+| 409 | 文件里已有同名档位（`details` 指出该用 PUT）；或与 `executors.commands` 里的名字撞了（`details` 点名配置来源，配置文件那份不会被顶掉） |
+| 500 | 写文件失败（登记表与调度器一行都没动）；或写成功却没能生效（已回滚，`details` 说明回滚结果） |
+| 503 | `web_enabled=false`；或打开了却没装配依赖 |
+
+### 修改档位：`PUT /api/v1/executors/profiles/:name`
+
+请求体与 POST 同形状。`name` 省略时取路径上那个；写了就必须与路径一致（忽略大小写），否则 400——
+改名等于换一条档位，本端点不做改名，要换名就删了重建。
+
+`kind` / `script` / `program` **不许改**（决策 D7）：这三项决定"这条档位是什么"，换内核不是改参数：
+
+```json
+{"code":400,"message":"field cannot be changed",
+ "details":"script cannot be changed on an existing profile (\"smoke_py\"); delete it and create a new one"}
+```
+
+其余判定、五步顺序与状态码与 POST 相同，两处差别：路径上的名字在文件里没有 → 404
+（它属于配置侧档位时是 409，`details` 说明它是只读的）；生效失败时文件退回到**改之前的值**。
+
+改动只影响之后的执行：已经在跑的那一次用的还是它启动时拿到的那份定义。
+
+### 删除档位：`DELETE /api/v1/executors/profiles/:name`
+
+```json
+DELETE /api/v1/executors/profiles/smoke_py             # 默认 jobs=pause
+DELETE /api/v1/executors/profiles/smoke_py?jobs=block
+```
+
+- `pause`（默认）：把该类型**待执行**的任务逐条置 `paused` 等人工确认；
+  **一条正在执行的都不动**（决策 D6：中止正在跑的执行属于 admin 档的 `force-pause`）。
+- `block`：该类型还有未终态任务（待执行 / 正在执行 / 已暂停）就 409，什么都不改。
+- `jobs` 的其它取值 400（`details` 写 `expected pause or block`），不会被静默当成默认处理。
+- 文件里没有这条档位 → 404；它属于配置侧 → 409。
+
+三步顺序：先钉住任务 → 再删文件里的记录 → 最后让整张表重新生效（摘掉处理函数）。
+生效失败会把记录写回去，于是任务只是被钉住、档位仍在，重试删除即可（幂等）。
+
+200 响应把影响面报清楚（2026-10-01 本机冒烟）：
+
+```json
+{"key":"exec.smoke_py","name":"smoke_py","paused_jobs":1,"running_jobs":0,"already_paused_jobs":0}
+```
+
+`paused_jobs` 是**本次新钉住的待执行任务数**，不含正在执行的那条，也不删之前就已经暂停的——
+后一项在 `already_paused_jobs` 里单独给。
+
+删除之后，被钉住的那条恢复时会走到"没有处理函数"的既有判定，不会悄悄跑起来：
+
+```
+level=ERROR msg="no handler registered for job" handler_key=exec.smoke_py
+```
+
+任务因此判为 `failed` 且没有执行产物可读。要保住结果就别恢复它，让它停在 `paused` 上。
 
 ### 提交执行器任务：`POST /jobs`
 
@@ -1393,7 +1530,9 @@ GET /job-types
 }
 ```
 
-档位随进程启动从配置注册，改档位要重启；不存在"通过接口新增档位"这条路（见[执行器 API](#执行器-api)）。
+档位来自配置的 `executors.commands` 与 `executors.profiles_path` 那份文件，两份都在进程启动时注册，
+改前者要重启；后者在 `executors.web_enabled: true` 时可以用接口改，立即生效并在这里立刻出现
+（见[档位的在线管理](#档位的在线管理post--put--delete-apiv1executorprofiles)）。
 
 ## WebSocket 实时通信
 
