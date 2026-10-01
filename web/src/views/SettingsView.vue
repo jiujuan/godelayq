@@ -1,19 +1,27 @@
 <script setup lang="ts">
 /* 设置页：当前身份与凭据边界 + 这台服务器声明了哪些执行器档位。
-   这里刻意只读——账号增删改与档位配置都是配置文件的事，运行时改它们不在本期范围（§1 非目标）。 */
+   账号增删改是配置文件的事；档位这一节曾经也只能读，TASK-W06/W08 之后在线档位归
+   档位管理页（ProfilesView）管，这里留一份只读概览与一个入口，不做第二套表单。 */
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { RouterLink } from 'vue-router'
 import { useQuery } from '@tanstack/vue-query'
+import { ExternalLink } from 'lucide-vue-next'
 import PageHeader from '../components/layout/PageHeader.vue'
 import UiBadge from '../components/ui/UiBadge.vue'
 import { listExecutors } from '../api/executors'
 import { queryKeys } from '../api/keys'
 import { useAuthStore } from '../stores/auth'
+import { usePermission } from '../composables/usePermission'
 
 const auth = useAuthStore()
+const permission = usePermission()
+
+/** 档位管理页的入口只对管得动它的人露出来（与服务端四个管理端点同一条 ops 门槛） */
+const canManageProfiles = computed(() => permission.can('executor.profile_create'))
 
 /**
- * 档位一览并入本页而不是新开一个路由（TASK-E18 §3.5 第 3 条）：
- * 档位由配置决定、运维只能读、给它单独一路由要牵动菜单与权限表，而这里本来就是"看这台机器配置了什么"的地方。
+ * 档位一览留在本页（TASK-E18 §3.5 第 3 条）：这一页本来就是"看这台机器配置了什么"的地方，
+ * 而"改"的部分自 TASK-W08 起搬到了独立视图——表单有十几组字段和一张参数表，塞进来会把这里变成第二个编辑页。
  */
 const executorsQuery = useQuery({
   queryKey: queryKeys.executors,
@@ -88,20 +96,31 @@ const profiles = computed(() => executorsQuery.data.value?.profiles ?? [])
       越权请求仍会被服务端以 403 拒绝。跨域与来源白名单见 <code>docs/api.md</code> 的鉴权与跨域章节。
     </p>
 
-    <!-- 执行器档位（TASK-E18 §3.5 第 3 条）：只读一览，改不了也新建不了 -->
+    <!-- 执行器档位：这一节只读，增删改在线档位去档位管理页（TASK-W08） -->
     <section class="mt-6 rounded-[var(--radius-card)] border border-[var(--color-border)] bg-white p-4">
       <div class="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h2 class="text-sm font-semibold">执行器档位</h2>
-        <UiBadge :tone="executorState === 'ready' ? 'success' : executorState === 'disabled' ? 'neutral' : 'warning'">
-          {{ executorState === 'ready' ? `${profiles.length} 个档位` : executorState === 'disabled' ? '未启用' : '开了，但没有档位' }}
-        </UiBadge>
+        <div class="flex flex-wrap items-center gap-2">
+          <UiBadge :tone="executorState === 'ready' ? 'success' : executorState === 'disabled' ? 'neutral' : 'warning'">
+            {{ executorState === 'ready' ? `${profiles.length} 个档位` : executorState === 'disabled' ? '未启用' : '开了，但没有档位' }}
+          </UiBadge>
+          <RouterLink
+            v-if="canManageProfiles"
+            :to="{ name: 'profiles' }"
+            class="flex items-center gap-1 text-xs text-[var(--color-primary)] hover:underline"
+          >
+            <ExternalLink :size="12" aria-hidden="true" />
+            去档位管理
+          </RouterLink>
+        </div>
       </div>
 
       <p class="mb-3 text-xs leading-relaxed text-[var(--color-text-muted)]">
-        档位有两份来源：配置的 <code>executors.commands</code>（改完要重启进程），以及档位文件
-        <code>executors.profiles_path</code>（<code>executors.web_enabled</code> 打开时由 ops 在页面上增删改，
-        改完立即生效、重启后仍在）。这一节只是把"这台机器现在能执行什么"
-        说清楚。<em class="font-medium text-[var(--color-text)]">"现在能不能跑"是探测结论</em>，
+        档位可以来自两个地方：配置的 <code>executors.commands</code>，以及档位文件
+        <code>executors.profiles_path</code>。<em class="font-medium text-[var(--color-text)]">在
+        档位管理页上改的那些立即生效，并且活过重启</em>；<em class="font-medium text-[var(--color-text)]">配置里的那一部分仍然要重启进程
+        才改得动</em>（<code>executors.web_enabled</code> 打开时由 ops 身份在线增删改档位文件）。
+        这一节只是把"这台机器现在能执行什么"说清楚。<em class="font-medium text-[var(--color-text)]">"现在能不能跑"是探测结论</em>，
         看的是程序在不在 PATH、脚本文件在不在，与配置是否合法是两件事。
       </p>
 
@@ -121,6 +140,10 @@ const profiles = computed(() => executorsQuery.data.value?.profiles ?? [])
             <UiBadge :tone="profile.runtime_ok ? 'success' : 'danger'">
               {{ profile.runtime_ok ? '可用' : '不可用' }}
             </UiBadge>
+            <UiBadge :tone="profile.source === 'store' ? 'primary' : 'neutral'">
+              {{ profile.source === 'store' ? '在线档位' : '来自配置' }}
+            </UiBadge>
+            <UiBadge v-if="profile.degraded" tone="warning">与配置同名，未生效</UiBadge>
             <span class="text-xs text-[var(--color-text-muted)]">{{ profile.kind }}</span>
             <span class="ml-auto text-xs tabular-nums text-[var(--color-text-muted)]">
               单次执行 {{ profile.timeout }} · 同时最多 {{ profile.max_parallel }} 个
