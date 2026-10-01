@@ -93,7 +93,7 @@ W09 负责把它们逐条落成文档里的登记项，并核对 §7.1 那张偏
 | --- | --- |
 | W01 | 已完成（2026-10-01，实现记录见该卡第 10 节；六处偏离含"存储类型名带 `Executor` 前缀"、"**新增一条配套校验：`web_enabled: true` 必须同时 `enabled: true`，设计文档 D2 的方向因此改了**（W09 原场景 1 拆成 1a 拒启动 / 1b 双关 503）"、"`Command()` 返回 error 且顺带拒负数 timeout"、"List 只拷结构不拷嵌套切片，登记为 D-0101"；守卫 `TestExampleConfigMatchesLocal` 实测是 `--- PASS` 而不是跳过；冒烟证实 `web_enabled: true` 时进程连档位文件的父目录都不碰） |
 | W02 | 已完成（2026-10-01，实现记录见该卡第 10 节；六处偏离含"`resolveAny` 落地叫 `resolveAnywhere`"、"相对写法在两种模式下都以 workspace 为基准"、"错误前缀按来源分（配置侧保留 `executors.commands[i]`，单条侧改给 `profile "name"`）"、"`BuildProfile` 自行调 `Config.Normalized`"；**抓到卡面前提错误一条并就地改掉**：`relativeTo` 只在 Windows 跨盘符时兜底成文件名，同盘越界会给 `..\..\` 上跳形式，所以 W07 的 `path_display` 判"在不在 workspace 内"只能用 `withinDirectory`（D-0201）；真实进程冒烟证实 yaml 侧越界拒绝一字未松，宽松模式没有调用方、端到端留给 W05/W06；Linux/macOS 未实跑） |
-| W03 | 待执行 |
+| W03 | 已完成（2026-10-01，实现记录见该卡第 10 节；六处偏离含"`ApplyStore` 收 `[]StoreEntry` 而不是两个平行参数"、"**降级条目不进 `entries`，改成 `snapshot.degraded` + `Degraded()` 访问器**（注册键是 map 的键，同名两条无法共存；设计文档 §5.2/§6.3 与 W07 §3 已同步，W07 输出时降级那批的 `key` 与生效那条相同）"、"source/degraded 不放 `Profile`，靠 `SourceOf()` 反查"、"执行器关闭时 `ApplyStore` 直接报错而不是收下空表"、"`Degraded` 标志只在真撞名时有意义（W05/W06 别拿它表达'我不想注册它'）"、"并发用例的轮次标记改用 `Timeout` 并加断言 store 键数只能是 0 或 2"；**反向验证做过**：临时改成原地先删后加，`-race` 报 8 条 DATA RACE（读 `Profiles()` registry.go:282 vs 写 `ApplyStore` registry.go:225），撤销后绿；`api/` 包零改动，既有登记表用例未改预期即通过） |
 | W04 | 待执行 |
 | W05 | 待执行 |
 | W06 | 待执行 |

@@ -30,6 +30,10 @@ W05 之后表里同时存在两份来源的条目，且可能有降级条目（�
      **由后端算好**，不在前端重复一遍规则（前端只读这个布尔决定是否显示按钮，
      边界仍是服务端 403——`web-console-design.md:767` 那条口径）。
    - `degraded`: bool；为真时 `available=false`，`reason` 必须指名"与 `executors.commands` 的同名档位冲突，未注册"。
+     **这批要从 `Registry.Degraded()` 取，不是从 `Profiles()`** —— W03 的落地形态是降级条目从不进注册表键，
+     所以 `Profiles()`/`Lookup()`/`Available()` 都看不到它们。接口要把两批合进同一个 `profiles` 数组输出，
+     降级那批的 `key` 与生效那条**相同**（同名冲突的本义），前端靠 `degraded` 区分；
+     `available` 恒 false，`reason` 用 `DegradedProfile.Reason`（W03 已给默认文案）。
    - `path_display`: 脚本/产物的展示写法。workspace 内给相对写法（沿用 `ScriptRel`/`ProgramRel`），
      越界给绝对路径原样；两者都没有（http 档位）时该键**省略而不是空串**。
      **W02 §3.5 已核实**：判"有没有越界"不能看 `ScriptRel` 的形状（同盘越界它会给 `..\..\` 上跳形式，

@@ -123,8 +123,11 @@
 ### 5.2 来源与冲突
 
 每条合并后的条目带 `source`：`config`（来自 yaml，只读）或 `store`（来自文件，可编辑）。
-同名冲突时 `config` 生效、`store` 那一条注册表里保留但标记 `degraded`，
-`available=false`、`reason` 写明"与 `executors.commands` 中的同名档位冲突，未注册"，且**不注册 handler**。
+同名冲突时 `config` 生效、`store` 那一条**不进注册表**，改由登记表的降级面单独给出
+（W03 落地形态：`snapshot.degraded` + `Registry.Degraded()`，而不是塞进 `entries`——
+注册键是 map 的键，同名两条无法共存，塞进去要么顶掉配置那条、要么让 `Lookup` 语义二义）。
+这一条仍然出现在 `GET /executors` 里（`degraded=true`、`available=false`、
+`reason` 写明"与 `executors.commands` 中的同名档位冲突，未注册"），但 `Lookup(key)` 给的是生效那一条。
 理由：页面上的一次点击不该让整个进程起不来；而"文件条目让位于 yaml 条目"这个方向与 D4 一致。
 
 `executors.commands` 内部重名、或与代码注册的类型名（`payment_check` 等）冲突，仍然启动失败
@@ -181,9 +184,13 @@ func BuildProfile(cmd core.ExecutorCommand, ec core.ExecutorsConfig, mode PathMo
   所有读方法改为一次 `Load()`（D9），删掉 `registry.go:23` 那句注释并换成新承诺：
   "构造与替换都在写锁内完成，读侧永远看到一整份自洽的表"。
 - 新增写入侧方法（全部只在 `web_enabled=true` 时被调用）：
-  `ApplyStore(profiles []*Profile, probes map[string]ProbeResult)`（整表重建，启动与页面写入共用一条路径）、
+  `ApplyStore(items []StoreEntry) error`（`StoreEntry{Profile, Probe, Source, Degraded, Reason}`，
+  整批重建 store 部分、config 部分保留；启动与页面写入共用这一条路径）、
   `Lookup`/`Profiles`/`Keys`/`Available`/`ProbeOf` 保持签名不变。
-- 每条条目多两个字段：`source`、`degraded`（§5.2）。
+- 来源与降级状态放在登记表的条目上，不放进 `Profile`：`SourceOf(key)` 与 `Degraded()` 两个访问器给接口用
+  （W03 落地形态；`Profile` 是档位定义，"来自哪份来源""有没有被降级"是登记表对它的位置判断）。
+- `ApplyStore` 在执行器关闭时明确返回错误：那时一个 exec.* 都不会注册，
+  往里合 store 条目会造出"接口看得见、调度器跑不了"的半状态。
 - `RequiredRole`/`MaxTimeout`/`InlinePreview`/`EffectiveTimeout` 仍读配置，与档位来源无关。
 
 ### 6.4 `core`：调度器的热注册与按类型暂停
@@ -203,11 +210,13 @@ func BuildProfile(cmd core.ExecutorCommand, ec core.ExecutorsConfig, mode PathMo
 
 `cmd/server/main.go`：
 
-1. `executors.web_enabled=true` 时构造 `JSONFileProfileStore`（失败即启动失败，与分组同口径：
+1. `executors.web_enabled=true` 时构造 `core.JSONFileExecutorProfileStore`（失败即启动失败，与分组同口径：
    `main.go:233-239` 读不到分组文件就不起服务）。错误文案要带自救指引
    （"删掉或修好该文件可退回只有 `executors.commands` 的形态"）。
-2. 合并：yaml 严格 → store 宽松 → 同名按 §5.2 降级 → 逐条 `Probe` → 构造可变 Registry。
-3. `executor.Register`（`executor/register.go:49-100`）跳过 `degraded` 条目；启动日志多一个计数。
+2. 合并：yaml 严格 → store 宽松 → 同名按 §5.2 降级 → 逐条 `Probe` → 构造可变 Registry
+   （`NewRegistry` 只装 config 侧，文件侧随后调 `ApplyStore` 合进来）。
+3. `executor.Register`（`executor/register.go:49-100`）不需要"跳过 degraded"的分支：
+   降级条目从不进 `Keys()`，因此天然不会被注册；启动日志多一个 `degraded` 计数（`Registration.Degraded`）。
 4. 注入 api：`WithExecutorProfileStore(store)`（照 `WithGroupStore`，`api/server.go:89-91`）。
    `WithExecutorRegistry` 保持原样（`api/server.go:96-98`）。
 
