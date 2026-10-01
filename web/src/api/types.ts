@@ -149,6 +149,87 @@ export interface ExecutorPositional {
   pattern: string
 }
 
+/** 档位文件里的一条参数声明（core.ExecutorArgRecord） */
+export interface ExecutorProfileArgRecord {
+  name: string
+  required?: boolean
+  default?: string
+  pattern?: string
+  secret?: boolean
+  allow_dash?: boolean
+}
+
+/** 档位文件里的位置参数声明（core.ExecutorPositionalRecord） */
+export interface ExecutorProfilePositionalRecord {
+  max: number
+  pattern?: string
+}
+
+/**
+ * 档位文件里的那条记录本身（core.ExecutorProfileRecord），也就是档位的**定义**。
+ *
+ * 与 ExecutorProfile 的分工：那一份说的是"这条档位现在的处境"（来源、能不能改、
+ * 这台机器跑不跑得动），这一份说的是"它是什么"（用什么程序、跑哪个文件、允许哪些参数）。
+ * 定义只在 GET /executors/profiles/:name 上给（TASK-W08 补的口，ops 档）。
+ *
+ * 除 name/kind 之外全部可选：后端每个字段都是 omitempty，没填的字段整个键不要出现，
+ * 空串与"没写"在两处判据里不是一回事（例如 positional 与 http 的 body_mode）。
+ */
+export interface ExecutorProfileRecord {
+  name: string
+  kind: 'script' | 'binary' | 'http' | string
+  runtime?: string
+  script?: string
+  program?: string
+  fixed_args?: string[]
+  args?: ExecutorProfileArgRecord[]
+  args_render?: string[]
+  positional?: ExecutorProfilePositionalRecord
+  cwd?: string
+  /**
+   * 固定注入的环境变量。读端点**不回显取值**（只给 env_keys），
+   * 写端点把"没带这个键"解释成"不改"，因此编辑一条档位时不要伪造一个空对象发回去。
+   */
+  env?: Record<string, string>
+  env_allow?: string[]
+  /** time.ParseDuration 的写法，如 90s / 5m / 1h30m */
+  timeout?: string
+  max_parallel?: number
+  retry_on_exit?: number[]
+  method?: string
+  url_template?: string
+  allowed_hosts?: string[]
+  headers?: Record<string, string[]>
+  header_allow?: string[]
+  body?: string
+  expect_status?: number[]
+  capture_response?: boolean
+  max_body_bytes?: number
+  max_redirects?: number
+  deny_private_ranges?: boolean
+  /** 服务端事实，客户端填了也会被覆盖；表单不发这两个键 */
+  created_at?: string
+  updated_at?: string
+}
+
+/** GET /executors/profiles/:name（ExecutorProfileRecordResponse） */
+export interface ExecutorProfileRecordResponse extends ExecutorProfileRecord {
+  /** 这条档位固定的环境变量名（按字典序）。取值不外露，因此也不参与编辑回填。 */
+  env_keys: string[]
+}
+
+/** DELETE /executors/profiles/:name 的响应（条数口径见 api 文档那一节） */
+export interface ExecutorProfileDeleteResult {
+  key: string
+  name: string
+  /** 本次新钉住的**待执行**任务数：不含正在执行的那条，也不删之前就已经暂停的 */
+  paused_jobs: number
+  /** 此刻仍在执行、因此一条都没被动的任务数 */
+  running_jobs: number
+  /** 删除之前就已经在 paused 上的条数 */
+  already_paused_jobs: number
+}
+
 export interface ExecutorArgSpec {
   name: string
   required: boolean
@@ -429,7 +510,7 @@ export type AuditExecVerdict =
   | 'timeout_rejected'
 
 /**
- * action 的全部合法取值 = 19 个动作 + 两个兜底（unmatched / other）。
+ * action 的全部合法取值 = 22 个动作 + 两个兜底（unmatched / other）。
  *
  * 与 api/audit.go 的 auditActions 映射表对照维护：那张表没有透出到任何端点，
  * 而下拉需要完整候选项，所以这是全项目唯一一份前端复制后端枚举的地方。
@@ -453,6 +534,9 @@ export const AUDIT_ACTIONS = [
   'group.create',
   'group.update',
   'group.delete',
+  'executor.profile_create',
+  'executor.profile_update',
+  'executor.profile_delete',
   'admin.scheduler_suspend',
   'admin.scheduler_unsuspend',
   'admin.events_clear',

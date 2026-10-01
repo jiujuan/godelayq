@@ -16,6 +16,11 @@ export const queryKeys = {
   /** 档位列表：只有启动期配置会改它，页面自己不带轮询 */
   executors: ['executors'] as const,
   /**
+   * 单条档位的定义（GET /executors/profiles/:name）。
+   * 只在编辑那条档位时取，按名字分键：连续编辑两条不会共用一份草稿来源。
+   */
+  executorProfile: (name: string) => ['executor-profile', name] as const,
+  /**
    * 写操作台账按筛选条件分页：整体失效用 auditAll。
    * 与 jobs 同一形状（filters + offset），不发明第二套分页键。
    */
