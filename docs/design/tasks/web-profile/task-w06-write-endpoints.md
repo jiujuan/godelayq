@@ -196,4 +196,108 @@ go build ./... && go vet ./...
 
 ## 10. 实现记录（执行时补写）
 
-（待补：落地的接口 / 与本卡写法的差异 / 验证证据 / 手工验收 / 缺陷 / 未覆盖项）
+完成日期：2026-10-01。
+
+### 10.1 落地的接口与位置
+
+| 位置 | 内容 |
+| --- | --- |
+| `executor/applier.go:19` | `HandlerSync`（`Registrar` + `UnregisterHandler` + `HandlerNames`），编译期由 `executor/register_test.go` 的 `var _ HandlerSync = (*core.Scheduler)(nil)` 钉住 |
+| `executor/applier.go:28` | `ApplyResult{Stored, Config, Degraded, Added, Removed, Warnings}` |
+| `executor/applier.go:56,70` | `Applier` 与 `NewApplier(store, syncer, registry, artifacts, logger)`；三个依赖任一为 nil 即构造失败 |
+| `executor/applier.go:98` | `(*Applier).Validate(cmd) (*Profile, ProbeResult, error)` —— 单条校验 + 探测的唯一入口（I1） |
+| `executor/applier.go:115` | `(*Applier).Apply() (ApplyResult, error)` —— 读整份文件 → `mergeStoreProfiles` → `ApplyStore` → 注册 store 侧全部键 → 摘掉"表里已没有、进程里还挂着"的 `exec.` 键 |
+| `executor/merge_profiles.go:39,46` | `MergeStoreProfiles` 保留给启动路径，实现下沉到 `mergeStoreProfiles(executors, stored)`，两条来源共用 |
+| `executor/register.go:139` | 导出 `Handler(p, artifacts, cfg, logger) core.Handler`，Applier 注册单条时用它（与 `Register` 同一个构造器） |
+| `executor/registry.go:221` | `(*Registry).WebEnabled()`，守卫读它而不是读配置 |
+| `api/handlers_executor_profiles.go` | 三个端点 + `requireExecutorProfiles()` + `jobTallyByHandlerKey` + `immutableFieldChange` + 两个窄接口（`:33`、`:44`） |
+| `api/server.go:51,52,102,108` | 两个字段与 `WithExecutorProfileStore` / `WithExecutorProfileApplier` |
+| `api/server.go:302-306` | 三条路由，全部 `RequireRole(core.RoleOps)` |
+| `api/audit.go:117-119` | `executor.profile_create` / `_update` / `_delete` |
+| `cmd/server/main.go:123,145,169` | `profileStoreAPI{store, applier}` 打包成 `newServer` 的第 7 个参数；依赖 `newExecutorProfileStore` 交回**活的存储实例** |
+
+用例：`executor/applier_test.go` 9 条、`api/handlers_executor_profiles_test.go` 14 条（其中
+`TestExecutorProfiles_StoreAndApplyFailures` 带 4 个子用例）、`cmd/server/profile_merge_test.go` 新增 2 条
+（依赖成对到达服务、关闭时两样都不注入）。
+
+### 10.2 与本卡写法的差异
+
+1. **卡 §3.2 的三个窄接口落地成两个**。`profileApplier` 与 `profileRegistrar` 合并成
+   `executorProfileApplier`（`Validate` + `Apply`），实现是新类型 `*executor.Applier` 而不是 `*executor.Registry`。
+   理由：卡 §3.3 的五步与 §3.5 的回滚是同一段逻辑，"重建整表 → 注册 → 摘除"摊到 `api` 与 `executor` 两处
+   会长出两份顺序规则；`api` 只保留自己那半（冲突判定、落盘、回滚、按类型暂停）。
+   调度器仍然只被 `Applier` 通过 `HandlerSync` 使唤，`api` 不直接调 `RegisterHandler`/`UnregisterHandler`。
+   例外是 `PauseByHandlerKey`：只有删除端点知道用的是哪种策略，所以由端点直接调。
+2. **DELETE 的三步顺序改成"钉任务 → 删记录 → 生效（摘 handler）"**（卡 §3.3 写的是"钉 → 摘 → 删"）。
+   理由：卡面顺序里"摘成功、删失败"会留下"表里有这条、进程里跑不了"，正是 I2 要防的那个方向；
+   现顺序下任一步失败要么文件与内存一致，要么"任务被钉住、档位仍在"，后者重试删除即可（幂等）。
+3. **POST 成功是 201**（卡 §5.2 写 200）。照 `POST /groups`、`POST /jobs` 的既有体例；PUT 是 200、DELETE 是 200 带计数。
+4. **`?jobs=block` 的判定按存储自己数**，并把三档分开报（`paused_jobs` / `running_jobs` / `already_paused_jobs`）。
+   卡只说"还有未终态任务就 409"；实现里"未终态"= pending + running + paused，
+   因为 `PauseByHandlerKey` 的返回值只含新钉住的 pending（W04 口径），拿它当"还有几个没跑完"会漏判。
+5. **W05 那条依赖换了形状**：`runtimeDeps.newExecutorProfiles`（交回记录切片）改成
+   `newExecutorProfileStore`（交回存储实例），启动时随后 `profileStore.List()` 读记录。
+   这样页面写入与启动读取共用同一个带互斥的实例，避免出现两份各自缓存同一份文件的视图。
+6. **请求体解码不用 `ShouldBindJSON`**：gin 不拒未知键，改成 `json.Decoder` + `DisallowUnknownFields()`，
+   与配置侧 `UnmarshalExact` 同口径（键名拼错的档位不该"保存成功但那条没生效"）。
+7. **`name` 以路径写法为准**：PUT 时体内 `name` 与路径只差大小写时接受，落盘的是路径上那份写法
+   （存储主键一直按小写存，注册键因此不会随大小写漂移）。
+8. 卡 §5.2 的"POST 一条 python 档位并跑成"在单元用例里改用本机一定有的外壳（Windows `cmd`、其它 `sh`），
+   python + 入库脚本那条留给 §7 的真实进程冒烟——单元用例不该依赖某个解释器在不在。
+
+### 10.3 验证证据
+
+- `go test ./api -run TestExecutorProfiles -count=1 -race` 绿；`go test ./api -count=1 -race` 绿（234s）。
+- 全仓 `go test ./... -count=1 -race` 绿：api 234.355s / cmd/server 5.944s / core 13.100s / executor 25.230s / store/sqlite 4.143s。
+- `go build ./...`、`go vet ./...`、`go build -tags dashboard ./cmd/server` 全过。
+
+**变异反向验证三处**（各自变红后原样恢复并复跑）：
+
+| 变异 | 变红的用例 |
+| --- | --- |
+| 生效失败时不删回刚写的那条（回滚调用短路） | `TestExecutorProfiles_StoreAndApplyFailures/apply_fails_on_create_rolls_the_file_back` |
+| 删除时跳过 `PauseByHandlerKey` | `TestExecutorProfiles_DeletePausesPendingAndLeavesRunning`（三条任务仍 pending、计数为 0） |
+| POST 路由摘掉 `RequireRole(core.RoleOps)` | `TestExecutorProfiles_RoleGate`（viewer/operator/admin 由 403 变 409，说明请求走进了处理器） |
+
+### 10.4 真实进程冒烟（`%TEMP%\w06smoke`，跑完已删）
+
+配置：`enabled: true` + `web_enabled: true` + `required_role: admin` + `runtime_allow: [python, node]`，
+`workspace` 指向仓库 `exec-workspace`，store / profiles / 产物 / 观测库全部落在临时目录；
+端口 18913（IPv4、IPv6 都空）。账号两个：`smoke_ops`(ops) 与 `smoke_operator`(operator)，
+JWT 密钥经环境变量注入。仓库的 `configs/config.yaml`、`data/` 一次都没被写过。
+
+1. operator 档 POST 建档位 → **403**，日志 `msg="access denied" who=smoke_operator have=operator required=ops`。
+2. ops 档 POST `smoke_py`（python + 已入库的 `scripts/py_hello.py` + `env.SMOKE_FIXED=canary-...`）→ **201**，
+   `runtime_ok:true`，`data/exec-profiles.json` 里出现该条并带 `created_at`/`updated_at`；
+   `GET /job-types` 里立刻有 `exec.smoke_py`；响应与 `GET /executors` 全文搜不到 `canary-...`。
+3. 不重启提交 `exec.smoke_py`（`delay: 2s`）→ 201 → 轮询到 **`success`**，
+   `GET /jobs/:id/result?stream=out` 读到 `hello from godelayq executor / runtime=python 3.13.2 / day=today`，
+   服务端日志 `msg="executor run finished" profile=smoke_py exit_code=0 duration_ms=58`。
+4. PUT 换 `script` → **400** `field cannot be changed` / `delete it and create a new one`；PUT 只换 `timeout` → 200。
+5. 提交一条 `delay: 30m` 的同类型任务后：`?jobs=block` → **409**（`1 pending, 0 running and 0 paused`）、
+   `?jobs=whatever` → **400**、默认删除 → **200** `{"paused_jobs":1,"running_jobs":0,"already_paused_jobs":0}`，
+   该任务读到 `paused`，档位文件回到 `[]`，`GET /executors` 的 `profiles` 变空。
+6. `POST /jobs/:id/resume` → 200（回到 pending，仍带着原来的 30 分钟触发时间）；
+   用 `PUT /jobs/:id` 把 `trigger_at` 提到 3 秒后 → 到期判 **`failed`**，
+   日志 `level=ERROR msg="no handler registered for job" handler_key=exec.smoke_py`，
+   `GET /jobs/:id/result` 是 404（没有产物可读）。
+7. `GET /admin/audit?action=executor.profile_{create,update,delete}` 各查到本次那几行
+   （含 403/400/409 那几条被拒的），`actor=smoke_ops role=ops`，
+   整个响应里搜不到 `canary-...`，也搜不到 `args_render` 这类请求体字段名。
+
+### 10.5 缺陷与处置
+
+| 编号 | 内容 | 处置 |
+| --- | --- | --- |
+| D-0601 | 设计文档 §5.3 的端点表写"校验或探测不过 400"，与同节第 2 条"探测失败不拒绝保存"（以及本卡 §5.8）自相矛盾 | **已修**：表格行改成"校验不过 400（探测不可用不拒，见下面第 2 条）" |
+| D-0602 | 页面写入与手改 `exec-profiles.json` 之间没有乐观并发（没有 mtime / 版本号比对）：`Apply()` 每次都整表重读重写，两边同时改以后写覆盖先写 | **登记不修**：本期口径是"文件是人手也可以改的，重启可对齐"（设计文档 §6.10），要收口得先有改前/改后摘要，归 S-2 |
+| D-0603 | 每次写请求都全表重建并逐个注册（O(档位总数)） | **登记不修**：默认 4 并发的本地部署量级下无感；真出现几百条档位再改成增量 |
+
+### 10.6 未覆盖项
+
+- `executors.commands` 那一份的在线删除/编辑不做（设计文档 §8），端点只给 409 说明它是只读来源。
+- 台账里没有"改前 / 改后"摘要列（S-2），事后只能看到动作、身份与结论。
+- 绝对路径（D5 的口子）在本卡只有单元用例覆盖（`Validate` 用 `PathAnywhere`），
+  真实进程里的越界写入没做冒烟；配套的收口项是 S-1 / S-3。
+- `web/src/` 一次都没改：页面上的档位管理归 W08，本卡只交付端点与 `docs/api.md`。
+
