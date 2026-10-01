@@ -343,6 +343,45 @@ level=INFO msg="artifact expired directories purged" count=24 ttl=1m0s
 服务端也没有这条链——未接线时这个配置项没有任何行为差别。打开之前请确认监控目录的写权限已收窄到服务账号独占，
 并清楚放弃的是哪一层防护。
 
+### 13. 档位的在线管理（`executors.web_enabled`）
+
+默认关闭。打开之后控制台多一个"档位"页、REST 多四个端点，ops 身份可以在**不重启**的前提下
+新建/修改/删除档位；这些档位落在 `executors.profiles_path`（默认 `./data/exec-profiles.json`），
+重启时与配置的 `executors.commands` 合并，**同名以配置为准**，文件里那条只出现在展示面并标记未生效。
+
+两条硬前提（`core.Config.Validate` 当场拒，不是运行期才发现）：
+
+- `web_enabled: true` 必须同时 `enabled: true`，否则启动即报
+  `executors.web_enabled requires executors.enabled to be true`（与 `loader_allow` 同一条口径）；
+- 打开之后必须已有鉴权（`server.auth.token` 或 `server.auth.users` 任一），否则这条链路上没有任何身份判定。
+
+**这份文件必须随 `data/` 一起备份**。它是"这台机器能执行什么"的一部分：只备份 `jobs.json`
+而漏掉它，恢复出来的进程会少掉所有页面建的档位，而那些任务类型可能正有历史任务挂着。
+权限与 `groups.json` 同档（`0640` 起）：里面是脚本路径、固定参数与固定环境变量的**取值**，
+按凭据等级设权限，别放进全局可读的目录。
+
+文件形态与故障口径：
+
+- 顶层是 JSON 数组，`created_at` / `updated_at` 可以缺省；**文件不存在是正常状态**
+  （还没人在页面上建过档位），启动不会创建它。
+- **内容损坏会启动失败**，不是"当成空文件继续跑"——静默清空会抹掉已建好的档位。
+  error 日志同时给出路径与自救指引：
+  `fix that file or delete it to fall back to profiles declared only in executors.commands`，
+  删掉或修好该文件即可退回"只看 yaml"的形态。
+- 多机部署请把它当**本机文件**：档位里存的是本机路径，换一台机器探测会失败
+  （`GET /executors` 那行的 `runtime_ok` 变 `false`，`reason` 说清是文件不在还是程序不在），
+  **这是预期而不是故障**。页面建的档位照常看得见、只是跑不了，提交它会被拒。
+
+一句话警告：**打开 `web_enabled` 等于把"往执行面注入一条可执行命令"的权限交给一个 ops 档 JWT**。
+本期档位允许指向 workspace 之外的任意本机路径（设计文档决策 D5），
+`executor-design.md` §7 那条越界拒绝只对配置侧的 `executors.commands` 保留。
+生产部署前应补设计文档 §7.2 的 S-1（页面侧路径白名单）与 S-2（档位写入的独立凭据/双确认）；
+在那之前，请把 ops 档账号的数量与口令强度按"能执行命令"来评估，而不是按"能改配置"。
+
+另外两条与凭据有关的口径：档位里 `env` 的固定取值**不出现在任何读口**
+（`GET /executors` 与 `GET /executors/profiles/:name` 都只给键名），也不进写操作台账；
+它只落在这份文件里。`PUT` 的请求体不带 `env` 这个键表示"不改"，显式 `"env": {}` 才是清空。
+
 ## 启用观测层（可选）
 
 `observability.enabled` 默认是 `false`。打开之后进程多写一个 SQLite 文件，把三类可观测数据落盘：
