@@ -156,7 +156,9 @@ go build -tags dashboard -o godelayq-server ./cmd/server
 - 带前端产物的二进制里，`GET`/`HEAD` 的静态资源与 SPA 深链**免凭据**（登录页本身就在产物里）。
   放行范围只到产物为止：`/api/`、`/ws`、`/sse/` 三个名字空间与一切写方法照旧要凭据，
   判定见 `api/console.go` 的 `consoleRequest`。产物里不含任何业务数据，但会暴露"这里有个控制台"。
-- 写操作只有结构化日志，没有可查询的审计存储；要留证据链请收集 stdout 日志（见下文日志与观测）。
+- 写操作台账：未启用观测层时只有结构化日志，没有可查询的审计存储，要留证据链请收集 stdout 日志（见下文日志与观测）；
+  打开 `observability.audit.enabled` 之后每个写请求还会落一行 `write_audit`，用 `GET /api/v1/admin/audit` 查
+  （见"启用观测层"一节）。两种出口都不记请求体与参数取值。
 
 数据目录需提前创建并保证进程可写：
 
@@ -341,6 +343,166 @@ level=INFO msg="artifact expired directories purged" count=24 ttl=1m0s
 服务端也没有这条链——未接线时这个配置项没有任何行为差别。打开之前请确认监控目录的写权限已收窄到服务账号独占，
 并清楚放弃的是哪一层防护。
 
+## 启用观测层（可选）
+
+`observability.enabled` 默认是 `false`。打开之后进程多写一个 SQLite 文件，把三类可观测数据落盘：
+
+| 子开关 | 表 | 记什么 | 打开后能多看到什么 |
+| --- | --- | --- | --- |
+| `events.enabled` | `job_events` | 事件总线广播的 `job.*` | 重启后详情页时间线仍有历史；`GET /jobs/:id/events` 与 `GET /events` 改读库 |
+| `artifacts.enabled` | `artifact_index` | 每次执行的输出文件属性 | `GET /jobs/:id/artifacts` 按尝试列出尺寸与清理状态 |
+| `audit.enabled` | `write_audit` | 每个写请求一行台账 | `GET /api/v1/admin/audit` 查"谁在什么时候改了什么" |
+
+三个子开关都只在总开关为真时生效。字段与键值说明见 `configs/config.example.yaml` 的
+`observability:` 一节与设计文档 [sqlite-observability-design.md](./design/sqlite-observability-design.md)。
+
+### 1. 打开方式，以及"关掉即回到原状"
+
+```yaml
+observability:
+  enabled: true
+  path: ./data/observe.sqlite
+  flush_interval: 200ms     # 三个写入器共用的合并落盘周期
+```
+
+关闭时（默认）：不建库文件、不订阅事件总线、不注入任何写入器，两个事件端点仍读进程内缓冲。
+实测对照：删掉整段 `observability` 后启动，`data/` 下不出现任何 `.sqlite*` 文件，
+两个事件端点的响应与接入观测层之前的二进制逐字段一致（TASK-S07 §10.4 场景 1，
+基线取的是 `c971f81` 构建出来的程序）。
+
+回滚也是这一条：把 `enabled` 改回 `false` 即停止全部读写，表与既有行留在文件里不影响任何东西；
+只关某一个子开关时，那张表照旧建出来但一行不写，对应的读端点给出 503 或退回内存缓冲。
+8 种开关组合的逐格实测在 TASK-S07 §10.4 场景 2。
+
+`observability.enabled: true` 而鉴权没配时**不会**像执行器那样报 error——台账与事件库里只会出现
+`actor_kind=anonymous` 的行，没有越权风险，所以不额外拦一条启动检查。
+
+### 2. 依赖与二进制体积
+
+驱动是 `modernc.org/sqlite`（纯 Go，无 CGO、无需 C 工具链），版本钉在 `v1.46.0`：
+更高版本要求整仓 `go` 指令抬到 1.25/1.26，会连带抬高 `examples/` 的 `go run` 门槛。
+驱动只在 `store/sqlite` 这一个包里出现，`core`、`api`、`executor` 都不认识 SQLite
+（`go list -deps ./api | grep -i sqlite` 必须为空，这条在 CI 里可查）。
+
+体积代价实测（`windows/amd64`，不带 `-tags dashboard`）：接入观测层之前 32,773,120 B，
+接入之后 38,583,808 B，当前 38,813,696 B ⇒ 约 **+5.8 MiB / +18.4%**。
+设计阶段估的 +8~10 MB 落在实测之上，按实测记。
+
+### 3. 文件、旁文件与备份
+
+`observability.path` 指向一个单独的文件（默认口径 `./data/observe.sqlite`，与 `store.path` 同目录不同文件）。
+WAL 模式会带来两个旁文件，运行期都在：
+
+```
+data/observe.sqlite      data/observe.sqlite-wal      data/observe.sqlite-shm
+```
+
+**运行中备份请用 `VACUUM INTO`，不要只拷单个 `.sqlite` 文件**——那一刻 `-wal` 里还有未合并的已提交事务，
+只拷主文件会丢掉最近的行：
+
+```bash
+sqlite3 /var/lib/godelayq/observe.sqlite "VACUUM INTO '/backup/observe-$(date +%F).sqlite'"
+```
+
+（本仓库的容量实测就是这么量的：`VACUUM INTO` 一份只读副本再看文件大小，避免读到半成品。）
+停服后备份整个数据目录即可，三个文件一起走。定期 `VACUUM` 不做：单连接、批量写、
+条数有上界，碎片不是这里的瓶颈（设计文档 §13）。
+
+### 4. 权限
+
+库文件 `0640`、目录 `0750`，与产物文件同一取向；建目录与建文件都由启动装配顺手做掉。
+`data/` 若与 `jobs.json` 同级，同一份属主与备份策略覆盖两者。
+
+需要单独设权限的理由：`write_audit` 的行里含**账号名**与拒绝结论，`job_events` 含任务执行结论与输出预览，
+这两类信息比任务快照更贴近"谁做了什么"。读取端点的档位也因此不低：`/admin/audit` 取 `ops`（`admin` 也不行），
+`/jobs/:id/artifacts` 取 `viewer`（只有元信息，正文另有端点）。
+
+⚠️ 权限位本身在 Windows 上没跑过（用例按平台跳过）。Linux 侧的 `0640/0750` 断言、
+`-race` 实跑与优雅停服都还缺一次真机验证——与执行器系列同一限制。
+
+### 5. 持久化强度
+
+`synchronous` 默认 `normal`：WAL + `NORMAL` 下断电最多丢最后几个已提交事务，
+与 `store.flush_interval`（JSON 存储的合并落盘周期）"崩溃最多丢一个周期"是同一量级的保证。
+需要更强保证改 `full`，代价是每次提交都等磁盘同步、写入变慢。
+
+实测的崩溃现场（`flush_interval: 500ms`，硬杀进程 5 轮）：
+每轮丢的都是"最后一个未提交周期内"的行——3 轮丢 0 行、2 轮丢整批 5 行台账（事件侧同理）。
+换句话说，**丢掉的上界是一个 `flush_interval` 内攒下的量**，不会出现半行或坏行；
+重启后库照样打得开、已落的行一条不少（TASK-S07 §10.4 场景 6）。
+
+### 6. 容量与保留：先看条数上界，再看天数
+
+三张表都是"有界保留"：`retention_count` 按写入顺序淘汰最旧，`retention_age` 按时间淘汰（`0` 表示不按时间淘汰）。
+默认值：事件 200,000 条 / 720 小时，台账 500,000 条 / 2160 小时，产物索引没有独立上界（跟着任务删除）。
+
+每行的实际大小（本机实测，`VACUUM INTO` 之后）：500 行事件 + 500 行台账 = 1,000 行，
+库文件 311,296 B ⇒ **约 311 B/行**（含八个索引与页开销）。按一次完整执行产生
+3 行事件（`job.scheduled` / `job.started` / `job.completed`）+ 1 行台账（那次提交请求）算：
+
+| 吞吐 | 每天新增行 | 每天大约多占 | 默认上界留得住多久 |
+| --- | --- | --- | --- |
+| 1 万次执行/天 | 4 万 | 12 MB | 事件 5 天 / 台账 50 天 |
+| 10 万次执行/天 | 40 万 | 124 MB | **事件约 12 小时**、台账约 5 天 |
+
+也就是说：**量大的部署先撞到条数上界，不是天数**。需要长历史时调 `retention_count`
+（这正是它与 `store.history_limit` 的区别：那一个限的是终态快照条数）。
+CI 里高频建任务的场景同理——`?action=job.create` 的历史会比预期短。
+
+### 7. 丢弃计数怎么看（这一条与直觉不同）
+
+写入是有界的：队列容量默认 4,096 条，队满时**丢新来的那一条、绝不阻塞请求或调度**。
+丢了的条数记在写入器自己身上，但**当前实现没有在线出口**：
+
+- `GET /api/v1/admin/runtime` 里**没有**观测层段落，`DB.Stats()` 也只有三张表行数与 `schema_version`；
+- 唯一的现场是**关停时**的一条汇总 WARN，例如实测到的：
+
+```
+level=WARN msg="observability event writer dropped records" dropped=497 path=./data/observe.sqlite
+```
+
+所以运行一个长期不重启的进程时，你**看不到**它正在缺页；表看起来完整，实际可能少了几百行。
+需要主动检查的部署，眼下只有两条路：定期重启看日志，或者自己按 `store/sqlite` 暴露的
+`Dropped()` 方法接一层指标。补一个在线出口（`/admin/runtime` 加一段）已登记为缺陷，见设计文档 §15 第 10 条。
+
+同一件事的另一半由响应自己说明：装配了事件库时 `note` 是
+`persisted event store; newest entry may lag by the write flush interval`，
+说的是"最新一批最多晚一个 `flush_interval`"，不是"丢了"。
+
+### 8. 关掉即回到原状，不影响任何功能
+
+关掉总开关后：事件端点退回内存缓冲、`GET /jobs/:id/artifacts` 与 `GET /api/v1/admin/audit` 各回 503
+（503 而不是 404：路由存在，开关没开这件事本身要说清楚）、写请求照旧成功并落一行
+`msg="write operation audited"` 的结构化日志。实测的 503 原文：
+
+```json
+{"code":503,"message":"write audit log is not configured","details":"start the server with observability.enabled and observability.audit.enabled to enable /api/v1/admin/audit"}
+```
+
+观测库文件损坏或被外部删掉也不会连累业务：库打不开时启动失败并给出原因（与档位配置非法同一口径，
+不带"记不住"的状态上线）；库能开但某次写失败时只记日志，执行结果与任务状态都不受影响。
+
+### 9. 与 `store.history_limit` / 产物 TTL 的关系
+
+三处保留策略管的是三种不同的东西，**不要指望它们同步**（设计文档 D9）：
+
+| 配置 | 保留的是 | 被淘汰后还能看到什么 |
+| --- | --- | --- |
+| `store.history_limit` / `history_ttl` | 任务的**终态快照**（`jobs.json` 里的历史条目） | 事件库与台账里仍有它的行，但 `GET /jobs?status=success` 不再给出这条 |
+| `observability.events.retention_*` | 任务的**事件时间线** | 任务快照照旧，只是时间线从头开始 |
+| `executors.output.ttl` | 输出**正文文件** | `artifact_index` 的行被删掉，`/result` 报 `found: false` |
+
+典型后果：快照留痕被清掉之后，事件库里的时间线还在（这是有意设计，排障时更常回看历史事件）；
+反过来"事件已淘汰但任务快照还在"也正常。真要对齐，就按上一节的表把三个上界一起调。
+
+### 10. Systemd 与写权限清单
+
+`docs/deployment.md` 下面那份 Systemd 单元里若配了 `ProtectSystem`、`ReadWritePaths` 或
+`ProtectHome`，把 `observability.path` 所在的目录一并加进可写路径——与 `store.path`、
+`executors.output.dir` 同一处理。默认值 `./data/observe.sqlite` 在 `WorkingDirectory` 之下，
+只有你把它指到别处时才需要动这一项；配错的现场是启动直接失败并报
+`sqlite: create dir for ...` 之类的可读原因（实测三种：目录不可写、路径非法、路径指向已存在的目录）。
+
 ## Systemd 服务配置
 
 ```ini
@@ -374,7 +536,8 @@ WantedBy=multi-user.target
 
 收到 `SIGTERM` 后进程按序关停：停止接受新连接 → 取消所有请求上下文（SSE 长连接随即返回）→
 关闭全部 WebSocket 客户端并等待读写协程退出 → 停调度器（取消在途任务的 `context`，等待 worker 返回）→
-最后一次落盘。
+观测层收尾（撤事件订阅 → 把队列里剩下的行落成最后一批 → 关观测库，仅在启用时存在）→
+最后一次落盘任务存储。
 
 其中**只有 HTTP/长连接这一段受 `scheduler.shutdown_timeout`（默认 5s）约束**：超时后强制关闭残留连接并继续收尾。
 `Scheduler.Stop()` 没有自己的超时——它依赖 Handler 检查传入的 `context`；
