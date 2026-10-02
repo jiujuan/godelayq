@@ -2055,6 +2055,10 @@ func (s *stubStore) Flush() error {
 	return nil
 }
 
+// SetHistoryRetention 是替身：淘汰行为在 core 包里用真存储验证（core/store_hot_test.go），
+// 这里只需要接口完整。
+func (s *stubStore) SetHistoryRetention(limit int, ttl time.Duration) {}
+
 func (s *stubStore) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()

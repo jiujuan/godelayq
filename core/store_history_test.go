@@ -84,9 +84,11 @@ func TestJSONFileStore_HistoryLimitOffDropsTerminalImmediately(t *testing.T) {
 func TestJSONFileStore_ZeroHistoryLimitUsesDefault(t *testing.T) {
 	store := newHistoryStore(t, StoreOptions{})
 
-	assert.Equal(t, DefaultHistoryLimit, store.historyLimit)
+	// 两个策略位现在是原子字段（重载链会运行期写它们），断言改成读 Load，
+	// 长度与补齐口径一条都没变。
+	assert.Equal(t, int64(DefaultHistoryLimit), store.historyLimit.Load())
 	assert.Equal(t, DefaultFlushInterval, store.interval)
-	assert.Zero(t, store.historyTTL)
+	assert.Zero(t, store.historyTTL.Load())
 }
 
 func mustLoadAll(t *testing.T, store *JSONFileStore) []JobSnapshot {

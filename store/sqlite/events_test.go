@@ -540,11 +540,13 @@ func TestEventLog_DefaultsForNonPositiveOptions(t *testing.T) {
 		opts.FlushInterval = 0
 	})
 
-	if log.retentionCount != core.DefaultObserveEventRetentionCount {
-		t.Errorf("expected the default retention count, got %d", log.retentionCount)
+	// 两个策略位现在是原子字段（重载链会运行期写它们），断言只换读法：
+	// 补齐口径仍然是 NewEventLog 那一条，取值一个没变。
+	if log.retentionCount.Load() != int64(core.DefaultObserveEventRetentionCount) {
+		t.Errorf("expected the default retention count, got %d", log.retentionCount.Load())
 	}
-	if log.retentionAge != 0 {
-		t.Errorf("expected a negative age to become 0 (no time pruning), got %v", log.retentionAge)
+	if log.retentionAge.Load() != 0 {
+		t.Errorf("expected a negative age to become 0 (no time pruning), got %d", log.retentionAge.Load())
 	}
 	if log.batch.capacity != core.DefaultObserveQueueCapacity || log.batch.interval != core.DefaultObserveFlushInterval {
 		t.Errorf("expected queue defaults to come from core, got capacity=%d interval=%v",

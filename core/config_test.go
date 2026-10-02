@@ -268,8 +268,10 @@ func TestConfig_ThreadsIntoComponents(t *testing.T) {
 	require.NoError(t, err)
 	defer store.Close()
 	assert.Equal(t, 15*time.Millisecond, store.interval)
-	assert.Equal(t, 2, store.historyLimit)
-	assert.Equal(t, time.Hour, store.historyTTL)
+	// 两个策略位现在是原子字段（重载链会运行期写它们），断言只换读法：Load() 出来的
+	// 仍然是构造时补齐过的同一个取值。
+	assert.Equal(t, int64(2), store.historyLimit.Load())
+	assert.Equal(t, int64(time.Hour), store.historyTTL.Load())
 
 	scheduler := NewScheduler(store, nil, nil)
 	scheduler.SetConcurrency(cfg.Scheduler.Workers)

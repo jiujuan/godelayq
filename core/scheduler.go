@@ -36,9 +36,12 @@ const (
 
 // Scheduler 任务调度器
 type Scheduler struct {
-	heap        *QuaternaryHeap
-	store       Store
-	retryPolicy RetryPolicy
+	heap  *QuaternaryHeap
+	store Store
+	// retryPolicy 用原子指针而不是普通接口字段：worker 协程在 handleFailure 里读它，
+	// 重载链要在运行期写它（SetRetryPolicy），普通字段的读写并发会被 -race 抓住。
+	// 指针指向的是"接口值本身"，因此读写都是整条策略一次换掉，不存在半新半旧的策略。
+	retryPolicy atomic.Pointer[RetryPolicy]
 	cronParser  CronParser
 
 	// 控制
@@ -129,10 +132,9 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 
 	settings := newComponentOptions(opts...)
 
-	return &Scheduler{
+	s := &Scheduler{
 		heap:           NewQuaternaryHeap(),
 		store:          store,
-		retryPolicy:    retryPolicy,
 		cronParser:     NewCronParser(),
 		stopCh:         make(chan struct{}),
 		newJobCh:       make(chan struct{}, 1),
@@ -148,6 +150,9 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 		eventBus:          eventBus,
 		logger:            resolveLogger(settings.logger),
 	}
+	// 原子字段不能进结构体字面量，所以建好体之后一次性 Store。
+	s.retryPolicy.Store(&retryPolicy)
+	return s
 }
 
 // SetConcurrency 设置执行 worker 数量，需在 Start 之前调用。
@@ -251,6 +256,32 @@ func (s *Scheduler) SetEventPreviewLimit(n int) {
 		return
 	}
 	s.eventPreviewLimit = n
+}
+
+// SetRetryPolicy 运行期替换重试策略。传 nil 视为不改（保持现值）。
+//
+// 与上面那批 Set* 的分别：那些只在 Start 前有效、运行期 warn 并忽略，
+// 本方法是专给重载链用的（配置热重载 R02/R06），运行期生效——
+// 退避算法不绑通道也不绑协程，换掉它只影响下一次失败重试算出的时刻。
+func (s *Scheduler) SetRetryPolicy(p RetryPolicy) {
+	if p == nil {
+		return
+	}
+	s.retryPolicy.Store(&p)
+}
+
+// RetryPolicyMaxDelay 返回当前策略的延迟上限，非 ExponentialBackoffRetry 时返回 0。
+// 给 /admin/runtime 的重载读数与测试用：调用方不该为了看一个取值去断言接口类型。
+func (s *Scheduler) RetryPolicyMaxDelay() time.Duration {
+	loaded := s.retryPolicy.Load()
+	if loaded == nil {
+		return 0
+	}
+	backoff, ok := (*loaded).(*ExponentialBackoffRetry)
+	if !ok {
+		return 0
+	}
+	return backoff.MaxDelay
 }
 
 // RegisterHandler 注册任务类型对应的处理函数。
@@ -1682,8 +1713,9 @@ func (s *Scheduler) handleFailure(job *Job, err error) {
 	}
 
 	if job.RetryCount < job.MaxRetries {
-		// 计算下次重试时间
-		nextTime := s.retryPolicy.NextRetry(job)
+		// 计算下次重试时间：只 Load 一次，算出的时刻同时用于发事件与排期，
+		// 否则中间插进一次 SetRetryPolicy 就会让两条记录给出不同的重试时刻
+		nextTime := (*s.retryPolicy.Load()).NextRetry(job)
 
 		// 发布重试事件
 		s.eventBus.Publish(Event{

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -33,6 +34,10 @@ type Store interface {
 	Flush() error
 	// Close 停止后台合并写入并落盘当前状态，幂等
 	Close() error
+	// SetHistoryRetention 运行期替换终态留痕的条数与时长上限，下一次写入触发的 trim 用新值。
+	// 两项必须一起给：分开调会出现"新条数配旧时长"的中间态。取值口径与 StoreOptions 同一条
+	// （limit==0 用 DefaultHistoryLimit、limit<0 不留痕、ttl<=0 不按时间淘汰）。
+	SetHistoryRetention(limit int, ttl time.Duration)
 }
 
 // StoreOptions 存储构造参数，零值即使用各项默认。
@@ -53,9 +58,11 @@ type JSONFileStore struct {
 	filePath string
 	interval time.Duration
 
-	// 终态留痕策略
-	historyLimit int
-	historyTTL   time.Duration
+	// 终态留痕策略。写成原子值而不是普通字段：重载链会在运行期写它们（SetHistoryRetention），
+	// 而读它们的是持有 s.mu 的写入协程，普通字段的读写并发会被 -race 抓住。
+	// historyTTL 存纳秒，与 time.Duration 之间只在读写两处转换。
+	historyLimit atomic.Int64
+	historyTTL   atomic.Int64
 
 	// logger 后台协程使用的日志器，构造后不再变更
 	logger *slog.Logger
@@ -81,21 +88,19 @@ func NewJSONFileStoreWithOptions(path string, opts StoreOptions) (*JSONFileStore
 	if interval <= 0 {
 		interval = DefaultFlushInterval
 	}
-	historyLimit := opts.HistoryLimit
-	if historyLimit == 0 {
-		historyLimit = DefaultHistoryLimit
-	}
+	historyLimit, historyTTL := historyRetentionValues(opts.HistoryLimit, opts.HistoryTTL)
 
 	s := &JSONFileStore{
-		filePath:     path,
-		interval:     interval,
-		historyLimit: historyLimit,
-		historyTTL:   opts.HistoryTTL,
-		logger:       resolveLogger(opts.Logger),
-		data:         make(map[string]JobSnapshot),
-		stopCh:       make(chan struct{}),
-		doneCh:       make(chan struct{}),
+		filePath: path,
+		interval: interval,
+		logger:   resolveLogger(opts.Logger),
+		data:     make(map[string]JobSnapshot),
+		stopCh:   make(chan struct{}),
+		doneCh:   make(chan struct{}),
 	}
+	// 原子字段不能进结构体字面量，所以建好体之后一次性 Store。
+	s.historyLimit.Store(historyLimit)
+	s.historyTTL.Store(historyTTL)
 
 	// 确保目录存在
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
@@ -108,6 +113,28 @@ func NewJSONFileStoreWithOptions(path string, opts StoreOptions) (*JSONFileStore
 
 	go s.flushLoop()
 	return s, nil
+}
+
+// historyRetentionValues 把留痕的条数与时长折成入库的两个取值（条数、纳秒）。
+//
+// 口径只有一份，构造与 SetHistoryRetention 共用：limit==0 回 DefaultHistoryLimit
+// （0 不解释成"不限量"，那会让一次漏配把留痕推成无界增长）、limit<0 不留痕、
+// ttl<=0 不按时间淘汰。setter 里再抄一遍这条判断，就出现了第二套规则。
+func historyRetentionValues(limit int, ttl time.Duration) (int64, int64) {
+	if limit == 0 {
+		limit = DefaultHistoryLimit
+	}
+	return int64(limit), int64(ttl)
+}
+
+// SetHistoryRetention 运行期调整终态快照的保留条数与时长。
+// 两项必须一起给：分开调会出现"新条数配旧时长"的中间态，而 history_limit=-1（不留痕）
+// 与 history_ttl 的组合语义只在成对时说得清。取值口径与 StoreOptions 完全同一条
+// （见 historyRetentionValues）。生效时机是下一次写入触发的 trim，这里不主动补一次清理。
+func (s *JSONFileStore) SetHistoryRetention(limit int, ttl time.Duration) {
+	historyLimit, historyTTL := historyRetentionValues(limit, ttl)
+	s.historyLimit.Store(historyLimit)
+	s.historyTTL.Store(historyTTL)
 }
 
 func (s *JSONFileStore) Save(job *Job) error {
@@ -157,23 +184,29 @@ func (s *JSONFileStore) LoadAll() ([]JobSnapshot, error) {
 }
 
 // trimTerminalLocked 按保留策略清理终态快照，Pending/Running 永不淘汰。
-// historyLimit < 0 表示不留痕；0 已在构造时替换为 DefaultHistoryLimit。
+// 条数上限 < 0 表示不留痕；0 已在构造与 SetHistoryRetention 里替换为 DefaultHistoryLimit。
+// 两个原子值在开头各读一次并留在局部变量里：调用方持 s.mu，所以两次 Load 不会读到半个值，
+// 但同一次淘汰的"按几条切"与"按多久切"必须来自同一代策略——分两次 Load 时中间插进一次
+// SetHistoryRetention，就会出现条数用新值、时长用旧值的那种没人配置过的组合。
 func (s *JSONFileStore) trimTerminalLocked() {
 	now := time.Now()
+	limit := int(s.historyLimit.Load())
+	ttl := time.Duration(s.historyTTL.Load())
+
 	terminal := make([]JobSnapshot, 0, len(s.data))
 
 	for id, snap := range s.data {
 		if !JobStatus(snap.Status).IsTerminal() {
 			continue
 		}
-		if s.historyLimit < 0 || (s.historyTTL > 0 && now.Sub(snap.UpdatedAt) > s.historyTTL) {
+		if limit < 0 || (ttl > 0 && now.Sub(snap.UpdatedAt) > ttl) {
 			delete(s.data, id)
 			continue
 		}
 		terminal = append(terminal, snap)
 	}
 
-	if s.historyLimit >= 0 && len(terminal) > s.historyLimit {
+	if limit >= 0 && len(terminal) > limit {
 		sort.Slice(terminal, func(i, j int) bool {
 			if !terminal[i].UpdatedAt.Equal(terminal[j].UpdatedAt) {
 				return terminal[i].UpdatedAt.After(terminal[j].UpdatedAt)
@@ -181,7 +214,7 @@ func (s *JSONFileStore) trimTerminalLocked() {
 			// 同一时刻写入时按 ID 稳定排序，避免淘汰结果随遍历顺序漂移
 			return terminal[i].ID < terminal[j].ID
 		})
-		for _, snap := range terminal[s.historyLimit:] {
+		for _, snap := range terminal[limit:] {
 			delete(s.data, snap.ID)
 		}
 	}

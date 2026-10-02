@@ -2,7 +2,9 @@ package core
 
 import (
 	"bytes"
+	"io"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -117,4 +119,66 @@ func TestResolveLogger_FallsBackToDefault(t *testing.T) {
 
 	custom := slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil))
 	assert.Equal(t, custom, resolveLogger(custom))
+}
+
+// TestSetLogLevel_ChangesOutput 交回载体的目的只有一个：运行期改级别真的改变了输出。
+// 三条断按 R02 §5.1 的顺序排——先证明 info 下 debug 不出现，再证明改完出现，
+// 最后证明"写错的级别名"不会把已经在跑的级别带走（这条最容易写成"失败也置默认值"）。
+func TestSetLogLevel_ChangesOutput(t *testing.T) {
+	var buf bytes.Buffer
+	logger, levelVar, err := NewLoggerWithLevelVar("info", "text", &buf)
+	if err != nil {
+		t.Fatalf("NewLoggerWithLevelVar: %v", err)
+	}
+
+	logger.Debug("first") // info 级别下不该出现
+	if strings.Contains(buf.String(), "first") {
+		t.Fatal("debug record emitted at info level")
+	}
+
+	if err := SetLogLevel(levelVar, "debug"); err != nil {
+		t.Fatalf("SetLogLevel: %v", err)
+	}
+	buf.Reset()
+	logger.Debug("second")
+	if !strings.Contains(buf.String(), "second") {
+		t.Fatal("debug record still hidden after SetLogLevel")
+	}
+
+	// 解析失败保持原值：这一条守住"写错的级别名不会把日志关掉"
+	if err := SetLogLevel(levelVar, "verbose"); err == nil {
+		t.Fatal("SetLogLevel accepted an invalid level name")
+	}
+	buf.Reset()
+	logger.Debug("third")
+	if !strings.Contains(buf.String(), "third") {
+		t.Fatal("level changed by a rejected SetLogLevel call")
+	}
+}
+
+// TestSetLogLevel_NilCarrierIsRejected 载体是调用方交进来的，nil 只能来自接线的疏漏：
+// 返回错误而不是 panic，重载链才能把它当成一次普通的失败收口。
+func TestSetLogLevel_NilCarrierIsRejected(t *testing.T) {
+	require.Error(t, SetLogLevel(nil, "debug"))
+}
+
+// TestNewLogger_KeepsOldContract NewLogger 转调新构造函数之后，既有调用方的三条预期不变：
+// 非法级别报错、非法格式报错、默认 info/text。级别过滤与 text|json 两条分岔
+// 由上面三个既有用例继续守着，这里只补"签名与行为没被转调改动"这一条。
+func TestNewLogger_KeepsOldContract(t *testing.T) {
+	if _, err := NewLogger("nope", "text", io.Discard); err == nil {
+		t.Error("NewLogger accepted an invalid level")
+	}
+	if _, err := NewLogger("info", "yaml", io.Discard); err == nil {
+		t.Error("NewLogger accepted an invalid format")
+	}
+	var buf bytes.Buffer
+	logger, err := NewLogger("", "", &buf)
+	if err != nil {
+		t.Fatalf("NewLogger defaults: %v", err)
+	}
+	logger.Info("hello")
+	if !strings.Contains(buf.String(), "hello") {
+		t.Error("default logger wrote nothing")
+	}
 }

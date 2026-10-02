@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"godelayq/api"
@@ -70,8 +71,11 @@ type AuditLog struct {
 	batch  *batcher[auditRecord]
 	logger *slog.Logger
 
-	retentionCount int
-	retentionAge   time.Duration
+	// 保留策略写成原子值：重载链会在运行期写它们（SetRetention），
+	// 而读它们的是批量落盘协程，普通字段的读写并发会被 -race 抓住。
+	// retentionAge 存纳秒，与 time.Duration 之间只在读写两处转换。
+	retentionCount atomic.Int64
+	retentionAge   atomic.Int64
 	now            func() time.Time
 
 	closeOnce sync.Once
@@ -92,22 +96,16 @@ func NewAuditLog(db *DB, opts AuditLogOptions, logger *slog.Logger) (*AuditLog, 
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
-	retentionCount := opts.RetentionCount
-	if retentionCount <= 0 {
-		retentionCount = core.DefaultObserveAuditRetentionCount
-	}
-	retentionAge := opts.RetentionAge
-	if retentionAge < 0 {
-		retentionAge = 0
-	}
+	retentionCount, retentionAge := auditRetentionValues(opts.RetentionCount, opts.RetentionAge)
 
 	a := &AuditLog{
-		db:             db,
-		logger:         logger,
-		retentionCount: retentionCount,
-		retentionAge:   retentionAge,
-		now:            opts.Now,
+		db:     db,
+		logger: logger,
+		now:    opts.Now,
 	}
+	// 原子字段不能进结构体字面量，所以建好体之后一次性 Store。
+	a.retentionCount.Store(retentionCount)
+	a.retentionAge.Store(retentionAge)
 
 	batch, err := newBatcher[auditRecord](opts.QueueCapacity, opts.FlushInterval, a.writeBatch, func(err error) {
 		logger.Error("observability audit batch dropped", "error", err, "path", db.Path())
@@ -133,6 +131,29 @@ func (a *AuditLog) Append(entry api.AuditEntry) error {
 	}
 	a.batch.append(a.mapEntry(entry))
 	return nil
+}
+
+// auditRetentionValues 把保留条数与保留时长折成入库的两个取值（条数、纳秒）。
+//
+// 口径只有一份，构造与 SetRetention 共用：count<=0 回 core.DefaultObserveAuditRetentionCount
+// （0 不当成"不限量"，那会让一次漏配把表推成无界增长）、age<0 按 0 处理、
+// age==0 表示不按时间淘汰。setter 里再抄一遍这两条判断，就出现了第二套规则。
+func auditRetentionValues(count int, age time.Duration) (int64, int64) {
+	if count <= 0 {
+		count = core.DefaultObserveAuditRetentionCount
+	}
+	if age < 0 {
+		age = 0
+	}
+	return int64(count), int64(age)
+}
+
+// SetRetention 运行期调整保留条数与时长，下一个批量周期的淘汰用新值。
+// 取值口径与 NewAuditLog 里的补齐同一条（见 auditRetentionValues），不在这里另立一套。
+func (a *AuditLog) SetRetention(count int, age time.Duration) {
+	retentionCount, retentionAge := auditRetentionValues(count, age)
+	a.retentionCount.Store(retentionCount)
+	a.retentionAge.Store(retentionAge)
 }
 
 // mapEntry 把 api 侧的行折成库里的一行。空字符串的可空列写成 NULL，
@@ -210,15 +231,20 @@ func (a *AuditLog) writeBatch(rows []auditRecord) error {
 
 // prune 按保留条数与保留时长淘汰旧行，与插入同一个事务。形状与事件表那条相同（S03）：
 // 条数淘汰切在 seq 上（seq 就是写入顺序），时间淘汰跳过 0 而不是写一条恒假谓词。
+//
+// 两个原子值在开头各读一次：一次淘汰里"跳过时间淘汰"的判断与算截止点必须用同一个时长，
+// 中间插进一次 SetRetention 就会让两条判断对上两套值。
 func (a *AuditLog) prune(tx *sql.Tx) error {
+	retentionCount := a.retentionCount.Load()
+	retentionAge := time.Duration(a.retentionAge.Load())
 	if _, err := tx.Exec(`DELETE FROM write_audit WHERE seq <= (SELECT COALESCE(MAX(seq)-?, 0) FROM write_audit)`,
-		a.retentionCount); err != nil {
+		retentionCount); err != nil {
 		return fmt.Errorf("sqlite: prune audit by count: %w", err)
 	}
-	if a.retentionAge <= 0 {
+	if retentionAge <= 0 {
 		return nil
 	}
-	cutoff := a.now().Add(-a.retentionAge).UnixMicro()
+	cutoff := a.now().Add(-retentionAge).UnixMicro()
 	if _, err := tx.Exec(`DELETE FROM write_audit WHERE ts_us < ?`, cutoff); err != nil {
 		return fmt.Errorf("sqlite: prune audit by age: %w", err)
 	}

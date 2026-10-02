@@ -75,6 +75,10 @@ func (m *mockStore) Close() error {
 	return nil
 }
 
+// SetHistoryRetention 是替身：淘汰行为由 store_hot_test.go 用真存储验证，
+// 这里只需要接口完整。
+func (m *mockStore) SetHistoryRetention(limit int, ttl time.Duration) {}
+
 func (m *mockStore) GetSaveCalls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -121,7 +125,9 @@ func TestNewScheduler(t *testing.T) {
 	if scheduler.store != store {
 		t.Error("Expected store to be set")
 	}
-	if scheduler.retryPolicy != retryPolicy {
+	// retryPolicy 换成 atomic.Pointer 之后不能整体比较字段本身（卡 §5.2 的有意偏离）：
+	// 比的是它装的那个接口值，身份语义与改写前一致。
+	if scheduler.retryPolicy.Load() == nil || *scheduler.retryPolicy.Load() != retryPolicy {
 		t.Error("Expected retry policy to be set")
 	}
 	if scheduler.eventBus != eventBus {
@@ -138,7 +144,7 @@ func TestNewScheduler(t *testing.T) {
 func TestNewScheduler_DefaultRetryPolicy(t *testing.T) {
 	scheduler := NewScheduler(nil, nil, nil)
 
-	if scheduler.retryPolicy == nil {
+	if scheduler.retryPolicy.Load() == nil {
 		t.Error("Expected default retry policy to be set")
 	}
 	if scheduler.eventBus == nil {
