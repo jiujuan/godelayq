@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"context"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -69,6 +70,37 @@ func newApplierFixture(t *testing.T, configNames ...string) *applierFixture {
 func (f *applierFixture) save(t *testing.T, name string) {
 	t.Helper()
 	require.NoError(t, f.store.Save(core.NewExecutorProfileRecord(namedScript(t, f.workspace, name))))
+}
+
+// newConfigApplierFixture 是 TASK-R04 的 ApplyConfig 用例用的 fixture：在 newApplierFixture
+// 之上只多预登记一个不带 exec. 前缀的普通任务键 payment_check，用来断言
+// 任何 config 路径都不碰它（"摘除只看 exec. 前缀"的既有承诺）。
+//
+// config 键的处理函数仍按启动语义预登记（executor.Register 在装配期就是这么干的），
+// 所以改一条既有条位的闭包时 Added/Removed 都空、只重登记一次。既有用例继续走
+// newApplierFixture，本构造函数只增不改，applier_test.go 的断言一字未动。
+func newConfigApplierFixture(t *testing.T, configNames ...string) *applierFixture {
+	t.Helper()
+
+	f := newApplierFixture(t, configNames...)
+	f.syncer.RegisterHandlerClass("payment_check",
+		func(context.Context, *core.Job) error { return nil }, core.JobClassDefault)
+	return f
+}
+
+// configWithCommands 造一份"冻结的非 Commands 取值 + 给定新命令列表"的合成配置：
+// 这正是 Applier.ApplyConfig 第 2 步拿去做 LoadProfiles 严格校验的那一份
+// （用例与实现共用同一个构造点，避免造出实现拿不到的配置）。
+// 每个 name 对应的脚本文件真实创建在 fixture 的 workspace 里，探测必然可用。
+func (f *applierFixture) configWithCommands(t *testing.T, names ...string) core.Config {
+	t.Helper()
+
+	exec := f.executor // 冻结的 workspace / runtime_allow / timeout 取值
+	exec.Commands = make([]core.ExecutorCommand, 0, len(names))
+	for _, name := range names {
+		exec.Commands = append(exec.Commands, namedScript(t, f.workspace, name))
+	}
+	return core.Config{Executors: exec}
 }
 
 func TestApplier_NewApplierRequiresItsDeps(t *testing.T) {

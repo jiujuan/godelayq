@@ -319,14 +319,154 @@ go test ./... -race -count=1
 
 ## 10. 实现记录（执行时补写）
 
+本节覆盖本卡的两半：前半已落地的 `Registry.ApplyConfig` 与 `executor/registry_apply_config_test.go`，
+以及后半的 `Applier.ApplyConfig`、`configCommands` 记账、`NewConfigApplier`、`main.go` 构造条件。
+
 ### 10.1 落地的接口（含 `ApplyConfig` 是否带 `commands` 参数）
+
+按符号名定位，不写行号（行号会随改动漂移）。
+
+- `executor/registry.go`：`func (r *Registry) ApplyConfig(profiles []*Profile) error`（前半落地）。
+  签名不带 `commands []core.ExecutorCommand` ——卡 §3.1 就预计大概率收不到读取方，最终确认没有读取点，
+  按 YAGNI 删掉该参数。探测在 `ApplyConfig` 内部对每条档位现调 `Probe(profile)`，口径与 `NewRegistry` 相同。
+- `executor/applier.go`：
+  - `Applier` 新增字段 `configCommands []core.ExecutorCommand`（受既有 `a.writeMu` 保护）。
+  - `func (a *Applier) executorsNow() core.ExecutorsConfig`：非 `Commands` 恒为冻结值、`Commands` 换成 `configCommands`，
+    只能在 `writeMu` 内调用。
+  - `func (a *Applier) syncHandlers(reRegister []string, live map[string]bool) (added, removed []string)`：
+    `Apply` 与 `ApplyConfig` 共享的"重登记 + 摘除"片段，差集逻辑只有一份。
+  - `func (a *Applier) ApplyConfig(candidate core.Config) (ApplyResult, error)`（后半主入口，§3.3 四步）。
+  - `func NewConfigApplier(syncer HandlerSync, registry *Registry, artifacts *ArtifactStore, logger *slog.Logger) (*Applier, error)`：
+    不接 store 的构造入口；`store` 为 nil 时 `Apply()` 返回明确错误而不是 panic。
+  - `NewApplier` 保留要求 store 非 nil，并把 `configCommands` 初始化为 `registry.executors.Commands`。
+  - `Validate` 未改代码路径，仍在 `writeMu` 之外读冻结的 `a.registry.executors`，取舍写进了方法注释。
+- `executor/applier_test.go`（只增不改）：
+  - `func newConfigApplierFixture(t, configNames ...string) *applierFixture`：在 `newApplierFixture` 之上多预登记一个
+    不带前缀的普通任务键 `payment_check`。
+  - `func (f *applierFixture) configWithCommands(t, names ...string) core.Config`：复制冻结的非 `Commands` 取值、
+    只换 `Commands` 的合成配置构造点，实现与用例共用（§3.3 第 2 步的那份合成）。
+- 测试文件：
+  - `executor/registry_apply_config_test.go`（前半，7 个用例）。
+  - `executor/applier_config_test.go`（后半，§5.2/§5.3/§5.4/§5.5 共 11 个用例，含 `NewConfigApplier` 的 nil-store 用例）。
+  - 两个新增文件合起来 18 个 `func Test`。
+- `cmd/server/main.go`：唯一一处改动——`Applier` 的构造条件从 `if cfg.Executors.WebEnabled` 改成
+  `if cfg.Executors.WebEnabled || (cfg.Reload.Enabled && cfg.Executors.Enabled)`，`web_enabled=false` 一支用
+  `NewConfigApplier`（档位文件保持关闭）。`profileStore` 的打开条件未改（仍只看 `web_enabled`）。
+- `cmd/server/profile_merge_test.go`（修复轮增补）：新增 `TestRun_ReloadWithoutWebBuildsConfigOnlyApplier`，
+  给上面那支放宽后的分支补装配证据。为拿到调度器侧的注册结果，把既有的 `runWithCapturingServer`
+  拆成"薄壳 + `runWithCapturingServerAndScheduler`"（后者多交回那份替身调度器），
+  既有两条用例的调用方式与断言一字未改。
 
 ### 10.2 与本卡写法的差异
 
+1. `ApplyConfig(profiles)` 不带 `commands`（§3.1 已预计，见上）。`Applier.ApplyConfig` 只为自己的 warn 日志探测一次，
+   登记表内部会再探一次，两处同一个 `Probe`，结论不分叉——卡 §3.3 第 3 步"调用方与登记表重复探测"是有意为之，不是遗漏。
+2. `Registry.ApplyConfig` 会随进来的那一批重算降级视图：一条 store 条目因 config 条目压制而降级时，
+   只要压制它的那条还在这批里就仍降级；那条件从这批里消失时，降级行也一起消失——它不会"复活"回生效表
+   （复活要一次 store 路径的 `Apply()` 重读文件）。这是 §5.3 case 2 的既定行为，`applier_config_test.go` 的注释里写清了，
+   不是缺陷。
+3. 共享片段 `syncHandlers` 把卡 §3.2/§4 里 `Apply` 的 `keepConfig` 变量折进了入参：`Apply` 的"config 键不摘也不重建"
+   由两个入参表达——重建集合只给 `storeKeys`、`live` 集合含全部生效键（config 天然被放过）。摘除判据两条链一致
+   （"有 `exec.` 前缀又不在生效表里"），语义与既有 `keepConfig` 等价。`Apply` 没有改成调用 `ApplyConfig`（范围不同）。
+4. `ApplyResult` 的实际字段是 `Config / Stored / Degraded / Added / Removed / Warnings`，卡 §3.3 期望的形状吻合；
+   多出的 `Warnings` 在 `ApplyConfig` 里恒为空——config 侧走 `LoadProfiles` 的严格连坐，一条非法即整次失败，
+   没有 store 侧那种"单条跳过、其余进表"的逐条告警可记。
+5. `configWithCommands` 需要创建脚本文件，因此方法签名带 `t`（卡 §5.4 示例里省略了）；这是测试辅助函数，不影响实现。
+6. `configCommands` 存的只是 `candidate.Executors.Commands` 的**最外层切片副本**：调用方之后对自己那份列表
+   做增、删、换顺序都动不到这份记账，但元素是值拷贝，每条命令里的 `FixedArgs` / `Args` / `ArgsRender` /
+   `EnvAllow` / `RetryOnExit` 这些内层切片（以及 `Env` / `Headers` 映射）仍与调用方共享同一份底层数组，
+   **原地改某一条的元素会连记账一起改**。今天唯一的 candidate 生产方（热重载链）每次都把配置文件整份重新解析、
+   交来一批全新的命令对象，不会留着旧列表去原地改，所以这里不做深拷贝；
+   `applier.go` 的注释按这条真实边界写，不再写成"存一份副本就隔离了"。
+7. `Applier.ApplyConfig` 的方法注释原先把 `env_allow` 与 `workspace` / `runtime_allow` / 两个 timeout 并列，
+   读起来像"四者都由第 2 步的 `LoadProfiles` 按冻结值把关"。核实结果：`executor/profile.go` 的校验路径
+   从不读全局 `ExecutorsConfig.EnvAllow`（它只在执行时被 `executor/env.go` 的 `BuildEnv` 读；
+   参与校验的是每条档位自己声明的 `cmd.EnvAllow`，检查点在 `buildProfile` 与 `args.go`）。
+   注释已改成实际机制：`workspace` / `runtime_allow` / 两个 timeout 由 `LoadProfiles` 按冻结值拒绝，
+   `env_allow` 不在那份校验里，而是随 `executorsNow()` 钉进每个处理函数闭包、在执行时生效——
+   所以新 YAML 里放宽的 `env_allow` 到不了已经建好的档位，安全实质不变。
+8. 同一条声明在 `executor/registry.go` 的 `ApplyConfig` 注释里**并不存在**（评审引用的那一处讲的是
+   "快照只做一次 Load"的读侧语义），因此那一处一字未改。
+
 ### 10.3 验证证据
+
+`gofmt -w` 逐个文件跑：`executor/applier.go`、`executor/applier_config_test.go`、`executor/applier_test.go`、
+`cmd/server/main.go`，修复轮再加 `cmd/server/profile_merge_test.go` 与 `cmd/server/main.go` 的格式化复查
+（`executor/registry.go` 本轮一字未改，见 §10.2 第 8 条）。repo 级 `gofmt -l` 因 CRLF 会误报，只判自己改的文件，
+上述文件 `gofmt -l` 均无输出。
+
+1. `go test ./executor -run 'TestRegistry_ApplyConfig|TestApplier' -v`：全绿。
+   既有的 `TestApplier_*`（来自 `applier_test.go`）在断言一字未改的前提下通过，新增的 `TestApplier_ApplyConfig*`
+   与 `TestApplier_NewConfigApplier*` 也全过。
+2. `go test ./cmd/server -run 'WebEnabled|Profile|Reload' -v`：14 条全过，其中
+   `TestRun_WebDisabledNeverTouchesTheProfilesPath` 与 `TestRun_ProfileDependenciesAreAbsentWhenDisabled`
+   证明"关闭时不装配 / 不碰 profiles_path"仍在，`TestRun_ReloadWithoutWebBuildsConfigOnlyApplier`
+   是修复轮新加的分支证据（web_enabled=false + reload.enabled=true + executors.enabled=true：
+   档位存储闭包一次都没被调用、服务拿到的 `profileStoreAPI` 是 `store=nil` 且 `applier≠nil`、
+   `exec.alpha` 照旧注册）。注意卡 §7 那条 `WebEnabled|Profile` 过滤器选不中这条新用例，
+   要带 `Reload`；带 `Reload` 的过滤器还会顺带跑上 R01/R06 的三条冒烟，它们也全过。
+3. `go test ./executor -race -count=5 -timeout 30m`：修复轮复跑 `ok 108.1s`（wall `1m52s`），`-race` 干净
+   （首落地那次是 `ok 105.4s` / wall `1m48s`；交付前第三次复核复跑 `ok 109.929s`，三次都是同一份终态字节）。
+4. `go build ./... && go vet ./...`：无输出（成功）。
+5. `go test ./... -race -count=1 -timeout 30m`：五个包 `ok`，修复轮复跑
+   （api 148.6s / cmd/server 6.4s / core 13.3s / executor 22.8s / store/sqlite 3.9s，wall `2m34s`；
+   首落地那次 api 99.1s / cmd/server 6.4s / core 13.5s / executor 22.4s / store/sqlite 3.9s，wall `1m44s`；
+   交付前第三次复核复跑 api 111.0s / cmd/server 6.4s / core 13.7s / executor 22.9s / store/sqlite 4.2s）。
+
+变异反向验证（7 个变异，逐个"破坏 → 跑对应用例 → 确认报红 → 从字节副本还原"）：
+
+| 编号 | 变异 | 判红的用例 | 报红信息 |
+| --- | --- | --- | --- |
+| M1 | 第 2 步用整份 candidate 校验（丢掉冻结的非 `Commands` 取值） | `TestApplier_ApplyConfig_ValidatesAgainstFrozenPermissions` | `An error is expected but got nil.` |
+| M2 | `ApplyConfig` 不重建 config 闭包（`syncHandlers` 的重登记集合传 `nil`） | `TestApplier_ApplyConfig_AddsNewProfile` | `[]string(nil) does not contain "exec.cfg_b"` |
+| M3 | 摘除丢掉 `core.ExecPrefix` 判据（普通任务键也被摘） | `TestApplier_ApplyConfig_RemovesDroppedProfileAndLeavesOrdinaryKeys` | `Should be true`（`payment_check` 不在了） |
+| M4 | 失败批次也把 `configCommands` 提前推进 | `TestApplier_ApplyConfig_IllegalEntryLeavesEverythingAlone` | `Not equal`（记账长度变了） |
+| M5 | `NewConfigApplier` 出来的 `Apply()` 走 nil 解引用而不是报错 | `TestApplier_NewConfigApplierStorePathErrorsNotPanics` | `panic: ... nil pointer dereference` |
+| M6 | `Apply` 读启动期冻结列表而不是 `configCommands` | `TestApplier_ApplyConfig_CoexistsWithStoreSide` | `Received unexpected error`（`ApplyStore` 硬撞名报错） |
+| M7 | 修复轮：把 `cmd/server/main.go` 的构造条件退回 `if cfg.Executors.WebEnabled {`（放宽的那一支 reload 分支消失） | `TestRun_ReloadWithoutWebBuildsConfigOnlyApplier` | `profile_merge_test.go:329: Expected value not to be nil.` + `Messages: reload 打开的部署要拿到一份配置侧热更依赖`（`got` 整个是 nil，跑不到后两条断言） |
+
+字节同一性：每个变异用 `open(p,'rb')`/`open(p,'wb')` 从原始字节还原；M1–M6 那六个跑完后
+`sha256sum executor/applier.go` 每次都回到当时那份基线
+`af480b70ebb452687ecea08d603d804bdc7bff6ab293920301c07199fed4a357`（§10.2 第 6 条说的外层切片副本当时已在里面，
+M1–M6 是对那份交付文件跑的）。修复轮把 `applier.go` 的两处注释（§10.2 第 6、7 条）改掉之后，
+该文件的新基线是 `0d1de289be4b251cc8f5702b3a2fd6f75f303310fbb4139bb622fd5bb1818cac`。
+**这份新基线之上又重跑过 M1**（承重的那条：第 2 步改用整份 candidate 校验）：
+`TestApplier_ApplyConfig_ValidatesAgainstFrozenPermissions` 仍在
+`executor/applier_config_test.go:179` 报红（`An error is expected but got nil.`），
+还原后 sha256 仍是 `0d1de289…18cac`、逐字节相同。M2~M6 未在新基线上重跑——
+修复轮只动了两处注释与该文件的文本，没有触及它们的判据路径。
+M7 动的是 `cmd/server/main.go`：改前 `f09ef2b74ecbe27811364ff165aabe76527849421dcca94b88a214d056655a84`，
+变异态 `a04bc3cddca9842608718efa101dc44ba28ad170be83921f5f1c35da89c20e11`，
+从字节副本还原后回到 `f09ef2b74ecb…55a84`（与改前逐字节相同，37961 字节）。
+文本 round-trip 会因 CRLF 破坏该仓文件，所以全程只用二进制 I/O。
 
 ### 10.4 手工验收
 
+本卡不改 `api`，也不起进程冒烟（触发链在 R05/R06）。改而在单包层面手工验了一次 §5.6：
+`go test ./executor -race -count=5 -timeout 30m`（见 §10.3 第 3 条），并针对 `main.go` 的构造条件放宽跑了
+`go test ./cmd/server -run 'WebEnabled|Profile|Reload' -v`（14 条全过，含修复轮新加的
+`TestRun_ReloadWithoutWebBuildsConfigOnlyApplier`）确认关闭态不装配、打开态不碰档位文件、
+reload 态只建不接 store 的同步器。
+
 ### 10.5 缺陷
 
+| # | 说明 | 处置 | 归属 |
+| --- | --- | --- | --- |
+| D-R0401 | 卡 §5.2 长条目建议"放宽 `workspace` 后新档位越出冻结 workspace"作为兜底判据，但 `LoadProfiles` 走 `PathWithinWorkspace` 严格模式，无条件拒绝绝对路径与 `..`（`resolveInside` 前两层），换 `workspace` 取值并不会改变某条相对写法的合法性。真正能随顶层取值放宽而改变合法性、从而证明"用的是冻结值"的是 `runtime_allow`。用例据此把判据落在 `runtime`（`missingProgram` 不在冻结白名单、放宽后在里面），并同时放宽 `workspace` 只为证明它压根没参与校验 | 已在用例注释写明，非代码缺陷，不修 | 本卡（文档收口留 R07） |
+| D-R0402 | D-R0103（来自 R01）：无名/重名档位在 `core.Diff` 里塌成 `#<i>`。R04 的答复是"整表替换按 `LoadProfiles` 的结论判"。核实：`LoadProfiles` 会拒绝空名（`name must not be empty`）与重名（`duplicate profile name`），所以 `ApplyConfig` 收到的档位永远是有名字且唯一的，`Registry.ApplyConfig` 自身的同批 `HandlerKey` 去重只是兜底。`#<i>` 这种形状是 `Diff` 侧的展示塌缩，不会作为 `*Profile` 进到 `ApplyConfig`，因此 `ApplyConfig` 的去重天然覆盖不到它、也无需覆盖 | 登记不修：口径正确，R06 接线时 `Diff` 的 `#<i>` 只作日志/拒绝档判据，生效判定以本卡的 `LoadProfiles` 为准 | R06 |
+| D-R0403 | `NewConfigApplier` 的 nil-store 部署里 `Apply()` 恒返回错误。这是 P2 拍板的结果（web 关闭不打开档位文件），但未来若 reload 需要顺带重放 store 侧，会撞上这条错误 | 登记不修：那种部署本就没有 store 条目；要重放需先打开 `web_enabled` | R06 |
+| D-R0404 | 设计文档 `docs/design/config-reload-design.md` §12 那张风险表（以及 §9 的同一句）把免重启新增档位的兜底写成"`ApplyConfig` 加载新批次固定用冻结的顶层 `workspace`/`runtime_allow`/`env_allow` 做 `LoadProfiles` 越界拒绝"。核实：`LoadProfiles` 只按 `workspace`/`runtime_allow`/两个 timeout 与档位自己的 `env_allow` 校验，**全局 `executors.env_allow` 从不进那次校验**（唯一读取点是执行时的 `executor/env.go` 的 `BuildEnv`），兜住它的实际机制是"冻结值随 `executorsNow()` 钉进处理函数闭包"。代码侧注释已按实际机制改写（§10.2 第 7 条） | 登记不修：R04 不改设计文档，文档同步留 R07 收口 | R07 |
+
 ### 10.6 未覆盖项
+
+- 没有触发方：`ApplyConfig` 在本卡没有调用者（R05 监听、R06 重载链才接线）。本卡只在单包层验证这条链自身正确，
+  没验"文件变了自动走到 ApplyConfig"——那是 R05/R06 的范围。
+- 进程级冒烟未做（§10.4）：`cmd/server` 这一侧覆盖的是**装配可达性**，而且是修复轮才真正补上的——
+  `TestRun_ReloadWithoutWebBuildsConfigOnlyApplier` 走的就是放宽后那一支
+  （`web_enabled=false && reload.enabled=true && enabled=true`），断言 `NewConfigApplier` 被选中、
+  档位文件的构造闭包一次都没被调用、服务拿到 `store=nil` 且 `applier≠nil`、`exec.alpha` 照旧注册。
+  仍未覆盖的是"起一个真进程、改一次配置文件、看它自动重载"——那要 R05 的监听器与 R06 的重载链接线，
+  本卡的 `ApplyConfig` 到现在也没有生产调用方（见上一条）。
+- 探测"不可用"分支在 `ApplyConfig` 里只走 warn 日志、没有断言：`selfExecutable` 恒可用，构造不出稳定的不可用档位
+  而不引入本机依赖；`Registry.ApplyConfig` 的探测口径已有 `registry_apply_config_test.go` 覆盖（同批重复、空批等）。
+- `ApplyResult.Warnings` 在 `ApplyConfig` 恒空（§10.2 第 4 条），因此没有针对它的用例——它设计上就没有可填的内容。

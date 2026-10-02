@@ -299,6 +299,38 @@ func TestRun_ProfileDependenciesAreAbsentWhenDisabled(t *testing.T) {
 	assert.Nil(t, got, "关闭状态下服务侧不该拿到任何档位写依赖")
 }
 
+// TASK-R04 把 Applier 的构造条件放宽到 `web_enabled || (reload.enabled && enabled)`。
+// 这一支是全新的装配逻辑，判三件事：
+//   - 档位文件的构造闭包一次都没被调用（web_enabled 才是它的条件，reload 不搭车）；
+//   - 服务拿到的 profileStoreAPI 里 store 是 nil 而 applier 非 nil——
+//     这正是"这种部署不打开档位文件，但 executors.commands 仍能热更"的形状；
+//   - 启动期的注册链照常把配置侧档位登记上，放宽条件没碰到别的东西。
+func TestRun_ReloadWithoutWebBuildsConfigOnlyApplier(t *testing.T) {
+	cfg, workspace := profileRunConfig(t)
+	cfg.Executors.WebEnabled = false
+	cfg.Reload.Enabled = true
+	cfg.Executors.Commands = []core.ExecutorCommand{declareStoredCommand(t, workspace, "alpha")}
+	// 只打开开关即可：DefaultConfig 给 reload.debounce 的就是默认那份合并窗口，
+	// Validate 只拒绝"写了但小于下界"的取值，这里不需要额外配。
+	require.NoError(t, cfg.Validate())
+
+	var got *profileStoreAPI
+	called := false
+	scheduler, err := runWithCapturingServerAndScheduler(t, cfg,
+		func(core.Config) (core.ExecutorProfileStore, error) {
+			called = true
+			return nil, errors.New("must not be called")
+		}, func(profiles *profileStoreAPI) { got = profiles })
+	require.NoError(t, err)
+
+	assert.False(t, called, "reload 打开不该把档位文件也一起打开")
+	assert.Contains(t, scheduler.registeredKeys(), "exec.alpha", "配置侧档位照旧注册")
+
+	require.NotNil(t, got, "reload 打开的部署要拿到一份配置侧热更依赖")
+	assert.Nil(t, got.store, "这种部署没有档位存储：写端点继续靠'两个都在场'的判定回 503")
+	require.NotNil(t, got.applier, "applier 在场才谈得上运行期换 executors.commands")
+}
+
 // runWithCapturingServer 与 runWithProfileStore 同一套替身，只是把 newServer 收到的
 // 档位依赖交给回调。
 func runWithCapturingServer(t *testing.T, cfg core.Config,
@@ -306,10 +338,22 @@ func runWithCapturingServer(t *testing.T, cfg core.Config,
 	capture func(*profileStoreAPI)) error {
 	t.Helper()
 
+	_, err := runWithCapturingServerAndScheduler(t, cfg, store, capture)
+	return err
+}
+
+// runWithCapturingServerAndScheduler 在上面那份之上多交回替身调度器：
+// 判装配放宽时既要看见服务拿到了哪两面，也要看见调度器里的注册结果。
+func runWithCapturingServerAndScheduler(t *testing.T, cfg core.Config,
+	store func(core.Config) (core.ExecutorProfileStore, error),
+	capture func(*profileStoreAPI)) (*spyScheduler, error) {
+	t.Helper()
+
+	scheduler := newSpyScheduler()
 	err := run(runtimeDeps{
 		config:                  cfg,
 		newStore:                func() (core.Store, error) { return newStubStore(), nil },
-		newScheduler:            func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return newSpyScheduler() },
+		newScheduler:            func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return scheduler },
 		newExecutorRegistry:     executor.NewRegistry,
 		newExecutorProfileStore: store,
 		newArtifactStore:        artifactStoreFromConfig,
@@ -325,5 +369,5 @@ func runWithCapturingServer(t *testing.T, cfg core.Config,
 		timeout: 20 * time.Millisecond,
 		logger:  quietLogger(),
 	})
-	return err
+	return scheduler, err
 }

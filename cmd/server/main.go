@@ -598,9 +598,24 @@ func run(deps runtimeDeps) error {
 	// 不会出现"能建档位、建完不生效"这种半套部署。
 	// 同步器在这里建而不是在服务里建：它要同时握调度器、登记表、存储与产物存储，
 	// 这四样都在装配方手里，服务只该拿到已经接好的东西。
+	//
+	// 构造条件在 web_enabled 之外再加一支 reload：热重载 executors.commands 要用同一个 Applier
+	// 的 ApplyConfig（config 侧整表替换）。但**不为 reload 打开档位文件**——profileStore 的
+	// 打开条件仍只看 web_enabled（上面那段，一字未改）。所以 web_enabled=false、reload=true 的
+	// 部署拿到的是不接 store 的 NewConfigApplier：档位文件照旧一次都不碰（W01 的关闭即惰性口径），
+	// 那条 store 路径（Apply）在这种部署里返回明确错误而不是 panic，ApplyConfig 照常可用。
+	// 写端点的 503 判定看的是 profileStore 与 applier 成对在场，而这里 store 是 nil，
+	// 服务据此仍回 503——放宽构造条件不会把写端点打开。
 	var profiles *profileStoreAPI
-	if cfg.Executors.WebEnabled {
-		applier, err := executor.NewApplier(profileStore, scheduler, executors, artifacts, deps.logger)
+	if cfg.Executors.WebEnabled || (cfg.Reload.Enabled && cfg.Executors.Enabled) {
+		var applier *executor.Applier
+		var err error
+		if cfg.Executors.WebEnabled {
+			applier, err = executor.NewApplier(profileStore, scheduler, executors, artifacts, deps.logger)
+		} else {
+			// reload 打开但 web 关闭：不接 store，只服务 config 批次热更。
+			applier, err = executor.NewConfigApplier(scheduler, executors, artifacts, deps.logger)
+		}
 		if err != nil {
 			return err
 		}

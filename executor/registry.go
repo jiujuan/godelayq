@@ -210,6 +210,92 @@ func (r *Registry) ApplyStore(items []StoreEntry) error {
 	return nil
 }
 
+// ApplyConfig 用给进来的这一批档位重建登记表的 config 部分。
+//
+// 与 ApplyStore 镜像对称（那一份只动 store 侧、保留 config 侧，本方法反之）：
+// 不在这一批里的旧 config 条目消失，store 来源的条目一律保留。同样没有增量入口，
+// 同样是"构造新的一整份、一次换掉指针"，失败时旧表一字未动。
+//
+// 入参是已经过 LoadProfiles 严格校验的那一批档位（空名、重名、越界路径在那一步就连坐拒绝，
+// 走不到这里）。本方法因此只判登记表侧的事：同批键重复与撞名方向。
+// 探测在这里逐条补做，口径与 NewRegistry 完全相同——不可用也照常入表，
+// 调用方（Applier.ApplyConfig）要记 warn 用的也是同一个 Probe，两处结论不会分叉。
+//
+// 三条规则：
+//   - 同一批里注册键重复：拒，整表不动（与 ApplyStore 的 :182-185 同一条）。
+//   - 新的 config 条目与现存 store 条目撞名：**config 赢**，那条 store 条目移入降级展示面，
+//     不留在生效表里。方向与启动合并一致（executor/merge_profiles.go 的 D4/待拍板 P1 答案），
+//     差别只在这里发生在运行期，所以原因文案说的是"配置里新加的这条把它顶掉了"，
+//     而不是启动合并那句"这条本来就在 commands 里"。
+//   - 执行器关闭（enabled=false）时返回错误，与 ApplyStore 的 :155-161 同一个理由：
+//     一个 exec.* 类型都没注册时往里合 config 条目，会造出"接口看得见、调度器跑不了"的半状态。
+//     这条同样是跨包写入口的边界，正常装配走不到（热重载链只在 enabled 为真时调本方法）。
+func (r *Registry) ApplyConfig(profiles []*Profile) error {
+	if !r.enabled {
+		return fmt.Errorf("executors are disabled, the config profiles cannot be applied")
+	}
+
+	r.writeMu.Lock()
+	defer r.writeMu.Unlock()
+
+	current := r.data.Load()
+
+	// 键校验先于任何构造：这一节之后没有返回错误的路径，
+	// 所以"被拒的那批不动表"这件事只靠这一个问题就能保证，不需要回滚。
+	batchKeys := make(map[string]bool, len(profiles))
+	for _, profile := range profiles {
+		if profile == nil {
+			return fmt.Errorf("executor registry: config entry without a profile")
+		}
+		key := profile.HandlerKey()
+		if batchKeys[key] {
+			return fmt.Errorf("executor registry: duplicate handler key %q in one config batch", key)
+		}
+		batchKeys[key] = true
+	}
+
+	// 保留非 config 来源的那一批——与 ApplyStore 保留非 store 那一批是同一条判据的两半。
+	merged := make(map[string]*entry, len(current.entries)+len(profiles))
+	for key, item := range current.entries {
+		if item.source == SourceConfig {
+			continue
+		}
+		merged[key] = item
+	}
+
+	// 降级展示面跟着这一批重算，判据是"这一批里还有没有一条 config 档位压着它"：
+	//   - 仍压着 → 原样保留（含它原本那句原因）。否则同一批重复应用时降级计数会在 1 与 0
+	//     之间来回跳，"可重入"就破了。
+	//   - 压它的那条已经不在这一批里 → 整条消失，既不回到生效表也不留在降级面。
+	//     这是设计文档 §12 那条风险的落点，也是本方法的既定行为：
+	//     复活它需要一次 store 路径的 Apply 重读档位文件，那才是 store 侧的正常语义。
+	var degraded []DegradedProfile
+	for _, item := range current.degraded {
+		if batchKeys[item.Profile.HandlerKey()] {
+			degraded = append(degraded, item)
+		}
+	}
+
+	for _, profile := range profiles {
+		key := profile.HandlerKey()
+		if existing, clash := merged[key]; clash {
+			degraded = append(degraded, DegradedProfile{
+				Profile: existing.profile,
+				Probe:   existing.probe,
+				Reason: fmt.Sprintf(
+					"executors.commands added profile %q during this reload, the stored profile with the same name is not registered",
+					profile.Name),
+			})
+		}
+		// config 赢：生效表里这一格换成交进来的这条，探测在这里现算（与 NewRegistry 同一口径）
+		merged[key] = &entry{profile: profile, probe: Probe(profile), source: SourceConfig}
+	}
+
+	// keys 与 entries 必须出自同一次构造：整表替换要保住的就是这件事。
+	r.data.Store(newSnapshot(merged, degraded))
+	return nil
+}
+
 // Enabled 返回执行器总开关，供接口区分"没开"与"开了但没有档位"。
 func (r *Registry) Enabled() bool { return r.enabled }
 
