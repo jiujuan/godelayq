@@ -1,6 +1,7 @@
 package core
 
 import (
+	"reflect"
 	"sort"
 	"strings"
 	"testing"
@@ -21,35 +22,21 @@ import (
 // 样本必须同时含一条 script 与一条 http，否则 http 那一组字段（allowed_hosts、
 // deny_private_ranges 之类）摊不出来，拒绝档的守卫等于没守。
 func TestEveryLeafKeyIsClassed(t *testing.T) {
+	// 样本用 diffScriptCommand/diffHTTPCommand 而不是内联字面量：内联那份和用例里的
+	// 差异构造是同一份数据的两个真相源，早各自漂过（只有内联这侧设了 CaptureResponse）。
 	sample := DefaultConfig()
-	deny := false
 	sample.Executors.Commands = []ExecutorCommand{
-		{
-			Name:       "cfg-script-one",
-			Kind:       "script",
-			Runtime:    "bash",
-			Script:     "scripts/one.sh",
-			Timeout:    5 * time.Minute,
-			Args:       []ExecutorArg{{Name: "day", Required: true}},
-			ArgsRender: []string{"--day={day}"},
-		},
-		{
-			Name:            "cfg-http-one",
-			Kind:            "http",
-			Method:          "POST",
-			URLTemplate:     "https://api.example.com/jobs",
-			AllowedHosts:    []string{"api.example.com"},
-			Headers:         map[string][]string{"Accept": {"application/json"}},
-			Body:            "json",
-			CaptureResponse: true,
-			DenyPrivate:     &deny,
-		},
+		diffScriptCommand("cfg-script-one"),
+		diffHTTPCommand("cfg-http-one"),
 	}
 
 	leaves := flattenLeaves(sample)
-	if len(leaves) < 60 {
-		t.Fatalf("flattenLeaves gave %d leaves, the walker is probably missing a section", len(leaves))
-	}
+
+	// 覆盖断言是类型驱动的：从 Config 的类型走一遍每个导出字段路径，要求它"自身是叶子，
+	// 或其下有叶子"。它同时抓两种漏摊——整节没被摊开，以及摊不出导出字段的结构体
+	// （time.Time 那一类，靠 flattenStruct 的容器叶子兜底才出现在 leaves 里）。
+	// 原先的 len(leaves) < 60 是个没有出处的魔法数字，漏的是"少了哪一节"而不是"少了几个"。
+	assertEveryExportedFieldCovered(t, reflect.TypeOf(sample), "", leaves)
 
 	// 正向：每个叶子都有档
 	for path := range leaves {
@@ -60,10 +47,18 @@ func TestEveryLeafKeyIsClassed(t *testing.T) {
 
 	// 反向一：表里的路径必须真能被摊出来（executors.commands 与凭据前缀是合法例外）
 	for path := range configClasses {
-		if _, ok := leaves[path]; !ok && !isCommandOrCredentialPrefix(path) {
+		if _, ok := leaves[path]; !ok && !isCommandContainerPath(path) {
 			t.Errorf("configClasses has %q but DefaultConfig does not produce it", path)
 		}
 	}
+
+	// 反向二：摊出来的每条档位路径必须能反解回自己在 leaves 里的键（配对可逆）。
+	// splitCommandLeaf 用两次 Cut 拆 name 与 field，前提是名字段不含点——由 commandEntryName
+	// 兜底保证。这条守卫就是那个前提的可执行表述：档位名含点时
+	// executors.commands.report.timeout.script 会被切成 name=report field=timeout，
+	// 反解出的 executors.commands.report.timeout 不是叶子 → 这里红。
+	// 含点样本本身的用例见 TestDiffDottedCommandNameKeepsAttribution。
+	assertCommandLeavesPair(t, leaves)
 
 	// 档位字段的两份清单必须**恰好**覆盖摊出来的每一个字段名——多一个少一个都报错：
 	//   少（清单漏字段）：ExecutorCommand 新增了字段却没进 permission/hot 任一清单 → 未归档，
@@ -85,15 +80,62 @@ func TestEveryLeafKeyIsClassed(t *testing.T) {
 			t.Errorf("hotCommandFields lists %q but no executors.commands.* leaf carries it", field)
 		}
 	}
+	// 两份清单还必须**不相交**：同一个字段名两边都写时 classify 的 switch 会静默偏向拒绝档
+	//（先判 permissionCommandFields），写热更清单的那半等于没写，谁也不会发现。
+	for field := range permissionCommandFields {
+		if hotCommandFields[field] {
+			t.Errorf("executors.commands field %q is on both permissionCommandFields and hotCommandFields; classify silently prefers the reject side", field)
+		}
+	}
 
-	// 摊平必须真的把两条档位摊成按名字的子路径，否则上面两条反向检查都在空转
+	// 摊平必须真的把两条档位摊成按名字的子路径，否则上面几条反向检查都在空转
 	require.Contains(t, leaves, "executors.commands.cfg-script-one.runtime")
 	require.Contains(t, leaves, "executors.commands.cfg-http-one.deny_private_ranges")
 	assert.NotContains(t, leaves, "executors.commands", "有条目时档位列表不作为一个容器叶子出现")
+}
 
-	// 带连字符的名字（风险表 §9 第二条）：档位名由 ValidateProfileName 限定为
-	// [A-Za-z0-9_-]{1,64}，不含点，所以按名字摊路径不会被 Cut 拆错。
-	require.NoError(t, ValidateProfileName("cfg-script-one"))
+// assertEveryExportedFieldCovered 从 structType 的类型出发，逐个导出字段路径断言
+// "自身是叶子，或其下有叶子"。递归只进结构体字段：切片与映射本身就是叶子
+// （档位列表下面按名字摊出的子路径由"其下有叶子"这一支覆盖，元素字段名则由
+// permission/hotCommandFields 的恰好覆盖断言守着，不在这里重复）。
+func assertEveryExportedFieldCovered(t *testing.T, structType reflect.Type, prefix string, leaves map[string]leafValue) {
+	t.Helper()
+	for i := 0; i < structType.NumField(); i++ {
+		field := structType.Field(i)
+		if field.PkgPath != "" {
+			continue // 非导出字段不是配置项，摊平也不会摊它
+		}
+		path := joinLeafPath(prefix, mapstructureKey(field))
+		if _, isLeaf := leaves[path]; isLeaf {
+			continue
+		}
+		if !hasLeafUnder(leaves, path) {
+			t.Errorf("exported field path %q is neither a leaf nor has any leaf under it; 摊平漏了这一节", path)
+			continue
+		}
+		if field.Type.Kind() == reflect.Struct {
+			assertEveryExportedFieldCovered(t, field.Type, path, leaves)
+		}
+	}
+}
+
+// mapstructureKey 与实现里的 leafKey 同规则，但独立写一遍：实现把标签读错时
+// 这条覆盖断言不会跟着一起瞎。
+func mapstructureKey(field reflect.StructField) string {
+	key, _, _ := strings.Cut(field.Tag.Get("mapstructure"), ",")
+	if key == "" {
+		return strings.ToLower(field.Name)
+	}
+	return key
+}
+
+func hasLeafUnder(leaves map[string]leafValue, prefix string) bool {
+	for path := range leaves {
+		if strings.HasPrefix(path, prefix+".") {
+			return true
+		}
+	}
+	return false
 }
 
 // TestClassifyUnarchivedCommandFieldIsNotSilent 证明"给 ExecutorCommand 新增字段时必须显式
@@ -107,19 +149,14 @@ func TestClassifyUnarchivedCommandFieldIsNotSilent(t *testing.T) {
 	assert.Equal(t, ClassRestart, class, "未归档时返回重启档：忽略 ok 的调用方最坏只是进 ignored_keys，不会把新字段变成免重启通道")
 }
 
-// isCommandOrCredentialPrefix 认两类合法条目：executors.commands（条目增删本身，
-// 只在列表为空时以容器路径出现）与 rejectPrefixes 里那三条前缀（凭据的子路径按元素摊开，
-// 精确路径本来就不在 configClasses 里）。放在测试文件里，不外溢。
-func isCommandOrCredentialPrefix(path string) bool {
-	if path == "executors.commands" {
-		return true
-	}
-	for _, prefix := range rejectPrefixes {
-		if path == prefix {
-			return true
-		}
-	}
-	return false
+// isCommandContainerPath 只认一类合法条目：executors.commands（条目增删本身，
+// 列表为空时以容器路径出现、有条目时摊成按名字的子路径，两种形状都不会同时在场）。
+//
+// 这里不再放行 rejectPrefixes 那三条凭据前缀：configClasses 里没有那三条精确键
+// （凭据只在前缀表里），所以原来的循环是死分支，留着会让读者以为反向守卫对凭据开了口子。
+// 放在测试文件里，不外溢。
+func isCommandContainerPath(path string) bool {
+	return path == "executors.commands"
 }
 
 // commandFieldNames 收集摊出的 executors.commands.<name>.<field> 集合里出现过的所有字段名。
@@ -163,8 +200,8 @@ func TestFlattenLeavesKinds(t *testing.T) {
 		assert.Equal(t, leafSlice, leaf.Kind, "%q 是列表", path)
 	}
 
-	// 空档位列表以容器路径出现（有条目时的形状由下面的 commandLeaves 断言）
-	require.Contains(t, leaves, "executors.commands")
+	// 空档位列表以容器路径出现。它同时是"这一节被摊出来了"的证据：同一段循环里
+	// executors.commands 已经 require 过存在且 Kind 是列表，这里不再重复 Contains 一遍。
 
 	// 映射是叶子：Headers 整份比较，不会摊成 headers.<名字>（那是 executor 侧的事，
 	// 分类只看"能不能执行什么"）
@@ -177,6 +214,46 @@ func TestFlattenLeavesKinds(t *testing.T) {
 		"*bool 也当一个叶子：nil 与指向 false 必须比出不同结论")
 	assert.NotContains(t, commandLeaves, "executors.commands.cfg-http-one.headers.Accept")
 }
+
+// TestFlattenLeavesOpaqueStructBecomesContainerLeaf 钉住 flattenStruct 的容器叶子兜底：
+// 一个摊不出任何导出字段的结构体（time.Time 的 wall/ext/loc 全未导出，不透明封装类型与
+// 空占位节同理）本身必须成为一个叶子，否则这个配置键既不进 leaves 也不进 Diff，
+// 正反向两条守卫都看不见它——改了它既不热更也不提示重启，是纯粹的静默失效。
+//
+// 现存的 Config 里还没有这种形状（实测：加了兜底之后 flattenLeaves(DefaultConfig())
+// 的叶子集合与加之前逐条相同，53 条一个不多），所以只能用探针类型直接喂 flattenStruct：
+// 它正是 flattenLeaves 的第一步。将来 Config 真出现这种字段时，摊出的容器路径会多出来，
+// 由 TestEveryLeafKeyIsClassed 的正向断言逼着人去 configClasses 归档。
+func TestFlattenLeavesOpaqueStructBecomesContainerLeaf(t *testing.T) {
+	probe := func(value r01ProbeSection) map[string]leafValue {
+		leaves := make(map[string]leafValue)
+		flattenStruct(leaves, "section", reflect.ValueOf(value))
+		return leaves
+	}
+
+	leaves := probe(r01ProbeSection{Level: "info", Stamped: r01Opaque{hidden: 1}, Blank: r01Empty{}})
+	require.Contains(t, leaves, "section.stamped", "摊不出导出字段的结构体必须整体算一个叶子")
+	require.Contains(t, leaves, "section.blank", "空占位节同理")
+	require.Contains(t, leaves, "section.level", "能摊出来的字段照旧是它自己的叶子")
+
+	// 兜底出来的叶子不是死形状：它背后的取值一改就得报出差异，否则归了档也没意义
+	before := probe(r01ProbeSection{Stamped: r01Opaque{hidden: 1}})
+	after := probe(r01ProbeSection{Stamped: r01Opaque{hidden: 2}})
+	assert.False(t, sameLeaf(before["section.stamped"], after["section.stamped"]),
+		"未导出字段变了也要报出差异：DeepEqual 比的是整个结构体")
+}
+
+// r01ProbeSection 是上面那条用例的探针类型；r01Opaque 只有一个未导出字段，
+// 像 time.Time 那样摊不出任何叶子，r01Empty 一个字段都没有，是"空占位节"的形状。
+type r01ProbeSection struct {
+	Level   string    `mapstructure:"level"`
+	Stamped r01Opaque `mapstructure:"stamped"`
+	Blank   r01Empty  `mapstructure:"blank"`
+}
+
+type r01Opaque struct{ hidden int }
+
+type r01Empty struct{}
 
 // TestFlattenLeavesNamelessCommand 钉住无名档位的兜底路径：core 不校验档位字段
 // （组合规则在 executor.LoadProfiles），摊平不能因为名字为空就产出重复或残缺的路径。
@@ -212,14 +289,15 @@ func diffScriptCommand(name string) ExecutorCommand {
 func diffHTTPCommand(name string) ExecutorCommand {
 	deny := false
 	return ExecutorCommand{
-		Name:         name,
-		Kind:         "http",
-		Method:       "POST",
-		URLTemplate:  "https://api.example.com/jobs",
-		AllowedHosts: []string{"api.example.com"},
-		Headers:      map[string][]string{"Accept": {"application/json"}},
-		Body:         "json",
-		DenyPrivate:  &deny,
+		Name:            name,
+		Kind:            "http",
+		Method:          "POST",
+		URLTemplate:     "https://api.example.com/jobs",
+		AllowedHosts:    []string{"api.example.com"},
+		Headers:         map[string][]string{"Accept": {"application/json"}},
+		Body:            "json",
+		CaptureResponse: true,
+		DenyPrivate:     &deny,
 	}
 }
 
@@ -231,20 +309,22 @@ func TestDiffClassifiesChangedKeys(t *testing.T) {
 	twoCommands := withCommands(base, diffScriptCommand("cfg-script-one"), diffHTTPCommand("cfg-http-one"))
 
 	for _, tc := range []struct {
-		name         string
-		applied      Config
-		candidate    Config
-		hot          []string
-		restart      []string
-		reject       []string
-		commands     []string
-		wantNoChange bool
+		name           string
+		applied        Config
+		candidate      Config
+		hot            []string
+		restart        []string
+		reject         []string
+		commands       []string
+		wantNoCommands bool // 这行的改动不涉及任何档位，Commands 必须是空的
+		wantNoChange   bool
 	}{
 		{
-			name:      "logging.level 是热更",
-			applied:   base,
-			candidate: withLoggingLevel(base, "debug"),
-			hot:       []string{"logging.level"},
+			name:           "logging.level 是热更",
+			applied:        base,
+			candidate:      withLoggingLevel(base, "debug"),
+			hot:            []string{"logging.level"},
+			wantNoCommands: true,
 		},
 		{
 			name:      "scheduler.workers 是热更",
@@ -345,10 +425,11 @@ func TestDiffClassifiesChangedKeys(t *testing.T) {
 			reject:    []string{"executors.commands.cfg-script-one.env"},
 		},
 		{
-			name:      "server.port 是重启档",
-			applied:   base,
-			candidate: withServerPort(base, "9090"),
-			restart:   []string{"server.port"},
+			name:           "server.port 是重启档",
+			applied:        base,
+			candidate:      withServerPort(base, "9090"),
+			restart:        []string{"server.port"},
+			wantNoCommands: true,
 		},
 		{
 			name:      "server.auth.token 是拒绝档",
@@ -422,6 +503,16 @@ func TestDiffClassifiesChangedKeys(t *testing.T) {
 			// Commands 的定义是"Hot 里属于 executors.commands 的那批"，不许多出别的键
 			for _, path := range commands {
 				assert.Contains(t, hot, path, "Commands 必须是 Hot 的子集")
+				assert.True(t, isCommandsKey(path), "Commands 里出现了非档位键 %q", path)
+			}
+			// Hot 里的档位键一条都不许漏出 Commands
+			for _, path := range hot {
+				if isCommandsKey(path) {
+					assert.Contains(t, commands, path, "热更的档位键必须同时进 Commands")
+				}
+			}
+			if tc.wantNoCommands {
+				assert.Empty(t, commands, "这行的改动不涉及任何档位，Commands 必须是空的")
 			}
 			assert.True(t, change.HasChanges())
 		})
@@ -455,19 +546,99 @@ func TestDiffHasRejections(t *testing.T) {
 
 // TestDiffListsKeysSorted 断言四份清单都按路径字典序排好：调用方把这份列表直接打进日志，
 // 无序的输出没法逐条比对。
+//
+// 这里刻意不走 changedPaths：那个 helper 内部自己 sort 过，用它断言"清单有序"是恒真断言
+// ——把实现的 sort.Strings 换成长度降序，用例照样全绿（这条的变异验证见卡 §10.3）。
+// 取路径要按清单里的原始顺序取，并且每份清单至少两条键：一条键的"有序"也是空转。
 func TestDiffListsKeysSorted(t *testing.T) {
-	applied := DefaultConfig().Normalized()
-	candidate := withLoggingLevel(withServerPort(withSchedulerWorkers(applied, 32), "9090"), "debug")
+	applied := withCommands(DefaultConfig().Normalized(),
+		diffScriptCommand("cfg-script-one"), diffHTTPCommand("cfg-http-one"))
+
+	candidate := applied
+	candidate = withLoggingLevel(candidate, "debug")              // Hot
+	candidate = withSchedulerWorkers(candidate, 32)               // Hot
+	candidate = withServerPort(candidate, "9090")                 // Restart
+	candidate = withReloadEnabled(candidate, true)                // Restart
+	candidate = withAuthToken(candidate, "rotated")               // Reject
+	candidate = withJWTSecret(candidate, strings.Repeat("k", 40)) // Reject
+	candidate = withAddedAndRetimedCommand(candidate)             // Hot + Commands
 
 	change := Diff(applied, candidate.Normalized())
-	lists := [][]ChangedKey{change.Hot, change.Restart, change.Reject, change.Commands}
-	total := 0
-	for _, list := range lists {
-		paths := changedPaths(list)
-		total += len(paths)
-		require.True(t, sort.StringsAreSorted(paths), "清单未按路径字典序排列：%v", paths)
+
+	for _, tc := range []struct {
+		label string
+		list  []ChangedKey
+	}{
+		{"Hot", change.Hot},
+		{"Restart", change.Restart},
+		{"Reject", change.Reject},
+		{"Commands", change.Commands},
+	} {
+		paths := pathsInListOrder(tc.list)
+		require.GreaterOrEqual(t, len(paths), 2, "%s 只有 %d 条键，排序断言在这份清单上是空转", tc.label, len(paths))
+		require.True(t, sort.StringsAreSorted(paths), "%s 未按路径字典序排列：%v", tc.label, paths)
 	}
-	assert.Positive(t, total, "这条用例得有内容才能证明排序断言不是空转")
+}
+
+// pathsInListOrder 按切片里的实际顺序取路径，一个都不重排。
+func pathsInListOrder(list []ChangedKey) []string {
+	paths := make([]string, 0, len(list))
+	for _, key := range list {
+		paths = append(paths, key.Path)
+	}
+	return paths
+}
+
+// TestDiffDottedCommandNameKeepsAttribution 守住 I-3：档位名里含点时路径归属不能错。
+//
+// 清洗前的形状是 executors.commands.report.timeout.script，被 splitCommandLeaf 的两次
+// Cut 切成 name=report、field=timeout，于是这条新档位的 26 个字段全按"字段 timeout
+// 在热更清单"归类，归因署成 report 的 timeout 字段——分类结论碰巧还是热更，署名是错的，
+// 而 Diff 的输出要直接进日志与 applied_keys，署错名的改动没法逐条核对。
+func TestDiffDottedCommandNameKeepsAttribution(t *testing.T) {
+	applied := withCommands(DefaultConfig().Normalized(), diffScriptCommand("report"))
+
+	// 名为 report.timeout 的新档位：与已有档位 report 同前缀，script 也不同
+	// 名为 report.timeout 的新档位，script 与已有档位不同：合法的名字 report 一条没改
+	dotted := diffScriptCommand("report.timeout")
+	dotted.Script = "scripts/other.sh"
+	candidate := withCommands(applied, diffScriptCommand("report"), dotted)
+	change := Diff(applied, candidate.Normalized())
+
+	// 新增的条目按"条目增删"归热更，不进拒绝档
+	assert.False(t, change.HasRejections(), "新增档位不该被切成已有档位 report 的字段改动")
+	hot := changedPaths(change.Hot)
+	assert.Contains(t, hot, "executors.commands.#1.script",
+		"含点的名字必须整体兜底成 #<i>，路径署在新条目自己名下")
+	for _, path := range hot {
+		assert.NotContains(t, path, "executors.commands.report.timeout",
+			"含点的档位名不许出现被切成 report 的 timeout 字段的路径：%q", path)
+	}
+	// 已有档位 report 自己一条都没改
+	for _, path := range hot {
+		assert.NotEqual(t, "executors.commands.report.script", path,
+			"report 自己没被改过，不许出现在热更清单里")
+	}
+
+	// 配对可逆：摊出的每条档位路径都能反解回自己在 leaves 里的键（守卫的另一半见
+	// TestEveryLeafKeyIsClassed，这里用同一份含点样本直接跑一遍）
+	assertCommandLeavesPair(t, flattenLeaves(candidate.Normalized()))
+}
+
+// assertCommandLeavesPair 断言摊出的每条档位路径与 splitCommandLeaf 的解析结果可逆：
+// commandsPath + "." + name + "." + field 必须仍是 leaves 的键。
+func assertCommandLeavesPair(t *testing.T, leaves map[string]leafValue) {
+	t.Helper()
+	for path := range leaves {
+		name, field, ok := splitCommandLeaf(path)
+		if !ok {
+			continue
+		}
+		paired := commandsPath + "." + name + "." + field
+		if _, found := leaves[paired]; !found {
+			t.Errorf("command leaf %q does not pair back: %q is not a leaf; 档位名里含点会把路径切错", path, paired)
+		}
+	}
 }
 
 // TestClassifyUnknownPathIsNotSilent 守住 classify 的第二种返回：既无精确命中也无前缀命中
@@ -495,10 +666,22 @@ func TestClassifyUnknownPathIsNotSilent(t *testing.T) {
 		assert.True(t, ok, tc.path)
 		assert.Equal(t, tc.class, class, tc.path)
 	}
+}
 
-	assert.Equal(t, "hot", ClassHot.String())
-	assert.Equal(t, "restart", ClassRestart.String())
-	assert.Equal(t, "reject", ClassReject.String())
+// TestConfigClassString 是档位名的可读输出：三个结论名给日志与 /admin/runtime 用，
+// 表外的整数值给"分类器与表失去同步"时的现场留一个能读的形状（ConfigClass(7) 而不是 panic）。
+func TestConfigClassString(t *testing.T) {
+	for _, tc := range []struct {
+		class ConfigClass
+		want  string
+	}{
+		{ClassHot, "hot"},
+		{ClassRestart, "restart"},
+		{ClassReject, "reject"},
+		{ConfigClass(7), "ConfigClass(7)"},
+	} {
+		assert.Equal(t, tc.want, tc.class.String())
+	}
 }
 
 // ---- 构造两份配置的辅助函数（只在测试里用） ----
@@ -650,6 +833,13 @@ func changedPaths(list []ChangedKey) []string {
 	}
 	sort.Strings(paths)
 	return paths
+}
+
+// isCommandsKey 认档位相关的两条形状：容器路径 executors.commands 本身（条目增删，
+// 列表由空变非空或反向时出现）与按名字/索引摊出的子路径 executors.commands.<name>.<field>。
+// Commands 的并集断言与子集断言共用它，避免两处各写一遍前缀规则。
+func isCommandsKey(path string) bool {
+	return path == commandsPath || strings.HasPrefix(path, commandsPath+".")
 }
 
 func assertPresent(t *testing.T, label string, list, want []string) {

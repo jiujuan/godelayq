@@ -96,10 +96,13 @@ var configClasses = map[string]ConfigClass{
 	"server.auth.jwt.access_ttl": ClassRestart, "server.auth.jwt.refresh_ttl": ClassRestart,
 }
 
-// rejectPrefixes 是凭据那一组：整棵子树拒绝，包括按元素摊开的用户条目。
+// rejectPrefixes 是凭据那一组：整棵子树拒绝。
 //
-// 用前缀而不是精确路径（风险表 §9 第四条）：将来给 UserConfig 加字段时，
-// 摊出来的新子路径也必须落在拒绝档里，不能因为表里没写就退化成"改了静默不生效"。
+// 现在是**等值匹配就命中**：只有 executors.commands 按元素摊开，server.auth.users
+// 整份账号列表摊出来是 server.auth.users 这一个叶子（见卡 §3.3 的落地口径）。
+// 带点子路径的匹配（path == prefix || HasPrefix(path, prefix+".")）是给将来
+// 真的按元素摊用户（server.auth.users.#0.password_bcrypt 那一类）留的口子：
+// 真摊开的那天，新子路径不用改表也落在拒绝档，不会退化成"改了凭据静默不生效"。
 var rejectPrefixes = []string{
 	"server.auth.token",
 	"server.auth.users",
@@ -194,8 +197,14 @@ func classify(path string) (class ConfigClass, ok bool) {
 	return ClassRestart, false
 }
 
-// leafKind 区分标量、列表与映射：比较时要能说出"空列表"和"没有这个键"不是一回事
-// ——executors.commands 从没有条目变成有一条，是一次真实的能力变化。
+// leafKind 是叶子的形状标记（标量 / 列表 / 映射），测试用它断言摊平的形状。
+//
+// 比较本身不看它：sameLeaf 只用 reflect.DeepEqual，因为同一个类型摊出的同一条路径
+// Kind 恒等，比对 Kind 是个不可达分支（曾经的写法，见卡 §10.2 第 14 条）。
+// "空列表"与"没有这个键"确实是两次不同的改动，但它们的区分不靠 Kind：
+//   - 空列表 vs nil 列表：两侧的 map 里都有这个键，reflect.DeepEqual 对 nil slice
+//     与空 slice 返回 false；
+//   - 没有这个键：一侧的 map 里根本没有这个路径，由 Diff 的遍历（两侧路径并集）发现。
 type leafKind int
 
 const (
@@ -204,10 +213,10 @@ const (
 	leafMap
 )
 
-// leafValue 是摊平出来的一个取值。
+// leafValue 是摊平出来的一个取值。Kind 只是测试可见的形状标记（见 leafKind 的说明），
+// 比较与分类都只看 Val 和路径。
 type leafValue struct {
 	Kind leafKind
-	Path string
 	Val  reflect.Value
 }
 
@@ -227,6 +236,8 @@ func (l leafValue) any() any {
 //     列表为空（含 nil）时容器路径本身作为一个叶子出现，承载"条目增删"这件事；
 //   - 其余切片、映射与标量（含 time.Duration 这类命名标量，它的 Kind 是 Int64 不是 Struct）
 //     都是叶子，值用 reflect.DeepEqual 比；
+//   - 摊不出任何导出字段的结构体（time.Time、不透明封装类型、空占位节）整体作为一个叶子
+//     出现在它的容器路径上，否则这个键会从分类表和 Diff 里彻底消失（见 flattenStruct）；
 //   - 指针（deny_private_ranges、positional）也当一个叶子：nil 与"指向 false"是两次不同的
 //     改动，DeepEqual 顺着指针比内容，所以指针背后的取值改动照样能被发现。
 //
@@ -254,7 +265,17 @@ func flattenStruct(leaves map[string]leafValue, prefix string, structValue refle
 			flattenCommands(leaves, path, value)
 		case value.Kind() == reflect.Struct:
 			// time.Duration 等命名标量的 Kind 不是 Struct，走不到这一支
+			before := len(leaves)
 			flattenStruct(leaves, path, value)
+			// 摊不出任何导出字段的结构体整体算一个叶子：time.Time 的三个字段
+			// （wall/ext/loc）全是未导出的，不透明封装类型与空占位节同理。
+			// 不做这个兜底，这一支会安静地产出 0 个叶子，于是这个配置键既不进 leaves
+			// 也不进 Diff，正反向两条守卫都看不见它——改了它既不会热更、也不会提示要重启，
+			// 正是本卡要消灭的那种静默。当成一个整体叶子之后，改它的任何可见表现都会
+			// 让 DeepEqual 报出差异，键名也会以容器路径出现在清单里、必须显式归档。
+			if len(leaves) == before {
+				addLeaf(leaves, path, value)
+			}
 		default:
 			addLeaf(leaves, path, value)
 		}
@@ -279,12 +300,17 @@ func isCommandList(value reflect.Value) bool {
 	return value.Kind() == reflect.Slice && value.Type().Elem() == reflect.TypeOf(ExecutorCommand{})
 }
 
-// commandEntryName 取档位的路径名。空名字是 executor 侧会拒掉的写法，但摊平不能因此
-// 产出重复路径，所以按索引兜底成 #<i>。
+// commandEntryName 取档位的路径名。
+//
+// 配置加载链不校验档位名（ValidateProfileName 只挂在档位存储的写入入口上），所以这里自己保证
+// 路径段里不含点：splitCommandLeaf 用两次 strings.Cut 反解 name 与 field，前提就是
+// "名字那一段不含点"。带点的名字（例如 report.timeout）会让它下面 26 个字段路径被误切成
+// name=report field=timeout，全部按"字段 timeout 在热更清单"归类、归因署错名。
+// 与空名同一个处置：兜底成 #<i> 索引，合法名字的取值原样返回、行为不变。
 func commandEntryName(item reflect.Value, index int) string {
 	name := item.FieldByName("Name")
 	if name.IsValid() && name.Kind() == reflect.String {
-		if trimmed := strings.TrimSpace(name.String()); trimmed != "" {
+		if trimmed := strings.TrimSpace(name.String()); trimmed != "" && !strings.Contains(trimmed, ".") {
 			return trimmed
 		}
 	}
@@ -294,7 +320,7 @@ func commandEntryName(item reflect.Value, index int) string {
 // addLeaf 记录一个叶子。同一路径重复出现时后者覆盖前者——档位重名属于 executor 侧
 // 启动就拒的写法，这里不值得为它再造一套规则。
 func addLeaf(leaves map[string]leafValue, path string, value reflect.Value) {
-	leaves[path] = leafValue{Kind: kindOfLeaf(value), Path: path, Val: value}
+	leaves[path] = leafValue{Kind: kindOfLeaf(value), Val: value}
 }
 
 func kindOfLeaf(value reflect.Value) leafKind {
@@ -328,8 +354,10 @@ func joinLeafPath(prefix, key string) string {
 // splitCommandLeaf 把 executors.commands.<name>.<field>[.子字段] 拆成名字与字段名。
 // ok 为 false 表示这不是档位内部的叶子（含容器路径 executors.commands 本身）。
 //
-// 档位名由 ValidateProfileName 限定为 [A-Za-z0-9_-]{1,64}，不含点，所以第一次 Cut
-// 拆出的必然是名字；字段名取剩下的首段，所以 positional.max 归到 positional 一项。
+// 两次 Cut 能反解的前提是"名字那一段不含点"。这个前提由 commandEntryName 在摊平时
+// 自己保证（含点与空名一起兜底成 #<i>），不是由 ValidateProfileName 保证的——
+// 配置加载链不调它，它只挂在档位存储的写入入口上（D-R0106）。
+// 字段名取剩下的首段，所以 positional.max 归到 positional 一项。
 func splitCommandLeaf(path string) (name, field string, ok bool) {
 	rest, found := strings.CutPrefix(path, commandsPath+".")
 	if !found {
@@ -461,13 +489,14 @@ func sortedLeafPaths(oldLeaves, newLeaves map[string]leafValue) []string {
 	return paths
 }
 
-// sameLeaf 判断一个叶子的取值是否没变：Kind 相同再比内容。
+// sameLeaf 判断一个叶子的取值是否没变。
 // 空切片与 nil 在这里算两次不同的取值——它们各自表达"没有条目"的写法不同，
 // 而 Diff 的调用方只关心"有没有差别",宁可多报一次也不能漏报。
+//
+// 这里不看 leafKind：同一条路径在两侧都来自同一个 Config 类型，Kind 必然相同，
+// 比对它是个不可达分支（M-1 的结论，卡 §10.2 第 14 条）。只有一侧有这个键时
+// 另一侧是零值 leafValue，由下面的有效性判断兜住。
 func sameLeaf(oldLeaf, newLeaf leafValue) bool {
-	if oldLeaf.Kind != newLeaf.Kind {
-		return false
-	}
 	if !oldLeaf.Val.IsValid() || !newLeaf.Val.IsValid() {
 		return oldLeaf.Val.IsValid() == newLeaf.Val.IsValid()
 	}

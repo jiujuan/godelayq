@@ -492,7 +492,7 @@ go test ./... -race -count=1
 | 风险 | 说明 | 处置 |
 | --- | --- | --- |
 | 摊平漏掉某类字段 | 未摊出来的键等于没有分类，将来永远不会被重载 | §5.1 的反向查表 + `TestEveryLeafKeyIsClassed` 用带 http 档位的样本 |
-| 档位字段名当普通路径处理 | `executors.commands.foo.runtime` 里 `foo` 含点会打乱 `strings.Cut` 的判定 | 档位名由 `core.ValidateProfileName` 限定为 `[A-Za-z0-9_-]{1,64}`（`core/executor_profile_store.go`），不含点；用例里加一条含连字符的名字 |
+| 档位字段名当普通路径处理 | `executors.commands.foo.runtime` 里 `foo` 含点会打乱 `strings.Cut` 的判定 | **落地时发现的前提是错的**（D-R0106）：`core.ValidateProfileName`（`core/executor_profile_store.go:240`）确实限定 `[A-Za-z0-9_-]{1,64}`，但配置加载链一次都不调它——只有档位存储写入路径调（同文件 `:250`）。所以 YAML 里的档位名可以含点。改为由 `commandEntryName` 自己保证"名字段不含点"（含点与空名一起兜底成 `#<i>`），并加 `assertCommandLeavesPair` 这条配对可逆守卫 + `TestDiffDottedCommandNameKeepsAttribution`；含连字符的名字那条用例保留 |
 | `Validate` 与 `Normalized` 对 `debounce` 的口径打架 | `Normalized` 把 0 补成 500ms，`Validate` 拒的是"显式写 10ms"；顺序是 `LoadConfig` 里 Validate 在前（`core/config.go:811`），所以 0 会先被 Validate 放过再由 Normalized 补齐 | §3.1 第 4 条明确写"0 合法（表示用默认）"，用例覆盖 0 与 10ms 两种 |
 | 把凭据误归档成 `ClassRestart` | 改了凭据静默不生效，正是设计文档要消灭的行为 | 凭据走前缀表而不是精确路径，`server.auth.users[0].password_bcrypt` 一类摊出的子路径也被拒；用例覆盖 |
 | 依赖方向红线 | 借 `executor.LoadProfiles` 做投影最省事，但 `core` 不许 import `executor` | 待拍板 P2 已定：只用 `core` 侧字段清单，R04 在 executor 侧再挡一层 |
@@ -508,48 +508,53 @@ go test ./... -race -count=1
 
 ### 10.1 落地的接口
 
+只列符号名，不写行号：本卡落地后 `core/config.go` 与 `core/config_reload.go` 还会被 R02/R04 继续改，
+行号一写就过期。按符号名 grep 即可定位。
+
 `core/config.go`（§3.1 的类型与五处配套）：
 
-| 符号 | 位置 |
-| --- | --- |
-| `Config.Reload ReloadConfig` | `core/config.go:36`（跟在 `Observability` 之后） |
-| `DefaultReloadDebounce = 500 * time.Millisecond` | `core/config.go:184` |
-| `minReloadDebounce = 50 * time.Millisecond` | `core/config.go:187` |
-| `type ReloadConfig struct{ Enabled bool; Debounce time.Duration }` | `core/config.go:189-197` |
-| `DefaultConfig()` 的 `Reload: ReloadConfig{Enabled: false, Debounce: DefaultReloadDebounce}` | `core/config.go:729-734` |
-| `LoadConfig` 的 `BindEnv` 列表末尾 `"reload.enabled"`、`"reload.debounce"` | `core/config.go:821-822` |
-| `Config.Validate()` 的两条 debounce 判据 | `core/config.go:916-922` |
-| `Config.Normalized()` 的 `Debounce == 0 → 默认值` | `core/config.go:1063-1065` |
+- `Config.Reload`（字段，跟在 `Observability` 之后）
+- `DefaultReloadDebounce`、`minReloadDebounce`（常量）
+- `ReloadConfig`（类型：`Enabled`、`Debounce`）
+- `DefaultConfig()`（`Reload` 初值）、`LoadConfig`（`BindEnv` 列表末尾两条）、
+  `Config.Validate()`（debounce 两条判据）、`Config.Normalized()`（`Debounce == 0 → 默认值`）
 
-`core/config_reload.go`（新增，478 行；小节顺序按 §4.3 的依赖顺序排）：
+`core/config_reload.go`（新增；小节顺序按 §4.3 的依赖顺序排）：
 
-| 符号 | 位置 |
-| --- | --- |
-| `const commandsPath = "executors.commands"` | `:20` |
-| `type ConfigClass int` + `ClassHot`/`ClassRestart`/`ClassReject` | `:23-32` |
-| `func (c ConfigClass) String() string`（hot/restart/reject，未知给 `ConfigClass(n)`） | `:35-46` |
-| `var configClasses map[string]ConfigClass`（**50 条**：热更 11、重启 39） | `:54-97` |
-| `var rejectPrefixes []string`（3 条凭据前缀） | `:103-107` |
-| `var permissionCommandFields map[string]bool`（**15 个**可执行体身份/目标/凭据字段：14 个原有 + `kind`，见 §10.2 第 13 条） | `:118-136` |
-| `var hotCommandFields map[string]bool`（**11 个**允许热更的档位字段，D-R0104 补、D-R0105 把 `kind` 移到拒绝侧） | 本次新增，位置见改动后的 `core/config_reload.go` |
-| `func classify(path string) (ConfigClass, bool)` | `:144-162` |
-| `type leafKind int` + `leafScalar`/`leafSlice`/`leafMap` | `:166-172` |
-| `type leafValue struct{ Kind; Path; Val }` + `func (leafValue) any() any` | `:175-187` |
-| `func flattenLeaves(cfg Config) map[string]leafValue` | `:202-206` |
-| 摊平内部：`flattenStruct`（`:209`）、`flattenCommands`（`:232`）、`isCommandList`（`:245`）、`commandEntryName`（`:251`）、`addLeaf`（`:263`）、`kindOfLeaf`（`:267`）、`leafKey`（`:280`）、`joinLeafPath`（`:288`） | — |
-| `func splitCommandLeaf(path) (name, field string, ok bool)` | `:300-314` |
-| `func isCommandPath(path string) bool` | `:317-319` |
-| `type ChangedKey struct{ Path string; Old, New any }` | `:323-327` |
-| `type ConfigChange struct{ Hot, Restart, Reject, Commands []ChangedKey }` | `:330-335` |
-| `func (ConfigChange) HasChanges() bool` / `HasRejections() bool` | `:338-345` |
-| `func Diff(applied, candidate Config) ConfigChange` | `:355-386` |
-| `func classifyChange(path string, oldEntries, newEntries map[string]bool) ConfigClass` | `:390-402` |
-| `func commandEntryNames` / `sortedLeafPaths` / `sameLeaf` | `:405` / `:416` / `:434` |
-| `type ReloadResult string` + `ReloadOK`/`ReloadUnchanged`/`ReloadRejected`/`ReloadFailed`/`ReloadDegraded` | `:445-458` |
-| `type ReloadState struct`（十个字段，JSON 标签照 §3.5） | `:467-478` |
+- `commandsPath`（常量 `executors.commands`）
+- `ConfigClass` + `ClassHot`/`ClassRestart`/`ClassReject`，`ConfigClass.String()`
+  （hot/restart/reject，表外整数给 `ConfigClass(n)` 而不是 panic）
+- `configClasses`（**50 条**精确路径：热更 11、重启 39）
+- `rejectPrefixes`（3 条凭据前缀；现在是等值命中就生效，按元素摊用户那天才用得上子路径匹配，
+  见该变量的注释）
+- `permissionCommandFields`（**15 个**可执行体身份/目标/凭据字段：14 个原有 + `kind`，见 §10.2 第 13 条）
+- `hotCommandFields`（**11 个**允许热更的档位字段；D-R0104 补、D-R0105 把 `kind` 移到拒绝侧）
+- `classify(path) (ConfigClass, bool)`（档位字段那支是三态：permission → 拒绝、hot → 热更、
+  两者都不是 → 返回 `false` 让守卫红）
+- `leafKind` + `leafScalar`/`leafSlice`/`leafMap`；`leafValue{ Kind, Val }` 与 `leafValue.any()`
+  （`Kind` 只是测试可见的形状标记，比较不看它，见 §10.2 第 14 条）
+- `flattenLeaves(cfg Config) map[string]leafValue`，内部 `flattenStruct`（含"摊不出导出字段
+  的结构体整体当一个叶子"的容器叶子兜底）、`flattenCommands`、`isCommandList`、
+  `commandEntryName`（空名与含点名都兜底成 `#<i>`）、`addLeaf`、`kindOfLeaf`、`leafKey`、`joinLeafPath`
+- `splitCommandLeaf(path) (name, field string, ok bool)`、`isCommandPath(path) bool`
+- `ChangedKey{ Path; Old, New any }`、`ConfigChange{ Hot, Restart, Reject, Commands }`、
+  `ConfigChange.HasChanges()` / `HasRejections()`
+- `Diff(applied, candidate Config) ConfigChange`、`classifyChange`、`commandEntryNames`、
+  `sortedLeafPaths`、`sameLeaf`
+- `ReloadResult` + `ReloadOK`/`ReloadUnchanged`/`ReloadRejected`/`ReloadFailed`/`ReloadDegraded`
+- `ReloadState`（十个字段，JSON 标签照 §3.5）
+
+`core/config_reload_test.go`（新增）里除用例外的测试专用符号：
+`diffScriptCommand`/`diffHTTPCommand`（两份档位样本的唯一来源，§10.2 第 15 条）、
+`assertEveryExportedFieldCovered` + `mapstructureKey` + `hasLeafUnder`（类型驱动的覆盖断言，
+取代原先的魔法数）、`isCommandContainerPath`、`assertCommandLeavesPair`、`pathsInListOrder`、
+`isCommandsKey`、`changedPaths`、`assertPresent`/`assertAbsent`、
+探针类型 `r01ProbeSection`/`r01Opaque`/`r01Empty`。
 
 摊平的实际规模：`flattenLeaves(DefaultConfig())` 给出 **53** 个叶子；
 §5.1 的样本（带一条 script + 一条 http）给出 **104** 个叶子（每条档位摊出 26 个字段叶子）。
+容器叶子兜底落地前后，53 这一份集合逐条相同（§10.2 第 16 条），即现存 Config 里还没有
+"摊不出导出字段"的形状，兜底是给将来防身的。
 `core/config.go` 与 `core/config_test.go` 的既有符号一个没改（`configKeys`、
 `TestExampleConfigMatchesLocal` 原样），`cmd/server`、`api`、`executor`、`store/sqlite`、
 `core/logging.go`、`core/scheduler.go`、`core/store.go` 零改动。
@@ -640,6 +645,93 @@ go test ./... -race -count=1
     §5.1 那条"两份清单恰好覆盖档位字段"的集合等式断言**没有改动也没有绕过**：`kind` 换了清单、
     两侧并集不变，它仍然双向成立。条目新增（`executors.commands.<新名字>.kind`）仍按 §3.4 的
     `classifyChange` 走"条目增删本身"那一档热更，不受本次移动影响。
+
+14. **`sameLeaf` 里的 `leafKind` 比较是不可达分支，删掉**（M-1）。原写法是
+    `if oldLeaf.Kind != newLeaf.Kind { return false }` 再 `reflect.DeepEqual`。同一条路径在
+    两侧都来自同一个 `Config` 类型，`kindOfLeaf` 只看 `value.Kind()`，所以 Kind 恒等；
+    唯一可能不同的情形是"只有一侧有这个键"，那时另一侧是 map 零值 `leafValue{}`，
+    而这种情况本来就由下面的 `!oldLeaf.Val.IsValid()` 分支兜住。留着一个永不改变的判定
+    会让读者以为"形状变了算改动"是 Diff 的一条判据。改动：判定删除，`leafKind` 与
+    `leafValue.Kind` 保留（测试用它断言摊平的形状，见 `TestFlattenLeavesKinds`），并在
+    `leafKind`、`leafValue`、`sameLeaf` 三处注释里写清"Kind 只是形状标记、比较与分类都只看
+    Val 和路径"。附带删掉 `leafValue.Path`（M-3）：它由 `addLeaf` 写入却与 map 键完全重复，
+    全仓没有读取点。
+15. **档位样本的两份真相源合成一份**（M-4）。§5.1 的守卫用例原先内联写了一对 script/http
+    样本，与 `TestDiffClassifiesChangedKeys` 用的 `diffScriptCommand` / `diffHTTPCommand`
+    是同一份数据的两份写法，而且已经漂了：只有内联那份设了 `CaptureResponse: true`，
+    于是 `hotCommandFields` 里的 `capture_response` 在差异用例里从没被真正摊出过。改动：
+    守卫用例改调两个 helper（"样本必须同时含一条 script 与一条 http"这条前提不变），
+    并把 `CaptureResponse: true` 补进 `diffHTTPCommand`，让两份合成一份；helper 的注释写明
+    它是档位样本的唯一来源。
+16. **摊平对"摊不出任何导出字段的结构体"是静默盲区，补容器叶子兜底**（I-2，登记 D-R0107）。
+    `flattenStruct` 对 `Kind() == Struct` 的字段无条件递归，而递归只看导出字段：
+    `time.Time` 的 `wall`/`ext`/`loc` 全是未导出的，不透明封装类型与空占位节同理，
+    这一支会安静地产出 **0 个叶子**。后果不是"少一条键"而是"这个配置键彻底不存在"——
+    既不进 `leaves`（正向归档守卫看不见它），也不进 `Diff`（改了它既不热更也不提示重启），
+    正是 §2 要消灭的那种静默失效。改动：`flattenStruct` 的 struct 分支记录递归前后的
+    `len(leaves)`，没增长就把这个结构体整体 `addLeaf` 到它的容器路径上；于是它会以容器路径
+    出现在清单里，由 `TestEveryLeafKeyIsClassed` 的正向断言逼着归档，而 `reflect.DeepEqual`
+    保证它背后任何取值一变就报差异。
+    **实测影响面为零**：加兜底后 `flattenLeaves(DefaultConfig())` 的叶子集合与加之前逐条相同
+    （53 个，一个不多），因为现存 `Config` 里还没有这种形状（`time.Time` 只出现在
+    `ReloadState`，不在 `Config`）。所以本卡另用探针类型直接喂 `flattenStruct`
+    （`TestFlattenLeavesOpaqueStructBecomesContainerLeaf`，探针类型 `r01ProbeSection` /
+    `r01Opaque` / `r01Empty`），并把"未导出字段变了也要报差异"作为断言。
+17. **`TestDiffListsKeysSorted` 原本是恒真断言，改成按清单原始顺序断言**（I-1）。旧写法把
+    每份清单交给 `changedPaths()` 再 `sort.StringsAreSorted`——而 `changedPaths` 内部自己就
+    sort 过，于是"实现的排序"被"另一个排序"验证：把 `sortedLeafPaths` 的 `sort.Strings`
+    换成长度降序，用例照样全绿。改动：新增 `pathsInListOrder`（按切片实际顺序取路径、
+    一个都不重排），四份清单各自断言 `sort.StringsAreSorted`；同时补
+    `require.GreaterOrEqual(len(paths), 2)`——只有一条键的"有序"同样是空转。为此把样本扩成
+    一次同时改 6 个键（`logging.level`、`scheduler.workers`、`server.port`、`reload.enabled`
+    与两条凭据）并新增一条档位，使四份清单各自 ≥2 条（`Commands` 那侧靠新档位摊出的字段）。
+    变异证据见 §10.3 的 M2。
+18. **含点的档位名会把路径切错，兜底与守卫一起补**（I-3，登记 D-R0106）。
+    `splitCommandLeaf` 用两次 `strings.Cut` 反解 name 与 field，前提是"名字那一段不含点"；
+    原注释把这个前提挂在 `ValidateProfileName`（`[A-Za-z0-9_-]{1,64}`）上，但**配置加载链不调
+    它**：这个函数在 `core/executor_profile_store.go:240`，唯一的调用点是档位存储写入路径
+    （同文件 `:250` 的 `checkProfileRecord`），`Config.Validate` 与 `LoadConfig` 一次都没碰过
+    档位名。而 `Diff` 收到的 `candidate` 正是 R06 从文件读来的那份，没经过任何名字关卡。
+    名为 `report.timeout` 的档位会摊出
+    `executors.commands.report.timeout.script`，被切成 `name=report`、`field=timeout`，
+    于是这条新档位的 26 个字段全按"字段 `timeout` 在热更清单"归类、归因署成 `report` 的
+    `timeout` 字段。分类结论碰巧还是热更，署名是错的，而 §3.4 的输出要直接进日志与
+    `applied_keys`，署错名的改动没法逐条核对。改动三处：`commandEntryName` 与空名同一个
+    处置，含点的名字一起兜底成 `#<i>`（合法名字的取值原样返回、行为不变）；
+    `splitCommandLeaf` 的注释改成"前提由 `commandEntryName` 自己保证，不是由
+    `ValidateProfileName` 保证"；测试补 `TestDiffDottedCommandNameKeepsAttribution`
+    （含点样本：不进拒绝档、路径署在 `#<i>` 名下、同名前缀的已有档位 `report` 自己不出现在
+    清单里）与 `assertCommandLeavesPair`（每条档位叶子都能反解回自己在 `leaves` 里的键，
+    配对可逆），后者同时挂进 §5.1 的守卫用例。
+19. **其余轻量项一次做完**：
+    - M-2 `rejectPrefixes` 的注释与实现口径对齐。现在只有 `executors.commands` 按元素摊开，
+      `server.auth.users` 整份列表摊出来是一个叶子，所以前缀匹配目前是等值命中即生效；
+      注释改为"带点子路径的匹配是给将来真按元素摊用户（`server.auth.users.#0.password_bcrypt`
+      那一类）留的口子"，不再宣称正在用子路径匹配。
+    - M-5 `TestEveryLeafKeyIsClassed` 里的 `len(leaves) < 60` 是没有出处的魔法数，
+      漏的是"少了哪一节"而不是"少了几个"。换成类型驱动的 `assertEveryExportedFieldCovered`：
+      从 `Config` 的反射类型走一遍每个导出字段路径，断言"自身是叶子，或其下有叶子"，
+      既抓整节漏摊也抓第 16 条那种结构体；字段名到路径的映射由测试侧独立写一遍的
+      `mapstructureKey` 承担（实现把 `leafKey` 的标签读错时这条断言不会跟着一起瞎）。
+    - M-6 `isCommandOrCredentialPrefix` 里遍历 `rejectPrefixes` 的循环是死分支
+      （`configClasses` 里没有那三条精确键），改名 `isCommandContainerPath` 并只留
+      `executors.commands` 一条判据，注释说明为什么不再放行凭据前缀。
+    - M-7 两份档位清单补"必须不相交"断言（交叠时 `classify` 的 switch 先判拒绝侧，
+      静默偏向拒绝档，写进热更清单的那半等于没写）；同时删掉 §5.1 里那条只对常量字符串
+      断言 `ValidateProfileName` 的用例行（不检验本卡任何行为，而且把"存储侧的名字口径"
+      当成"配置加载侧的前提"——正是第 18 条那个错误前提的来源）。
+    - M-8 `Commands` 与 `Hot` 的关系补成双向：`Commands ⊆ Hot` 之外，`Hot` 里带
+      `executors.commands` 前缀（含容器路径本身）的键必须一条不漏地进 `Commands`；
+      新增 `isCommandsKey` 认这两条形状，子集与并集两条断言共用它。表驱动用例加
+      `wantNoCommands` 字段，不涉档位的行显式断言 `Commands` 为空。"什么都没改"与
+      "默认值 vs 归一化默认值"两行本来就是这条的 Empty 用例，未改。
+    - M-9 `TestConfigClassString` 从 `TestClassifyUnknownPathIsNotSilent` 里拆出来独立成用例，
+      并补表外整数分支（`ConfigClass(7)` → `"ConfigClass(7)"`，证明不给 panic）。
+    - M-10 §10.1 的"位置"列去掉行号，改成按符号名定位：本卡落地后 `core/config.go` 与
+      `core/config_reload.go` 还会被 R02/R04 继续改，行号一写就过期。
+    - M-11 **不做**：`Diff` 的返回类型不加 `error`。§3.4 与 §5.3 都把"candidate 必须已
+      归一化"这条前提放在 R06 的重载链上单点保证（见 D-R0102），本卡加 `error` 只会让
+      22 个子用例各自多写一段没有判据的错误分支。
 
 ### 10.3 验证证据
 
@@ -825,6 +917,64 @@ FAIL	godelayq/core	0.180s
 全 CRLF（511/511、667/667），未引入混合行尾。`configs/config.yaml` 与 `configs/config.example.yaml`
 未触碰，因此 `TestExampleConfigMatchesLocal` 无需改动仍为 PASS。
 
+**质量复核轮（I-1/I-2/I-3 + M-1…M-10）的验证证据**
+
+改动后本卡的用例总数由 30 条（含 22 个子用例）变为 **16 个顶层用例 + 22 个子用例**，
+新增 `TestFlattenLeavesOpaqueStructBecomesContainerLeaf`、`TestDiffDottedCommandNameKeepsAttribution`、
+`TestConfigClassString` 三个顶层用例。终态实跑：
+
+```
+$ go test ./core -count=1 -v -run 'TestEveryLeafKeyIsClassed|TestDiff|TestFlatten|TestClassify|TestConfigClassString|TestLoadConfig_Reload|TestValidate_Reload|TestExampleConfigMatchesLocal'
+--- PASS: TestEveryLeafKeyIsClassed
+--- PASS: TestClassifyUnarchivedCommandFieldIsNotSilent
+--- PASS: TestFlattenLeavesKinds
+--- PASS: TestFlattenLeavesOpaqueStructBecomesContainerLeaf
+--- PASS: TestFlattenLeavesNamelessCommand
+--- PASS: TestDiffClassifiesChangedKeys          （22 个子用例全 PASS）
+--- PASS: TestDiffReportsOldAndNewValues
+--- PASS: TestDiffHasRejections
+--- PASS: TestDiffListsKeysSorted
+--- PASS: TestDiffDottedCommandNameKeepsAttribution
+--- PASS: TestClassifyUnknownPathIsNotSilent
+--- PASS: TestConfigClassString
+--- PASS: TestLoadConfig_ReloadDefaults
+--- PASS: TestLoadConfig_ReloadEnvOverrides
+--- PASS: TestValidate_Reload
+--- PASS: TestExampleConfigMatchesLocal
+ok  	godelayq/core	0.204s
+```
+
+六条变异反验证（每条都是把 `core/config_reload.go` 的实现改坏、跑对应用例、再从动笔前的
+字节副本恢复；`-race` 套件跑完之后再动，避免变异态进别的用例）：
+
+| 编号 | 变异内容 | 期望判红的用例 | 实际 |
+| --- | --- | --- | --- |
+| M1 | 去掉 `flattenStruct` 的容器叶子兜底（`if len(leaves) == before` 那三行换成 `_ = before`） | `TestFlattenLeavesOpaqueStructBecomesContainerLeaf` | 红，`map[...] does not contain "section.stamped"` |
+| M2 | `sortedLeafPaths` 的 `sort.Strings(paths)` 换成字典序倒排 | `TestDiffListsKeysSorted` | 红，`Hot 未按路径字典序排列：[...]` |
+| M3 | `commandEntryName` 去掉 `&& !strings.Contains(trimmed, ".")` | `TestDiffDottedCommandNameKeepsAttribution` | 红，26 条 `executors.commands.report.timeout.<field>` 全被署到 `report` 名下 |
+| M4a | 给 `permissionCommandFields` 加一条 `timeout`（与热更清单交叠） | `TestEveryLeafKeyIsClassed` | 红，`field "timeout" is on both permissionCommandFields and hotCommandFields` |
+| M4b | `Diff` 里 `isCommandPath(path)` 追加 `&& path != commandsPath`（容器路径不进 `Commands`） | `TestDiffClassifiesChangedKeys` | 红，两条各一次：`档位变更必须单列进 Commands`、`热更的档位键必须同时进 Commands` |
+| M5 | `flattenStruct` 里对 `path == "store"` 直接 `continue`（整节漏摊） | `TestEveryLeafKeyIsClassed` | 红，`exported field path "store" is neither a leaf nor has any leaf under it`；同一次还报出 6 条 `configClasses has "store.*" but DefaultConfig does not produce it`，即新的类型驱动断言与既有反向守卫是两张独立的网 |
+
+M2 那条同时是 §10.2 第 17 条的正面证据：旧写法（把清单交给 `changedPaths()` 再断言有序）
+在这个变异下**照样全绿**，因为它断的是另一个函数的排序。
+
+六条变异跑完后 `core/config_reload.go` 与动笔前的字节副本逐字节相同
+（脚本末尾 `source restored byte-identical: True`）。
+
+终态验收命令：
+
+1. `go build ./... && go vet ./...`：无输出（通过）。
+2. `go test ./core -race -count=5 -timeout 30m`：`ok godelayq/core 55.939s`。
+3. `go test ./... -race -count=1 -timeout 30m`：`api` 100.293s、`cmd/server` 5.642s、
+   `core` 12.329s、`executor` 22.431s、`store/sqlite` 3.783s，全 `ok`；其余 `[no test files]`。
+4. 两份 Go 文件显式 `gofmt -w`（不走 `gofmt -l`，本仓 CRLF 误报），跑完 `git diff --stat` 无额外变化，
+   行尾仍与 `HEAD` 一致（LF）。
+
+本卡改动文件：`core/config_reload.go`、`core/config_reload_test.go`、本卡与设计文档。
+`configs/config.yaml` 与 `configs/config.example.yaml` 本轮未触碰，
+`TestExampleConfigMatchesLocal` 因此仍为 PASS（不是 SKIP）。
+
 ### 10.4 手工验收
 
 §5.4 的启动失败证据（`%TEMP%` 下的 `r01-smoke-*` 目录，跑完已删）：
@@ -860,6 +1010,8 @@ exit status 1
 | **D-R0103** | 无名档位靠 `#<i>` 索引兜底，重名档位则后者覆盖前者（`addLeaf` 同路径写入）：这两种形状的"按名字配对"不成立，改了名字会让整条档位的字段全部报成改动 | **登记不修**：`core.Validate` 不校验档位字段是既有口径（组合规则在 `executor.LoadProfiles`，任一条不过即启动失败），所以 `applied` 里永远是有名字且唯一的档位；无名/重名只可能出现在"executor 侧还没拒但 R06 已经比过一次"的中间态。归 **R04**：档位整表替换时按 `LoadProfiles` 的结论判，`Diff` 的这份形状只作日志与拒绝档判据 |
 | **D-R0104** | 卡 §3.3 与设计 §6.4 承诺的"给 `ExecutorCommand` 加字段时新字段必须显式归档"守卫在首版实现里不存在：`classify` 的档位字段分支是两态（命中拒绝清单→拒绝，否则一律热更），新字段会静默落进热更档、守卫正向放行、反向只遍历已列的 14 条拒绝字段 | **本卡已修**：新增显式 `hotCommandFields` 清单（设计 §6.4 第一条十项 + `kind`/`body`，共 12 项），`classify` 改三态（两边都不在→`ok=false`），`TestEveryLeafKeyIsClassed` 加"两份清单恰好覆盖档位字段"的双向断言，另加 `TestClassifyUnarchivedCommandFieldIsNotSilent` 直接证明未归档字段会让 `classify` 回 `ok=false`。见 §10.2 第 12 条。注：其中 `kind` 的归档方向由 D-R0105 更正 |
 | **D-R0105** | D-R0104 补 `hotCommandFields` 时把 `kind` 归进了热更侧（理由是"清单/卡面没把它列进拒绝侧"），归档方向反了：`kind`（`script`/`binary`/`http`）决定走进程执行器还是 HTTP 执行主体，是"哪一个可执行体"的身份字段而不是可调参数。允许它原地热更会出现"同一条任务类型上周跑脚本、这周发 HTTP"而任务留痕看不出来，且与档位在线管理已拍板的 D7（`docs/design/web-profile-design.md:38`，落地 `immutableFieldChange` @ `api/handlers_executor_profiles.go:514`：PUT 改 `kind` 直接 400）形成两条相反的口径 | **本卡已修**：`kind` 移入 `permissionCommandFields`（拒绝侧十五项、热更侧十一项），`core/config_reload.go` 两份清单注释、卡 §3.3、设计 §6.4 同步并补上指向 D7 的理由；`TestDiffClassifiesChangedKeys` 加"改既有档位 `kind`→拒绝、同行改 `timeout`→热更"的对照行，`TestClassifyUnknownPathIsNotSilent` 加 `executors.commands.a-b.kind`→`ClassReject`；§5.1 的集合等式断言未改、未绕过，靠变异（从拒绝清单删掉 `kind`）验过它确实会红。见 §10.2 第 13 条、§10.3 的 D-R0105 复核补记 |
+| **D-R0106** | 含点的档位名（例如 YAML 里写 `name: report.timeout`）会破坏档位路径的可逆性：`splitCommandLeaf` 用两次 `strings.Cut` 反解 name 与 field，`executors.commands.report.timeout.script` 被切成 `name=report`、`field=timeout`，于是这条新档位摊出的 26 个字段全按"字段 `timeout` 在热更清单"归类、归因署成已有档位 `report` 的 `timeout` 字段。首版实现把"名字不含点"这个前提挂在 `ValidateProfileName` 上，而**配置加载链根本不调它**（该函数只挂在档位存储写入入口 `checkProfileRecord`），所以 YAML 侧的档位名没有经过名字关卡 | **本卡已修**：`commandEntryName` 与空名同一个处置，含点的名字一起兜底成 `#<i>`（合法名字行为不变）；`splitCommandLeaf` 与 `commandEntryName` 的注释改成"前提由摊平自己保证"；测试补 `TestDiffDottedCommandNameKeepsAttribution`（署名与"不进拒绝档"两条判据）与 `assertCommandLeavesPair`（每条档位叶子可反解回自己的键），后者同时挂进 §5.1 的守卫用例。见 §10.2 第 18 条、§10.3 的 M3 变异证据。残余：executor 侧那道名字关卡仍不在 core 的配置加载里跑，这是既有口径（§2 的分工），本卡只保证路径不会切错 |
+| **D-R0107** | `flattenStruct` 对"摊不出任何导出字段的结构体"是静默盲区：`time.Time` 那一类（全部字段未导出）、不透明封装类型与空占位节走 `Kind() == Struct` 那支会递归出 0 个叶子，于是这个配置键既不进 `leaves`（正向归档守卫看不见）也不进 `Diff`（改了它既不热更也不提示重启），正是本卡要消灭的静默失效 | **本卡已修**：该分支记录递归前后的 `len(leaves)`，没增长就把结构体整体作为容器叶子 `addLeaf` 到容器路径上，键名进入清单、取值由 `reflect.DeepEqual` 整体比较。现存 `Config` 里还没有这种形状（加兜底前后 `flattenLeaves(DefaultConfig())` 都是 53 个叶子且逐条相同），所以用探针类型直接喂 `flattenStruct` 验证，见 `TestFlattenLeavesOpaqueStructBecomesContainerLeaf` 与 §10.2 第 16 条、§10.3 的 M1 变异证据 |
 
 ### 10.6 未覆盖项
 
@@ -876,8 +1028,14 @@ exit status 1
 - **摊平形状没覆盖的写法**：档位字段值为 nil 指针 / nil 映射 / 空切片时，`Diff` 仍会给出这些叶子
   （本卡样本里 `positional`、`env`、`headers` 都有 nil 形状出现过），但"档位重名""档位名为空"
   两种畸形输入只单测了摊出的路径形状（`TestFlattenLeavesNamelessCommand`），
-  没测它们在 `Diff` 配对时的表现（见 D-R0103）。
-- **`ConfigClass.String()` 的未知分支**没写用例（`fmt.Sprintf("ConfigClass(%d)")` 只在传了
-  表外整数时出现，卡 §3.3 只要求三个结论名可读）。
+  没测它们在 `Diff` 配对时的表现（见 D-R0103）。含点的档位名那一种已经补了 `Diff` 侧的
+  表现（`TestDiffDottedCommandNameKeepsAttribution` + `assertCommandLeavesPair`，D-R0106），
+  重名与空名仍只测形状。
+- **容器叶子兜底只有探针证据**（D-R0107 / §10.2 第 16 条）：现存 `Config` 里还没有
+  "摊不出导出字段"的结构体字段，所以这条分支的真实触发点只能由探针类型
+  （`r01ProbeSection`/`r01Opaque`/`r01Empty`）直接喂 `flattenStruct` 来证明。
+  真实触发要等将来 `Config` 真加一个这样的字段——那时 `TestEveryLeafKeyIsClassed` 的
+  正向归档断言会先红，逼着人去 `configClasses` 补档。R07 若发现 `Config` 已经有了这种
+  形状，要回来把这条从未覆盖项划掉。
 - **`Reject` 非空时 `Hot` 仍然填好**这条只由 `TestDiffHasRejections` 覆盖了一对一的组合
   （`logging.level` + `server.auth.token`）；多热更键 + 多拒绝键的混合场景留给 R06 的重载链用例。
