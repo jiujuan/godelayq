@@ -62,9 +62,28 @@ type Scheduler struct {
 	suspended atomic.Bool
 
 	// 执行侧：有界队列 + 固定 worker 池，避免到期风暴时无限起协程
+	//
+	// concurrency 是"启动期那份快照"：Start 按它建 workCh、起 worker。运行期扩缩不写它，
+	// 因为 queueCapacity<=0 时通道容量回退到的就是这一个值（见 Start），
+	// 把它改成新的期望并发会让 RuntimeStats 的 QueueCapacity 报出通道并不具备的容量
+	// （两个读数口径见 docs/design/config-reload-design.md §7.1）。
+	// 运行期的期望并发另存在 targetWorkers。
 	concurrency   int
 	queueCapacity int // 0 表示与 concurrency 相等
 	workCh        chan *Job
+
+	// targetWorkers 是"此刻想要几个 worker"，供 RuntimeStats 的 Workers 读数与扩缩判定。
+	// 用原子而不是并进 s.mu 保护的 concurrency：它是运行期的期望并发，与 concurrency
+	// 那份启动期快照在扩缩之后会分叉（通道容量按老值建着，期望并发按新值跑着），
+	// 两个概念各自一个字段，读数才不会把彼此说成对方。
+	targetWorkers atomic.Int32
+
+	// retireRequests 是"还有几个 worker 该退场"的计数。缩容只加这个计数，
+	// 不主动通知任何协程：正在跑任务的 worker 跑完、回到循环开头时看到计数>0 就自己减一并 return。
+	// 这条形状（而不是给每个 worker 一个身份序号）是有意的：
+	// 序号方案在 Start→Stop→Start 之后要重新对齐编号（Start 会重建 stopCh 与 workCh，
+	// 老协程全退、新协程从 0 开始），而计数方案只需 Start 清零一次。
+	retireRequests atomic.Int32
 
 	// 执行器池（TASK-E13）：与上面的默认池各自排队、各自起 worker。
 	// execConcurrency 为 0 表示这个池不存在——没打开执行器的进程连通道和协程都不建，
@@ -152,6 +171,9 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 	}
 	// 原子字段不能进结构体字面量，所以建好体之后一次性 Store。
 	s.retryPolicy.Store(&retryPolicy)
+	// targetWorkers 与 concurrency 成对初始化：构造完到 Start 之前，RuntimeStats 的
+	// Workers 读的是前者，少这一行会让没显式设置过并发的调度器报出 0 而不是 DefaultConcurrency。
+	s.targetWorkers.Store(int32(s.concurrency))
 	return s
 }
 
@@ -169,6 +191,10 @@ func (s *Scheduler) SetConcurrency(n int) {
 		return
 	}
 	s.concurrency = n
+	// 与 concurrency 一起写：Workers 读数取自 targetWorkers（期望并发口径），
+	// 装配期设的值也要在 Start 之前读得出来，否则设成 4 的调度器报 0。
+	// 运行期真要改并发请走 ResizeWorkers——这里只写下取值，不起也不退任何协程。
+	s.targetWorkers.Store(int32(n))
 }
 
 // SetQueueCapacity 设置执行队列容量，需在 Start 之前调用。
@@ -1156,6 +1182,99 @@ func (s *Scheduler) RunningCount() int {
 	return int(s.inFlight.Load())
 }
 
+// ResizeWorkers 在运行期把普通池的 worker 数调整到 n（n>=1）。
+//
+// 与 SetConcurrency 的分工：SetConcurrency 只在 Start 之前有效、运行期 warn 并忽略
+// （既有口径原样保留），ResizeWorkers 专给配置重载链用、运行期生效
+// （docs/design/config-reload-design.md §6.1 把 scheduler.workers 钉在热更档）。
+// 两者都改 targetWorkers，但只有本方法会真的起协程。
+//
+// 四条语义：
+//   - 扩容：立刻为差额起 goroutine，新协程与启动期起的完全同构（同一个 worker 方法、
+//     同一个 s.wg），因此 Stop 会等它们，一个都不能少算。
+//   - 缩容：只写下目标值并记退场名额，不强杀、不取消在途任务；多出来的 worker
+//     跑完手上那条任务、回到循环开头时退场。若之后一直没有任务流动，
+//     读数（RuntimeStats.Workers）已经变小而实跑协程可能还多几个——这是温和缩容的代价，
+//     不是缺陷，使用者文档（R07）里也要写清。
+//   - 队列容量不变：通道换不得。默认池的投递方阻塞在 s.workCh <- job 上（见 dispatch），
+//     换通道会让正在阻塞的那次发送永远等不到结果——发送的对象还挂在旧通道上。
+//     worker 数与通道容量本来就是解耦的（容量只决定排队多少个，并发由协程数决定），
+//     所以扩 worker 不碰通道就能生效。
+//   - n <= 0 直接报错且不留任何痕迹，不回退到 DefaultConcurrency：重载链传进 0 说明
+//     配置写错，静默补默认会把这条错配置跑下去。这条与 SetConcurrency 的
+//     "非正数回退默认"方向相反是有意的——SetConcurrency 服务的是装配期
+//     （那里 0 的常见含义是"这一节没写"，Normalized 已经补过一遍），
+//     本方法服务的是运行期改配置（那里 0 只可能是笔误）。
+//
+// 调度器未启动时调用等价于 SetConcurrency(n)：只写下取值（含 concurrency，
+// 下一次 Start 要按它建通道与协程），不起协程，返回 nil。
+//
+// 并发安全（与 Stop 的交错）：本方法全程在 s.mu 内判定 s.running 并记账，
+// 而 Stop 在同一把锁内先置 running=false 再 close(stopCh)。于是只有两种交错：
+//   - 本方法先拿到锁：它起了新协程并计入 wg；这些协程随后就会退出（select 的两个分支是随机的，
+//     所以也可能先领到一条队列里等着的任务再退），Stop 的 wg.Wait() 仍然收敛。
+//   - Stop 先释放锁：本方法看到 running==false，一个协程都不起。
+//
+// 不会出现"wg.Add 落在 wg.Wait 已经返回之后"那种违反：计数器归零必然发生在
+// Stop 释放锁之后，而那时 running 已经是 false。wg.Add 在锁内、go 语句在锁外，
+// 是为了不让持锁期间执行任何可能阻塞的动作；两者相隔一次解锁，
+// 中间新协程即便先跑起来也只会在 select 上等通道，不影响这里的记账。
+//
+// 一个已知边界：上面两种交错的前提是"这一代的生命周期里没有第二次 Start"。
+// 若 ResizeWorkers 放锁之后、go 语句执行之前，另一条协程做完了 Stop→Start，这批新协程领到的
+// 还是上一代那条 workCh（队列是当参数传进 worker 的，卡片 §3.2 定死了签名），
+// 而它们 select 的 s.stopCh 已经是新一代那个还开着的通道——于是卡在一条没人再投递的队列上，
+// 把那一次 Stop 的 wg.Wait 拖住。本仓里 scheduler 只被启动一次（cmd/server 唯一的 Start 调用点），
+// 重载链也是单线程逐项应用，凑不出这个交错；真要支持"关停与重启并发"，得把停止信号一起传进 worker。
+// 已登记在卡片 §10.5。
+func (s *Scheduler) ResizeWorkers(n int) error {
+	if n <= 0 {
+		return fmt.Errorf("workers must be positive, got %d", n)
+	}
+
+	s.mu.Lock()
+	if !s.running {
+		// 未启动时等价于 SetConcurrency：连 concurrency 一起写，下一次 Start 才按新值建通道起协程。
+		// 代价是热更值不跨 Start→Stop→Start 保留（运行期那条分支不写 concurrency，见下面），
+		// 本仓只有一个 Start 调用点（cmd/server），今天到不了；R06 若引入进程内重启要重放一次。
+		s.concurrency = n
+		s.targetWorkers.Store(int32(n))
+		s.mu.Unlock()
+		return nil
+	}
+
+	current := int(s.targetWorkers.Load())
+	if n == current {
+		// 幂等：重载链靠 Diff 保证只在真变了时调用，但重复调用不该多起协程或多记名额。
+		s.mu.Unlock()
+		return nil
+	}
+
+	// 只改期望并发，不碰 s.concurrency：那一份是启动期快照，queueCapacity<=0 时
+	// 通道容量的回退值取的就是它，改了会让 RuntimeStats 报出通道并不具备的容量。
+	s.targetWorkers.Store(int32(n))
+	start := 0
+	queue := s.workCh
+	if n > current {
+		// Add 在锁内：见上面"并发安全"——Stop 拿不到锁就无法在 Wait 之前看到这批新协程。
+		start = n - current
+		s.wg.Add(start)
+	} else {
+		// 缩容只记名额，不碰协程：名额由跑到循环开头的 worker 自己消费。
+		// 不清既有余额也是有意的：余额始终等于"活着但超出目标的人数"，
+		// 扩容补进来的协程会被这些名额逐一退掉，两边一起收敛到新目标值。
+		s.retireRequests.Add(int32(current - n))
+	}
+	s.mu.Unlock()
+
+	// go 语句在放锁之后：worker 第一件事是读原子计数、抢 s.stopCh 与队列，
+	// 都不需要 s.mu，但也绝不该在持锁期间被启动。
+	for i := 0; i < start; i++ {
+		go s.worker(queue, false)
+	}
+	return nil
+}
+
 // Start 启动调度器。可重复调用：每次启动都会复位停止信号与执行队列。
 func (s *Scheduler) Start() {
 	s.mu.Lock()
@@ -1166,10 +1285,16 @@ func (s *Scheduler) Start() {
 	s.running = true
 	// 复位停止信号，否则 Start→Stop→Start 的新协程会立刻撞上已关闭的通道
 	s.stopCh = make(chan struct{})
+	// 退场余额与停止信号同理：跨重启不留残留名额。上一代的 worker 已经全部退出
+	// （Stop 等过 wg），留下的名额只会让这一代凭空少几个 worker。
+	s.retireRequests.Store(0)
 	// 调度总开关不跨重启：suspend 是给"这次发版/维护窗口"用的进程内意图，
 	// 进程都换了，留着它只会让人对着一个不出任务的调度器猜原因。
 	s.suspended.Store(false)
 	workers := s.concurrency
+	// 期望并发按这一次真正建出来的协程数计：未启动时 ResizeWorkers 写的是 concurrency，
+	// 这里只是把两者对齐，运行期扩缩之后 concurrency 保持启动期口径不动。
+	s.targetWorkers.Store(int32(workers))
 	queueCap := s.queueCapacity
 	if queueCap <= 0 {
 		queueCap = workers
@@ -1210,10 +1335,21 @@ func (s *Scheduler) Start() {
 //
 // exec 为 true 表示服务的是执行器池：取走一个任务就敲一次 execSlotFreed——
 // "队列里少了一个"正是调度循环在等的空位信号。
+// 运行期扩缩的退场判定只作用于默认池，执行器池那一侧一个协程都不退。
 func (s *Scheduler) worker(queue chan *Job, exec bool) {
 	defer s.wg.Done()
 
 	for {
+		// 缩容的退场点：只在默认池生效。执行器池的 worker 数与"池存不存在"绑在
+		// Start 的通道构造上（execCh 为 nil 即没有池），运行期扩缩另议，
+		// 见 docs/design/config-reload-design.md §10 的 N1。
+		// 位置在 select 之前：判到名额就退，退场的协程一条新任务都不会去领（放在执行之后，
+		// 扩容时新起、又正好撞上余额的协程就会先跑一条再走）。
+		// 跑完手上那条的 worker 回到循环开头时落的就是这里。
+		if !exec && s.shouldRetire() {
+			return
+		}
+
 		select {
 		case <-s.stopCh:
 			return
@@ -1222,6 +1358,24 @@ func (s *Scheduler) worker(queue chan *Job, exec bool) {
 				s.notifyExecSlot()
 			}
 			s.executeJob(job)
+		}
+	}
+}
+
+// shouldRetire 消费一个退场名额；返回 true 表示当前这个 worker 该退出了。
+// 余额为 0 时不做任何修改。计数只在缩容时增加、在退场与 Start 时清零，
+// 因此不会出现"名额留到下一代 worker"的问题（Start 会清）。
+//
+// CAS 循环而不是 Add(-1)：两个同时到循环开头的协程可能把余额减成负数，
+// 那条负余额会在下一次缩容时被"少退一个 worker"的方式偿还——读数与实跑就此长期错开。
+func (s *Scheduler) shouldRetire() bool {
+	for {
+		pending := s.retireRequests.Load()
+		if pending <= 0 {
+			return false
+		}
+		if s.retireRequests.CompareAndSwap(pending, pending-1) {
+			return true
 		}
 	}
 }
@@ -1778,9 +1932,12 @@ func (s *Scheduler) HeapLen() int {
 type RuntimeStats struct {
 	// Started 表示调度循环与 worker 池是否在跑（Stop 之后为 false）
 	Started bool `json:"started"`
-	// Workers 配置的普通任务执行池协程数
+	// Workers 期望的普通任务执行池协程数：运行期扩缩立刻改这个读数，
+	// 实跑协程要等任务重新流动才收敛——闲着的多余协程停在 select 上，
+	// 既不检查退场名额也不会自己退出（温和缩容，见 ResizeWorkers）。
 	Workers int `json:"workers"`
-	// QueueCapacity 普通任务执行队列容量；未显式配置时与 Workers 相等
+	// QueueCapacity 普通任务执行队列容量；未显式配置时与**启动期**的 worker 数相等。
+	// 通道是 Start 那一刻建出来的，之后扩缩都不换通道，所以这一项不跟随 Workers。
 	QueueCapacity int `json:"queue_capacity"`
 	// QueueLength 普通任务里已入队但尚未被 worker 取走的数量
 	QueueLength int `json:"queue_length"`
@@ -1819,8 +1976,10 @@ func (s *Scheduler) RuntimeStats() RuntimeStats {
 	}
 
 	return RuntimeStats{
-		Started:           s.running,
-		Workers:           s.concurrency,
+		Started: s.running,
+		// Workers 读的是期望并发（targetWorkers），不是启动期那份 concurrency 快照：
+		// 与下面 QueueCapacity 的口径分别见两个结构体字段的注释，扩缩之后两者可以不相等。
+		Workers:           int(s.targetWorkers.Load()),
 		QueueCapacity:     capacity,
 		QueueLength:       len(s.workCh),
 		Running:           int(s.inFlight.Load()),

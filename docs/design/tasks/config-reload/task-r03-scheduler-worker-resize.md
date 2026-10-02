@@ -387,12 +387,218 @@ go test ./... -race -count=1
 
 ### 10.1 落地的接口
 
+生产代码只动 `core/scheduler.go`（按符号定位；卡面 §2/§3 里的行号是 R02 之前的，已经整体后移）：
+
+| 符号 | 内容 |
+| --- | --- |
+| `Scheduler.targetWorkers atomic.Int32` | 新字段，与 `concurrency`/`queueCapacity`/`workCh` 同一段 |
+| `Scheduler.retireRequests atomic.Int32` | 新字段，紧随其后 |
+| `NewScheduler` | 建好体之后把 `targetWorkers` 初始化成 `s.concurrency`（原子字段进不了字面量） |
+| `Scheduler.SetConcurrency` | 与 `concurrency` 一起写 `targetWorkers`；"Start 之后 warn 并忽略"的口径一字未改 |
+| `Scheduler.ResizeWorkers(n int) error` | 新方法，位置在 `RunningCount` 与 `Start` 之间 |
+| `Scheduler.Start` | `retireRequests.Store(0)` 与既有 `stopCh` 复位并排；`targetWorkers.Store(workers)`；`workCh` 容量口径未动 |
+| `Scheduler.worker(queue, exec)` | 循环开头加 `if !exec && s.shouldRetire()` 退场判定，两个参数签名未动 |
+| `Scheduler.shouldRetire() bool` | 新私有方法，CAS 消费一个退场名额 |
+| `RuntimeStats.Workers` | 由 `s.concurrency` 改读 `s.targetWorkers`；`QueueCapacity` 算法原样，两个字段的注释写清口径差别 |
+
+测试新增 `core/scheduler_resize_test.go`：**12 条用例**（`TestResizeWorkers_*`；前 11 条是实现轮，
+第 12 条 `…_RetireCheckPrecedesNextPickup` 是复核轮补的，见 §10.2 第 11 条）+ 卡面指定的
+`waitActiveExactly`、`resizeJob`，另加三个本地 helper：`waitUntil`（10ms 轮询等条件）、
+`assertHoldsAt`（"必须保持不变"的观察窗口）、`assertStopNotReturnedYet`（同上的 Stop 版）。
+第十二条 `TestResizeWorkers_RetireCheckPrecedesNextPickup` 是复核轮补的，用来判退场判定的**位置**
+（见 §10.2 第 11 条与 §10.3 的 M8）。
+计数设施全部复用 `core/scheduler_exec_class_test.go` 的 `poolCounters`/`blockedHandler`/
+`waitActive`/`openGate`，本文件没写第二份闸门计数。
+
 ### 10.2 与本卡写法的差异
+
+1. **§5.5 第四条不用 `runtime.NumGoroutine()`**。卡面引用 `core/scheduler_exec_class_test.go:430`
+   作为"进程级计数差值 + ±2 抖动"的先例，这条引用是反的：那段注释（`TestExecClass_DisabledCreatesNoPool`
+   头上）说的正是"卡片允许两种写法，这里选了另一种"，因为同包其它用例会在途留下协程，
+   进程级计数在本机 `-race -count=5` 下会 ±1 抖动（实测翻红过"应当多出 3 个，实际多出 2 个"）。
+   替代判据见 `TestResizeWorkers_SameValueIsNoOp`：3 个 worker 全卡在闸门上、队列里还压着三条，
+   `ResizeWorkers(3)` 之后要求"在跑数量保持在 3"（多起一个协程就会立刻有人领走被压住的任务），
+   并以终局的并发峰值 3 收尾（不看时间、不靠采样运气），附带断 `retireRequests` 仍为 0。
+2. **§5.3 的 `waitActiveExactly` 换了摆法**。卡面示例在第一阶段四条都返回之后等"正好 1"，
+   那时在跑数量是 0，等待必然不到判据（改坏之后能红，改好之前也红）。改成让第二阶段的任务
+   也卡在另一道闸门上：活下来的 worker 领走一条后停在 1、其余五条留在队列里没人领，
+   "正好 1 且连续两轮不变"才真的等于"退场已经收敛"。峰值判据仍然落在收敛之后。
+3. **运行期分支不回写 `s.concurrency`**。卡面 §3.4 要求 `QueueCapacity` 的回退值等于通道真实容量，
+   而那个回退值取的就是 `concurrency`；扩缩写它会报出通道并不具备的容量。于是 `concurrency`
+   定死为"启动期快照"，运行期只有 `targetWorkers` 动。未启动那条分支仍按卡面回写 `concurrency`。
+   代价（热更值不跨进程内重启）登记在 §10.5 D1。
+4. **`NewScheduler` 与 `SetConcurrency` 也要写 `targetWorkers`**，卡面 §3.2 只列了 `Start` 那一处。
+   不补的话 `Workers` 改读 `targetWorkers` 之后，未启动的调度器会报 0：
+   `core/runtime_stats_test.go` 与 `api/handlers_admin_test.go` 两条既有用例都断在未启动状态，
+   而本卡不许改既有用例。
+5. **`ResizeWorkers` 扩容时在锁内把 `workCh` 取成局部变量**，锁外的 `go` 语句用这个引用。
+   卡面只要求"`wg.Add` 在锁内、`go` 在锁外"；这一步是为了不在持锁期间之外再读共享字段。
+   由此留下的交错（放锁后另一条协程做完了 `Stop→Start`）登记在 §10.5 D2。
+6. **三条卡面没有的用例**：
+   - `TestResizeWorkers_StopWaitsForResizedWorkers`：卡面 §9 风险表第一行要求"`Add` 与 `go`
+     成对"有证据，而 §5.6 的压力用例判不了少算（少算只让 `Stop` 提前返回，不会自己报错）。
+     这里用"闸门还关着时 `Stop` 不得返回"直接判记账。
+   - `TestResizeWorkers_ExecutorPoolNeverRetires`：退场判定的 `!exec` 半边在 §5 的用例里
+     怎么摆都不会红，补一条"名额全程没被执行器协程动过 + 执行器池并发一格没少"。
+   - `TestResizeWorkers_RetireCheckPrecedesNextPickup`（复核轮补的第十二条）：钉住退场判定
+     在"领下一条任务之前"而不是"执行完手上那条之后"，摆法与判据见 §10.3 的 M8。
+7. **§5.2 多加了读数对照**（`Workers`=1、`QueueCapacity`=4、`cap(workCh)`=4、`retireRequests`=3），
+   并把 `SetQueueCapacity` 故意留空，好让"回退值取启动期 `concurrency`"这条口径也被断到。
+   卡面那两条行为断言（`Workers` 即时变、`done()==4`）原样保留。
+8. **§5.4 多加了前提凑数与"通道没被换"两条**：先等到"2 条在跑 + 通道里 1 条 + 堆空"这个状态
+   （凑不齐就说明第四条没压在阻塞的发送上，用例是空的），再断 `queueBefore == scheduler.workCh`。
+9. **§5.6 压力用例里读数的 `Workers` 区间与 `QueueCapacity` 恒定**是卡面没列的额外自洽检查；
+   扩缩协程每轮之间让出 1ms（否则 50 轮会在最初几毫秒里撞完，只压到锁不压到交错），
+   读数协程同样 1ms 节流——两处都只决定重叠程度，不参与判据。
+10. **注释按实现改写过一处卡面措辞**：§3.1 说 `targetWorkers` 用原子是"执行协程在循环开头读它"，
+    实际执行协程读的是 `retireRequests`（`targetWorkers` 只有 `ResizeWorkers` 与 `RuntimeStats` 读），
+    代码注释按实际写，保留"两个概念两个字段"的理由。
+
+**复核轮（fresh-context 复核判"仍需返工"）：1 条 Important + 3 条 Minor，全部处理**
+
+11. **Important：M8 曾被记成"等价变异"，那条记录是错的**。初版的理由是"退场判定放在循环开头还是
+    放在 `executeJob` 之后，观察到的并发数与任务数一模一样"——漏掉了**余额悬着时有新协程进来**这一形状：
+    判定在开头，新协程一条任务都不领就退；判定在执行之后，它会先领走队列里那条再退。
+    据此补了第十二条用例 `TestResizeWorkers_RetireCheckPrecedesNextPickup`
+    （2 个 worker 全卡在闸门里 → 缩到 1 让余额悬着 → 再排一条任务 → 扩回 2，
+    判据是"闸门还关着时余额就归零"加终局不看时间的并发峰值 2）。
+    补进去之后 M8 判红、其余 11 条不受影响，也就是它补的是真空而不是重复覆盖（§10.3 的 M8 行）。
+    **这条用例的首版把 `defer unblock()` 注册在 `defer scheduler.Stop()` 之前**，
+    失败路径上 defer 后进先出会先跑 `Stop`，而 `Stop` 要等还卡在被关闭闸门里的 worker——
+    第一次跑 M8 时整个包撞到 5 分钟超时才失败。现在按本文件既有口径把闸门那条 defer
+    注册在 Stop 之后（收尾时先开闸门再关停），M8 变成 5.02s 定点判红。
+    这个次序错误只有真的跑一遍变异才暴露得出来，记在这里是为了留住"变异也在测用例本身"这件事。
+12. **Minor：`TestResizeWorkers_RestartClearsRetireRequests` 的注释把用例构造写成了通用性质**。
+    原写"每个 worker 退出前都至少经过一次循环开头，余额在此耗光"——实情是该用例里四个 worker
+    当时全在处理函数里、跑完手上那条才回到循环开头；闲着停在 `select` 上的 worker 走的是 `stopCh`
+    那一支，根本不经过消费点，所以"带着余额关停"在一般情形下是可能的，跨代残留真正兜住它的是
+    `Start` 里的清零（也正是第二段用例存在的理由）。注释与那条断言的消息都收回到用例内的口径。
+13. **Minor：`RuntimeStats.Workers` 的字段注释不够诚实**。原写"实跑协程要等在途任务跑完才收敛"，
+    实情是闲着的多余协程在途任务跑完之后仍不收敛，要等**下一条任务**把它叫回循环开头。
+    R06 会把这行读数原样透到 `/api/v1/admin/runtime`，运维按旧措辞会误判，
+    已改成"要等任务重新流动才收敛"并写明闲着的协程停在 `select` 上既不检查名额也不会退出。
+    （`ResizeWorkers` 自己的文档注释本来就是这个口径，无需改。）
+14. **Minor：与 `Stop` 交错的那段注释承诺略强**。原写扩容起来的新协程"会立刻看到已关闭的 `stopCh`
+    并退出"——`select` 的两个分支是随机的，它也可能先领到一条队列里正等着的任务再退。
+    收敛性不受影响（那条任务跑完就退），注释按实际改成"随后就会退出"。
 
 ### 10.3 验证证据
 
+本机 Windows / Git Bash，`-count=5` 一律配 `-timeout 30m`。
+
+```bash
+$ gofmt -w core/scheduler.go core/scheduler_resize_test.go
+$ gofmt -l core/scheduler.go core/scheduler_resize_test.go      # 无输出
+# 仓级 gofmt -l 被既有 CRLF 文件污染，本卡只判自己碰的两个文件；两个文件都是 LF 换行、无差异
+
+$ go test ./core -run 'TestResizeWorkers' -v -timeout 5m        # 12 条用例，=== RUN 行从略
+--- PASS: TestResizeWorkers_UpRaisesConcurrency (0.03s)
+--- PASS: TestResizeWorkers_DownKeepsInFlightJobs (0.02s)
+--- PASS: TestResizeWorkers_DownConvergesToTarget (0.04s)
+--- PASS: TestResizeWorkers_RetireCheckPrecedesNextPickup (0.33s)
+--- PASS: TestResizeWorkers_BlockedDispatchStillLands (0.02s)
+--- PASS: TestResizeWorkers_RejectsNonPositiveTarget (0.02s)
+--- PASS: TestResizeWorkers_BeforeStartTakesEffectAtStart (0.02s)
+--- PASS: TestResizeWorkers_SameValueIsNoOp (0.33s)
+--- PASS: TestResizeWorkers_RestartClearsRetireRequests (0.04s)
+--- PASS: TestResizeWorkers_StopWaitsForResizedWorkers (0.31s)
+--- PASS: TestResizeWorkers_ConcurrentResizeScheduleAndStats (0.08s)
+--- PASS: TestResizeWorkers_ExecutorPoolNeverRetires (0.05s)
+PASS
+ok  	godelayq/core	1.454s
+
+$ go test ./core -race -count=5 -timeout 30m
+ok  	godelayq/core	63.303s       # 五轮无 flake、无 race 报告（复核轮补第十二条之后重跑）
+
+$ go test ./core -race -count=5 -run TestResizeWorkers -timeout 30m
+ok  	godelayq/core	7.864s        # 十二条扩缩用例单独压五轮
+
+$ go build ./... && go vet ./...
+# 无输出
+
+$ go test ./... -race -count=1 -timeout 30m
+ok  	godelayq/api		100.341s
+ok  	godelayq/cmd/server	6.363s
+ok  	godelayq/core		13.208s
+ok  	godelayq/executor	22.270s
+ok  	godelayq/store/sqlite	3.844s
+                                # 五个包全 ok
+```
+
+既有用例未经修改即通过：`core/scheduler_concurrency_test.go`、`core/scheduler_exec_class_test.go`、
+`core/runtime_stats_test.go`、`api/handlers_admin_test.go` 都在上面那两轮全量跑里（core 五轮 `-race`
+与全仓一轮 `-race`），断言一字未改。
+
+变异反向验证八条（M1~M7 用脚本 `%TEMP%/r03_mutations.py`，M8 用 `%TEMP%/r03mut/m8.py`；
+变异前先取字节副本，每条改坏→跑对应用例→
+下一条，最后整体还原，全部读写用 `open(p,'rb')`/`open(p,'wb')`，不做文本模式往返）：
+
+| 编号 | 变异 | 判红的用例 | 实际报红信息 |
+| --- | --- | --- | --- |
+| M1 | `worker` 从不退场（退场判定短路成 `false &&`） | `TestResizeWorkers_DownConvergesToTarget`（5.03s 判红） | `plain active never settled at exactly 1, got 4` |
+| M2 | 退场判定漏到执行器池（去掉 `!exec` 守卫） | `TestResizeWorkers_ExecutorPoolNeverRetires`（5.03s） | `执行器协程经过循环开头也不许碰这个名额`：expected `int(1)`、actual `int32(0)`；随后 `两个池没有同时占满自己的名额（普通在跑 0 期望 0，执行器在跑 1 期望 2）` |
+| M3 | `Start` 不再清零 `retireRequests` | `TestResizeWorkers_RestartClearsRetireRequests`（5.02s） | `Start 与复位 stopCh 一起把退场余额清零`：expected `int(0)`、actual `int32(3)`；随后 `普通在跑 1 期望 4` |
+| M4 | `ResizeWorkers(0)` 静默回退 `DefaultConcurrency` | `TestResizeWorkers_RejectsNonPositiveTarget`（0.00s） | `An error is expected but got nil.` |
+| M5 | 扩容起的新 worker 不计入 `wg`（删 `s.wg.Add(start)`） | `TestResizeWorkers_StopWaitsForResizedWorkers`（包级 0.519s） | `panic: sync: negative WaitGroup counter`，栈落在 `core.(*Scheduler).worker` 的 `defer s.wg.Done()`，`created by core.(*Scheduler).ResizeWorkers` |
+| M6 | `RuntimeStats.Workers` 仍读 `s.concurrency` | `TestResizeWorkers_DownKeepsInFlightJobs`（0.02s） | `Not equal: expected: 1, actual: 4`（缩容之后的 `Workers` 读数） |
+| M7 | 未启动分支不回写 `concurrency` | `TestResizeWorkers_BeforeStartTakesEffectAtStart`（5.00s） | `下一次 Start 建通道与协程取的就是这个值`：expected `6`、actual `1`；随后 `普通在跑 1 期望 6` |
+| M8 | 退场判定从"循环开头"挪到 `executeJob` 返回之后 | `TestResizeWorkers_RetireCheckPrecedesNextPickup`（5.02s，其余 11 条全绿） | `判据在 5s 内没有成立：扩进来的那个协程在领任务之前先退场，余额归零` |
+
+跑完还原核对：实现轮那七条变异之后脚本自报 `restored byte-identical: True`，
+`sha256sum -c` 对变异前的 `core/scheduler.go`（76342 字节）与 `core/scheduler_resize_test.go`
+（27665 字节）两行都是 `OK`。复核轮的 M8 用另一条脚本（`%TEMP%/r03mut/m8.py`）单跑，
+还原后两个文件的终态是 `core/scheduler.go` 76516 字节（sha256 前缀 `22f9f34e67753be5`）、
+`core/scheduler_resize_test.go` 30886 字节（前缀 `eee60759186964a4`），
+字节数与实现轮不同只因为复核轮改了注释并补了第十二条用例。
+M1、M5 与 M8 在复核轮被重跑过（复核者一次、本卡作者一次），M2~M7 沿用实现轮的记录——
+复核轮的改动全是注释与新增用例，没有触及那六条的判据路径。
+每次还原之后都重跑过 `go build ./... && go vet ./...`（无输出）与
+`go test ./core -run 'TestResizeWorkers'`（12 条全 PASS）。
+
+**M8 曾被本卡的初版记成"等价变异"，那条记录是错的，复核轮把它推翻并补了判别用例**：
+初版的理由是"两个位置说的都是跑完手上这条再退场，观察得到的并发数一模一样"——漏掉了一种摆法：
+**扩进来的那个协程自己撞上还有余额**时，两个位置的行为并不相同。判定在循环开头，新协程一条任务都不领就退；
+判定在执行之后，新协程会先领走队列里那条再退。`…_RetireCheckPrecedesNextPickup` 造的就是这个形状
+（2 个 worker 全卡在闸门里 → 缩到 1 让余额悬着 → 再排一条任务 → 扩回 2），
+判据是"闸门还关着时余额就归零"加上终局不看时间的并发峰值 2。
+这条用例补进来之后 M8 判红，其余 11 条不受影响——也就是说它补的是真空，不是重复覆盖。
+
 ### 10.4 手工验收（本卡不起进程；接线后由 R07 场景 3 覆盖）
+
+本卡不接线，所以没有起过进程，`ResizeWorkers` 至今零调用方（全仓 `grep -rn ResizeWorkers --include=*.go`
+只剩 `core/scheduler.go` 的定义与 `core/scheduler_resize_test.go` 的用例；
+`cmd/server/config_reload_smoke_test.go` 里出现的那一句是那条用例说明"本卡没给入口"的注释，不是调用）。
+取而代之做的是三件静态核对：
+
+1. 确认 `cmd/server` 里 `scheduler.Start()` 只有一个调用点、`Stop()` 在启动失败与优雅关闭两条路径上，
+   也就是说 §10.5 D2 那条交错在今天的进程生命周期里凑不出来。
+2. 确认 `/api/v1/pools` 与 `/api/v1/admin/runtime` 读的就是 `Scheduler.RuntimeStats`（`api/handlers.go`、
+   `api/handlers_admin.go` 各一处），所以本卡改的 `Workers` 口径会直接透到那两个端点上——
+   接线之后不需要再动 api 就能看见新值。
+3. 把 R06/R07 要补的场景 3 写清楚：跑起进程 → 改 `configs/config.yaml` 的 `scheduler.workers`
+   → 不重启，先看 `/api/v1/admin/runtime` 的 `scheduler.workers` 是否立刻变成新值（期望并发口径），
+   再看投递速率（缩容时队列长度 `queue_length` 上升、扩容时回落），
+   并确认 `queue_capacity` 读数不变（通道没换）。
 
 ### 10.5 缺陷
 
+| # | 现象 | 处置 |
+| --- | --- | --- |
+| D1 | 热更出来的并发数不跨进程内重启：运行期扩缩只改 `targetWorkers`，`Start` 会把它按 `concurrency`（启动期快照）重新覆盖。`Stop→Start` 之后并发退回启动值，`/admin/runtime` 那一刻也会跳回去 | 登记不修（今天没有进程内重启；归 R06 —— 接线时在 `Start` 之后重放一次，或在 `ReloadService` 里记住 applied 值并补 `ResizeWorkers`） |
+| D2 | 若 `ResizeWorkers` 放锁之后、`go` 语句执行之前另一条协程做完了 `Stop→Start`，这批新协程领的是上一代的 `workCh`、等的是新一代的 `stopCh`，会把那次 `Stop` 的 `wg.Wait()` 拖住 | 登记不修（单一启动点触发不了；归 R06/后续 —— 修法是把停止信号与队列成对传进 `worker`，那要改卡面 §3.2 定死的签名） |
+| D3 | `ResizeWorkers` 只有下限没有上限：热更一个 `scheduler.workers: 100000` 会立刻起十万条协程 | 登记不修（本卡按卡面只做"n<=0 报错"；归 R06 在重载链上补上界校验，配置层 `Normalized` 目前也只挡负数） |
+| D4 | 温和缩容期间读数与实跑不一致（`Workers` 已是新值、实跑协程还多几个），要等任务流动才收敛 | 登记不修，按设计保留（卡面 §3.3 已把它定义为代价）；归 R07 的使用者文档，运维读数要连 `running`/`queue_length` 一起看 |
+
+未发现"改动破坏既有语义"的缺陷：`SetConcurrency`/`SetQueueCapacity` 的 warn-and-ignore 口径、
+执行器池的建池条件、`workCh` 容量算法与 `Stop` 的取消时序都没动，既有用例未改一字即通过。
+
 ### 10.6 未覆盖项
+
+- **执行器池的运行期扩缩**与"关停状态下把池建起来"（§8、设计文档 §10 的 N1）：本卡只保证
+  `!exec` 这一侧不退场，不提供任何扩缩执行器池的能力。
+- **§10.5 D1/D2 的交错**没有用例：都要在一次 `Stop` 未完成期间再跑一次 `Start`，
+  与生产装配方式冲突，硬造出来的用例只会绑住 R06 的实现细节。
+- **`retireRequests` 被减成负数**只有 CAS 实现保证，没有专门的并发用例撞它
+  （§5.6 的压力用例里缩容轮次会反复出现多个协程同时退场，属于被动经过，没断言"计数恒非负"）。
+- **api 层的读数**：`/pools`、`/admin/runtime` 的 `workers` 字段随扩缩变化没有端点级用例（本卡不改 api）。
+- **`ResizeWorkers` 的上界**（D3）既没实现也没用例，等 R06 决定校验口径后一并补。
