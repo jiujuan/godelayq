@@ -731,30 +731,108 @@ go test ./... -race -count=1
 上面那句"本卡不起进程冒烟"是卡面口径，实测另补了两层：一层是把 R01 的判据与 R02 的六个入口
 串起来的测试内冒烟，一层是真起进程的冒烟。
 
-1. **测试内冒烟：`cmd/server/config_reload_smoke_test.go`（新增文件，7 条用例全绿）**。
+1. **测试内冒烟：`cmd/server/config_reload_smoke_test.go`（新增文件，8 条用例全绿）**。
    放在 `cmd/server` 是因为只有这一层能同时 import `core`、`store/sqlite` 与 `api`
-   （`core` 不许反向依赖）。文件里自带一个 miniature 重载器 `applyCandidate`：
-   读配置 → `core.Diff` → 有拒绝项就整次作废 → 逐键调 §10.1 那张表上的入口 → 成功后才推 `applied`。
+   （`core` 不许反向依赖）。文件里自带一个 miniature 重载器：`reloadFromFile` 读配置，
+   `applyCandidate` 走 `core.Diff` → 有拒绝项就整次作废 → **先整批查表确认每条热更键都有入口**
+   → 逐键调 §10.1 那张表上的入口 → 全部成功才推 `applied`。
    **这张表在这里第一次被当成接口使用**，签名对不上就编译不过；R06 接线之后
    `applyCandidate` 应被生产重载链替换，场景清单留下。
-   七条用例与判据：
-   - `TestSmokeHotReloadAppliesAllSixEntries`：一次改全部六个热更键（级别、重试上限、留痕条数、
-     事件保留条数、台账保留条数），逐条断行为——debug 记录写出来了、`RetryPolicyMaxDelay` 变 5s、
-     留痕在下一次写入后从 4 条剪到 2 条、`job_events` 与 `write_audit` 在下一个批量周期各剪到 2 行。
-   - `TestSmokeRejectedKeyAbortsWholeReload`：混进 `server.auth.token` 时整次作废，
+   半途失败时本 harness **刻意不做回滚**（逆序回滚是 R06 的交付物），只如实报出
+   "哪一条失败、已应用的是哪几条、`applied` 没动"，免得冒烟具先立一套与 R06 不同的语义。
+   应用顺序取的是 `core.Diff` 给出的路径字典序，这一点在 `applyCandidate` 的注释里标明是
+   本 harness 的取法——设计 §4 的 I2 要求 R06 **按依赖顺序**应用，替换时不必跟着改断言。
+   八个用例与判据（前缀一律 `TestSmoke`）：
+   - `…AppliesEveryHotKey`：主冒烟。一次改动把表上**八条热更键路径全部走一遍**
+     （五个 setter 对应 1+1+2+2+2 条路径：级别、重试上限、留痕条数与时长、
+     事件保留条数与年龄、台账保留条数与年龄），逐条断行为——debug 记录写出来了、
+     `RetryPolicyMaxDelay` 变 5s、留痕在下一次写入后从 4 条剪到 2 条、
+     `job_events` 与 `write_audit` 在下一个批量周期各剪到 2 行。
+     键名两侧互检：`applied_keys` 要恰好等于那八条路径的有序列表（表里键名写错 →
+     真实路径查不到入口 → 预检报错），而 `hotEntries()` 的键名集合也要恰好等于同一份列表
+     （表上新加一条却没有用例走到 → 这条先红）。R03/R04 往表上加键时必须同时改这里，
+     不会静默漂开。两条时长都放到 24h，起点数据全是刚写的，于是"剪到 2"这条判据只反映
+     条数入口的作用。
+   - `…RejectedKeyAbortsWholeReload`：混进 `server.auth.token` 时整次作废，
      本来会生效的级别与留痕上限都没变，`applied` 也没往前推（不变量 I1+I2）。
-   - `TestSmokeRestartKeysAreReportedNotApplied`：只改重启档时一条都不应用，
+   - `…RestartKeysAreReportedNotApplied`：只改重启档时 result 仍是 `ok`、一条都不应用，
      但两条键名都出现在 `ignored_keys` 里（不变量 I3：静默就是缺陷）。
-   - `TestSmokeUnchangedConfigIsNotAReload`：同一份配置比自身 → `unchanged`，一个键都不报。
-   - `TestSmokeHotKeyWithoutEntryFailsLoud`：表里没有入口的热更键（`scheduler.workers`，属 R03）
-     返回带键名的错误，而不是"改了文件、什么都没发生"。
-   - `TestSmokeBrokenConfigKeepsRunning`：坏 YAML 被 `UnmarshalExact` 拒掉之后，
-     运行面继续按旧配置工作（info 出、debug 挡、存储照常留痕）。
-   - `TestSmokeEnvOverrideReachesTheSameEntries`：`GODELAYQ_LOGGING_LEVEL` 与
+   - `…UnchangedConfigIsNotAReload`：同一份配置比自身 → `unchanged`，一个键都不报。
+   - `…HotKeyWithoutEntryFailsLoud`：两层都判。`applyHotKey("scheduler.workers")` 直接返回
+     带键名的错误；而一次改动里混进这条没入口的热更键（R03 才交付 `ResizeWorkers`）时整次
+     `failed`、`failed_keys` 就是它、别的键一条都没应用、级别仍停在 info。
+   - `…BrokenConfigFailsWithoutTouchingTheStack`：先把级别热更到 debug，再喂一份
+     解码不了的配置（往 `logging` 一节塞一个不认识的键，`LoadConfig` 走的 `UnmarshalExact`
+     会拒），经 `reloadFromFile` 得到 `failed` 与一条可归因的失败项；运行面继续按**上一次成功的**
+     配置工作（debug 仍写得出来、留痕上限仍是 100），`applied` 没被这份配置改写。
+   - `…EntryReturningErrorKeepsAppliedBack`：入口存在但返回错误那一支（给一个 `parseLogLevel`
+     认不出的级别名，真链路会先被 `Validate` 拦住，这里刻意不调）。断三件事：这条键被报成失败、
+     循环在它这里就停了（`applied_keys` 为空，且行为侧证明后面的键确实没执行——留痕上限仍是 100，
+     写四条剪不掉）、`applied` 没有前推。**本表造不出"半应用"的状态**：八个入口里只有
+     `logging.level` 那个会返回错误，而它在字典序里排最前，失败时必然还没应用任何键；
+     半应用与逆序回滚只能由 R06 用排在后面、又会失败的入口来断（这一条原先写成注释说
+     "它之前的键已应用"，与实现相反，见下面的复核轮）。
+   - `…EnvOverrideReachesTheSameEntries`：`GODELAYQ_LOGGING_LEVEL` 与
      `GODELAYQ_SCHEDULER_MAX_RETRY_DELAY` 覆盖进来后走同一条应用路径并落到运行面。
-   四条针对冒烟具本身的变异（把入口调用作废、去掉拒绝拦截、失败也推 `applied`、
-   把重启档当热更应用）全部判红，恢复后文件与备份逐字节相同——即这七条不是"只跑一遍不判对错"。
-   `go test ./cmd/server -count=3 -race -run TestSmoke` 干净（2.991s）。
+   八条针对冒烟具本身的变异全部判红，恢复后文件与备份逐字节相同——即这八条不是"只跑一遍不判对错"：
+
+   | 编号 | 变异（都改在冒烟具自己那一段） | 判红的用例 |
+   | --- | --- | --- |
+   | S1 | 级别入口不调 `SetLogLevel`，只返回 nil | `…AppliesEveryHotKey`（debug 记录仍写不出来） |
+   | S2 | 把 `case change.HasRejections():` 换成 `case false:` | `…RejectedKeyAbortsWholeReload`（result 变 `ok`） |
+   | S3 | 被拒那一次也把 `applied` 前推 | `…RejectedKeyAbortsWholeReload`（违反 I1） |
+   | S4 | 重启档写进 `appliedKeys` 而不是 `ignoredKeys` | `…RestartKeysAreReportedNotApplied` |
+   | S5 | 预检改成"把没入口的键从本次列表里剔除，其余照旧应用" | `…HotKeyWithoutEntryFailsLoud`（result 变 `ok`） |
+   | S6 | 读配置失败返回 `unchanged` | `…BrokenConfigFailsWithoutTouchingTheStack` |
+   | S7 | 入口返回错误时不停下，继续应用后面的键 | `…EntryReturningErrorKeepsAppliedBack`（`applied_keys` 变两条） |
+   | S8 | 表上新加一条没有用例走到的键（`reload.debounce`） | `…AppliesEveryHotKey`（键名集合互检先红） |
+
+   S5 的首版是"编译失败"型变异（整段删掉预检会让 `entries` 没人用），改成表格里那个形态之后
+   才真的判行为；S7/S8 是复核轮补出来的两条，对应下面 I-1 与 M-4。
+   `go test ./cmd/server -count=3 -race -run TestSmoke -timeout 30m` 干净（3.226s）。
+
+   **冒烟具的复核轮**（同一文件二次返工，fresh-context 复核判"仍需返工"）：2 条 Important + 4 条 Minor。
+   - **I-1 注释与实现相反**：新用例的注释写"这条键被报成失败、它之前的键已应用"，而实现里
+     失败的 `logging.level` 排最前，`applied_keys` 恒为空。改法不是补一条假入口，而是
+     把注释改成如实的"本表造不出半应用态，半应用与回滚归 R06"，并**补一条行为判据**
+     （失败之后的 `store.history_limit` 确实没执行：四条留痕一条没少）+ S7 变异。
+   - **I-2 应用顺序是 harness 的取法**：两条断言的推理挂在"字典序"上，而设计 I2 要求 R06 按依赖顺序应用。
+     在 `applyCandidate` 注释里标明这一点，并把 `…HotKeyWithoutEntryFailsLoud` 里那句
+     "有入口，且字典序在前"的推理删掉——缺入口那一条走的是预检，顺序在这一步不起作用
+     （入口自己失败那一条仍然靠顺序决定"谁排在失败键之后"，见下面的 N-3）。
+   - **M-3 `reloadOutcome` 的注释过度承诺**："字段形状对齐 R06 要交出去的 `ReloadState`"不成立——
+     `core.ReloadState` 只有 applied/ignored/rejected 三条键名列表加 `error` 字符串，**没有 failed_keys**，
+     读失败那个 `<配置文件读失败>` 占位标记正是会漏进 `/admin/runtime` 的假路径。注释改成
+     "前三条列表与 result 对齐，`failedKeys` 与占位标记是本 harness 自己的形状，R06 走 `error` 字段"。
+   - **M-4 "表只写这一份"是过度声明**：主用例里的 `wantApplied` 是第二份字面清单。补上键名集合互检（见上）+ S8。
+   - **M-5 日志收集器是共享可变状态**：`store.flushLoop` 与两个观测写入器的 `onError`
+     （`core/store.go:251`、`store/sqlite/events.go:110`、`store/sqlite/audit.go:111`）都拿着同一条
+     logger，可能在与主协程 `stack.logs.String()` 交错时写它；裸 `bytes.Buffer` 在 `-race` 下就是一条竞争报告
+     （Windows 上配置文件改名失败会走这条日志）。新增 `logSink`（`sync.Mutex` + `bytes.Buffer`，
+     `Write`/`String`/`Reset` 三个方法）替换。这条**没有判据型用例**，属于加固：现有八条在正常路径下不会踩到。
+   - **M-6 措辞**：那份"坏 YAML"其实是合法 YAML 语法、被 `UnmarshalExact` 按未知键拒掉，
+     注释与用例名口径改成"解码不了的配置"。
+   复核轮确认成立、无需改动的四点：`switch` 的优先级（`HasChanges()` 已覆盖只改拒绝项的情形，
+   不会把它报成 `unchanged`）、4~6 条事件不会因总线缓冲 200 而丢、24h 时长不会顺手剪掉刚写的行
+   （`cutoff = now - age`，且淘汰只在 `writeBatch` 的事务里跑）、`t.Cleanup` 逐条注册之后的
+   LIFO 关闭顺序（audit → events → db → store，`t.TempDir` 最早注册故最后删）。
+
+   **复核轮的复核**（同一文件第三次 fresh-context 复核，六条全部判为已解决，另出 1 条 Important + 3 条 Minor）：
+   - **N-1 计数没跟着本轮走**：README 的 R02 行仍写"六条针对冒烟具本身的变异"与旧的一条计时，
+     而卡上已是八条。已改正（本卡的记录以最终字节为准）。
+   - **N-2 顺序推理只删了一半**：`candidate.Store.HistoryLimit = 2` 那行的注释仍把"不会被应用"的理由挂在
+     字典序上；而卡上 I-2 那句"有预检之后顺序根本不起作用"说过头了——预检那条确实与顺序无关，
+     入口失败这条恰恰要靠顺序决定谁是"失败键之后的那一条"。两处都改成各自口径。
+   - **N-3 `applyCandidate` 的注释过度乐观**：原写"R06 换成依赖顺序时不需要跟着改那条断言"，
+     实情是断言的**语义**（循环在失败处停下）与顺序无关，但它挑的**那一条键**是按本 harness 的取法选的，
+     R06 换顺序时要跟着换键名。注释补上这半句。
+   - **N-4 新加的行为判据证明的是什么要说清**：`seedTerminalSnapshots` + 四条留住证明的是
+     "那一步根本没跑"，不是"跑了但用了旧配置"（后者若走 `s.applied` 也能过这条），
+     那一半由主用例证明；注释里补一句划界。
+   复核轮同时核实了新判据不是空转：`trimTerminalLocked` 是在每次终态 `Update` 里同步跑的
+   （`core/store.go:150-164`、`:192-221`），运行面这一侧的上限是起点显式设的 100
+   （不是 `DefaultHistoryLimit`，后者是 1000，`core/store.go:23`），候选值 2、时长维持 0，
+   所以"循环继续跑"这一实现下四条只剩 2 条，正是判红方向。
 2. **进程冒烟**：`go build -o %TEMP%/r02smoke/server.exe ./cmd/server`，
    在 `%TEMP%/r02smoke` 里放一份最小配置（`reload.enabled: false`），存储与观测层路径全部用
    `GODELAYQ_STORE_PATH`/`GODELAYQ_STORE_GROUPS_PATH`/`GODELAYQ_OBSERVABILITY_PATH`
@@ -767,9 +845,9 @@ go test ./... -race -count=1
    停止用的是 `taskkill /F`（强杀），所以优雅关闭不在这层冒烟的观察范围内，
    那部分由 `cmd/server` 既有的 `TestRun_*` 用例覆盖。
 
-加入这个文件之后的全量复跑：`go build ./... && go vet ./...` 无输出；
-`go test ./... -race -count=1 -timeout 30m` 为 `api` 191.721s、`cmd/server` 6.369s、
-`core` 12.937s、`executor` 23.484s、`store/sqlite` 4.210s，五包全 `ok`。
+加入这个文件之后的全量复跑（终态，即两轮复核都改完之后）：`go build ./... && go vet ./...` 无输出；
+`go test ./... -race -count=1 -timeout 30m` 为 `api` 132.682s、`cmd/server` 6.359s、
+`core` 12.168s、`executor` 22.797s、`store/sqlite` 4.146s，五包全 `ok`。
 
 ### 10.5 缺陷
 
