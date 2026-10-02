@@ -472,7 +472,8 @@ go test ./... -race -count=1
     原写"每个 worker 退出前都至少经过一次循环开头，余额在此耗光"——实情是该用例里四个 worker
     当时全在处理函数里、跑完手上那条才回到循环开头；闲着停在 `select` 上的 worker 走的是 `stopCh`
     那一支，根本不经过消费点，所以"带着余额关停"在一般情形下是可能的，跨代残留真正兜住它的是
-    `Start` 里的清零（也正是第二段用例存在的理由）。注释与那条断言的消息都收回到用例内的口径。
+    `Start` 里的清零（也正是第二段用例存在的理由）。函数头的注释改成用例内的口径
+    （那条断言的消息当时漏改，下一次复核才收口，见第 16 条）。
 13. **Minor：`RuntimeStats.Workers` 的字段注释不够诚实**。原写"实跑协程要等在途任务跑完才收敛"，
     实情是闲着的多余协程在途任务跑完之后仍不收敛，要等**下一条任务**把它叫回循环开头。
     R06 会把这行读数原样透到 `/api/v1/admin/runtime`，运维按旧措辞会误判，
@@ -481,6 +482,20 @@ go test ./... -race -count=1
 14. **Minor：与 `Stop` 交错的那段注释承诺略强**。原写扩容起来的新协程"会立刻看到已关闭的 `stopCh`
     并退出"——`select` 的两个分支是随机的，它也可能先领到一条队列里正等着的任务再退。
     收敛性不受影响（那条任务跑完就退），注释按实际改成"随后就会退出"。
+
+**复核轮的复核**（第二次 fresh-context 复核：四条全部判为已解决、M8 由复核者本人重跑确认"只被第十二条判红、
+其余 11 条全绿"，另出 2 条 Minor，均已处理）：
+
+15. **Minor：`ResizeWorkers` 里两处"本仓只有一个 `Start` 调用点"的说法过宽**。
+    实情是 `examples/demo1/main.go:29` 与 `examples/demo2/main.go:41` 也各调一次 `Scheduler.Start`，
+    只是它们各是独立 main、都不接 `ResizeWorkers`。D2/D1 的结论不受影响
+    （任何单个可执行文件都凑不出"一次 Stop 未完又起一次 Start"的交错），
+    但这条口径不能写成"全仓唯一调用点"。两处注释与 §10.5 的 D2 行都收回到"生产进程 `cmd/server`
+    只 `Start` 一次"这个范围。
+16. **Minor：第 12 条要改的断言消息漏改了一处**。`TestResizeWorkers_RestartClearsRetireRequests`
+    里那句 `retireRequests` 归零的断言消息仍写成无条件的"worker 退出前都经过循环开头，余额在此耗光"，
+    与同一个函数头上刚改过的说明自相矛盾。现在消息带上了用例范围
+    （"本用例四个 worker 都在跑任务…通用情形下不成立，见函数头"）。
 
 ### 10.3 验证证据
 
@@ -508,7 +523,7 @@ PASS
 ok  	godelayq/core	1.454s
 
 $ go test ./core -race -count=5 -timeout 30m
-ok  	godelayq/core	63.303s       # 五轮无 flake、无 race 报告（复核轮补第十二条之后重跑）
+ok  	godelayq/core	61.689s       # 五轮无 flake、无 race 报告（终态字节：复核两轮都改完之后重跑）
 
 $ go test ./core -race -count=5 -run TestResizeWorkers -timeout 30m
 ok  	godelayq/core	7.864s        # 十二条扩缩用例单独压五轮
@@ -517,11 +532,11 @@ $ go build ./... && go vet ./...
 # 无输出
 
 $ go test ./... -race -count=1 -timeout 30m
-ok  	godelayq/api		100.341s
-ok  	godelayq/cmd/server	6.363s
-ok  	godelayq/core		13.208s
-ok  	godelayq/executor	22.270s
-ok  	godelayq/store/sqlite	3.844s
+ok  	godelayq/api		108.962s
+ok  	godelayq/cmd/server	6.326s
+ok  	godelayq/core		13.117s
+ok  	godelayq/executor	22.410s
+ok  	godelayq/store/sqlite	3.752s
                                 # 五个包全 ok
 ```
 
@@ -544,14 +559,19 @@ ok  	godelayq/store/sqlite	3.844s
 | M7 | 未启动分支不回写 `concurrency` | `TestResizeWorkers_BeforeStartTakesEffectAtStart`（5.00s） | `下一次 Start 建通道与协程取的就是这个值`：expected `6`、actual `1`；随后 `普通在跑 1 期望 6` |
 | M8 | 退场判定从"循环开头"挪到 `executeJob` 返回之后 | `TestResizeWorkers_RetireCheckPrecedesNextPickup`（5.02s，其余 11 条全绿） | `判据在 5s 内没有成立：扩进来的那个协程在领任务之前先退场，余额归零` |
 
-跑完还原核对：实现轮那七条变异之后脚本自报 `restored byte-identical: True`，
-`sha256sum -c` 对变异前的 `core/scheduler.go`（76342 字节）与 `core/scheduler_resize_test.go`
-（27665 字节）两行都是 `OK`。复核轮的 M8 用另一条脚本（`%TEMP%/r03mut/m8.py`）单跑，
-还原后两个文件的终态是 `core/scheduler.go` 76516 字节（sha256 前缀 `22f9f34e67753be5`）、
-`core/scheduler_resize_test.go` 30886 字节（前缀 `eee60759186964a4`），
-字节数与实现轮不同只因为复核轮改了注释并补了第十二条用例。
-M1、M5 与 M8 在复核轮被重跑过（复核者一次、本卡作者一次），M2~M7 沿用实现轮的记录——
-复核轮的改动全是注释与新增用例，没有触及那六条的判据路径。
+复核轮的 M8 用另一条脚本（`%TEMP%/r03mut/m8.py`）单跑，
+实现轮首次记录时两个文件是 76342 / 27665 字节；复核轮补用例与改注释之后的终态是
+`core/scheduler.go` **76721 字节**（sha256 前缀 `235a09edce06a189`）、
+`core/scheduler_resize_test.go` **30958 字节**（前缀 `dcd9deddb0c6d36a`）——
+字节数与实现轮不同只因为复核轮改了注释并补了第十二条用例，最后一次复核又收了 `Start`
+调用点的口径与一条断言消息。
+M1、M5 与 M8 在复核轮被重跑过（复核者一次、本卡作者一次，M8 两次都是"只被第十二条判红、
+其余 11 条全绿"），M2~M7 沿用实现轮的记录——复核轮的改动全是注释与新增用例，
+没有触及那六条的判据路径。
+**每一轮变异的还原都核对过字节**：脚本从变异前的字节副本写回，自己断言
+`open(SRC,'rb').read() == 备份` 为真（实现轮那七条跑完时报 `restored byte-identical: True`，
+`sha256sum -c` 对变异前记录的 `core/scheduler.go` 76342 字节与 `core/scheduler_resize_test.go`
+27665 字节两行都是 `OK`；M8 那三次分别报 `22f9f34e67753be5` 一致）。
 每次还原之后都重跑过 `go build ./... && go vet ./...`（无输出）与
 `go test ./core -run 'TestResizeWorkers'`（12 条全 PASS）。
 
@@ -570,8 +590,10 @@ M1、M5 与 M8 在复核轮被重跑过（复核者一次、本卡作者一次�
 `cmd/server/config_reload_smoke_test.go` 里出现的那一句是那条用例说明"本卡没给入口"的注释，不是调用）。
 取而代之做的是三件静态核对：
 
-1. 确认 `cmd/server` 里 `scheduler.Start()` 只有一个调用点、`Stop()` 在启动失败与优雅关闭两条路径上，
-   也就是说 §10.5 D2 那条交错在今天的进程生命周期里凑不出来。
+1. 确认**生产进程** `cmd/server` 里 `scheduler.Start()` 只有一个调用点、`Stop()` 在启动失败与优雅关闭两条路径上，
+   也就是说 §10.5 D2 那条交错在今天的进程生命周期里凑不出来。（另有两个 `Start` 调用点在
+   `examples/demo1`、`examples/demo2` 这两个独立 main 里，它们不接 `ResizeWorkers`，也不构成反例——
+   复核轮提醒过不要把这条写成"全仓唯一调用点"，见 §10.2 第 15 条。）
 2. 确认 `/api/v1/pools` 与 `/api/v1/admin/runtime` 读的就是 `Scheduler.RuntimeStats`（`api/handlers.go`、
    `api/handlers_admin.go` 各一处），所以本卡改的 `Workers` 口径会直接透到那两个端点上——
    接线之后不需要再动 api 就能看见新值。
@@ -585,7 +607,7 @@ M1、M5 与 M8 在复核轮被重跑过（复核者一次、本卡作者一次�
 | # | 现象 | 处置 |
 | --- | --- | --- |
 | D1 | 热更出来的并发数不跨进程内重启：运行期扩缩只改 `targetWorkers`，`Start` 会把它按 `concurrency`（启动期快照）重新覆盖。`Stop→Start` 之后并发退回启动值，`/admin/runtime` 那一刻也会跳回去 | 登记不修（今天没有进程内重启；归 R06 —— 接线时在 `Start` 之后重放一次，或在 `ReloadService` 里记住 applied 值并补 `ResizeWorkers`） |
-| D2 | 若 `ResizeWorkers` 放锁之后、`go` 语句执行之前另一条协程做完了 `Stop→Start`，这批新协程领的是上一代的 `workCh`、等的是新一代的 `stopCh`，会把那次 `Stop` 的 `wg.Wait()` 拖住 | 登记不修（单一启动点触发不了；归 R06/后续 —— 修法是把停止信号与队列成对传进 `worker`，那要改卡面 §3.2 定死的签名） |
+| D2 | 若 `ResizeWorkers` 放锁之后、`go` 语句执行之前另一条协程做完了 `Stop→Start`，这批新协程领的是上一代的 `workCh`、等的是新一代的 `stopCh`，会把那次 `Stop` 的 `wg.Wait()` 拖住 | 登记不修（今天触发不了：**生产进程 `cmd/server` 只 `Start` 一次**，`examples/demo1:29`、`examples/demo2:41` 各是独立 main、也只 `Start` 一次且都不接 `ResizeWorkers`——注意这条口径别说成"全仓只有一个 Start 调用点"，那是错的，只是不影响结论；归 R06/后续 —— 修法是把停止信号与队列成对传进 `worker`，那要改卡面 §3.2 定死的签名） |
 | D3 | `ResizeWorkers` 只有下限没有上限：热更一个 `scheduler.workers: 100000` 会立刻起十万条协程 | 登记不修（本卡按卡面只做"n<=0 报错"；归 R06 在重载链上补上界校验，配置层 `Normalized` 目前也只挡负数） |
 | D4 | 温和缩容期间读数与实跑不一致（`Workers` 已是新值、实跑协程还多几个），要等任务流动才收敛 | 登记不修，按设计保留（卡面 §3.3 已把它定义为代价）；归 R07 的使用者文档，运维读数要连 `running`/`queue_length` 一起看 |
 

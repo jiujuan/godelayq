@@ -455,7 +455,8 @@ func TestResizeWorkers_RestartClearsRetireRequests(t *testing.T) {
 	unblock1()
 	waitUntil(t, "关停之前在途任务全部收尾", 5*time.Second, func() bool { return counters.done() >= 4 })
 	scheduler.Stop()
-	assert.EqualValues(t, 0, scheduler.retireRequests.Load(), "worker 退出前都经过循环开头，余额在此耗光")
+	assert.EqualValues(t, 0, scheduler.retireRequests.Load(),
+		"本用例四个 worker 都在跑任务，跑完回到循环开头时把余额耗光（通用情形下不成立，见函数头）")
 
 	gate2 := make(chan struct{})
 	unblock2 := openGate(gate2)

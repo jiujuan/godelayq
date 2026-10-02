@@ -1224,8 +1224,10 @@ func (s *Scheduler) RunningCount() int {
 // 若 ResizeWorkers 放锁之后、go 语句执行之前，另一条协程做完了 Stop→Start，这批新协程领到的
 // 还是上一代那条 workCh（队列是当参数传进 worker 的，卡片 §3.2 定死了签名），
 // 而它们 select 的 s.stopCh 已经是新一代那个还开着的通道——于是卡在一条没人再投递的队列上，
-// 把那一次 Stop 的 wg.Wait 拖住。本仓里 scheduler 只被启动一次（cmd/server 唯一的 Start 调用点），
-// 重载链也是单线程逐项应用，凑不出这个交错；真要支持"关停与重启并发"，得把停止信号一起传进 worker。
+// 把那一次 Stop 的 wg.Wait 拖住。生产进程里 `Scheduler.Start` 只有 `cmd/server` 一个调用点，
+// 而 `examples/demo1`、`examples/demo2` 各是独立的 main、也都不接 `ResizeWorkers`，
+// 所以今天哪个可执行文件都凑不出这个交错；重载链本身也是单线程逐项应用。
+// 真要支持"关停与重启并发"，得把停止信号一起传进 worker。
 // 已登记在卡片 §10.5。
 func (s *Scheduler) ResizeWorkers(n int) error {
 	if n <= 0 {
@@ -1236,7 +1238,8 @@ func (s *Scheduler) ResizeWorkers(n int) error {
 	if !s.running {
 		// 未启动时等价于 SetConcurrency：连 concurrency 一起写，下一次 Start 才按新值建通道起协程。
 		// 代价是热更值不跨 Start→Stop→Start 保留（运行期那条分支不写 concurrency，见下面），
-		// 本仓只有一个 Start 调用点（cmd/server），今天到不了；R06 若引入进程内重启要重放一次。
+		// 生产进程 cmd/server 只 Start 一次，examples/* 那两个独立 main 也不接 ResizeWorkers，
+		// 所以这条代价今天到不了；R06 若引入进程内重启要重放一次。
 		s.concurrency = n
 		s.targetWorkers.Store(int32(n))
 		s.mu.Unlock()
