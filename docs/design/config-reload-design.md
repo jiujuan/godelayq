@@ -33,7 +33,7 @@
 | # | 决策 | 取舍与理由 |
 | --- | --- | --- |
 | R1 ★ | **每个叶子键显式归入热更 / 重启 / 拒绝三档，表只有一张** | 本仓最不能接受的是"改了没生效，也没人说什么"。`logging.format`、`observability.events.enabled` 这类进重启档（改了这次不算，下次重启算，日志逐条列出），凭据类进拒绝档（改了整次作废并记 error）。分档表在 `core/config.go`，与 `LoadConfig` 的环境变量绑定表（`core/config.go:734-794`）并置，两张表都由测试守着 |
-| R2 ★ | **fsnotify 监听 + 防抖 + 内容哈希去重，不引入手动触发端点** | 与"改文件即生效"的诉求直接对应，且 `core/load.go:501` 已经在用同一套依赖、`loaderDebounceInterval`（`core/load.go:94`）已经确立了合并写入事件的写法。多一个 REST 触发口就多一份"谁有权改配置"的判定，本期不要 |
+| R2 ★ | **fsnotify 监听 + 防抖，不引入手动触发端点；"有没有真的变"由重载链判** | 与"改文件即生效"的诉求直接对应，且 `core/load.go:501` 已经在用同一套依赖、`loaderDebounceInterval`（`core/load.go:94`）已经确立了合并写入事件的写法。多一个 REST 触发口就多一份"谁有权改配置"的判定，本期不要。内容等价的判定放在 `Diff`（它握着 `applied`）而不是放在 watcher：见 §7.7 |
 | R3 ★ | **全量校验后原子生效；拒绝档变化则整次作废** | 照抄 `executor.Registry.ApplyStore` 的既有承诺："失败时旧表原样不动，不会留下删了一半的中间态"（`executor/registry.go:143-153`）。重载不是逐键尝试，而是先把新配置整个读通（`LoadConfig` 的 `UnmarshalExact` + `Validate`，`core/config.go:806-813`），再过一遍拒绝档，然后逐项应用 |
 | R4 ★ | **功能整体由 `reload.enabled` 控制，默认 false** | 与 `executors.enabled`、`observability.enabled`、`executors.web_enabled` 同一口径：打开前进程行为与本设计之前一字不差。热重载把"改文件要重启"这条人工防线撤掉了一道，而本系列的范围含 `executors.commands`（能执行什么的一部分），所以必须由部署方显式表态 |
 | R5 | **`scheduler.workers` 做运行期扩缩，队列容量不做** | 通道容量在 `Start` 里一次定下（`core/scheduler.go:1141-1146`），投递方阻塞在 `s.workCh <- job` 上（`core/scheduler.go:1327-1332`）。换通道会让正在阻塞的投递永远等不到结果。扩 worker 不碰通道：容量本来就与 worker 数解耦 |
@@ -145,7 +145,9 @@ reload:
 
 ```go
 // api/handlers_admin.go 的 RuntimeResponse 新增一个字段
-Reload core.ReloadState `json:"reload,omitempty"` // reload 未启用时整个字段缺省
+// 用指针而不是值类型：值类型会让未启用热重载的部署回出一个 {"result":""} 的空对象，
+// 那会被读成"启用过但从没重载"。
+Reload *core.ReloadState `json:"reload,omitempty"` // reload 未启用时整个字段缺省
 ```
 
 `ReloadState` 定义在 `core/config_reload.go`（不是 `api`）：产出它的一方是 `core.ConfigWatcher`
@@ -159,8 +161,8 @@ type ReloadState struct {
     WatchedPath   string    `json:"watched_path,omitempty"`
     LastAttemptAt time.Time `json:"last_attempt_at,omitempty"`
     LastAppliedAt time.Time `json:"last_applied_at,omitempty"`
-    // Result: ok | unchanged | rejected | failed | degraded
-    Result        string   `json:"result"`
+    // Result 是封闭枚举：ok | unchanged | rejected | failed | degraded
+    Result        ReloadResult `json:"result"`
     Error         string   `json:"error,omitempty"`
     AppliedKeys   []string `json:"applied_keys,omitempty"`   // 本次真正生效的热更键
     IgnoredKeys   []string `json:"ignored_keys,omitempty"`   // 本次改了但需要重启的键
@@ -181,7 +183,7 @@ type ReloadState struct {
 
 | 键 | 生效方式 | 落点 |
 | --- | --- | --- |
-| `logging.level` | `slog.LevelVar.Set` | `core/logging.go` 改造 + `core.SetLogLevel(logger, level)` |
+| `logging.level` | `slog.LevelVar.Set` | `core/logging.go` 改造（`NewLoggerWithLevelVar`）+ `core.SetLogLevel(levelVar, level)` |
 | `scheduler.workers` | 运行期扩缩 worker | `core.Scheduler.ResizeWorkers(n)`（§7.1） |
 | `scheduler.max_retry_delay` | 换重试策略实例 | `core.Scheduler.SetRetryPolicy(p)` |
 | `store.history_limit` | 下一次写入的 trim 用新值 | `core.Store.SetHistoryRetention(limit, ttl)` |
@@ -234,15 +236,23 @@ type ReloadState struct {
 
 ### 6.4 `executors.commands` 的两个方向
 
-- **允许热更的字段**：`timeout`、`args`/参数定义、`env` 键值、`name`/`description` 一类展示字段、
-  条目的增删。
-- **触发拒绝的字段**：档位内的 `deny_private_ranges`（http 档位），以及任何扩大执行能力的写法。
-  顶层的 `executors.workspace`/`runtime_allow`/`env_allow` 本来就在重启档（§6.2），而 §7.5 的加载固定用
+档位条目里的字段按"改它等于换身份、换目标、换可执行体或换凭据吗"分两侧：
+
+- **允许热更**：`name`（重命名等价于删一条加一条）、`timeout`、`max_parallel`、`retry_on_exit`、
+  `args`/`args_render`/`positional`（payload 参数声明）、`expect_status`、`capture_response`、
+  `max_body_bytes`，以及条目的增删。
+- **触发拒绝**：`runtime`、`script`、`program`、`fixed_args`、`cwd`、`env`、`env_allow`、
+  `method`、`url_template`、`allowed_hosts`、`headers`、`header_allow`、`deny_private_ranges`、
+  `max_redirects`。这十四项是"跑哪个可执行体、以什么身份、把请求发到哪里"的身份、目标与凭据字段，
+  其中 `env` 装的是固定注入的凭据材料（控制台因此从不回显它的取值），
+  改它等于换掉一次执行所凭的身份。
+- 顶层的 `executors.workspace`/`runtime_allow`/`env_allow` 本来就在重启档（§6.2），而 §7.5 的加载固定用
   启动时那份归一化配置，所以它们改了什么都不会进运行期——拒绝档在这里的作用是**给未来留字段余地**：
-  `Diff` 对新旧两份配置各跑一次 `executor.LoadProfiles`（`executor/profile.go`），
-  比较两份归一化结果里"执行许可相关字段"的投影，投影不同即拒绝。
-  投影的构造必须显式列字段，将来新增字段默认落在"未列"的一侧，而"未列"的一侧由 §8 的守卫测试挡住
-  ——这样加字段不会因为忘记归档而变成免重启的口子。
+  `Diff` 只用 `core` 自己看得见的信息判定（`core.ExecutorCommand` 的字段清单，实现上是一份显式的
+  `permissionCommandFields`），不借 `executor.LoadProfiles` 的归一化结果——`core` 不许 import `executor`
+  （这条依赖方向红线在本仓是硬约束，`core/executor_profile_store.go` 的存在就是为它服务的）。
+  清单必须显式列字段，将来新增字段默认落在"允许热更"的一侧，而"落在哪一侧"这件事由 §8 的守卫测试
+  逼着人显式回答——这样加字段不会因为忘记归档而变成免重启的口子。
 
 ## 7. 后端改动方案（逐文件）
 
@@ -325,14 +335,21 @@ func (a *AuditLog) SetRetention(count int, age time.Duration)
 
 ```go
 // ApplyConfig 用给进来的这一批档位重建登记表的 config 部分，store 来源的条目原样保留。
-// 与 ApplyStore 同一套承诺：整批替换、失败时旧表不动、同批内重复键拒绝。
-func (r *Registry) ApplyConfig(entries []*Profile) error
+// 与 ApplyStore 镜像对称、同一套承诺：整批替换、失败时旧表不动、同批内重复键拒绝；
+// 多一条 ApplyStore 没有的规则——新 config 条目与现存 store 条目撞名时 config 赢，
+// 那条 store 条目移入降级展示面（与启动合并同方向，§5.2）。
+func (r *Registry) ApplyConfig(profiles []*Profile) error
 ```
 
-`Applier` 新增 `ApplyConfig(old, new core.ExecutorsConfig) (ApplyResult, error)`：
+`Applier` 新增 `ApplyConfig(candidate core.Config) (ApplyResult, error)`
+（收整份新配置而不是只收 `ExecutorsConfig`：调用方手里就是 `LoadConfig` 的返回值，
+让它先取出 `Commands` 再合成一份配置是同一件事在两处各写一遍）：
 
-1. 用**启动时那一份**归一化 `ExecutorsConfig` 调 `LoadProfiles` 加载新 commands
-   （R8：许可字段属拒绝档，因此这一份实例不会与文件里的许可字段脱节）。
+1. 把 `candidate.Executors.Commands` 接到**启动时那一份**归一化 `ExecutorsConfig` 上
+   （其余字段一律用冻结值，R8：许可字段属重启档与拒绝档），调 `LoadProfiles` 加载新 commands。
+   这一步是整条链上唯一必须说清的地方：用整份 candidate 去校验会让新增的档位按**新的**
+   `workspace`/`runtime_allow` 建出来，而既有档位仍按旧值跑，
+   那是"同一台机器上两套许可"，比不改还糟。
 2. 逐条 `Probe`，探测失败仍入表（与 `NewRegistry` 同一口径，`executor/registry.go:126-137`）。
 3. 与现存 store 来源条目做撞名判定：新配置的某条与页面建的某条同名时，按 §5.2 的既有方向处理——
    config 赢、store 那条标 Degraded（复用 `MergeStoreProfiles`，`executor/merge_profiles.go:39`）。
@@ -342,10 +359,14 @@ func (r *Registry) ApplyConfig(entries []*Profile) error
 5. 任一步失败：不碰表、不碰调度器，返回错误，由重载方回滚。
 
 `cmd/server/main.go` 只有在 `executors.enabled=true` 时才有 `Applier`（`:596-608` 的分岔），
-而 `executors.enabled` 在重启档，所以热更 commands 时 `Applier` 必然已在手；
-`web_enabled=false` 时它也在——本设计把它从"只在 web_enabled 时构造"改成
-"reload 需要或 web_enabled 需要时构造"，`core.ExecutorProfileStore` 的打开条件同步放宽，
-两个写端点的 503 判定仍只看 `web_enabled`（§7.7），不受影响。
+而 `executors.enabled` 在重启档，所以热更 commands 时 `executors.enabled` 必为真；
+本设计把 `Applier` 的构造条件从"只在 `web_enabled` 时"放宽到"`web_enabled` 或 `reload.enabled` 时"，
+但**不为 `reload` 打开档位文件**：`web_enabled=false` 的部署今天连 `profiles_path` 的父目录都不碰
+（W01 的冒烟证据），为了热更档位而去读它，等于把"关闭时惰性"这条口径改掉。
+做法是给 `Applier` 一个不依赖 store 的构造入口（`executor.Applier.Apply` 那条 store 路径返回明确错误，
+`ApplyConfig` 照常可用），登记表的 store 侧条目在那种部署里本来就不存在，
+撞名判定只看 config 批次，与今天启动后的状态一致。两个写端点的 503 判定仍只看 `web_enabled`
+（§7.7），不受影响。
 
 ### 7.6 `core/config_reload.go`（新增）：分档表 + Diff + applied 快照
 
@@ -364,62 +385,78 @@ const (
 var configClasses = map[string]ConfigClass{ /* ... */ }
 
 // Diff 返回 candidate 相对 applied 三份清单：待应用的键与值、需重启的键名、导致作废的键名。
-// 调用方（重载链）在 candidate 已 Normalized 的前提下使用它；生效成功后整体换入 candidate。
-func Diff(applied, candidate Config) (ConfigChange, error)
+// 没有失败可报告：比较两份内存里的结构体不会出错，所以不返回 error。
+// 前提是两侧都已 Normalized()——否则 0 值与默认值的差别会被当成一次改动。
+// candidate 被换入 applied 由调用方负责，Diff 不改动任何一方。
+func Diff(applied, candidate Config) ConfigChange
 ```
 
-扁平化复用 `core/config_test.go:437-444` 那段 `configKeys` 的做法：用 Viper 把两份 `Config`
-各摊平成叶子路径 map 再逐键比。这个函数从测试文件提到 `core` 内部（同名，去掉测试专用假设），
-测试与 `Diff` 共用一份，避免"测试认得的键"与"Diff 认得的键"两套。
+扁平化是 `core` 内部一份新的 `reflect` 实现（R01 §3.2），**不复用**
+`core/config_test.go:437-444` 的 `configKeys`：那份从 YAML 文件读键名、只给路径不给值、
+且要求文件存在，而这里要比较两份内存配置的取值；`executors.commands` 还必须按元素摊成
+`executors.commands.<name>.<field>` 才能逐字段归档（§6.4）。`configKeys` 保持原样，
+它服务的是"两份 YAML 的键名集合"这条守卫，与"两份内存配置的取值"是两件事。
 
 ### 7.7 `core/watch.go`（新增）：监听器
 
 ```go
+// ReloadFunc 是一次重载的执行体：读配置、比对、应用，并把结论交回来。
+// 串行由实现方自己保证（重载链内部一把锁，另加与档位写链共用的那一把）。
+type ReloadFunc func() (ReloadState, error)
+
 // ConfigWatcher 盯一份 YAML，变化后按防抖窗口触发一次 onReload，并保存重载结果供读端点取用。
 // 它不认识任何业务键，也不自己应用配置：应用归装配方，失败也归装配方。
+// 状态的归属说清：ReloadState 由 ReloadFunc 产出、由 watcher 保存（一次 atomic.Pointer 换），
+// 唯一的例外是 WatcherError——那是 watcher 自己的字段，保存新状态时保留旧值不被覆盖。
+// api 的读端点注入的就是 watcher（它满足 State() core.ReloadState 这一个方法）。
 func NewConfigWatcher(path string, debounce time.Duration,
-    onReload func() error, logger *slog.Logger) (*ConfigWatcher, error)
+    onReload ReloadFunc, logger *slog.Logger) (*ConfigWatcher, error)
 func (w *ConfigWatcher) Run(ctx context.Context)
 func (w *ConfigWatcher) SetDebounce(d time.Duration)
 func (w *ConfigWatcher) State() ReloadState
-// SetState 由重载链在每次尝试结束时调用（成功、无变化、作废、失败都调），
-// 状态的产生方是那五个 setter 的调用方，不是 watcher——watcher 只负责保存与并发可读。
-func (w *ConfigWatcher) SetState(ReloadState)
+func (w *ConfigWatcher) Close() error
+func (w *ConfigWatcher) MarkWatcherError(msg string)
 ```
 
 - 监听**文件所在目录**，只认目标文件名的 / 路径匹配的事件；`Rename` 按"文件被换掉"处理，
   处理后重新登记监听。与目录加载器的监听（`core/load.go:501` 起）共用依赖但不复用代码：
   那边的合并窗口是 100ms 且按"每个文件各处理一次"记账（`core/load.go:94`、`:271`、`:446`），
   这边要的是"一份文件、比内容、失败也要留痕"，形状不同。
-- 事件类型不做筛选（Write/Chmod/Create/Rename 全触发一次防抖），靠内容哈希决定要不要真重载：
-  编辑器与杀软在 Windows 上的事件形状不可预测，筛事件不如比内容。
+- 事件类型不做筛选（Write/Chmod/Create/Rename 全触发一次防抖）。**watcher 不比较内容**：
+  判"内容有没有真的变"需要知道上一次真正生效的那份配置，而那份权威（`applied`）在重载链手里，
+  不在 watcher 手里——让两个类型共享同一个概念比省一次读文件更贵。
+  等价内容导致的那次重载由重载链自己给出 `unchanged` 结论（§8 那条验收就是它）。
 - `Run` 内所有错误都记进 `State()` 的 `watcher_error` 并继续存活；
-  watcher 彻底死亡（channel 关闭）时记 error，让"进程停在旧配置"这件事可见（I3）。
+  watcher 彻底死亡（事件通道关闭）时记 error 并留下 `watcher_error`，
+  且这个字段不被后续成功的重载抹掉，让"进程停在旧配置"这件事可见（I3）。
 
-### 7.8 `cmd/server/main.go`：接线
+### 7.8 `cmd/server`：接线
 
-在 `runtimeDeps` 里加一组**函数值字段**（沿用既有风格，`cmd/server/main.go:128-173`）：
+新增 `cmd/server/reload.go`（一个 `reloader` 类型而不是 `run()` 里的一串闭包：这条链的状态
+——`applied`、串行锁、待回滚的旧值——跨多次重载存活），并在 `runtimeDeps` 里加一个函数值字段
+（沿用既有风格，`cmd/server/main.go:128-173`）：
 
 ```go
-applyReload func(core.Config, core.ConfigChange) (appliedKeys []string, err error)
-newWatcher  func(path string, debounce time.Duration, onReload func() error, logger *slog.Logger) (*core.ConfigWatcher, error)
+newConfigWatcher func(path string, debounce time.Duration,
+    onReload core.ReloadFunc, logger *slog.Logger) (*core.ConfigWatcher, error)
 ```
 
-`defaultRuntimeDeps` 里给出的 `applyReload` 就是 §4 那条链的逐键实现：
-按 `change.Hot` 里的键名分派到 §7.1~§7.5 的五个 setter，并在同一步记录旧值用于回滚。
-`run()` 在 `scheduler.Start()`、`server.Start()` 之后建 watcher、`go watcher.Run(ctx)`，
-在收到 SIGINT/SIGTERM 时先停 watcher 再 `server.Stop`（顺序原因：重载可能重新登记档位，
-而优雅关闭期间不该有配置变化挤进来）。
+`reloader.Reload` 就是 §4 那条链的逐键实现：按 `change.Hot` 里的键名分派到 §7.1~§7.5 的 setter，
+并在同一步记录旧值用于回滚。`run()` 在 `scheduler.Start()`、`server.Start()` 之后建 watcher、
+`go watcher.Run(ctx)`；收到 SIGINT/SIGTERM 之后、`server.Stop` 之前显式 `watcher.Close()`
+（不是 `defer`——`defer` 会晚于 `server.Stop` 执行）。顺序原因：重载可能重新登记档位，
+而优雅关闭期间不该有配置变化挤进来。
 
-集成测试的 `spyScheduler`/假 watcher 通过这两个字段注入，与 `main_integration_test.go`
-既有替身同一套路。
+集成测试的 `spyScheduler` 与假 watcher 通过 `runtimeDeps` 的字段注入，与
+`main_integration_test.go` 既有替身同一套路；`/admin/runtime` 的读口注入的是 watcher
+（它满足 `State() core.ReloadState`），`api` 侧不需要知道 `reloader` 的存在。
 
 ## 8. 验收清单
 
 - [ ] `config.example.yaml` 与 `config.yaml` 都含 `reload` 一节，键一一对应
       （`TestExampleConfigMatchesLocal` 跑绿）。
 - [ ] `TestEveryLeafKeyIsClassed`：从 `Config` 结构体摊平出的**每一个**叶子键都在 `configClasses` 里有且
-      只有一档；`TestHotKeysAreEffective`：热更档的每个键都有一个对应的 `applyReload` 分派分支，
+      只有一档；`TestHotKeysAreEffective`：热更档的每个键都有一个对应的 `reloader` 分派分支，
       漏一个即失败（防止"归档成热更、但没人应用"）。
 - [ ] `reload.enabled=false`（默认）时：不建 watcher、`/admin/runtime` 无 `reload` 字段、
       全部行为与本设计之前一致。
@@ -440,7 +477,7 @@ newWatcher  func(path string, debounce time.Duration, onReload func() error, log
 - [ ] 坏 YAML / 未知键 / `Validate` 不过 → 旧配置原样、`result=rejected`、`error` 带原因；
       修好文件后下一次事件自动恢复。
 - [ ] 文件被删或读不到 → 视为一次失败的重载，绝不退回默认值。
-- [ ] 同一次存盘触发多个事件 → 只重载一次；内容与 `applied` 等价 → `result=unchanged`，不重登记档位。
+- [ ] 同一次存盘触发多个事件 → 防抖窗口内只重载一次；内容与 `applied` 等价 → `result=unchanged`，一个 setter 都不调（不重登记档位）。
 - [ ] 连续两次重载并发到达 → 被一把锁串行化，第二次能看到第一次的落盘结果。
 - [ ] watcher 出错（监听器关闭）→ `watcher_error` 有值且记 error，进程不停摆。
 - [ ] 优雅关闭顺序：先停 watcher，再关 server，再停调度器；关闭期间不再有注册动作。
@@ -466,8 +503,7 @@ newWatcher  func(path string, debounce time.Duration, onReload func() error, log
 | # | 项目 | 为什么本期不做 |
 | --- | --- | --- |
 | N1 | 执行器池的运行期扩缩与"从无到有建池" | `execCh` 为 nil 时建池要同时改 `SetExecConcurrency` 的 Start 前置约定、`execPoolEnabled` 的判定方式（`core/scheduler.go:1202-1204`）与产物存储的装配分岔，改动面大于本文其余部分之和 |
-| N2 | `executors.concurrency/required_role/default_timeout/max_timeout` 热更 | `concurrency` 属于 N1（要能建池才有意义）；`required_role` 与两个 timeout 都固化在 `Registry` 构造时的字段与那份冻结进闭包的 `ExecutorsConfig` 里（`executor/registry.go:102-110`），而提交期与执行期的超时合成又分别读这两处（合成规则见 `core/config.go:230-236` 的注释与
-`executor.Profile.timeoutWithin`），热更它们要同时改 `Registry` 快照、全部档位闭包与生效超时的合成入口，一处漏改就是"接口显示新上限、执行按旧上限"。本期由重启档明确挡住 |
+| N2 | `executors.concurrency/required_role/default_timeout/max_timeout` 热更 | `concurrency` 属于 N1（要能建池才有意义）；`required_role` 与两个 timeout 都固化在 `Registry` 构造时的字段与那份冻结进闭包的 `ExecutorsConfig` 里（`executor/registry.go:102-110`），而提交期与执行期的超时合成又分别读这两处（合成规则见 `core/config.go:230-236` 的注释与`executor.Profile.timeoutWithin`），热更它们要同时改 `Registry` 快照、全部档位闭包与生效超时的合成入口，一处漏改就是"接口显示新上限、执行按旧上限"。本期由重启档明确挡住 |
 | N3 | `store.flush_interval`、`observability.flush_interval/queue_capacity` 热更 | 换 ticker 与换有界通道都涉及正在等待的一方 |
 | N4 | 鉴权运行期热更（users/token/jwt.secret） | §6.3 |
 | N5 | 配置重载的专门读端点（`GET /api/v1/config`）与手动触发端点 | R2、R9：本期只要日志与 `/admin/runtime` |
@@ -480,22 +516,22 @@ newWatcher  func(path string, debounce time.Duration, onReload func() error, log
 
 | 卡 | 内容 | 依赖 |
 | --- | --- | --- |
-| TASK-R01 配置节与分档表 | `reload` 一节（两份 YAML + `DefaultConfig` + `Validate` + 环境变量绑定表）、`core/config_reload.go` 的 `ConfigClass`/`configClasses`/`Diff`、两条守卫测试、`configKeys` 从测试提到包内 | — |
+| TASK-R01 配置节与分档表 | `reload` 一节（两份 YAML + `DefaultConfig` + `Validate` + 环境变量绑定表）、`core/config_reload.go` 的 `ConfigClass`/`configClasses`/`Diff`/`ReloadState`、两条守卫测试 | — |
 | TASK-R02 轻量 setter | `SetLogLevel`（含 LevelVar 改造）、`Scheduler.SetRetryPolicy`、`JSONFileStore.SetHistoryRetention`、两个 sqlite 写入器的 `SetRetention`，各配单测 | R01 |
 | TASK-R03 调度器运行期扩缩 | `ResizeWorkers` + target 计数 + `RuntimeStats.Workers` 读数口径，含 §8 里那两条并发测试 | R02 |
 | TASK-R04 档位配置整表替换 | `Registry.ApplyConfig`、`Applier.ApplyConfig`、`main.go` 的 Applier 构造条件放宽 | R01 |
-| TASK-R05 监听器 | `core/watch.go`（目录监听 + 防抖 + 哈希去重 + 状态），watcher 单测用真实临时文件 | R01 |
-| TASK-R06 接线 | `runtimeDeps` 两个新字段、`applyReload` 分派表与回滚、`/admin/runtime` 的 `ReloadState`、关闭顺序 | R02-R05 |
+| TASK-R05 监听器 | `core/watch.go`（目录监听 + 防抖 + 状态保存），watcher 单测用真实临时文件；不比内容，等价由 `Diff` 判 | R01 |
+| TASK-R06 接线 | `cmd/server/reload.go` 的 `reloader`（分派表 + 逆序回滚）、`runtimeDeps` 的新字段、`/admin/runtime` 的 `reload`、关闭顺序 | R02-R05 |
 | TASK-R07 端到端验证与文档收口 | 集成用例（真文件驱动各类成功/失败路径）、`gofmt`/`go vet`/`-race -count=5 -timeout 30m`、`-tags dashboard` 内嵌形态冒烟、既有文档的表述同步与偏离标注 | R06 |
 
-七张卡，R02/R03/R04/R05 可在 R01 后并行。
+七张卡：R01 先行，R02 紧随，R03/R04/R05 可在 R01（R03 还要 R02 的字段改造结论）之后并行，R06 收拢，R07 收口。卡间依赖以 `docs/design/tasks/config-reload/README.md` 的执行顺序表为准。
 
 ## 12. 风险与后续演进
 
 | 风险 | 说明与对策 |
 | --- | --- |
-| Windows 事件形状不可预测 | 靠"内容哈希决定是否真重载"兜住重复事件；半截文件靠一次失败的重载 + 下一次事件恢复，不靠猜窗口长度 |
-| 回滚链比应用链更长 | 每个 apply 分支必须自带旧值与反向操作，`applyReload` 的形态是"一张表 + 逐项 undo"，而不是顺序 if；R06 的验收要求逐键断言回滚 |
+| Windows 事件形状不可预测 | 靠"防抖窗口 + `Diff` 判等价（等价内容回 `unchanged`）"兜住多余事件；半截文件靠一次失败的重载 + 下一次事件恢复，不靠猜窗口长度 |
+| 回滚链比应用长 | 每个 apply 分支必须自带旧值与反向操作，`reloader` 的形态是"一张表 + 逐项 undo"，而不是顺序 if；R06 的验收要求逐键断言回滚 |
 | 重载与页面档位写入撞上 | 两条链都要走 `Applier` 的同一把写锁（`executor/applier.go:116-117`）；R04 必须复用该锁而不是新建一把 |
 | 读数与真值短期不一致 | 缩容退场窗口内 `Running` 可能暂时高于 `Workers`；`RuntimeStats` 的注释要写明"Workers 是期望并发、Running 是瞬时值" |
 | 环境变量与文件谁赢造成困惑 | §5.3：本期只在文案提示，不新增来源判定；若后续要做，方向是在 `ReloadState` 里带一份"哪些键被环境覆盖"的只读清单 |
@@ -504,7 +540,7 @@ newWatcher  func(path string, debounce time.Duration, onReload func() error, log
 
 | # | 问题 | 本设计的取值 | 另一选择 |
 | --- | --- | --- | --- |
-| P1 | `Store` 接口是否加 `SetHistoryRetention`（会让所有测试替身一起实现） | 加，与既有 `SetExecConcurrency` 一组接口同法 | 只在 `*JSONFileStore` 上提供，`applyReload` 里做类型断言 |
-| P2 | `Applier` 构造条件放宽后，`web_enabled=false` 但 `reload.enabled=true` 时是否仍不打开档位文件 | 打开（`ApplyConfig` 需要 store 那一批参与撞名判定与整表重登记） | 只处理 config 批次、撞名判定推迟到下次启动 |
+| P1 | `Store` 接口是否加 `SetHistoryRetention`（会让所有测试替身一起实现） | 加，与既有 `SetExecConcurrency` 一组接口同法 | 只在 `*JSONFileStore` 上提供，`reloader` 里做类型断言 |
+| P2 | `Applier` 构造条件放宽后，`web_enabled=false` 但 `reload.enabled=true` 时是否仍不打开档位文件 | 构造 `Applier`，但**不打开档位文件**：给它一个不依赖 store 的构造入口，`Apply`（store 路径）在那种部署里返回明确错误、`ApplyConfig` 照常可用。选这条的理由是 W01 的冒烟证据——`web_enabled=false` 的部署今天连 `profiles_path` 的父目录都不碰，为热更档位而去读它会破掉"关闭即惰性"。撞名判定在那种部署里只看 config 批次，与今天的运行态一致 | 只处理 config 批次、撞名判定推迟到下次启动 |
 | P3 | `reload.debounce` 默认值 | 500ms（比目录加载器的 100ms 宽：配置改错的代价高于多等 400ms） | 100ms，与 `core/load.go:94` 对齐 |
 | P4 | 被环境变量压住的键是否在日志里单列 | 不单列，统一走"本次无变化"文案（§5.3） | 单列一份 `overridden_by_env` 清单，需要在 `LoadConfig` 侧新增来源信息 |
