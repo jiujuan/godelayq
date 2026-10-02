@@ -524,7 +524,7 @@ newConfigWatcher func(path string, debounce time.Duration,
 | TASK-R06 接线 | `cmd/server/reload.go` 的 `reloader`（分派表 + 逆序回滚）、`runtimeDeps` 的新字段、`/admin/runtime` 的 `reload`、关闭顺序 | R02-R05 |
 | TASK-R07 端到端验证与文档收口 | 集成用例（真文件驱动各类成功/失败路径）、`gofmt`/`go vet`/`-race -count=5 -timeout 30m`、`-tags dashboard` 内嵌形态冒烟、既有文档的表述同步与偏离标注 | R06 |
 
-七张卡：R01 先行，R02 紧随，R03/R04/R05 可在 R01（R03 还要 R02 的字段改造结论）之后并行，R06 收拢，R07 收口。卡间依赖以 `docs/design/tasks/config-reload/README.md` 的执行顺序表为准。
+七张卡：R01 先行（判据），R02–R05 都是落点、可并行（R03/R04/R05 只依赖 R01 的分类表，不依赖 R02），R06 收拢成一条链，R07 收口。卡间依赖以 `docs/design/tasks/config-reload/README.md` 的执行顺序表为准。
 
 ## 12. 风险与后续演进
 
