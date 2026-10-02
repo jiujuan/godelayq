@@ -63,12 +63,18 @@ func TestEventLog_SetRetentionPrunesNextBatch(t *testing.T) {
 // TestEventLog_SetRetentionZeroFallsBackToDefault 0 不是"不限量"，而是"回到
 // DefaultObserveEventRetentionCount"——这条口径与 NewEventLog 里的补齐同一条，
 // 否则 setter 就成了第二套规则。age<0 同样按 0（不按时间淘汰）处理。
+// 判据取存进去的两个数：写 5 条在"默认 20 万"与"不限量"两种实现下都成立，只有读数能分开；
+// 读私有字段在同包 events_test.go:545 已有先例。
 func TestEventLog_SetRetentionZeroFallsBackToDefault(t *testing.T) {
 	log, _, bus := newTestEventLog(t, func(opts *EventLogOptions) {
 		opts.RetentionCount = 3
 	})
 
 	log.SetRetention(0, -time.Hour)
+	assert.EqualValues(t, core.DefaultObserveEventRetentionCount, log.retentionCount.Load(),
+		"count<=0 必须回落到 core 的默认条数")
+	assert.EqualValues(t, 0, log.retentionAge.Load(), "age<0 必须折成 0，即不按时间淘汰")
+
 	for i := 0; i < 5; i++ {
 		bus.Publish(core.Event{Type: core.EventJobCompleted,
 			JobID: fmt.Sprintf("job-%d", i), JobName: "task"})
@@ -78,7 +84,7 @@ func TestEventLog_SetRetentionZeroFallsBackToDefault(t *testing.T) {
 
 	count, err := log.Count()
 	require.NoError(t, err)
-	assert.EqualValues(t, 5, count, "count<=0 falls back to the default (200000), age<0 to 0")
+	assert.EqualValues(t, 5, count, "回落默认条数之后这 5 条都该留着")
 }
 
 // TestEventLog_SetRetentionConcurrentWithPrune 写策略与读策略交错：
@@ -105,8 +111,9 @@ func TestEventLog_SetRetentionConcurrentWithPrune(t *testing.T) {
 	}
 	wg.Wait()
 
-	// 判据是 -race 干净加上"淘汰值半途变化也不会让行数越过最后一次设定的上界"：
-	// 这里显式收到 3 条再落一次盘，行数就不能再大于 3。
+	// 判据是 -race 干净，加上"并发写完之后自己再收一次"：交错期间哪一代条数在生效取决于
+	// 两个协程谁被调度到，直接断某个行数上界会把判据建在调度顺序上。这里显式收到 3 条
+	// 再落一次盘，落盘协程的下一轮 prune 必然用得上 3，行数就不再能大于 3。
 	log.SetRetention(3, 0)
 	require.NoError(t, log.Flush())
 
@@ -125,7 +132,7 @@ func TestAuditLog_SetRetentionPrunesNextBatch(t *testing.T) {
 		require.NoError(t, log.Append(auditEntry(i)))
 	}
 	waitAuditQueued(t, log, 6)
-	require.NoError(t, log.Flush())
+	mustFlush(t, log)
 
 	count, err := log.Count()
 	require.NoError(t, err)
@@ -134,7 +141,7 @@ func TestAuditLog_SetRetentionPrunesNextBatch(t *testing.T) {
 	log.SetRetention(2, 0)
 	require.NoError(t, log.Append(auditEntry(6)))
 	waitAuditQueued(t, log, 1)
-	require.NoError(t, log.Flush())
+	mustFlush(t, log)
 
 	count, err = log.Count()
 	require.NoError(t, err)
@@ -143,19 +150,24 @@ func TestAuditLog_SetRetentionPrunesNextBatch(t *testing.T) {
 
 // TestAuditLog_SetRetentionZeroFallsBackToDefault 台账侧的 0 与负时长走同一条补齐：
 // 回到 DefaultObserveAuditRetentionCount、不按时间淘汰，与 NewAuditLog 一致。
+// 判据取存进去的两个数（理由同事件侧那条：行数在两种实现下分不开）。
 func TestAuditLog_SetRetentionZeroFallsBackToDefault(t *testing.T) {
 	log, _ := newTestAuditLog(t, func(opts *AuditLogOptions) {
 		opts.RetentionCount = 3
 	})
 
 	log.SetRetention(0, -time.Hour)
+	assert.EqualValues(t, core.DefaultObserveAuditRetentionCount, log.retentionCount.Load(),
+		"count<=0 必须回落到 core 的默认条数")
+	assert.EqualValues(t, 0, log.retentionAge.Load(), "age<0 必须折成 0，即不按时间淘汰")
+
 	for i := 0; i < 5; i++ {
 		require.NoError(t, log.Append(auditEntry(i)))
 	}
 	waitAuditQueued(t, log, 5)
-	require.NoError(t, log.Flush())
+	mustFlush(t, log)
 
 	count, err := log.Count()
 	require.NoError(t, err)
-	assert.EqualValues(t, 5, count, "count<=0 falls back to the default, age<0 to 0")
+	assert.EqualValues(t, 5, count, "回落默认条数之后这 5 行都该留着")
 }

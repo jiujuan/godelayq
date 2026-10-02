@@ -66,9 +66,13 @@ func TestSetHistoryRetention_NegativeLimitKeepsNothing(t *testing.T) {
 
 // TestSetHistoryRetention_ZeroLimitFallsBackToDefault 0 在 setter 里也走同一条补齐：
 // 回到 DefaultHistoryLimit 而不是"不限量"，否则 setter 就成了第二套规则。
+// 判据取存进去的那个数：写满 5 条在"默认 100"与"不限量"两种实现下都成立，
+// 只有读数能区分这两者（读数断言在同包的 store_history_test.go:89 已有先例）。
 func TestSetHistoryRetention_ZeroLimitFallsBackToDefault(t *testing.T) {
 	store := newHistoryStore(t, StoreOptions{HistoryLimit: 2})
 	store.SetHistoryRetention(0, 0)
+	assert.Equal(t, int64(DefaultHistoryLimit), store.historyLimit.Load(),
+		"0 必须回落到 DefaultHistoryLimit，而不是当成不限量存进去")
 
 	base := time.Now()
 	for i := 0; i < 5; i++ {
@@ -80,7 +84,10 @@ func TestSetHistoryRetention_ZeroLimitFallsBackToDefault(t *testing.T) {
 
 // TestSetHistoryRetention_ConcurrentWithTrim 写策略与读策略交错：
 // 留痕字段换成原子值就是为了这一种交错——重载协程写、写入协程在同一次 trim 里读。
-// 终态自洽：读回来的记录数不超过最后一次设定的目标条数，且没有 panic / race。
+// 判据取"并发结束之后自己再走一遍成对设置 + 一次写入"：交错期间哪一代策略在生效
+// 取决于两个协程谁被调度到，直接断"记录数不超过某个值"会把判据建在调度顺序上
+// （setter 若被推迟到写入循环收尾，生效的仍是构造时的 50 条）。
+// 所以这里收到 3 条再写一条，让最后一次 trim 必然用 3，剩下的条数就是可断的语义。
 func TestSetHistoryRetention_ConcurrentWithTrim(t *testing.T) {
 	store := newHistoryStore(t, StoreOptions{HistoryLimit: 50})
 
@@ -95,10 +102,16 @@ func TestSetHistoryRetention_ConcurrentWithTrim(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for i := 0; i < 200; i++ {
-			_ = store.Update(terminalSnapshot(strconv.Itoa(i), StatusSuccess, time.Now()))
+			if err := store.Update(terminalSnapshot(strconv.Itoa(i), StatusSuccess, time.Now())); err != nil {
+				t.Errorf("concurrent Update(%d): %v", i, err)
+				return
+			}
 		}
 	}()
 	wg.Wait()
 
-	assert.Less(t, len(mustLoadAll(t, store)), 31)
+	store.SetHistoryRetention(3, 0)
+	require.NoError(t, store.Update(terminalSnapshot("after", StatusSuccess, time.Now())))
+	assert.LessOrEqual(t, len(mustLoadAll(t, store)), 3,
+		"末次 trim 必须用得上并发写完之后设定的条数上限")
 }

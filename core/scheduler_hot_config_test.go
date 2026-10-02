@@ -42,7 +42,7 @@ func TestRetryPolicyMaxDelay_NonBackoffPolicyReadsZero(t *testing.T) {
 // TestSetRetryPolicy_ChangesScheduledDelay 是行为用例而不是读数用例：
 // 换掉的策略必须真的改变下一次失败重试排下来的时刻——retryPolicy 换成原子字段之后，
 // 只改字段不改 handleFailure 的读取点也能让上面的读数用例通过。
-// 排期取值容忍 ±1ms 抖动，不断言精确时刻（本仓既有重试用例的口径）。
+// 排期取值留 ±1ms 容差，理由与基准取法见 assertScheduledDelay。
 func TestSetRetryPolicy_ChangesScheduledDelay(t *testing.T) {
 	store := newMockStore()
 	first := &recordingRetryPolicy{delay: 10 * time.Millisecond}
@@ -57,21 +57,23 @@ func TestSetRetryPolicy_ChangesScheduledDelay(t *testing.T) {
 		RetryDelay: 5 * time.Millisecond,
 	}
 	scheduler.handleFailure(job, errors.New("handler failed"))
-	assertScheduledDelay(t, retriedJob(t, scheduler, "hot-retry"), first, "before the swap")
+	assertScheduledDelay(t, retriedJob(t, scheduler, "hot-retry"), first, 1, "before the swap")
 
 	second := &recordingRetryPolicy{delay: 30 * time.Millisecond}
 	scheduler.SetRetryPolicy(second)
 	scheduler.handleFailure(retriedJob(t, scheduler, "hot-retry"), errors.New("handler failed"))
-	assertScheduledDelay(t, retriedJob(t, scheduler, "hot-retry"), second, "after the swap")
+	assertScheduledDelay(t, retriedJob(t, scheduler, "hot-retry"), second, 1, "after the swap")
 }
 
 // TestSetRetryPolicy_ConcurrentWithFailureHandling 覆盖"写策略 / 读策略"交错：
-// 重载协程写、worker 侧读同一字段时必须是原子的（普通接口字段在 -race 下直接判红）。
-// handleFailure 只在主协程里跑，堆与存储的写入仍由同一条协程串行，race 检测只针对这个字段。
+// 一条协程写、主协程每轮失败都读，字段若是普通接口字段会被 -race 直接抓住。
+// 除了 -race 干净，这里还断"每次读数都是写进去过的那一类值"（见循环后的说明）。
+// handleFailure 只在主协程里跑，堆与存储的写入仍由同一条协程串行。
 func TestSetRetryPolicy_ConcurrentWithFailureHandling(t *testing.T) {
 	scheduler := NewScheduler(newMockStore(), &ExponentialBackoffRetry{MaxDelay: time.Second}, nil, quietLogger())
 
 	var wg sync.WaitGroup
+	seen := make([]time.Duration, 0, 200)
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -89,23 +91,29 @@ func TestSetRetryPolicy_ConcurrentWithFailureHandling(t *testing.T) {
 			MaxRetries: 1,
 			RetryDelay: time.Millisecond,
 		}, errors.New("handler failed"))
-		_ = scheduler.RetryPolicyMaxDelay()
+		seen = append(seen, scheduler.RetryPolicyMaxDelay())
 	}
 	wg.Wait()
 
-	// 判据不能只有"-race 没报错"：写完 200 次之后再走一遍"设策略 → 失败重试 → 看排期"，
-	// 证明读取点在并发写之后仍然拿得到最近一次写入的策略。
-	tail := &recordingRetryPolicy{delay: 250 * time.Millisecond}
+	// 每次读数都必须是"构造时那一条（1s）"或"某一轮写进去的那一条（1..200ms）"：
+	// 读到 0、读到负数、读到 250ms 这种从没写过的值，说明读写没走原子语义。
+	// 这条断言管的是"读到的值完好"，跨协程可见性本身的判据是 -race（读数落在哪一代上
+	// 取决于两个协程谁被调度到，所以不能断"一定看到过 ≥2 个不同值"）。
+	for i, got := range seen {
+		if got == time.Second {
+			continue
+		}
+		if got < time.Millisecond || got > 200*time.Millisecond {
+			t.Fatalf("observation %d = %v, want either the initial 1s or one of the written 1..200ms", i, got)
+		}
+	}
+
+	// 并发写完之后字段仍可用：最后一次写入读得出来。
+	tail := &ExponentialBackoffRetry{MaxDelay: 250 * time.Millisecond}
 	scheduler.SetRetryPolicy(tail)
-	scheduler.handleFailure(&Job{
-		ID:         "concurrent-tail",
-		Name:       "flaky",
-		Type:       "flaky",
-		TriggerAt:  time.Now(),
-		MaxRetries: 1,
-		RetryDelay: time.Millisecond,
-	}, errors.New("handler failed"))
-	assertScheduledDelay(t, retriedJob(t, scheduler, "concurrent-tail"), tail, "after the concurrent writes")
+	if got := scheduler.RetryPolicyMaxDelay(); got != 250*time.Millisecond {
+		t.Fatalf("max delay after the concurrent writes = %v, want the last write 250ms", got)
+	}
 }
 
 // retriedJob 取回堆里的重试副本。
@@ -128,18 +136,23 @@ func quietLogger() Option {
 }
 
 // assertScheduledDelay 断言堆里的重试副本就是由这条策略算出来的时刻：
-// 副本的 TriggerAt 减去"策略被问到的那一瞬间"等于该策略声明的延迟（±1ms）。
+// 副本的 TriggerAt 减去"策略被问到的那一瞬间"等于该策略声明的延迟。
+//
+// wantCalls 断的是"这一次失败把策略问了几次"：handleFailure 只该 Load 一次、算一个时刻，
+// 分两次 Load 会让发出去的事件与真正排下来的时刻来自两代策略（读数一致时看不出，
+// 所以判据只能记在调用次数上）。
 //
 // 基准取策略自己取时的瞬间而不是用例开头：`go test ./...` 是各包并行跑的，
-// 一次 CPU 抢占就能把 ±1ms 的窗口整个吃掉，判红的是调度延迟而不是被测语义。
-// calledAt 为空同时守住另一件事——排期确实用到了这一条策略，不是留着旧的那条在算。
-func assertScheduledDelay(t *testing.T, retried *Job, policy *recordingRetryPolicy, stage string) {
+// 一个开用例时取的 time.Now() 与真正调用策略之间可能被任意抢占。
+// 容差 ±1ms 是给 time.Now() 与堆写入之间的残余抖动留的，不是既有用例的口径
+// （仓内其它重试用例断的是抖动区间，见 core/retry_test.go:25-30）。
+func assertScheduledDelay(t *testing.T, retried *Job, policy *recordingRetryPolicy, wantCalls int, stage string) {
 	t.Helper()
 
 	policy.mu.Lock()
 	defer policy.mu.Unlock()
-	if len(policy.calledAt) == 0 {
-		t.Fatalf("%s: the retry policy was never consulted", stage)
+	if len(policy.calledAt) != wantCalls {
+		t.Fatalf("%s: retry policy consulted %d times, want %d", stage, len(policy.calledAt), wantCalls)
 	}
 	got := retried.TriggerAt.Sub(policy.calledAt[len(policy.calledAt)-1])
 	if got < policy.delay-time.Millisecond || got > policy.delay+time.Millisecond {

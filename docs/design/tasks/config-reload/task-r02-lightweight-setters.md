@@ -173,23 +173,19 @@ func TestSetLogLevel_ChangesOutput(t *testing.T) {
         }
 }
 
-func TestNewLogger_KeepsOldContract(t *testing.T) {
-        // 既有调用方的三条预期：非法级别报错、非法格式报错、默认 info/text
-        if _, err := NewLogger("nope", "text", io.Discard); err == nil {
-                t.Error("NewLogger accepted an invalid level")
-        }
-        if _, err := NewLogger("info", "yaml", io.Discard); err == nil {
-                t.Error("NewLogger accepted an invalid format")
-        }
+func TestNewLogger_DelegationWritesThrough(t *testing.T) {
+        // 只断"转调之后 NewLogger 交出的 logger 仍按解析出的级别过滤"这一件没被测过的事；
+        // 非法级别/非法格式/默认 info+text 三条由既有的 TestNewLogger_RejectsUnknownValues
+        // 与 TestNewLogger_LevelAndFormat 守着，那两条必须未经修改即过（落地见 §10.2 第 18 条）
         var buf bytes.Buffer
-        logger, err := NewLogger("", "", &buf)
-        if err != nil {
-                t.Fatalf("NewLogger defaults: %v", err)
-        }
-        logger.Info("hello")
-        if !strings.Contains(buf.String(), "hello") {
-                t.Error("default logger wrote nothing")
-        }
+        logger, err := NewLogger("info", "text", &buf)
+        require.NoError(t, err)
+
+        logger.Debug("hidden at info level")
+        assert.NotContains(t, buf.String(), "hidden at info level")
+
+        logger.Info("kept at info level")
+        assert.Contains(t, buf.String(), "kept at info level")
 }
 ```
 
@@ -224,7 +220,9 @@ func TestSetRetryPolicy_SwapsMaxDelay(t *testing.T) {
 行为用例（不是只看读数）：`mockRetryPolicy` 定义在 `core/scheduler_test.go`
 （`core/scheduler_recovery_test.go` 里只是使用它），建调度器时给 `delay: 10ms`，跑一次失败重试
 确认按 10ms 排期；再 `SetRetryPolicy` 换成 `delay: 30ms` 的策略，跑第二次失败重试确认按 30ms 排期。
-排期取值断言容忍 ±1 个 `time.Millisecond` 的抖动，不断言精确时刻（本仓既有重试用例的口径）；
+排期取值断言容忍 ±1 个 `time.Millisecond` 的抖动，不断言精确时刻
+（这条容差是本用例自己留的，不是既有体例——仓内其它重试用例断的是退避算法的抖动区间，
+见 `core/retry_test.go:25-30`，与本卡的"排期用的是哪一条策略"不是同一件事）。
 基准要取"策略自己被调用的那一瞬间"而不是用例开头的一个 `time.Now()`——`go test ./...` 是各包
 并行跑的，一次 CPU 抢占就能把 ±1ms 的窗口整个吃掉。
 
@@ -590,17 +588,79 @@ go test ./... -race -count=1
 11. **并发用例的判据补强**。`TestSetRetryPolicy_ConcurrentWithFailureHandling` 首版的唯一判据是
     "-race 没报错"，一条都不断。补了尾部一段：并发写完之后设一条已知策略、再走一次失败重试，
     断排期等于它——证明 200 轮并发写之后读取点仍拿得到最近一次写入的策略。
-12. **`RetryPolicyMaxDelay` 的读数形状**：卡 §3.2 只说"非 `ExponentialBackoffPolicy` 返回 0"，
+12. **`RetryPolicyMaxDelay` 的读数形状**：卡 §3.2 只说"非 `ExponentialBackoffRetry` 返回 0"，
     落地还要处理"字段从没 `Store` 过"（零值 `Scheduler`）这一态，返回 0 而不是解引用空指针；
     这条没有独立用例（见 §10.6）。
 
+**质量复核轮（第 13~22 条）**：上一轮 3 条 Important + 9 条 Minor 的处置，逐条落地如下。
+
+13. **三条"分不开两种实现"的用例改成断存进去的取值**（复核的 I-3）。
+    `TestSetHistoryRetention_ZeroLimitFallsBackToDefault`、
+    `TestEventLog_SetRetentionZeroFallsBackToDefault`、
+    `TestAuditLog_SetRetentionZeroFallsBackToDefault` 原先只断"5 条都留着"，
+    而"回落到默认条数"与"当成不限量"两种实现下这个观察都成立，判据空转。
+    现在各自再断 `historyLimit.Load()` / `retentionCount.Load()` / `retentionAge.Load()` 等于
+    回落后的那个数——读写私有字段在同包既有用例里已有先例（`core/store_history_test.go` 的
+    `TestJSONFileStore_ZeroHistoryLimitUsesDefault`、`store/sqlite/events_test.go` 的
+    `TestEventLog_DefaultsForNonPositiveOptions），而"不许读私有字段"这条只适用于
+    卡 §5.3 说的"别绕过 `Update` 去直调 `trimAfterWriteLocked`"，不适用于读数。
+    **顺带把 §10.3 里那条等价变异 N5 变成了真判据**：负时长不再折 0 的变异现在会判红。
+14. **两条并发用例的终态判据改成"自己再收一次"**（复核的 I-1）。
+    `TestSetHistoryRetention_ConcurrentWithTrim` 原先断"记录数 < 31"：31 这个上界没有出处
+    （setter 写的是 10..29），而且 setter 协程若被推迟到写入循环收尾，末次 trim 用的仍是
+    构造时的 50 条——判据落在两个协程谁被调度到上面，不在被测语义上。
+    现在 `wg.Wait()` 之后自己 `SetHistoryRetention(3, 0)` 再写一条，断剩下的条数 ≤ 3；
+    事件侧那条同形用例本来就是这种写法，两处口径一致了。
+    同一处还改了 `_ = store.Update(...)`：写失败会让终态判据 trivially 通过，现在改成
+    `if err := ...; err != nil { t.Errorf(...); return }`。
+15. **`TestSetRetryPolicy_ConcurrentWithFailureHandling` 的判据写实**（复核的 I-2）。
+    尾段"设一条已知策略再跑一次失败重试"并不能证明跨协程可见性——写与读都在主协程，
+    程序序天然可见。改法两段：
+    其一，每轮读数收进切片，`wg.Wait()` 之后断每个读数都落在"构造时那条 1s"或
+    "某一轮写进去的 1..200ms"之内（读到 0、负数、从没写过的值就说明读写没走原子语义）；
+    其二，尾段只断"最后一次写入读得出来"。跨协程可见性本身的判据如实写成 `-race`，
+    注释里说明为什么不能断"一定看到过 ≥2 个不同值"（读数落在哪一代取决于调度）。
+16. **"只 Load 一次"这条注释主张补上了判据**（复核的 M-5 引申）。
+    `assertScheduledDelay` 增加 `wantCalls` 参数，断一次失败只把策略问一次。
+    加这条是因为 `handleFailure` 里"发事件用的时刻"与"真正排下来的时刻"必须来自同一次
+    `Load()`，而分两次 `Load()` 在只断读数的用例下完全看不出来——变异 N8 现在能判红。
+17. **±1ms 容差的出处卡面写错了，卡面与注释同步改正**（复核的 M-5）。
+    卡 §5.2 原写"不断言精确时刻（本仓既有重试用例的口径）"，实跑核过：仓内其它重试用例
+    断的是退避算法的抖动区间（`core/retry_test.go:25-30`），与本卡的"排期用的是哪一条策略"
+    不是同一件事，全仓此前没有 ±1ms 这条体例。现在注释与卡面都写明这条容差是本用例自己留的。
+18. **`TestNewLogger_KeepsOldContract` 换成 `TestNewLogger_DelegationWritesThrough`**（复核的 M-6）。
+    前者的三条断是既有的 `TestNewLogger_RejectsUnknownValues`（非法级别/非法格式，输入字面相同）
+    与 `TestNewLogger_LevelAndFormat`（默认 info+text）的子集，属于把既有覆盖抄一遍。
+    现在只断一件没被测过的事：`NewLogger` 丢掉载体之后交出去的那条 logger 仍按解析出的级别过滤
+    （转调若把 handler 的级别写成常量，这里会红）。非法级别/格式与默认值那三条由既有用例守，
+    那两条未经修改即过，这本身就是 §5.1 想要的"转调没改行为"的证据。
+    同时把 §5.1 给的两条新用例从 `if/t.Fatal` 改成同文件在用的 testify 写法（断言一条没减）。
+19. **`waitAuditQueued` 与既有 `waitQueued` 两份同构保留**（复核的 M-7）。
+    `batcher[T]` 是泛型，合成一份要把既有 `waitQueued` 的签名改掉，超出"本卡不改既有测试"的边界，
+    而卡 §5.4 明写"台账侧若还没有就照 `waitQueued` 的形状写一个"。
+    同一处能改的先改了：台账侧的落盘从 `require.NoError(t, log.Flush())` 换成包内既有的
+    `mustFlush(t, log)`，注释里"收到 3 条"的错字改成"收成 3 条"。
+20. **`core/scheduler_test.go` 的改写处不再一个表达式里 `Load()` 两次**（复核的 M-9）。
+    首版写成 `if scheduler.retryPolicy.Load() == nil || *scheduler.retryPolicy.Load() != retryPolicy`，
+    恰好是本卡在生产侧立起来的"读一次进局部变量"那条写法的反例，改成 `if loaded := ...; loaded == nil || *loaded != ...`。
+21. **三个新测试文件的构词不一致保留**（复核的 M-10）：`scheduler_hot_config` / `store_hot` /
+    `hot_retention` 三种形状都是卡"涉及文件"里点名的名字，本卡不自作改名。
+22. **变异 N1/N6 首版是"编译失败"型，换成可编译的变异重跑**：删掉 `if err != nil { return err }`
+    会让 `err` 没人用、删掉 nil 守卫会让 `errors` 导入没人用，两种都停在构建阶段而到不了断言。
+    N1b 改成"解析失败也 `v.Set`，但仍然返回错误"，N6b 改成"守卫不再拦 nil"，
+    两条都真跑到断言/panic 上判红（见 §10.3）。
+    判定为**不改**的两条：`eventRetentionValues` 与 `auditRetentionValues` 两份同构不合并
+    （默认常量不同、选项类型不同，各 8 行紧邻各自的构造函数，重复比抽象便宜）；
+    `TestSetHistoryRetention_NegativeLimitKeepsNothing` 与既有 `store_history_test.go:72`
+    看着重复但留（同机制、不同入口，本卡要证的正是 setter 这条路）。
+
 ### 10.3 验证证据
 
-卡 §7 的验收命令，终态实跑结果（终态 = §10.2 第 5/6/9/10/11 条改动之后）：
+卡 §7 的验收命令，终态实跑结果（终态 = §10.2 第 13~22 条改动之后）：
 
 1. `go test ./core -count=1 -v -run 'TestSetLogLevel|TestNewLogger|TestSetRetryPolicy|TestRetryPolicyMaxDelay|TestSetHistoryRetention'`：
    **15 条 `--- PASS`、0 条 FAIL**——其中 12 条是本卡新增（`TestSetLogLevel_ChangesOutput`、
-   `TestSetLogLevel_NilCarrierIsRejected`、`TestNewLogger_KeepsOldContract`、
+   `TestSetLogLevel_NilCarrierIsRejected`、`TestNewLogger_DelegationWritesThrough`、
    `TestSetRetryPolicy_SwapsMaxDelay`、`TestRetryPolicyMaxDelay_NonBackoffPolicyReadsZero`、
    `TestSetRetryPolicy_ChangesScheduledDelay`、`TestSetRetryPolicy_ConcurrentWithFailureHandling`、
    `TestSetHistoryRetention_LimitTakesEffectOnNextWrite`、`_TTLExpiresOnNextWrite`、
@@ -608,33 +668,44 @@ go test ./... -race -count=1
    另外 3 条是名单里的既有用例
    （`TestNewLogger_LevelAndFormat`/`_LevelFiltering`/`_RejectsUnknownValues`）**未经修改即过**。
    按 §10.2 第 1 条换了读法的那两条 `TestNewScheduler`/`TestNewScheduler_DefaultRetryPolicy`
-   不在这个 `-run` 名单里，另行跑过：`go test ./core -count=1 -run 'NewScheduler'` 全 `ok`。
+   不在这个 `-run` 名单里，另行跑过：`go test ./core -count=1 -v -run 'NewScheduler'`
+   两条 `--- PASS`、`ok godelayq/core`。
 2. `go test ./store/sqlite -count=1 -v -run 'SetRetention'`：**5 条 `--- PASS`、0 条 FAIL**
    （事件三条 + 台账两条）。
 3. `go test ./core ./store/sqlite -race -count=3 -timeout 30m`：
-   `ok godelayq/core 34.097s`、`ok godelayq/store/sqlite 12.048s`。
+   `ok godelayq/core 34.865s`、`ok godelayq/store/sqlite 12.951s`。
+   两条并发用例另按复核意见压过一遍：`go test ./core -count=50 -run 'TestSetHistoryRetention_ConcurrentWithTrim|TestSetRetryPolicy'`
+   与 `go test ./store/sqlite -count=30 -run 'SetRetentionConcurrent'` 都 `ok`。
 4. `go build ./... && go vet ./...`：无输出（`Store` 接口的实现者全在 `_test.go`，
    补齐判据取这条而不是 `go build`）。
-5. `go test ./... -race -count=1 -timeout 30m`：`api` 120.733s、`cmd/server` 5.872s、
-   `core` 12.754s、`executor` 22.467s、`store/sqlite` 4.405s，五包全 `ok`，其余 `[no test files]`。
+5. `go test ./... -race -count=1 -timeout 30m`：`api` 100.043s、`cmd/server` 5.699s、
+   `core` 12.397s、`executor` 22.318s、`store/sqlite` 4.020s，五包全 `ok`，其余 `[no test files]`。
 
-变异反验证：把每处新语义改回旧写法，跑对应用例判红，再从字节副本恢复。
+变异反验证：把每处新语义改回旧写法，跑对应用例判红，再从字节副本恢复。八条全部判红。
 
 | 编号 | 变异 | 期望判红 | 实际 |
 | --- | --- | --- | --- |
-| N1 | `SetLogLevel` 解析失败时也把级别写进载体（退成"失败也置默认"） | `TestSetLogLevel_ChangesOutput` | 红 |
-| N2 | `SetRetryPolicy` 只判 nil、不 `Store`（空操作） | `TestSetRetryPolicy_SwapsMaxDelay` + `TestSetRetryPolicy_ChangesScheduledDelay` | 两条都红 |
+| N1 | `SetLogLevel` 解析失败时也把级别写进载体（仍返回错误） | `TestSetLogLevel_ChangesOutput` | 红，`"" does not contain "third"` |
+| N2 | `SetRetryPolicy` 只判 nil、不 `Store`（空操作） | `TestSetRetryPolicy_SwapsMaxDelay` + `_ChangesScheduledDelay` | 两条都红 |
 | N3 | `SetHistoryRetention` 只写条数、不写时长 | `TestSetHistoryRetention_TTLExpiresOnNextWrite` | 红，`map[a b c fresh] should have 1 item(s), but has 4` |
-| N4 | `eventRetentionValues` 去掉 `count<=0` 的补齐 | `TestEventLog_SetRetentionZeroFallsBackToDefault` | 红 |
-| N5 | `auditRetentionValues` 不再把负时长折成 0 | `TestAuditLog_SetRetentionZeroFallsBackToDefault` | **仍然绿：等价变异**，见下 |
-| N6 | `SetLogLevel` 去掉 nil 载体守卫 | `TestSetLogLevel_NilCarrierIsRejected` | 红（解引用 nil 直接崩在测试里） |
+| N4 | `eventRetentionValues` 去掉 `count<=0` 的补齐 | `TestEventLog_SetRetentionZeroFallsBackToDefault` | 红，两条一起报：存进去的条数不等于默认值、5 条没留住 |
+| N5 | `auditRetentionValues` 不再把负时长折成 0 | `TestAuditLog_SetRetentionZeroFallsBackToDefault` | 红，`age<0 必须折成 0，即不按时间淘汰` |
+| N6 | `SetLogLevel` 的 nil 守卫不再拦 nil | `TestSetLogLevel_NilCarrierIsRejected` | 红，`panic: invalid memory address or nil pointer dereference` |
+| N7 | `historyRetentionValues` 去掉 `limit == 0` 的回退 | `TestSetHistoryRetention_ZeroLimitFallsBackToDefault` | 红，两条一起报：存进去的不是 `DefaultHistoryLimit`、`"[]" should have 5 item(s), but has 0` |
+| N8 | `handleFailure` 分两次 `Load()`（问两次策略才算一次排期） | `TestSetRetryPolicy_ChangesScheduledDelay` | 红，`retry policy consulted 2 times, want 1` |
 
-N5 是**行为等价的变异**，不是用例漏了：`prune` 的时间淘汰判据是 `retentionAge <= 0`，
-负数与 0 在这条判据下同义，所以"入库前把负数折成 0"这步只影响存储形状、不影响任何可见行为。
-本卡没有为它新造一个读取口（`retentionAge` 是包内私有字段，加 getter 属于为测试改生产面），
-处置是把这条如实留在 §10.6 的未覆盖项里，而不是写一条只能断私有字段的用例冒充覆盖。
+三点要记在这里：
 
-N1/N2/N3/N4/N6 五条跑完后 `core/logging.go`、`core/scheduler.go`、`core/store.go`、
+- **N1 与 N6 的首版是"编译失败"型变异**（删掉 `if err != nil { return err }` 会让 `err` 没人用，
+  删掉 nil 守卫会让 `errors` 导入没人用），停在构建阶段根本跑不到断言。上表记的是改成可编译形态
+  （N1b/N6b）之后的结果，见 §10.2 第 22 条。
+- **N5 首轮曾是等价变异**：`prune` 的时间淘汰判据是 `retentionAge <= 0`，负数与 0 在这条判据下
+  同义，所以只断行数的用例分不开。改成断"存进去的取值"之后（§10.2 第 13 条）它才有判据，
+  上表记的是那之后的结果。
+- **N8 是本轮新增的判据类型**：`handleFailure` 里"只 `Load()` 一次"是注释主张，
+  单看排期读数分不出问了一次还是两次，靠 `assertScheduledDelay` 的 `wantCalls` 才钉住（§10.2 第 16 条）。
+
+八条变异跑完后 `core/logging.go`、`core/scheduler.go`、`core/store.go`、
 `store/sqlite/events.go`、`store/sqlite/audit.go` 与变异前的字节副本逐字节相同。
 
 新增与改动的 Go 文件都过了显式 `gofmt -w`；`gofmt -l` 在本仓因 CRLF 会对既有文件全量误报
@@ -670,9 +741,12 @@ N1/N2/N3/N4/N6 五条跑完后 `core/logging.go`、`core/scheduler.go`、`core/s
 - **`Scheduler` 零值时 `RetryPolicyMaxDelay` 返回 0** 这条分支没有用例（§10.2 第 12 条）：
   仓内没有"零值 `Scheduler` 被人拿去读数"的构造路径，造一条只能靠手搭 `&Scheduler{}`，
   与本卡要证的语义无关。
-- **SQLite 侧的时间淘汰路径没有用例**：负时长折成 0 是等价变异（§10.3 的 N5），
-  正时长的淘汰本身是 S03 既有形状、本卡没改它的判据，只把取值换到原子上；
-  本卡的并发用例把 `age` 恒置 0，所以"下一个周期用新时长"这条只有读数侧的证据。
+- **SQLite 侧"按新时长淘汰旧行"这条热路径没有用例**：本卡把 `retentionAge` 换成原子值，
+  但时间淘汰的判据（`prune` 里 `retentionAge <= 0` 与 `cutoff`）与 S03 落地时相同、没改，
+  本卡的并发用例又把 `age` 恒置 0，所以"运行期把时长改成 24h 之后旧行在下一次 prune 消失"
+  这件事只有读数侧证据（存进去的值确实变了），没有行数侧证据。
+  归 R07 的端到端场景（那时才有配置文件这一条完整路径）。
+  注：首版曾把"负时长折成 0"记成等价变异，现已被 §10.2 第 13 条的读数断言变成真判据（§10.3 的 N5）。
 - **`slog.SetDefault` 之后改级别会影响经 `slog.Default()` 的那一路**（卡 §3.1 要求写进注释，
   注释已写在 `NewLoggerWithLevelVar` 上）：没有用例，因为断它要改全局默认日志器，
   会和同包并行跑的用例互相污染。

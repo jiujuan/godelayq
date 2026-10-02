@@ -2,9 +2,7 @@ package core
 
 import (
 	"bytes"
-	"io"
 	"log/slog"
-	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -127,33 +125,21 @@ func TestResolveLogger_FallsBackToDefault(t *testing.T) {
 func TestSetLogLevel_ChangesOutput(t *testing.T) {
 	var buf bytes.Buffer
 	logger, levelVar, err := NewLoggerWithLevelVar("info", "text", &buf)
-	if err != nil {
-		t.Fatalf("NewLoggerWithLevelVar: %v", err)
-	}
+	require.NoError(t, err)
 
 	logger.Debug("first") // info 级别下不该出现
-	if strings.Contains(buf.String(), "first") {
-		t.Fatal("debug record emitted at info level")
-	}
+	assert.NotContains(t, buf.String(), "first")
 
-	if err := SetLogLevel(levelVar, "debug"); err != nil {
-		t.Fatalf("SetLogLevel: %v", err)
-	}
+	require.NoError(t, SetLogLevel(levelVar, "debug"))
 	buf.Reset()
 	logger.Debug("second")
-	if !strings.Contains(buf.String(), "second") {
-		t.Fatal("debug record still hidden after SetLogLevel")
-	}
+	assert.Contains(t, buf.String(), "second", "debug record still hidden after SetLogLevel")
 
 	// 解析失败保持原值：这一条守住"写错的级别名不会把日志关掉"
-	if err := SetLogLevel(levelVar, "verbose"); err == nil {
-		t.Fatal("SetLogLevel accepted an invalid level name")
-	}
+	require.Error(t, SetLogLevel(levelVar, "verbose"))
 	buf.Reset()
 	logger.Debug("third")
-	if !strings.Contains(buf.String(), "third") {
-		t.Fatal("level changed by a rejected SetLogLevel call")
-	}
+	assert.Contains(t, buf.String(), "third", "level changed by a rejected SetLogLevel call")
 }
 
 // TestSetLogLevel_NilCarrierIsRejected 载体是调用方交进来的，nil 只能来自接线的疏漏：
@@ -162,23 +148,20 @@ func TestSetLogLevel_NilCarrierIsRejected(t *testing.T) {
 	require.Error(t, SetLogLevel(nil, "debug"))
 }
 
-// TestNewLogger_KeepsOldContract NewLogger 转调新构造函数之后，既有调用方的三条预期不变：
-// 非法级别报错、非法格式报错、默认 info/text。级别过滤与 text|json 两条分岔
-// 由上面三个既有用例继续守着，这里只补"签名与行为没被转调改动"这一条。
-func TestNewLogger_KeepsOldContract(t *testing.T) {
-	if _, err := NewLogger("nope", "text", io.Discard); err == nil {
-		t.Error("NewLogger accepted an invalid level")
-	}
-	if _, err := NewLogger("info", "yaml", io.Discard); err == nil {
-		t.Error("NewLogger accepted an invalid format")
-	}
+// TestNewLogger_DelegationWritesThrough 是 §5.1 那条"转调之后既有行为不变"的落点，
+// 但只断一件既有用例没断过的事：NewLogger 丢掉载体之后，交出去的那条 logger 仍然按
+// 解析出来的级别过滤输出（转调若把 handler 的 level 写死成常量，这里就会红）。
+// 非法级别 / 非法格式 / 默认 info+text 三条预期由同文件既有的
+// TestNewLogger_RejectsUnknownValues 与 TestNewLogger_LevelAndFormat 守着，
+// 那两条未经修改即过，所以这里不再抄一遍。
+func TestNewLogger_DelegationWritesThrough(t *testing.T) {
 	var buf bytes.Buffer
-	logger, err := NewLogger("", "", &buf)
-	if err != nil {
-		t.Fatalf("NewLogger defaults: %v", err)
-	}
-	logger.Info("hello")
-	if !strings.Contains(buf.String(), "hello") {
-		t.Error("default logger wrote nothing")
-	}
+	logger, err := NewLogger("info", "text", &buf)
+	require.NoError(t, err)
+
+	logger.Debug("hidden at info level")
+	assert.NotContains(t, buf.String(), "hidden at info level")
+
+	logger.Info("kept at info level")
+	assert.Contains(t, buf.String(), "kept at info level")
 }

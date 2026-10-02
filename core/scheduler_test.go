@@ -126,8 +126,9 @@ func TestNewScheduler(t *testing.T) {
 		t.Error("Expected store to be set")
 	}
 	// retryPolicy 换成 atomic.Pointer 之后不能整体比较字段本身（卡 §5.2 的有意偏离）：
-	// 比的是它装的那个接口值，身份语义与改写前一致。
-	if scheduler.retryPolicy.Load() == nil || *scheduler.retryPolicy.Load() != retryPolicy {
+	// 比的是它装的那个接口值，身份语义与改写前一致。只 Load 一次——本卡在生产侧
+	// 立的就是"读数与判断用同一次 Load 的结果"这条写法。
+	if loaded := scheduler.retryPolicy.Load(); loaded == nil || *loaded != retryPolicy {
 		t.Error("Expected retry policy to be set")
 	}
 	if scheduler.eventBus != eventBus {

@@ -185,9 +185,10 @@ func (s *JSONFileStore) LoadAll() ([]JobSnapshot, error) {
 
 // trimTerminalLocked 按保留策略清理终态快照，Pending/Running 永不淘汰。
 // 条数上限 < 0 表示不留痕；0 已在构造与 SetHistoryRetention 里替换为 DefaultHistoryLimit。
-// 两个原子值在开头各读一次并留在局部变量里：调用方持 s.mu，所以两次 Load 不会读到半个值，
-// 但同一次淘汰的"按几条切"与"按多久切"必须来自同一代策略——分两次 Load 时中间插进一次
-// SetHistoryRetention，就会出现条数用新值、时长用旧值的那种没人配置过的组合。
+// 两个原子值在开头各读一次并留在局部变量里：读不到半个值是 atomic 给的，
+// 这里防的是另一件事——SetHistoryRetention 不持 s.mu，两次独立 Store 之间有窗口，
+// 分两次 Load 就可能让同一次淘汰的"按几条切"与"按多久切"来自两代策略。
+// 这个窗口本身没有关（见卡 §10.5 的 D-R0201），关掉它要把两项装进一个整体一起换。
 func (s *JSONFileStore) trimTerminalLocked() {
 	now := time.Now()
 	limit := int(s.historyLimit.Load())
