@@ -238,15 +238,20 @@ type ReloadState struct {
 
 档位条目里的字段按"改它等于换身份、换目标、换可执行体或换凭据吗"分两侧：
 
-- **允许热更**：`name`（重命名等价于删一条加一条）、`kind`（只选执行方式的字段子集，不改变"能执行什么"
-  的身份/目标/凭据边界）、`body`（http 请求体来源，同样不改变能力边界）、`timeout`、`max_parallel`、
+- **允许热更**：`name`（重命名等价于删一条加一条）、`body`（只决定 payload 的 body 按 json/raw/none
+  解释，既不换可执行体也不换目标主机，见 `executor/http.go:372` 的 `requestBody`）、`timeout`、`max_parallel`、
   `retry_on_exit`、`args`/`args_render`/`positional`（payload 参数声明）、`expect_status`、
   `capture_response`、`max_body_bytes`，以及条目的增删。
-- **触发拒绝**：`runtime`、`script`、`program`、`fixed_args`、`cwd`、`env`、`env_allow`、
+- **触发拒绝**：`kind`、`runtime`、`script`、`program`、`fixed_args`、`cwd`、`env`、`env_allow`、
   `method`、`url_template`、`allowed_hosts`、`headers`、`header_allow`、`deny_private_ranges`、
-  `max_redirects`。这十四项是"跑哪个可执行体、以什么身份、把请求发到哪里"的身份、目标与凭据字段，
+  `max_redirects`。这十五项是"跑哪个可执行体、以什么身份、把请求发到哪里"的身份、目标与凭据字段，
   其中 `env` 装的是固定注入的凭据材料（控制台因此从不回显它的取值），
-  改它等于换掉一次执行所凭的身份。
+  改它等于换掉一次执行所凭的身份；`kind`（`script`/`binary`/`http`）与 `runtime`/`script`/`program`
+  同属"哪一个可执行体"的身份而不是可调参数——换了它，同一条任务类型上周跑脚本、这周发 HTTP，
+  而任务留痕里看不出来。这与档位在线管理已拍板的 D7（`docs/design/web-profile-design.md:38`：
+  修改档位不允许改 `kind` 与 `script`/`program`，要换就删了重建）同向，落地口径见
+  `immutableFieldChange`（`api/handlers_executor_profiles.go:514`）：在线 PUT 那侧本来就是改 `kind`
+  直接回 400，热重载这侧若允许原地热更就是两条相反的口径。
 - 顶层的 `executors.workspace`/`runtime_allow`/`env_allow` 本来就在重启档（§6.2），而 §7.5 的加载固定用
   启动时那份归一化配置，所以它们改了什么都不会进运行期——拒绝档在这里的作用是**给未来留字段余地**：
   `Diff` 只用 `core` 自己看得见的信息判定（`core.ExecutorCommand` 的字段清单，实现上是两份显式的

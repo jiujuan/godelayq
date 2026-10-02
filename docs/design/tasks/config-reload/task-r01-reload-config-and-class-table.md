@@ -165,12 +165,17 @@ var rejectPrefixes = []string{
         "server.auth.jwt.secret",
 }
 
-// permissionCommandFields 是档位内的身份、目标与凭据字段（设计文档 §6.4、待拍板 P2）。
-// 这些字段变了 → 整次作废。
+// permissionCommandFields 是档位内的可执行体身份、目标与凭据字段（设计文档 §6.4、待拍板 P2）。
+// "可执行体身份"含两层：这个任务类型到底是哪一类（kind）与它具体跑哪个文件/程序
+// （runtime、script、program 等）。这些字段变了 → 整次作废。
 // 清单必须显式列字段，且与 hotCommandFields 合起来恰好覆盖 ExecutorCommand 摊出的每一个
 // 字段名：将来给 ExecutorCommand 加字段时，新字段两边都不在 → classify 回 ok=false，
 // 由 §5.1 的守卫用例逼着人显式回答"它落在哪一侧"，而不是静默落进热更档。
 var permissionCommandFields = map[string]bool{
+        // 是哪一类可执行体（script|binary|http）：换了它等于换掉"这个任务类型执行什么"，
+        // 与档位在线管理的 D7 同向（web-profile-design.md:38、
+        // api/handlers_executor_profiles.go:514 的 immutableFieldChange）
+        "kind": true,
         // 跑哪个可执行体
         "runtime":    true,
         "script":     true,
@@ -192,9 +197,10 @@ var permissionCommandFields = map[string]bool{
 
 // hotCommandFields 是档位内允许热更的取值型字段（设计文档 §6.4 第一条），与
 // permissionCommandFields 显式对偶。两份清单合起来恰好覆盖 ExecutorCommand 的每一个字段名，
-// 命中的叶子归 ClassHot。kind 与 body 也归这一侧（它们不改变"能执行什么"的身份/目标/凭据边界）。
+// 命中的叶子归 ClassHot。这里放的都是可调参数：body 只决定 payload 的 body 按 json/raw/none
+// 解释，不换可执行体也不换目标主机；kind 不在这侧，它归 permissionCommandFields（见 §10.2 第 13 条）。
 var hotCommandFields = map[string]bool{
-        "name": true, "kind": true, "timeout": true, "max_parallel": true,
+        "name": true, "timeout": true, "max_parallel": true,
         "retry_on_exit": true, "args": true, "args_render": true, "positional": true,
         "body": true, "expect_status": true, "capture_response": true, "max_body_bytes": true,
 }
@@ -524,8 +530,8 @@ go test ./... -race -count=1
 | `func (c ConfigClass) String() string`（hot/restart/reject，未知给 `ConfigClass(n)`） | `:35-46` |
 | `var configClasses map[string]ConfigClass`（**50 条**：热更 11、重启 39） | `:54-97` |
 | `var rejectPrefixes []string`（3 条凭据前缀） | `:103-107` |
-| `var permissionCommandFields map[string]bool`（14 个身份/目标/凭据字段） | `:118-136` |
-| `var hotCommandFields map[string]bool`（12 个允许热更的档位字段，D-R0104 补） | 本次新增，位置见改动后的 `core/config_reload.go` |
+| `var permissionCommandFields map[string]bool`（**15 个**可执行体身份/目标/凭据字段：14 个原有 + `kind`，见 §10.2 第 13 条） | `:118-136` |
+| `var hotCommandFields map[string]bool`（**11 个**允许热更的档位字段，D-R0104 补、D-R0105 把 `kind` 移到拒绝侧） | 本次新增，位置见改动后的 `core/config_reload.go` |
 | `func classify(path string) (ConfigClass, bool)` | `:144-162` |
 | `type leafKind int` + `leafScalar`/`leafSlice`/`leafMap` | `:166-172` |
 | `type leafValue struct{ Kind; Path; Val }` + `func (leafValue) any() any` | `:175-187` |
@@ -614,6 +620,26 @@ go test ./... -race -count=1
     摊出的档位字段名集合的双向断言，另加 `TestClassifyUnarchivedCommandFieldIsNotSilent`
     用直接调 `classify("executors.commands.cfg-script-one.__not_archived__")` 证明这条守卫会红。
     卡面 §3.3、§5.1、§6 的文字与设计 §6.4 末段同步改为"新字段必须显式归档，否则守卫红"。
+    这条里"kind 与 body 都不改变身份/目标/凭据边界、因此同归热更"的判断已被 §10.2 第 13 条
+    （登记为 D-R0105）推翻：`kind` 改归拒绝侧，`body` 维持热更。
+13. **`kind` 的归档方向按 D7 从热更正归拒绝**（登记为 D-R0105）。上一条把 `kind` 放进
+    `hotCommandFields`，理由是"卡面与设计 §6.4 的拒绝清单里没有列它"——**归档方向反了**。
+    `kind`（`script`/`binary`/`http`）不是可调参数，而是"这个任务类型到底执行什么"的身份字段：
+    它决定走进程执行器还是 HTTP 执行主体。仓库里已有一条同方向的现成口径——档位在线管理的
+    D7（`docs/design/web-profile-design.md:38`）明写"修改档位不允许改 `kind` 与 `script`/`program`，
+    这两项是'哪一个可执行体'的身份，换掉等于新建一条档位；要换就删了重建"，落地是
+    `immutableFieldChange`（`api/handlers_executor_profiles.go:514`，PUT 改 `kind` 直接回 400）。
+    热重载这侧若允许 `kind` 原地热更，就会出现"同一条任务类型上周跑脚本、这周发 HTTP"而留痕
+    看不出来，正是 D7 要避免的现象，且与在线写那侧形成两条相反的口径。
+    改动（最小面）：`kind` 从 `hotCommandFields` 移入 `permissionCommandFields`（两份清单的注释
+    同步，"可执行体身份"这一类现在明确含"是哪一类"与"跑哪个文件"两层）；§3.3 与设计 §6.4 的
+    两侧清单同步（拒绝侧由十四项变十五项、热更侧由十二项变十一项，拒绝侧补 `kind` 的理由并带
+    D7 / `immutableFieldChange` 的 `文件:行号`）；`TestDiffClassifiesChangedKeys` 加一行"改一条
+    既有档位的 `kind` → 拒绝档，同一行同时改 `timeout` → 仍热更"作对照（22 个子用例），
+    `TestClassifyUnknownPathIsNotSilent` 的 `classify` 表加 `executors.commands.a-b.kind`→`ClassReject`。
+    §5.1 那条"两份清单恰好覆盖档位字段"的集合等式断言**没有改动也没有绕过**：`kind` 换了清单、
+    两侧并集不变，它仍然双向成立。条目新增（`executors.commands.<新名字>.kind`）仍按 §3.4 的
+    `classifyChange` 走"条目增删本身"那一档热更，不受本次移动影响。
 
 ### 10.3 验证证据
 
@@ -737,6 +763,68 @@ FAIL	godelayq/core
 全量 `go test ./... -race -count=1`：`api` 221.5s、`cmd/server` 5.9s、`core` 13.1s、
 `executor` 24.5s、`store/sqlite` 3.7s 全 `ok`，其余 `[no test files]`。
 
+**D-R0105 复核补记**（`kind` 归拒绝档这次修复的实测，2026-10-02，基线提交 `65c71c3`）：
+
+变异反向验证（按要求：从 `permissionCommandFields` 删掉 `"kind": true` 这一行、注释保留，
+验完即恢复）。恢复前实测三份判据全部变红——新增的分类行、§5.1 的集合等式断言、`classify` 表：
+
+```
+$ go test ./core -count=1 -run 'TestEveryLeafKeyIsClassed|TestDiff|TestClassify'
+--- FAIL: TestEveryLeafKeyIsClassed (0.00s)
+    config_reload_test.go:57: leaf key "executors.commands.cfg-script-one.kind" has no reload class; add it to configClasses
+    config_reload_test.go:57: leaf key "executors.commands.cfg-http-one.kind" has no reload class; add it to configClasses
+    config_reload_test.go:75: executors.commands field "kind" is on neither permissionCommandFields nor hotCommandFields; archive it explicitly
+--- FAIL: TestDiffClassifiesChangedKeys (0.00s)
+    --- FAIL: TestDiffClassifiesChangedKeys/换某条既有档位的_kind_是拒绝，同时改它的_timeout_仍是热更 (0.00s)
+        config_reload_test.go:415:
+            	Error:      	[]string{} does not contain "executors.commands.cfg-script-one.kind"
+            	Messages:   	拒绝档 缺 "executors.commands.cfg-script-one.kind"
+        config_reload_test.go:417:
+            	Error:      	[]string{"executors.commands.cfg-script-one.kind"} should not contain "executors.commands.cfg-script-one.kind"
+            	Messages:   	"executors.commands.cfg-script-one.kind" 不该出现在重启档
+--- FAIL: TestClassifyUnknownPathIsNotSilent (0.00s)
+    config_reload_test.go:495: Error: Should be true / Messages: executors.commands.a-b.kind
+    config_reload_test.go:496: Error: Not equal: expected: 2 actual: 1 / Messages: executors.commands.a-b.kind
+FAIL	godelayq/core	0.180s
+```
+
+`kind` 落到 `ClassRestart`（`expected: 2` 是 `ClassReject`、`actual: 1` 是 `ClassRestart`），
+即"两边都不在 → 未归档 → 落重启档"那条兜底路径，证明 §5.1 的集合等式断言没有被绕过。
+补记前的同一变异（把 `"kind"` 改名成 `"kind-MUTANT"`，用来同时试反向的"清单不许写不存在的字段名"
+那条断言）实测多报一行，两个方向都守得住：
+
+```
+$ go test ./core -count=1 -run 'TestEveryLeafKeyIsClassed'
+--- FAIL: TestEveryLeafKeyIsClassed (0.00s)
+    config_reload_test.go:57: leaf key "executors.commands.cfg-script-one.kind" has no reload class; add it to configClasses
+    config_reload_test.go:57: leaf key "executors.commands.cfg-http-one.kind" has no reload class; add it to configClasses
+    config_reload_test.go:75: executors.commands field "kind" is on neither permissionCommandFields nor hotCommandFields; archive it explicitly
+    config_reload_test.go:80: permissionCommandFields lists "kind-MUTANT" but no executors.commands.* leaf carries it
+FAIL	godelayq/core	0.180s
+```
+
+恢复后的验收命令实际结果：
+
+1. `go build ./... && go vet ./...`：无输出（通过）。
+2. `go test ./core -count=1 -run 'TestEveryLeafKeyIsClassed|TestDiff|TestClassify|TestExampleConfigMatchesLocal' -v`：
+   `--- PASS: TestEveryLeafKeyIsClassed`、`TestClassifyUnarchivedCommandFieldIsNotSilent`、
+   `TestDiffClassifiesChangedKeys`（**22 个子用例**，比上一条补记多一行 kind 对照）、
+   `TestDiffReportsOldAndNewValues`、`TestDiffHasRejections`、`TestDiffListsKeysSorted`、
+   `TestClassifyUnknownPathIsNotSilent`、`TestExampleConfigMatchesLocal`（是 PASS 不是 SKIP）
+   共 30 条 `--- PASS`、0 条 FAIL，`ok godelayq/core 0.180s`。
+   其中新增的那一行：
+   `--- PASS: TestDiffClassifiesChangedKeys/换某条既有档位的_kind_是拒绝，同时改它的_timeout_仍是热更 (0.00s)`
+3. `go test ./core -race -count=5 -timeout 30m`：`ok  godelayq/core  61.543s`
+   （改动落地后、变异实验前的同一状态首跑是 `62.207s`，两轮都 `ok`）。
+4. `go test ./... -race -count=1 -timeout 30m`（变异恢复后的最终状态实跑）：`api` 219.182s、
+   `cmd/server` 5.761s、`core` 12.341s、`executor` 24.719s、`store/sqlite` 3.706s 全 `ok`，
+   其余 `[no test files]`。
+
+改动文件只有 `core/config_reload.go`、`core/config_reload_test.go`、设计 §6.4 与本卡；
+两份 Go 文件按显式 `gofmt -w` 处理（不走 `gofmt -l`，本仓 CRLF 全量误报），恢复后核对行尾仍是
+全 CRLF（511/511、667/667），未引入混合行尾。`configs/config.yaml` 与 `configs/config.example.yaml`
+未触碰，因此 `TestExampleConfigMatchesLocal` 无需改动仍为 PASS。
+
 ### 10.4 手工验收
 
 §5.4 的启动失败证据（`%TEMP%` 下的 `r01-smoke-*` 目录，跑完已删）：
@@ -770,7 +858,8 @@ exit status 1
 | **D-R0101** | `ReloadState` 的 `LastAttemptAt`/`LastAppliedAt` 是 `time.Time` 却带 `json:",omitempty"`，而 `omitempty` 对结构体无效：`result=rejected` 这类"从没成功应用过"的状态会把 `last_applied_at` 序列化成 `"0001-01-01T00:00:00Z"`，读端点给出的是一个假时间 | **登记不修**：卡 §3.5 与设计文档 §5.4 都按这个形状写，本卡没有任何读取方（改字段类型没有验证面，也没有调用点能证明它更对）。归 **R06**：接 `/admin/runtime` 时改成 `*time.Time` 或在 API 侧格式化，并在那张卡的用例里断言"没应用过就没有这个键" |
 | **D-R0102** | `Diff` 的"入参必须已 `Normalized()`"前提无法在 `core` 内部自检（结构体里 0 值与"没写这一项"不可区分），落地只有函数注释与测试约定 | **登记不修**：无法实现断言，硬做只能是 `panic` 级别的新口径。归 **R06**：重载链里 `candidate` 必须由 `LoadConfig(...).Normalized()` 单点产出，`applied` 必须是上一次换入的归一化结果；R06 要有一条用例证明"未归一化的 candidate 会被 Diff 报出假改动"这一方向不再可能发生 |
 | **D-R0103** | 无名档位靠 `#<i>` 索引兜底，重名档位则后者覆盖前者（`addLeaf` 同路径写入）：这两种形状的"按名字配对"不成立，改了名字会让整条档位的字段全部报成改动 | **登记不修**：`core.Validate` 不校验档位字段是既有口径（组合规则在 `executor.LoadProfiles`，任一条不过即启动失败），所以 `applied` 里永远是有名字且唯一的档位；无名/重名只可能出现在"executor 侧还没拒但 R06 已经比过一次"的中间态。归 **R04**：档位整表替换时按 `LoadProfiles` 的结论判，`Diff` 的这份形状只作日志与拒绝档判据 |
-| **D-R0104** | 卡 §3.3 与设计 §6.4 承诺的"给 `ExecutorCommand` 加字段时新字段必须显式归档"守卫在首版实现里不存在：`classify` 的档位字段分支是两态（命中拒绝清单→拒绝，否则一律热更），新字段会静默落进热更档、守卫正向放行、反向只遍历已列的 14 条拒绝字段 | **本卡已修**：新增显式 `hotCommandFields` 清单（设计 §6.4 第一条十项 + `kind`/`body`，共 12 项），`classify` 改三态（两边都不在→`ok=false`），`TestEveryLeafKeyIsClassed` 加"两份清单恰好覆盖档位字段"的双向断言，另加 `TestClassifyUnarchivedCommandFieldIsNotSilent` 直接证明未归档字段会让 `classify` 回 `ok=false`。见 §10.2 第 12 条 |
+| **D-R0104** | 卡 §3.3 与设计 §6.4 承诺的"给 `ExecutorCommand` 加字段时新字段必须显式归档"守卫在首版实现里不存在：`classify` 的档位字段分支是两态（命中拒绝清单→拒绝，否则一律热更），新字段会静默落进热更档、守卫正向放行、反向只遍历已列的 14 条拒绝字段 | **本卡已修**：新增显式 `hotCommandFields` 清单（设计 §6.4 第一条十项 + `kind`/`body`，共 12 项），`classify` 改三态（两边都不在→`ok=false`），`TestEveryLeafKeyIsClassed` 加"两份清单恰好覆盖档位字段"的双向断言，另加 `TestClassifyUnarchivedCommandFieldIsNotSilent` 直接证明未归档字段会让 `classify` 回 `ok=false`。见 §10.2 第 12 条。注：其中 `kind` 的归档方向由 D-R0105 更正 |
+| **D-R0105** | D-R0104 补 `hotCommandFields` 时把 `kind` 归进了热更侧（理由是"清单/卡面没把它列进拒绝侧"），归档方向反了：`kind`（`script`/`binary`/`http`）决定走进程执行器还是 HTTP 执行主体，是"哪一个可执行体"的身份字段而不是可调参数。允许它原地热更会出现"同一条任务类型上周跑脚本、这周发 HTTP"而任务留痕看不出来，且与档位在线管理已拍板的 D7（`docs/design/web-profile-design.md:38`，落地 `immutableFieldChange` @ `api/handlers_executor_profiles.go:514`：PUT 改 `kind` 直接 400）形成两条相反的口径 | **本卡已修**：`kind` 移入 `permissionCommandFields`（拒绝侧十五项、热更侧十一项），`core/config_reload.go` 两份清单注释、卡 §3.3、设计 §6.4 同步并补上指向 D7 的理由；`TestDiffClassifiesChangedKeys` 加"改既有档位 `kind`→拒绝、同行改 `timeout`→热更"的对照行，`TestClassifyUnknownPathIsNotSilent` 加 `executors.commands.a-b.kind`→`ClassReject`；§5.1 的集合等式断言未改、未绕过，靠变异（从拒绝清单删掉 `kind`）验过它确实会红。见 §10.2 第 13 条、§10.3 的 D-R0105 复核补记 |
 
 ### 10.6 未覆盖项
 

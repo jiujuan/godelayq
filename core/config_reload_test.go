@@ -317,6 +317,16 @@ func TestDiffClassifiesChangedKeys(t *testing.T) {
 			reject:    []string{"executors.commands.cfg-script-one.runtime"},
 		},
 		{
+			// D7 同向：kind 是"这个任务类型到底执行什么"的身份字段，不是可调参数。
+			// 同一行里改 timeout 作对照——它是取值型参数，必须仍落热更档。
+			name:      "换某条既有档位的 kind 是拒绝，同时改它的 timeout 仍是热更",
+			applied:   twoCommands,
+			candidate: withCommandKindAndTimeout(twoCommands, "cfg-script-one", "binary", 10*time.Minute),
+			reject:    []string{"executors.commands.cfg-script-one.kind"},
+			hot:       []string{"executors.commands.cfg-script-one.timeout"},
+			commands:  []string{"executors.commands.cfg-script-one.timeout"},
+		},
+		{
 			name:      "改 http 档位的 allowed_hosts 是拒绝",
 			applied:   twoCommands,
 			candidate: withCommandHosts(twoCommands, "cfg-http-one", "evil.example.com"),
@@ -476,6 +486,7 @@ func TestClassifyUnknownPathIsNotSilent(t *testing.T) {
 		{"server.auth.users.#0.password_bcrypt", ClassReject},
 		{"executors.commands", ClassHot},
 		{"executors.commands.a-b.timeout", ClassHot},
+		{"executors.commands.a-b.kind", ClassReject},
 		{"executors.commands.a-b.script", ClassReject},
 		{"executors.commands.#0.script", ClassReject},
 		{"executors.commands.a-b.positional.max", ClassHot},
@@ -590,6 +601,16 @@ func withCommandScript(cfg Config, name, script string) Config {
 func withCommandRuntime(cfg Config, name, runtime string) Config {
 	return mapCommand(cfg, name, func(c ExecutorCommand) ExecutorCommand {
 		c.Runtime = runtime
+		return c
+	})
+}
+
+// withCommandKindAndTimeout 在一条既有档位上同时改身份字段（kind）与取值字段（timeout）：
+// 一行用例就能同时钉住"kind 进拒绝档、timeout 留热更档"两个方向。
+func withCommandKindAndTimeout(cfg Config, name, kind string, timeout time.Duration) Config {
+	return mapCommand(cfg, name, func(c ExecutorCommand) ExecutorCommand {
+		c.Kind = kind
+		c.Timeout = timeout
 		return c
 	})
 }

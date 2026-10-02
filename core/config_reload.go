@@ -106,8 +106,9 @@ var rejectPrefixes = []string{
 	"server.auth.jwt.secret",
 }
 
-// permissionCommandFields 是档位内的身份、目标与凭据字段（设计文档 §6.4、待拍板 P2）。
-// 这些字段变了 → 整次作废。
+// permissionCommandFields 是档位内的可执行体身份、目标与凭据字段（设计文档 §6.4、待拍板 P2）。
+// "可执行体身份"含两层：这个任务类型到底是哪一类（kind）、它具体跑哪个文件/程序（runtime、
+// script、program 等）。这些字段变了 → 整次作废。
 //
 // 清单必须显式列字段，且与 hotCommandFields 合起来**恰好覆盖** core.ExecutorCommand 摊出的
 // 每一个字段名：将来给 ExecutorCommand 加字段时，新字段不会默认落进任何一侧——它两边都不在，
@@ -118,6 +119,10 @@ var rejectPrefixes = []string{
 // 判据只用 core 自己看得见的字段名，不借 executor.LoadProfiles 的归一化结果
 // ——core 不许 import executor（依赖方向红线，待拍板 P2）。
 var permissionCommandFields = map[string]bool{
+	// 是哪一类可执行体（script|binary|http）：它决定走进程执行器还是 HTTP 执行主体，
+	// 换了它等于换掉"这个任务类型到底执行什么"。与档位在线管理的 D7 同向，
+	// 见 web-profile-design.md:38 与 api/handlers_executor_profiles.go:514 的 immutableFieldChange。
+	"kind": true,
 	// 跑哪个可执行体
 	"runtime":    true,
 	"script":     true,
@@ -139,13 +144,12 @@ var permissionCommandFields = map[string]bool{
 
 // hotCommandFields 是档位内允许热更的取值型字段（设计文档 §6.4 第一条），与
 // permissionCommandFields 显式对偶：两份清单合起来恰好覆盖 core.ExecutorCommand 的每一个字段名，
-// 命中的叶子归 ClassHot。kind 与 body 也在这里——它们不改变"能执行什么"的身份/目标/凭据边界
-// （kind 选执行方式的字段子集、body 选 http 请求体来源），归热更与既有实现一致。
+// 命中的叶子归 ClassHot。这里的都是可调参数：body 只决定 payload 的 body 按 json/raw/none 解释，
+// 既不换可执行体也不换目标主机。kind 不在这里——它选的是执行主体本身，归 permissionCommandFields。
 //
 // 加字段时必须显式选一份清单登记，否则 classify 回 ok=false、守卫用例红（见 permissionCommandFields 的说明）。
 var hotCommandFields = map[string]bool{
 	"name":             true, // 重命名等价于删一条加一条
-	"kind":             true,
 	"timeout":          true,
 	"max_parallel":     true,
 	"retry_on_exit":    true,
