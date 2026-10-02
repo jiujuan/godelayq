@@ -209,3 +209,19 @@ observability:
     retention_count: 500000
     # 保留时长；0 表示不按时间淘汰。默认 90 天：安全台账的价值在事后追溯。
     retention_age: 2160h
+
+# 配置热重载：改文件即生效，不必重启进程。默认关闭，关闭时一个监听器都不建，
+# 进程行为与本节不存在时一致。
+# 设计依据见 docs/design/config-reload-design.md，实施进度见 docs/design/tasks/config-reload/README.md。
+# 注意：监听器与重载链的接线在 R05/R06 落地，状态表收口（R07）之前打开本节不会有行为变化。
+reload:
+  # 总开关。打开后进程会盯着启动时实际读到的那个文件（见设计文档 §5.2）。
+  # 这一项本身改了不生效：运行期关掉监听只能重启，所以它属于重启档。
+  # 环境变量：GODELAYQ_RELOAD_ENABLED=true
+  enabled: false
+  # 静默窗口：同一文件在这段时间内的多次写入合并成一次重载。
+  # 编辑器存盘往往拆成 Create + 多次 Write，逐次读会读到半截内容。
+  # 留空/0 用默认 500ms；低于 50ms 会被拒（那样等于每次存盘读好几遍配置文件）。
+  # 这一项可以热更：改它下一次事件就用新窗口。
+  # 环境变量：GODELAYQ_RELOAD_DEBOUNCE=2s
+  debounce: 500ms

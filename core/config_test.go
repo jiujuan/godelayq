@@ -810,3 +810,97 @@ func TestLoadConfig_RejectsUnknownObservabilityKeys(t *testing.T) {
 	require.Error(t, err, "子节里的未知键同样要被拒绝")
 	assert.Contains(t, err.Error(), "parse config failed")
 }
+
+// ---- 配置热重载（TASK-R01）：reload 一节的读取、覆盖与校验 ----
+
+// TestLoadConfig_ReloadDefaults 守住两件事：本节默认关闭，以及"引入本节没有碰到其余默认值"。
+// 后半段用整份结构体相等来断言——只要新增键时顺手改了别的默认值，这里立刻红。
+func TestLoadConfig_ReloadDefaults(t *testing.T) {
+	cfg := DefaultConfig()
+
+	assert.False(t, cfg.Reload.Enabled, "热重载必须默认关闭：关闭时一个监听器都不建，进程行为与本节不存在时一致")
+	assert.Equal(t, DefaultReloadDebounce, cfg.Reload.Debounce)
+	assert.NoError(t, cfg.Validate())
+
+	// 文件里完全不写 reload: 一节时，解出来的整份配置与 DefaultConfig() 相等
+	loaded, err := LoadConfig(writeConfigFile(t, "logging:\n  level: info\n"))
+	require.NoError(t, err)
+	assert.Equal(t, cfg, loaded, "本节不存在等价于默认关闭，且其余默认值一字未变")
+
+	// 显式写 enabled: false 与不写本节等价
+	off, err := LoadConfig(writeConfigFile(t, "reload:\n  enabled: false\n"))
+	require.NoError(t, err)
+	assert.Equal(t, cfg, off)
+
+	// debounce 的 0 表示"用默认值"，由 Normalized 补齐；显式取值不动
+	zero := cfg
+	zero.Reload.Debounce = 0
+	assert.Equal(t, DefaultReloadDebounce, zero.Normalized().Reload.Debounce)
+
+	kept := cfg
+	kept.Reload.Debounce = 2 * time.Second
+	assert.Equal(t, 2*time.Second, kept.Normalized().Reload.Debounce, "显式写的合并窗口不该被归一化改掉")
+
+	// enabled 自身属于重启档：归一化不会替人打开监听器
+	enabled := zero
+	enabled.Reload.Enabled = true
+	assert.True(t, enabled.Normalized().Reload.Enabled)
+}
+
+// TestLoadConfig_ReloadEnvOverrides 守 BindEnv 列表里的两个新键。
+// 漏在这一份列表里不会让任何东西失败——YAML 照常读、值照常生效，只有环境变量悄悄无效，
+// 所以必须有用例真去覆盖一次。（对照 TestLoadConfig_WebProfileEnvOverrides 的写法。）
+func TestLoadConfig_ReloadEnvOverrides(t *testing.T) {
+	path := writeConfigFile(t, "reload:\n  enabled: false\n  debounce: 500ms\n")
+
+	cfg, err := LoadConfig(path)
+	require.NoError(t, err)
+	assert.False(t, cfg.Reload.Enabled)
+	assert.Equal(t, DefaultReloadDebounce, cfg.Reload.Debounce)
+
+	t.Setenv("GODELAYQ_RELOAD_ENABLED", "true")
+	t.Setenv("GODELAYQ_RELOAD_DEBOUNCE", "2s")
+
+	cfg, err = LoadConfig(path)
+	require.NoError(t, err)
+	assert.True(t, cfg.Reload.Enabled, "GODELAYQ_RELOAD_ENABLED 必须真能覆盖")
+	assert.Equal(t, 2*time.Second, cfg.Reload.Debounce, "GODELAYQ_RELOAD_DEBOUNCE 必须真能覆盖")
+}
+
+// TestValidate_Reload 钉住合并窗口的三条取值口径（§3.1 第 4 条）。
+// 方向与 executors.* 那组不同：debounce 在关闭状态下也没有"合法的过小写法"，
+// 因为它会被 Normalized 补成默认值，所以负数与过小一律拒，不挂在 enabled 上。
+func TestValidate_Reload(t *testing.T) {
+	// 过小：enabled=true
+	_, err := LoadConfig(writeConfigFile(t, "reload:\n  enabled: true\n  debounce: 10ms\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reload.debounce")
+	assert.Contains(t, err.Error(), "too small")
+	assert.Contains(t, err.Error(), minReloadDebounce.String(), "错误文案要给出合法下界")
+	assert.Contains(t, err.Error(), DefaultReloadDebounce.String(), "错误文案要给出省略本项时的取值")
+
+	// 负数：一律拒，与 enabled 无关
+	_, err = LoadConfig(writeConfigFile(t, "reload:\n  debounce: -1s\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reload.debounce must not be negative")
+
+	// enabled=false 也拒：关闭状态下写 10ms 同样是写错，而不是"反正不生效"
+	_, err = LoadConfig(writeConfigFile(t, "reload:\n  enabled: false\n  debounce: 10ms\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "reload.debounce")
+	assert.Contains(t, err.Error(), "too small")
+
+	// 0 合法（表示用默认值），下界本身合法
+	omitted, err := LoadConfig(writeConfigFile(t, "reload:\n  enabled: true\n  debounce: 0s\n"))
+	require.NoError(t, err, "0 表示用默认值，必须放过")
+	assert.Equal(t, DefaultReloadDebounce, omitted.Normalized().Reload.Debounce)
+
+	floor, err := LoadConfig(writeConfigFile(t, "reload:\n  enabled: true\n  debounce: 50ms\n"))
+	require.NoError(t, err)
+	assert.Equal(t, minReloadDebounce, floor.Reload.Debounce)
+
+	// 未知键同样被精确解码拒绝
+	_, err = LoadConfig(writeConfigFile(t, "reload:\n  enabled: true\n  watcher: inotify\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse config failed")
+}

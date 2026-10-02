@@ -32,6 +32,8 @@ type Config struct {
 	// Observability SQLite 观测层（运行事件、产物索引、写操作审计）；默认关闭，
 	// 关闭时不创建任何文件，详见 ObservabilityConfig。
 	Observability ObservabilityConfig `mapstructure:"observability"`
+	// Reload 配置热重载的开关与节奏；默认关闭，关闭时一个监听器都不建，详见 ReloadConfig。
+	Reload ReloadConfig `mapstructure:"reload"`
 }
 
 // ServerConfig HTTP 接入层配置
@@ -176,6 +178,22 @@ type LoggingConfig struct {
 	Level string `mapstructure:"level"`
 	// Format 输出格式：text|json
 	Format string `mapstructure:"format"`
+}
+
+// DefaultReloadDebounce 是配置监听的事件合并窗口（设计文档 §5.1、待拍板 P3）。
+const DefaultReloadDebounce = 500 * time.Millisecond
+
+// minReloadDebounce 是可用取值下界：比它小等于每次存盘读好几遍配置文件。
+const minReloadDebounce = 50 * time.Millisecond
+
+// ReloadConfig 配置热重载的开关与节奏。整体默认关闭。
+type ReloadConfig struct {
+	// Enabled 总开关。false 时不建监听器，进程行为与本节不存在时一致。
+	// 这一项自身属于重启档：运行期关掉监听只能重启。
+	Enabled bool `mapstructure:"enabled"`
+	// Debounce 事件合并窗口；0 表示 DefaultReloadDebounce。
+	// 低于 minReloadDebounce 由 Validate 拒绝。这一项可以热更。
+	Debounce time.Duration `mapstructure:"debounce"`
 }
 
 // 执行器配置的默认值。执行能力默认关闭（ExecutorsConfig.Enabled），
@@ -708,6 +726,12 @@ func DefaultConfig() Config {
 				RetentionAge:   DefaultObserveAuditRetentionAge,
 			},
 		},
+		Reload: ReloadConfig{
+			// 默认关闭：打开它等于让进程盯着配置文件自动换取值，
+			// 关闭时一个监听器都不建，本节其余取值全部不生效。
+			Enabled:  false,
+			Debounce: DefaultReloadDebounce,
+		},
 	}
 }
 
@@ -791,6 +815,11 @@ func LoadConfig(path string) (Config, error) {
 		"observability.audit.enabled",
 		"observability.audit.retention_count",
 		"observability.audit.retention_age",
+		// 配置热重载：两项都是标量，逐项绑定。这里漏一项不会让任何东西失败——
+		// YAML 里的 reload.* 照常能被读出来（那是 UnmarshalExact 按结构体字段判断的），
+		// 只有环境变量悄悄无效，所以由 TestLoadConfig_ReloadEnvOverrides 守着。
+		"reload.enabled",
+		"reload.debounce",
 	} {
 		if err := v.BindEnv(key, "GODELAYQ_"+strings.ToUpper(strings.ReplaceAll(key, ".", "_"))); err != nil {
 			return cfg, fmt.Errorf("bind env for %q failed: %w", key, err)
@@ -878,6 +907,18 @@ func (c Config) Validate() error {
 
 	if err := c.Observability.Validate(); err != nil {
 		return err
+	}
+
+	// 配置热重载：与 executors.* 那组方向不同——关闭状态下 reload.debounce 也没有
+	// "合法的过小写法"，因为它会被 Normalized 补成默认值，写 10ms 只会是写错而不是"不生效"。
+	// 0 是唯一合法的"用默认值"写法：LoadConfig 里 Validate 在 Normalized 之前，
+	// 所以 0 先被放过、再由 Normalized 补齐。
+	if c.Reload.Debounce < 0 {
+		return fmt.Errorf("reload.debounce must not be negative, got %v", c.Reload.Debounce)
+	}
+	if c.Reload.Debounce > 0 && c.Reload.Debounce < minReloadDebounce {
+		return fmt.Errorf("reload.debounce %v is too small, a merge window below %v means re-reading the config file several times per save (omit the key to use %v)",
+			c.Reload.Debounce, minReloadDebounce, DefaultReloadDebounce)
 	}
 
 	for _, origin := range c.Server.CORS.AllowOrigins {
@@ -1015,6 +1056,12 @@ func (c Config) Normalized() Config {
 	}
 	if c.Observability.Audit.RetentionAge < 0 {
 		c.Observability.Audit.RetentionAge = defaults.Observability.Audit.RetentionAge
+	}
+
+	// 配置热重载：enabled 的 false 是有意的取值（"关闭"就是它的正常工作状态），归一化不动；
+	// debounce 的 0 表示"用默认值"，与 store.flush_interval 同一读法。
+	if c.Reload.Debounce == 0 {
+		c.Reload.Debounce = defaults.Reload.Debounce
 	}
 
 	return c
