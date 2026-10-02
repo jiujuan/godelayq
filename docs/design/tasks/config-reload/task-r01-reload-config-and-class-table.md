@@ -166,11 +166,10 @@ var rejectPrefixes = []string{
 }
 
 // permissionCommandFields 是档位内的身份、目标与凭据字段（设计文档 §6.4、待拍板 P2）。
-// 这些字段变了 → 整次作废；档位其余字段（timeout、max_parallel、retry_on_exit、
-// args/args_render/positional、expect_status、capture_response、max_body_bytes）
-// 以及条目增删 → 热更。
-// 清单必须显式列字段：将来给 ExecutorCommand 加字段时，新字段默认落在
-// "允许热更"一侧，由 §5.1 的守卫用例逼着人显式回答"它落在哪一侧"。
+// 这些字段变了 → 整次作废。
+// 清单必须显式列字段，且与 hotCommandFields 合起来恰好覆盖 ExecutorCommand 摊出的每一个
+// 字段名：将来给 ExecutorCommand 加字段时，新字段两边都不在 → classify 回 ok=false，
+// 由 §5.1 的守卫用例逼着人显式回答"它落在哪一侧"，而不是静默落进热更档。
 var permissionCommandFields = map[string]bool{
         // 跑哪个可执行体
         "runtime":    true,
@@ -190,6 +189,15 @@ var permissionCommandFields = map[string]bool{
         "deny_private_ranges": true,
         "max_redirects":   true,
 }
+
+// hotCommandFields 是档位内允许热更的取值型字段（设计文档 §6.4 第一条），与
+// permissionCommandFields 显式对偶。两份清单合起来恰好覆盖 ExecutorCommand 的每一个字段名，
+// 命中的叶子归 ClassHot。kind 与 body 也归这一侧（它们不改变"能执行什么"的身份/目标/凭据边界）。
+var hotCommandFields = map[string]bool{
+        "name": true, "kind": true, "timeout": true, "max_parallel": true,
+        "retry_on_exit": true, "args": true, "args_render": true, "positional": true,
+        "body": true, "expect_status": true, "capture_response": true, "max_body_bytes": true,
+}
 ```
 
 分类判定函数（`Diff` 与守卫用例共用一份，避免两套规则）：
@@ -201,8 +209,9 @@ func classify(path string) (class ConfigClass, ok bool)
 ```
 
 判定顺序：精确路径 → `rejectPrefixes` 前缀 → `executors.commands.<name|.#i>.<field>`
-形式的字段名（命中 `permissionCommandFields` 则 `ClassReject`，否则该路径归 `ClassHot`）。
-最后一条要在 `classify` 里用 `strings.Cut` 拆出字段名，不要把档位字段单独存一份表。
+形式的字段名，**三态**：命中 `permissionCommandFields` 则 `ClassReject`，命中 `hotCommandFields`
+则 `ClassHot`，两边都不在则 `ok=false`（与"未知顶层键未归档"同一脸色，让守卫去红）。
+最后一条要在 `classify` 里用 `strings.Cut` 拆出字段名。
 
 三条落地口径（实现时补进卡，避免后来人按字面理解）：
 
@@ -351,9 +360,23 @@ func TestEveryLeafKeyIsClassed(t *testing.T) {
                         t.Errorf("configClasses has %q but DefaultConfig does not produce it", path)
                 }
         }
-        for path := range permissionCommandFields {
-                if !hasCommandField(leaves, path) {
-                        t.Errorf("permissionCommandFields lists %q but no executors.commands.* leaf carries it", path)
+        // 两份清单必须恰好覆盖摊出的每一个档位字段名，多一个少一个都报错：
+        //   少——ExecutorCommand 新增字段却没进任一清单（未归档，静默落热更档），本次新增的守卫；
+        //   多——清单列着结构体没有的字段名（笔误/字段被删）。
+        commandFields := commandFieldNames(leaves)
+        for field := range commandFields {
+                if !permissionCommandFields[field] && !hotCommandFields[field] {
+                        t.Errorf("executors.commands field %q is on neither permissionCommandFields nor hotCommandFields; archive it explicitly", field)
+                }
+        }
+        for field := range permissionCommandFields {
+                if !commandFields[field] {
+                        t.Errorf("permissionCommandFields lists %q but no executors.commands.* leaf carries it", field)
+                }
+        }
+        for field := range hotCommandFields {
+                if !commandFields[field] {
+                        t.Errorf("hotCommandFields lists %q but no executors.commands.* leaf carries it", field)
                 }
         }
 }
@@ -361,9 +384,8 @@ func TestEveryLeafKeyIsClassed(t *testing.T) {
 
 `isCommandOrCredentialPrefix(path)` 认两类合法条目：`executors.commands`（条目增删本身）与
 `rejectPrefixes` 里那三条前缀（凭据的子路径按元素摊开，精确路径本来就不在 `configClasses` 里）。
-`hasCommandField(leaves, field)` 在摊出的 `executors.commands.<name>.<field>` 集合里找这个字段名
-——它是"清单里的字段名写错了"这类笔误的守卫。
-两个辅助函数都放在测试文件里，不外溢。
+`commandFieldNames(leaves)` 收集摊出的 `executors.commands.<name>.<field>` 里出现过的字段名集合，
+是"两份清单恰好覆盖档位字段"这条守卫的基础。两个辅助函数都放在测试文件里，不外溢。
 
 同一条用例还要反向查表：`configClasses` 里的键若在 `DefaultConfig()` 摊出的路径集合里找不到，
 也要报错（防止改了键名而表里留着旧路径——那种键会永久静默）。
@@ -408,10 +430,12 @@ func TestEveryLeafKeyIsClassed(t *testing.T) {
 最后再加一条 `HasRejections()` 的用例：一次改动同时含 `logging.level` 与
 `server.auth.token` 时，`Reject` 有内容、`Hot` 也有内容，调用方据此整次作废。
 
-落地时另加五条同族用例（都守本卡已写明的判据，不是新行为）：
+落地时另加六条同族用例（都守本卡已写明的判据，不是新行为）：
 `TestDiffReportsOldAndNewValues`（`ChangedKey` 带两侧原值）、
 `TestDiffListsKeysSorted`（四份清单按路径字典序）、
 `TestClassifyUnknownPathIsNotSilent`（`classify` 的 `ok=false` 分支 + 十个代表路径的归档）、
+`TestClassifyUnarchivedCommandFieldIsNotSilent`（档位新增未归档字段 → `classify` 回 `ok=false`，
+证明"新字段必须显式归档"这条守卫存在）、
 `TestFlattenLeavesKinds`（`time.Duration` 当叶子、列表/映射的 `Kind`、空列表以容器路径出现、
 `*bool` 与 `map` 不递归）、`TestFlattenLeavesNamelessCommand`（无名档位的 `#<i>` 兜底路径）。
 
@@ -425,8 +449,9 @@ func TestEveryLeafKeyIsClassed(t *testing.T) {
 
 - [x] `reload.enabled` / `reload.debounce` 能读、能归一化、能被环境变量覆盖，
       `TestExampleConfigMatchesLocal` 通过（不是跳过）。
-- [x] `configClasses` + `rejectPrefixes` + `permissionCommandFields` 覆盖 `DefaultConfig()`
-      摊出的每一个叶子路径，`TestEveryLeafKeyIsClassed` 双向绿（缺归档、留旧路径都报错）。
+- [x] `configClasses` + `rejectPrefixes` + `permissionCommandFields` + `hotCommandFields` 覆盖
+      `DefaultConfig()` 摊出的每一个叶子路径，`TestEveryLeafKeyIsClassed` 双向绿（缺归档、留旧路径、
+      档位字段两份清单没恰好覆盖都报错）。
 - [x] `Diff` 的表驱动用例逐条通过，含"同时含热更与拒绝"那一条。
 - [x] `ReloadState` 与五个结论常量在 `core` 里定义，`api`/`cmd` 尚未引用也能编译通过
       （本卡不接线）。
@@ -500,6 +525,7 @@ go test ./... -race -count=1
 | `var configClasses map[string]ConfigClass`（**50 条**：热更 11、重启 39） | `:54-97` |
 | `var rejectPrefixes []string`（3 条凭据前缀） | `:103-107` |
 | `var permissionCommandFields map[string]bool`（14 个身份/目标/凭据字段） | `:118-136` |
+| `var hotCommandFields map[string]bool`（12 个允许热更的档位字段，D-R0104 补） | 本次新增，位置见改动后的 `core/config_reload.go` |
 | `func classify(path string) (ConfigClass, bool)` | `:144-162` |
 | `type leafKind int` + `leafScalar`/`leafSlice`/`leafMap` | `:166-172` |
 | `type leafValue struct{ Kind; Path; Val }` + `func (leafValue) any() any` | `:175-187` |
@@ -576,6 +602,18 @@ go test ./... -race -count=1
     并把"调用方必须传 `Normalized()` 结果"这条留给 R06 的重载链（用例里靠
     `Diff(applied.Normalized(), candidate.Normalized())` 与"默认值 vs 归一化默认值无改动"那一行守）。
     登记为 D-R0102。
+12. **卡 §3.3 承诺的"新字段必须显式归档"守卫在首版实现里不存在，本次补上**（登记为 D-R0104）。
+    首版 `classify` 的档位字段分支是两态：命中 `permissionCommandFields` 归拒绝档，否则一律归热更档。
+    后果是将来给 `ExecutorCommand` 加字段时，新字段会**静默落进热更档**、守卫正向放行，
+    反向只遍历已列的 14 条拒绝字段，§5.1 里唯一的规模断言是 `len(leaves) < 60` 这个下限——
+    "逼着人显式回答'它落在哪一侧'"这句话因此不成立。修法：新增显式的 `hotCommandFields`
+    （设计 §6.4 第一条那十项，再加 `kind`、`body`——它们不改变身份/目标/凭据边界，与既有实现
+    把它们当热更的方向一致，共 12 项），`classify` 的档位字段分支改三态
+    （拒绝清单命中→`ClassReject`、热更清单命中→`ClassHot`、两边都不在→`ok=false`），
+    `TestEveryLeafKeyIsClassed` 加一条 `permissionCommandFields ∪ hotCommandFields` **恰好等于**
+    摊出的档位字段名集合的双向断言，另加 `TestClassifyUnarchivedCommandFieldIsNotSilent`
+    用直接调 `classify("executors.commands.cfg-script-one.__not_archived__")` 证明这条守卫会红。
+    卡面 §3.3、§5.1、§6 的文字与设计 §6.4 末段同步改为"新字段必须显式归档，否则守卫红"。
 
 ### 10.3 验证证据
 
@@ -662,6 +700,43 @@ ok  	godelayq/store/sqlite	3.635s
 落地后核对过四个 Go 文件与两份 YAML 的行尾仍是全 CRLF（1068/1068、906/906、478/478、617/617），
 没有引入混和行尾。
 
+**D-R0104 复核补记**（本次修复的实测，2026-10-02，基线提交 `41691f9`）：
+
+先红后绿：新增 `TestClassifyUnarchivedCommandFieldIsNotSilent` 断言
+`classify("executors.commands.cfg-script-one.__not_archived__")` 回 `ok=false`，
+在两态实现下先 FAIL（实测 `actual: 0`（ClassHot）、`Should be false`），加 `hotCommandFields`
++ 三态 `classify` 后 PASS。
+
+守卫用例的变异反向验证（三处，验完即恢复，两个 Go 文件行尾仍是全 CRLF 507/507、646/646）：
+
+```
+# 变异一：从 hotCommandFields 删掉 "timeout"（模拟新增字段没归档）→ 正向守卫红
+--- FAIL: TestEveryLeafKeyIsClassed (0.00s)
+    config_reload_test.go:57: leaf key "executors.commands.cfg-script-one.timeout" has no reload class; add it to configClasses
+    config_reload_test.go:75: executors.commands field "timeout" is on neither permissionCommandFields nor hotCommandFields; archive it explicitly
+    config_reload_test.go:57: leaf key "executors.commands.cfg-http-one.timeout" has no reload class; add it to configClasses
+FAIL	godelayq/core
+
+# 变异二：往 hotCommandFields 塞一个 "not_a_real_field"（清单里写着不存在的字段名）→ 反向守卫红
+--- FAIL: TestEveryLeafKeyIsClassed (0.00s)
+    config_reload_test.go:85: hotCommandFields lists "not_a_real_field" but no executors.commands.* leaf carries it
+FAIL	godelayq/core
+
+# 恢复后：ok  godelayq/core
+```
+
+验收命令 1（`-v`）：`TestEveryLeafKeyIsClassed`、`TestClassifyUnarchivedCommandFieldIsNotSilent`、
+`TestDiffClassifiesChangedKeys`（21 子用例）、`TestDiffReportsOldAndNewValues`、`TestDiffHasRejections`、
+`TestDiffListsKeysSorted`、`TestClassifyUnknownPathIsNotSilent`、`TestExampleConfigMatchesLocal`、
+`TestLoadConfig_Reload*`（2）、`TestValidate_Reload` 全部 PASS、0 FAIL。
+
+验收命令 2：`go build ./... && go vet ./...` 无输出（通过）。
+
+`-race -count=5`：`ok  godelayq/core  57.690s`。
+
+全量 `go test ./... -race -count=1`：`api` 221.5s、`cmd/server` 5.9s、`core` 13.1s、
+`executor` 24.5s、`store/sqlite` 3.7s 全 `ok`，其余 `[no test files]`。
+
 ### 10.4 手工验收
 
 §5.4 的启动失败证据（`%TEMP%` 下的 `r01-smoke-*` 目录，跑完已删）：
@@ -695,6 +770,7 @@ exit status 1
 | **D-R0101** | `ReloadState` 的 `LastAttemptAt`/`LastAppliedAt` 是 `time.Time` 却带 `json:",omitempty"`，而 `omitempty` 对结构体无效：`result=rejected` 这类"从没成功应用过"的状态会把 `last_applied_at` 序列化成 `"0001-01-01T00:00:00Z"`，读端点给出的是一个假时间 | **登记不修**：卡 §3.5 与设计文档 §5.4 都按这个形状写，本卡没有任何读取方（改字段类型没有验证面，也没有调用点能证明它更对）。归 **R06**：接 `/admin/runtime` 时改成 `*time.Time` 或在 API 侧格式化，并在那张卡的用例里断言"没应用过就没有这个键" |
 | **D-R0102** | `Diff` 的"入参必须已 `Normalized()`"前提无法在 `core` 内部自检（结构体里 0 值与"没写这一项"不可区分），落地只有函数注释与测试约定 | **登记不修**：无法实现断言，硬做只能是 `panic` 级别的新口径。归 **R06**：重载链里 `candidate` 必须由 `LoadConfig(...).Normalized()` 单点产出，`applied` 必须是上一次换入的归一化结果；R06 要有一条用例证明"未归一化的 candidate 会被 Diff 报出假改动"这一方向不再可能发生 |
 | **D-R0103** | 无名档位靠 `#<i>` 索引兜底，重名档位则后者覆盖前者（`addLeaf` 同路径写入）：这两种形状的"按名字配对"不成立，改了名字会让整条档位的字段全部报成改动 | **登记不修**：`core.Validate` 不校验档位字段是既有口径（组合规则在 `executor.LoadProfiles`，任一条不过即启动失败），所以 `applied` 里永远是有名字且唯一的档位；无名/重名只可能出现在"executor 侧还没拒但 R06 已经比过一次"的中间态。归 **R04**：档位整表替换时按 `LoadProfiles` 的结论判，`Diff` 的这份形状只作日志与拒绝档判据 |
+| **D-R0104** | 卡 §3.3 与设计 §6.4 承诺的"给 `ExecutorCommand` 加字段时新字段必须显式归档"守卫在首版实现里不存在：`classify` 的档位字段分支是两态（命中拒绝清单→拒绝，否则一律热更），新字段会静默落进热更档、守卫正向放行、反向只遍历已列的 14 条拒绝字段 | **本卡已修**：新增显式 `hotCommandFields` 清单（设计 §6.4 第一条十项 + `kind`/`body`，共 12 项），`classify` 改三态（两边都不在→`ok=false`），`TestEveryLeafKeyIsClassed` 加"两份清单恰好覆盖档位字段"的双向断言，另加 `TestClassifyUnarchivedCommandFieldIsNotSilent` 直接证明未归档字段会让 `classify` 回 `ok=false`。见 §10.2 第 12 条 |
 
 ### 10.6 未覆盖项
 

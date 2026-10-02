@@ -65,10 +65,24 @@ func TestEveryLeafKeyIsClassed(t *testing.T) {
 		}
 	}
 
-	// 反向二：拒绝档字段清单里的名字必须真出现在某个档位叶子里
+	// 档位字段的两份清单必须**恰好**覆盖摊出来的每一个字段名——多一个少一个都报错：
+	//   少（清单漏字段）：ExecutorCommand 新增了字段却没进 permission/hot 任一清单 → 未归档，
+	//     本次要新增的就是这条守卫；
+	//   多（清单写多了）：清单里列着结构体根本没有的字段名（笔误或字段被删）。
+	commandFields := commandFieldNames(leaves)
+	for field := range commandFields {
+		if !permissionCommandFields[field] && !hotCommandFields[field] {
+			t.Errorf("executors.commands field %q is on neither permissionCommandFields nor hotCommandFields; archive it explicitly", field)
+		}
+	}
 	for field := range permissionCommandFields {
-		if !hasCommandField(leaves, field) {
+		if !commandFields[field] {
 			t.Errorf("permissionCommandFields lists %q but no executors.commands.* leaf carries it", field)
+		}
+	}
+	for field := range hotCommandFields {
+		if !commandFields[field] {
+			t.Errorf("hotCommandFields lists %q but no executors.commands.* leaf carries it", field)
 		}
 	}
 
@@ -80,6 +94,17 @@ func TestEveryLeafKeyIsClassed(t *testing.T) {
 	// 带连字符的名字（风险表 §9 第二条）：档位名由 ValidateProfileName 限定为
 	// [A-Za-z0-9_-]{1,64}，不含点，所以按名字摊路径不会被 Cut 拆错。
 	require.NoError(t, ValidateProfileName("cfg-script-one"))
+}
+
+// TestClassifyUnarchivedCommandFieldIsNotSilent 证明"给 ExecutorCommand 新增字段时必须显式
+// 归档"这条守卫真的存在：一个不在 permissionCommandFields 也不在 hotCommandFields 里的档位
+// 字段路径，classify 必须回 ok=false（与"未知顶层键未归档"同一脸色），而不是悄悄落到热更档。
+// 用直接调 classify 的写法，不依赖改结构体——将来加字段忘了归档时，守卫用例（
+// TestEveryLeafKeyIsClassed）正是靠这个 ok=false 分支变红。
+func TestClassifyUnarchivedCommandFieldIsNotSilent(t *testing.T) {
+	class, ok := classify("executors.commands.cfg-script-one.__not_archived__")
+	assert.False(t, ok, "未归档的档位字段必须报 miss，而不是默认落进热更档")
+	assert.Equal(t, ClassRestart, class, "未归档时返回重启档：忽略 ok 的调用方最坏只是进 ignored_keys，不会把新字段变成免重启通道")
 }
 
 // isCommandOrCredentialPrefix 认两类合法条目：executors.commands（条目增删本身，
@@ -97,21 +122,25 @@ func isCommandOrCredentialPrefix(path string) bool {
 	return false
 }
 
-// hasCommandField 在摊出的 executors.commands.<name>.<field> 集合里找指定字段名。
-// 它是"permissionCommandFields 里的字段名写错了"这类笔误的守卫。
+// commandFieldNames 收集摊出的 executors.commands.<name>.<field> 集合里出现过的所有字段名。
+// 它是"两份清单恰好覆盖档位字段"这条守卫的基础：结构体新增/删除字段都会在这里显形。
 // 这里刻意用字面量重新解析一遍路径，不复用实现里的拆分函数：实现写错时守卫不会跟着一起错。
 // 放在测试文件里，不外溢。
-func hasCommandField(leaves map[string]leafValue, field string) bool {
+func commandFieldNames(leaves map[string]leafValue) map[string]bool {
 	const prefix = "executors.commands."
+	fields := make(map[string]bool)
 	for path := range leaves {
 		if !strings.HasPrefix(path, prefix) {
 			continue
 		}
-		if name, f, ok := strings.Cut(strings.TrimPrefix(path, prefix), "."); ok && name != "" && f == field {
-			return true
+		if name, rest, ok := strings.Cut(strings.TrimPrefix(path, prefix), "."); ok && name != "" {
+			field, _, _ := strings.Cut(rest, ".")
+			if field != "" {
+				fields[field] = true
+			}
 		}
 	}
-	return false
+	return fields
 }
 
 // ---- §5.3 Diff 的分类 ----

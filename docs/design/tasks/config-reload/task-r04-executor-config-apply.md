@@ -191,6 +191,15 @@ fixture 用 `selfExecutable(t)` + `namedScript(...)`（`executor/applier_test.go
   逐条断言 `Keys()`、`HandlerNames()` 与调用前相等，`a.configCommands` 也保持旧值
   （再调一次 `Apply()` 时撞名判定仍按旧列表，用 §5.3 那条用例的形式验证）。
 - **`enabled=false`** → 返回错误且不碰任何东西。
+- **新增/重命名一条档位越出冻结许可 → 整次失败、一字不动**（这条是设计文档 §9"免重启新增档位"
+  那句的验证面，兜底在 R04 手里）：fixture 冻结的 `workspace` 只允许 `scripts/` 下、
+  `runtime_allow` 只含 `bash`。candidate 里既放宽顶层 `workspace`（改成能覆盖 `../elsewhere/`）、
+  放宽 `runtime_allow`（加 `node`），又新增（或把一条既有档位改名后）一条档位，其 `script` 落在
+  放宽后目录里但**越出冻结 workspace**、或其 `runtime` 用 `node`（**不在冻结 `runtime_allow`**）。
+  判据：`ApplyConfig` 返回错误（走 §3.3 第 2 步的 `LoadProfiles`，用的是冻结的那份非 `Commands`
+  取值而不是整份 candidate），且登记表 `Keys()`、替身 `HandlerNames()`、`a.configCommands`
+  与调用前逐条相等——即使 YAML 里顶层许可字段已放宽，新档位也不能按新值建出来。
+  这条守的是"新增条目可热更"被限定在既有许可范围内、不能借热更扩边界（§9、§12 新增风险行）。
 - 连续两次 `ApplyConfig` 同一份列表 → 第二次 `Added`/`Removed` 全空、
   替身里每个键都只被重登记一次（可重入，与 `Applier.Apply` 的既有承诺同一条）。
 
@@ -257,7 +266,7 @@ func TestApplier_ApplyConfigMatchesStartup(t *testing.T) {
 ## 6. 完成标准（DoD）
 
 - [ ] `Registry.ApplyConfig` 存在，四条规则各有用例（整表替换、同批重复拒绝、撞名降级、关闭时拒绝）。
-- [ ] `Applier.ApplyConfig` 存在，六条行为各有用例（§5.2 全部），
+- [ ] `Applier.ApplyConfig` 存在，七条行为各有用例（§5.2 全部），
       失败点全部在动手之前（那条"非法即整次不动"的用例逐条断言表与替身都没变）。
 - [ ] `Applier` 的 `configCommands` 记账生效：`Apply` 的撞名判定与处理函数构造
       用的是当前列表而不是启动期列表（§5.3 那条用例是它的唯一证据，别省）。

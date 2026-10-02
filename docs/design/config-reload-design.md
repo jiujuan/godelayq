@@ -238,9 +238,10 @@ type ReloadState struct {
 
 档位条目里的字段按"改它等于换身份、换目标、换可执行体或换凭据吗"分两侧：
 
-- **允许热更**：`name`（重命名等价于删一条加一条）、`timeout`、`max_parallel`、`retry_on_exit`、
-  `args`/`args_render`/`positional`（payload 参数声明）、`expect_status`、`capture_response`、
-  `max_body_bytes`，以及条目的增删。
+- **允许热更**：`name`（重命名等价于删一条加一条）、`kind`（只选执行方式的字段子集，不改变"能执行什么"
+  的身份/目标/凭据边界）、`body`（http 请求体来源，同样不改变能力边界）、`timeout`、`max_parallel`、
+  `retry_on_exit`、`args`/`args_render`/`positional`（payload 参数声明）、`expect_status`、
+  `capture_response`、`max_body_bytes`，以及条目的增删。
 - **触发拒绝**：`runtime`、`script`、`program`、`fixed_args`、`cwd`、`env`、`env_allow`、
   `method`、`url_template`、`allowed_hosts`、`headers`、`header_allow`、`deny_private_ranges`、
   `max_redirects`。这十四项是"跑哪个可执行体、以什么身份、把请求发到哪里"的身份、目标与凭据字段，
@@ -248,11 +249,15 @@ type ReloadState struct {
   改它等于换掉一次执行所凭的身份。
 - 顶层的 `executors.workspace`/`runtime_allow`/`env_allow` 本来就在重启档（§6.2），而 §7.5 的加载固定用
   启动时那份归一化配置，所以它们改了什么都不会进运行期——拒绝档在这里的作用是**给未来留字段余地**：
-  `Diff` 只用 `core` 自己看得见的信息判定（`core.ExecutorCommand` 的字段清单，实现上是一份显式的
-  `permissionCommandFields`），不借 `executor.LoadProfiles` 的归一化结果——`core` 不许 import `executor`
-  （这条依赖方向红线在本仓是硬约束，`core/executor_profile_store.go` 的存在就是为它服务的）。
-  清单必须显式列字段，将来新增字段默认落在"允许热更"的一侧，而"落在哪一侧"这件事由 §8 的守卫测试
-  逼着人显式回答——这样加字段不会因为忘记归档而变成免重启的口子。
+  `Diff` 只用 `core` 自己看得见的信息判定（`core.ExecutorCommand` 的字段清单，实现上是两份显式的
+  清单 `permissionCommandFields` 与 `hotCommandFields`），不借 `executor.LoadProfiles` 的归一化结果——
+  `core` 不许 import `executor`（这条依赖方向红线在本仓是硬约束，`core/executor_profile_store.go`
+  的存在就是为它服务的）。两份清单合起来恰好覆盖 `ExecutorCommand` 的每一个字段名，`classify` 的
+  档位字段分支是**三态**：命中拒绝清单→拒绝、命中热更清单→热更、两边都不在→未归档（`ok=false`）。
+  将来新增字段必须显式选一份清单登记，否则 §8 的守卫用例红——这样加字段不会因为忘记归档而静默
+  落进"允许热更"的一侧变成免重启的口子。
+- 上条只说"原地改档位内的字段"这一侧；新增或重命名一条档位属于本次已拍板的热更范围，其约束来自顶层
+  许可字段（重启档）与 §7.5 的 workspace 越界拒绝。这一后果的完整口径见 §9。
 
 ## 7. 后端改动方案（逐文件）
 
@@ -489,8 +494,17 @@ newConfigWatcher func(path string, debounce time.Duration,
 - **默认关**：`reload.enabled=false` 时本设计一个 goroutine 都不建（R4）。
 - **打开之后的新威胁面**：能在本机改 `configs/config.yaml` 的人，从此不必重启就能改变并发数、
   留痕策略与**可执行档位的内容**。这条边界本来由"改配置的人 = 有部署权限的人" implicit 保证，
-  热重载把它压缩成"改文件的人"。因此拒绝档必须严格执行：凭据与执行许可字段（§6.3、§6.4）
-  仍然只能靠重启变更。
+  热重载把它压缩成"改文件的人"。这条压缩的确切成立范围要说清，不要藏：
+  - **原地改一条既有档位或凭据的字段**：拒绝档严格执行——`Diff` 只要检测到身份/目标/凭据字段
+    （§6.3、§6.4 的 `permissionCommandFields` 与凭据前缀）变化就整次作废、一项都不应用，
+    这类变更仍然只能靠重启生效。
+  - **新增一条档位、或把一条既有档位改名再配新 `script`**：这属于本次已拍板的热更范围（§6.4 把
+    "条目增删""重命名"明列在允许热更一侧），**可以在本机免重启新增一条档位**。它的约束不来自拒绝档，
+    而来自两处：顶层许可字段 `executors.workspace`/`runtime_allow`/`env_allow` 是重启档（改了不生效，
+    运行期用的仍是冻结在启动那份配置里的值），以及 §7.5/R04 加载新批次时固定用这份冻结值做
+    `executor.LoadProfiles` 的越界拒绝——新档位若越出冻结 workspace 或 `runtime` 不在冻结
+    `runtime_allow` 里，整次失败。因此"改文件的人免重启新增档位"这件事被限定在**既有许可范围内**，
+    不能借热更扩边界。兜底位置在 R04 的 `ApplyConfig`，其验证面见 `task-r04` §5.2 新增用例。
 - **谁有权触发**：只有文件系统。没有新端点，因此没有新增鉴权面；`/admin/runtime` 的读权限不变。
 - **审计**：重载本身不写 `write_audit`（那张表记的是 API 写操作，口径见
   `docs/design/sqlite-observability-design.md` §6.3），它的痕迹在日志与 `/admin/runtime`。
@@ -535,6 +549,7 @@ newConfigWatcher func(path string, debounce time.Duration,
 | 重载与页面档位写入撞上 | 两条链都要走 `Applier` 的同一把写锁（`executor/applier.go:116-117`）；R04 必须复用该锁而不是新建一把 |
 | 读数与真值短期不一致 | 缩容退场窗口内 `Running` 可能暂时高于 `Workers`；`RuntimeStats` 的注释要写明"Workers 是期望并发、Running 是瞬时值" |
 | 环境变量与文件谁赢造成困惑 | §5.3：本期只在文案提示，不新增来源判定；若后续要做，方向是在 `ReloadState` 里带一份"哪些键被环境覆盖"的只读清单 |
+| 免重启新增档位是"改文件的人"绕开重启的一条口 | §6.4 已拍板"条目增删/重命名可热更"，因此能改本机配置文件的人可以免重启新增一条档位。兜底不在 `Diff` 的拒绝档（原地改字段才进拒绝档），而在 R04：`ApplyConfig` 加载新批次固定用冻结在启动那份配置里的顶层 `workspace`/`runtime_allow`/`env_allow` 做 `LoadProfiles` 越界拒绝，新档位越界即整次失败、生效表与处理函数一字不动。验证面见 `task-r04` §5.2 新增用例；完整口径见 §9 |
 
 ## 13. 待拍板（写卡时按推荐值落的，执行前请复核）
 

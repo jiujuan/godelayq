@@ -107,11 +107,13 @@ var rejectPrefixes = []string{
 }
 
 // permissionCommandFields 是档位内的身份、目标与凭据字段（设计文档 §6.4、待拍板 P2）。
-// 这些字段变了 → 整次作废；档位其余字段（timeout、max_parallel、retry_on_exit、
-// args/args_render/positional、expect_status、capture_response、max_body_bytes、
-// kind、name、body）以及条目增删 → 热更。
-// 清单必须显式列字段：将来给 ExecutorCommand 加字段时，新字段默认落在
-// "允许热更"一侧，由 TestEveryLeafKeyIsClassed 逼着人显式回答"它落在哪一侧"。
+// 这些字段变了 → 整次作废。
+//
+// 清单必须显式列字段，且与 hotCommandFields 合起来**恰好覆盖** core.ExecutorCommand 摊出的
+// 每一个字段名：将来给 ExecutorCommand 加字段时，新字段不会默认落进任何一侧——它两边都不在，
+// classify 回 ok=false，由 TestEveryLeafKeyIsClassed 逼着人显式回答"它落在哪一侧"。
+// 这是本卡修的一条守卫：首版实现里"字段名不在拒绝清单就归热更"的写法会让新字段静默落进
+// 热更档、守卫正向放行，卡面承诺的"显式归档"因此不成立（见卡 §10.2 第 12 条、D-R0104）。
 //
 // 判据只用 core 自己看得见的字段名，不借 executor.LoadProfiles 的归一化结果
 // ——core 不许 import executor（依赖方向红线，待拍板 P2）。
@@ -135,11 +137,33 @@ var permissionCommandFields = map[string]bool{
 	"max_redirects":       true,
 }
 
+// hotCommandFields 是档位内允许热更的取值型字段（设计文档 §6.4 第一条），与
+// permissionCommandFields 显式对偶：两份清单合起来恰好覆盖 core.ExecutorCommand 的每一个字段名，
+// 命中的叶子归 ClassHot。kind 与 body 也在这里——它们不改变"能执行什么"的身份/目标/凭据边界
+// （kind 选执行方式的字段子集、body 选 http 请求体来源），归热更与既有实现一致。
+//
+// 加字段时必须显式选一份清单登记，否则 classify 回 ok=false、守卫用例红（见 permissionCommandFields 的说明）。
+var hotCommandFields = map[string]bool{
+	"name":             true, // 重命名等价于删一条加一条
+	"kind":             true,
+	"timeout":          true,
+	"max_parallel":     true,
+	"retry_on_exit":    true,
+	"args":             true, // payload 参数声明
+	"args_render":      true,
+	"positional":       true,
+	"body":             true,
+	"expect_status":    true,
+	"capture_response": true,
+	"max_body_bytes":   true,
+}
+
 // classify 返回一个叶子路径的档位。ok 为 false 表示既没有精确命中也没有前缀命中，
 // 属于"新增键忘了归档"，调用方（守卫用例）据此报错。
 //
-// 判定顺序：精确路径 → 凭据前缀 → executors.commands.<name>.<field> 的字段名
-// （命中 permissionCommandFields 则拒绝档，否则该路径归热更档）。
+// 判定顺序：精确路径 → 凭据前缀 → executors.commands.<name>.<field> 的字段名（三态：
+// 命中 permissionCommandFields 归拒绝档、命中 hotCommandFields 归热更档、两边都不在则
+// ok=false——新增字段必须显式归档，否则守卫红，不会静默落进热更档）。
 // Diff 与守卫用例共用这一份规则，避免两套判据。
 func classify(path string) (class ConfigClass, ok bool) {
 	if class, found := configClasses[path]; found {
@@ -151,10 +175,15 @@ func classify(path string) (class ConfigClass, ok bool) {
 		}
 	}
 	if _, field, isCommand := splitCommandLeaf(path); isCommand {
-		if permissionCommandFields[field] {
+		switch {
+		case permissionCommandFields[field]:
 			return ClassReject, true
+		case hotCommandFields[field]:
+			return ClassHot, true
+		default:
+			// 档位新增字段没归档：与未知顶层键同一脸色，落到下面的 ok=false。
+			return ClassRestart, false
 		}
-		return ClassHot, true
 	}
 	// 没归档：ok=false 让调用方（守卫用例）报错。档位返回重启档而不是热更档，
 	// 这样忽略 ok 的调用方最坏只是"改了没生效但有记录"，不会把未归档的键当成免重启通道。
