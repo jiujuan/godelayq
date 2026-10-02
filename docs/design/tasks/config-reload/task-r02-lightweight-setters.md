@@ -726,6 +726,51 @@ go test ./... -race -count=1
   而 `NewLogger` 的三条既有行为由 `core/logging_test.go` 里**未经修改**的
   `TestNewLogger_LevelAndFormat`/`_LevelFiltering`/`_RejectsUnknownValues` 三条用例继续守着。
 
+**补做的冒烟（2026-10-03，用户要求"检测核心功能是否正常使用"）**
+
+上面那句"本卡不起进程冒烟"是卡面口径，实测另补了两层：一层是把 R01 的判据与 R02 的六个入口
+串起来的测试内冒烟，一层是真起进程的冒烟。
+
+1. **测试内冒烟：`cmd/server/config_reload_smoke_test.go`（新增文件，7 条用例全绿）**。
+   放在 `cmd/server` 是因为只有这一层能同时 import `core`、`store/sqlite` 与 `api`
+   （`core` 不许反向依赖）。文件里自带一个 miniature 重载器 `applyCandidate`：
+   读配置 → `core.Diff` → 有拒绝项就整次作废 → 逐键调 §10.1 那张表上的入口 → 成功后才推 `applied`。
+   **这张表在这里第一次被当成接口使用**，签名对不上就编译不过；R06 接线之后
+   `applyCandidate` 应被生产重载链替换，场景清单留下。
+   七条用例与判据：
+   - `TestSmokeHotReloadAppliesAllSixEntries`：一次改全部六个热更键（级别、重试上限、留痕条数、
+     事件保留条数、台账保留条数），逐条断行为——debug 记录写出来了、`RetryPolicyMaxDelay` 变 5s、
+     留痕在下一次写入后从 4 条剪到 2 条、`job_events` 与 `write_audit` 在下一个批量周期各剪到 2 行。
+   - `TestSmokeRejectedKeyAbortsWholeReload`：混进 `server.auth.token` 时整次作废，
+     本来会生效的级别与留痕上限都没变，`applied` 也没往前推（不变量 I1+I2）。
+   - `TestSmokeRestartKeysAreReportedNotApplied`：只改重启档时一条都不应用，
+     但两条键名都出现在 `ignored_keys` 里（不变量 I3：静默就是缺陷）。
+   - `TestSmokeUnchangedConfigIsNotAReload`：同一份配置比自身 → `unchanged`，一个键都不报。
+   - `TestSmokeHotKeyWithoutEntryFailsLoud`：表里没有入口的热更键（`scheduler.workers`，属 R03）
+     返回带键名的错误，而不是"改了文件、什么都没发生"。
+   - `TestSmokeBrokenConfigKeepsRunning`：坏 YAML 被 `UnmarshalExact` 拒掉之后，
+     运行面继续按旧配置工作（info 出、debug 挡、存储照常留痕）。
+   - `TestSmokeEnvOverrideReachesTheSameEntries`：`GODELAYQ_LOGGING_LEVEL` 与
+     `GODELAYQ_SCHEDULER_MAX_RETRY_DELAY` 覆盖进来后走同一条应用路径并落到运行面。
+   四条针对冒烟具本身的变异（把入口调用作废、去掉拒绝拦截、失败也推 `applied`、
+   把重启档当热更应用）全部判红，恢复后文件与备份逐字节相同——即这七条不是"只跑一遍不判对错"。
+   `go test ./cmd/server -count=3 -race -run TestSmoke` 干净（2.991s）。
+2. **进程冒烟**：`go build -o %TEMP%/r02smoke/server.exe ./cmd/server`，
+   在 `%TEMP%/r02smoke` 里放一份最小配置（`reload.enabled: false`），存储与观测层路径全部用
+   `GODELAYQ_STORE_PATH`/`GODELAYQ_STORE_GROUPS_PATH`/`GODELAYQ_OBSERVABILITY_PATH`
+   指到该目录，仓库的 `data/` 一次都没被写。观察到的事实：
+   `GET /api/v1/health` 200 `{"status":"healthy"}`；`POST /api/v1/jobs`（`payment_check`，
+   `delay: 10m`，带重试参数）201 回 id，`GET /api/v1/jobs` 列出这一条；
+   `data/jobs.json` 与 `data/observe.sqlite`（含 -wal）在该目录里落出来；
+   启动日志一条 `observability enabled`，**整份日志里 `reload` 出现 0 次**——
+   即 R01+R02 落地之后，未接线状态下确实没有任何重载行为。
+   停止用的是 `taskkill /F`（强杀），所以优雅关闭不在这层冒烟的观察范围内，
+   那部分由 `cmd/server` 既有的 `TestRun_*` 用例覆盖。
+
+加入这个文件之后的全量复跑：`go build ./... && go vet ./...` 无输出；
+`go test ./... -race -count=1 -timeout 30m` 为 `api` 191.721s、`cmd/server` 6.369s、
+`core` 12.937s、`executor` 23.484s、`store/sqlite` 4.210s，五包全 `ok`。
+
 ### 10.5 缺陷
 
 | 编号 | 内容 | 处置 |
