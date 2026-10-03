@@ -45,14 +45,18 @@
 
 **落地位置**（实现之后补写，方便按决策找代码）：
 
-- D1 ⚠️ **白名单从"一处"变成"两处"**：`executors.commands`（本文原样，改完仍要重启）之外，
+- D1 ⚠️ **白名单从"一处"变成"两处"**：`executors.commands`（本文原样；`reload.enabled: true` 时改条目自身的
+  可改字段——超时、参数声明、条目增删——下一个防抖窗口就生效，改条目内的执行许可字段会让整次重载被拒绝，
+  `reload.enabled: false`（默认）时改完仍要重启，见[配置热重载设计文档](./config-reload-design.md) §6.4）之外，
   `executors.web_enabled: true` 时还有一份档位文件 `executors.profiles_path`
   （`core/executor_profile_store.go`），ops 档可以在控制台/REST 增删改它，**立即生效、活过重启**，
   同名以配置为准（合并与降级判定在 `executor/merge_profiles.go`）。
   "加一条命令要改配置重启"这句代价因此只对配置侧成立；D2（不接受内联源码）**没有松动**——
   页面只能引用已存在的文件，请求体里没有放脚本正文的键。
   收窄条件也跟着变了：原话是"收窄到能改配置文件并重启的人"，现在等价于
-  "能改配置文件并重启的人 + **拿到一个 ops 档 JWT 的人**"。
+  "能改配置文件并重启的人 + **拿到一个 ops 档 JWT 的人**"；
+  再打开 `reload.enabled` 之后，前半句里的"并重启"也不再成立（[配置热重载设计文档](./config-reload-design.md) §9
+  把这条压缩的确切范围与兜底写清了：新增/改名档位可以免重启，但被钉在启动时冻结的许可范围内）。
   全套决策、风险与本期刻意留下的口子见 [web-profile-design.md](./web-profile-design.md)（D5、§7）。
 - D2 ⚠️ **"工作目录内"这半边只对配置侧保留**：`executors.commands` 的 script/program/cwd
   仍必须解析在 `executors.workspace` 之内（`executor/profile.go` 的 `resolveInside`，逐字未改）；

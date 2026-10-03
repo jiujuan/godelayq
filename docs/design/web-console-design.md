@@ -27,9 +27,13 @@
 
 非目标（本期不做）：
 
-- 用户账号的在线增删改（账号在 `configs/config.yaml` 声明，改动需重启）
-- 运行时调整 worker 数 / 队列容量（现有 `SetConcurrency`/`SetQueueCapacity`
-  在 Start 后被忽略并告警，`core/scheduler.go 的 SetConcurrency/SetQueueCapacity`；需要 worker 池 resize 能力，列为二期）
+- 用户账号的在线增删改（账号在 `configs/config.yaml` 声明，改动需重启；
+  打开[配置热重载](./config-reload-design.md)也不会代劳这件事——凭据项一旦变化整次重载被拒绝，
+  现网照旧按旧凭据跑，见该文 §6.3）
+- 运行时调整 worker 数 / 队列容量（本文写作时不做：`SetConcurrency`/`SetQueueCapacity`
+  在 Start 后被忽略并告警。**worker 数已二期落地**——`Scheduler.ResizeWorkers` 支持运行期温和扩缩，
+  在 `reload.enabled: true` 时改 `scheduler.workers` 即生效；`scheduler.queue_capacity` 仍是重启档，
+  换通道要换掉正在阻塞的等待方，见该文 §6.2 与 §7.1）
 - 运行历史的持久化审计：**本文写作时不做，现已由观测层落地**——事件持久化在 `TASK-S03`/`TASK-S04`
   （`job_events`，重启后时间线仍有历史），写操作台账在 `TASK-S06`（`write_audit` + `GET /admin/audit`）。
   两者都是 `observability.enabled` 打开后可选，默认仍只有内存缓冲与结构化日志；

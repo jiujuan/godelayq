@@ -30,7 +30,9 @@ server:
       access_ttl: 15m   # 访问令牌有效期；0 表示用代码默认值 15m
       refresh_ttl: 12h  # 刷新令牌有效期；0 表示用代码默认值 12h
     # 控制台账号。本项不能靠环境变量覆盖（嵌套列表无法用逗号分隔表达），
-    # 增删账号需改本文件并重启进程。
+    # 增删账号需改本文件并重启进程。热重载也不会代劳这件事：`reload.enabled: true` 时
+    # 改动 server.auth.users（以及下面的 token 与 jwt.secret）会让整次重载被拒绝，
+    # 一项都不会应用，旧凭据照旧可用。
     # 密码只存 bcrypt 哈希，用 `go run ./cmd/hashpassword` 生成；明文禁止写入配置。
     # role 取 viewer|operator|admin|ops，权限矩阵见 docs/design/web-console-design.md §5.7.3
     # 这里故意不写 []：解开下面的示例即可启用。写成 `users: []` 再挂列表项，
@@ -114,6 +116,8 @@ executors:
   # 这条边界比"改配置重启"宽得多——它把"能执行什么"的修改权限交给了 ops 档 JWT，
   # 所以默认 false。打开它必须同时 executors.enabled: true，否则启动即报（与 loader_allow
   # 同一条：没有执行能力却允许在线改档位，只能是配置写错）。
+  # 本项自己是重启档：热重载不会代劳它——`reload.enabled: true` 时改 web_enabled 也只会进
+  # ignored_keys，要生效仍需重启进程。
   # 设计依据见 docs/design/web-profile-design.md §2（D2）。
   # 环境变量：GODELAYQ_EXECUTORS_WEB_ENABLED=true
   web_enabled: false
@@ -138,7 +142,11 @@ executors:
     # 建议与上面的 store.history_ttl 配对：留痕被清掉后，对应产物会在下次启动的孤儿清理中删除
     ttl: 168h
   # 档位列表（两份来源之一）：这一节之外的另一份是下面的 profiles_path，页面建的档位改完立即生效。
-  # 本节是配置面：改它仍需重启进程，同名档位以本节为准（档位文件里那条会被标记为未生效）。
+  # 本节是配置面：`reload.enabled: false`（默认）时改它要重启进程；打开热重载时，改条目自身的可改字段
+  # （timeout、参数声明、条目增删）下一个防抖窗口就生效，而改动条目内的执行许可字段
+  # （kind/runtime/script/program/fixed_args/cwd/env/env_allow/method/url_template/allowed_hosts/
+  # headers/header_allow/deny_private_ranges/max_redirects）会让整次重载被拒绝；顶层的 workspace、
+  # runtime_allow、env_allow 属重启档，改完仍需重启。同名档位以本节为准（档位文件里那条会被标记为未生效）。
   # 两种来源都不提供自由命令行，也不接受任务里内联源码。
   # 与 server.auth.users 同理，这里故意不写 []（解开示例即可启用，写 [] 再挂列表项会让 YAML 报错）。
   # 键名拼错会被配置解码直接拒绝；字段取值与组合规则由 executor.LoadProfiles 在启动时校验，
@@ -213,7 +221,23 @@ observability:
 # 配置热重载：改文件即生效，不必重启进程。默认关闭，关闭时一个监听器都不建，
 # 进程行为与本节不存在时一致。
 # 设计依据见 docs/design/config-reload-design.md，实施进度见 docs/design/tasks/config-reload/README.md。
-# 注意：监听器与重载链的接线在 R05/R06 落地，状态表收口（R07）之前打开本节不会有行为变化。
+#
+# 打开之后每一项各自的去向分三档（完整清单见部署文档的"配置热重载"一节）：
+#   热更 = 改了下一个防抖窗口生效：logging.level、scheduler.workers、scheduler.max_retry_delay、
+#          store.history_limit、store.history_ttl、observability 的四个 retention_*、
+#          executors.commands（条目内容与增删）、reload.debounce。
+#   重启 = 改了接受但不应用（读数里进 ignored_keys），重启才变：本节 reload.enabled 自己、
+#          两个 queue_capacity、各 flush_interval、所有路径与所有 enabled 总开关、
+#          executors 的顶层白名单与 required_role/超时上限、logging.format、server.port、server.cors.*。
+#   拒绝 = 改了整次作废（进 rejected_keys，一项都不应用）：server.auth.token、server.auth.users、
+#          server.auth.jwt.secret，以及 executors.commands 条目内的十五项执行许可字段
+#          （kind/runtime/script/program/fixed_args/cwd/env/env_allow/method/url_template/
+#          allowed_hosts/headers/header_allow/deny_private_ranges/max_redirects）。
+# 坏文件（未知键、缩进错、被删）同样是整次作废；一份不再表达任何取值的文件也一样——
+# 只剩空白/注释/文档标记（含带 BOM 或 UTF-16 写成的），或只有键名没有值（`logging:`、`workers: null`、
+#   `logging: {}`、顶层 `null`），读出来是一份合法的全默认配置，拦下来才不会被静默应用到现网。
+# 进程停在旧配置上；文件修好即自动恢复。
+# 注意"把某项从文件里删掉"不等于"让它空着"：比较的是整份文件，没写的键会退回默认值并生效。
 reload:
   # 总开关。打开后进程会盯着启动时实际读到的那个文件（见设计文档 §5.2）。
   # 这一项本身改了不生效：运行期关掉监听只能重启，所以它属于重启档。

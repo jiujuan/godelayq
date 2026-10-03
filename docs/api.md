@@ -512,7 +512,9 @@ Content-Type: application/json
 用什么程序、跑哪个脚本、发哪个 HTTP 请求、允许哪些参数。注册之后它的任务类型名就是 `exec.<档位名>`。
 
 能执行什么完全由 `executors.commands` 决定：**没有自由命令行**，任务里也不能内联源码、不能要求现场编译。
-档位有两份来源：配置里的 `executors.commands` 改动要重启进程，`executors.web_enabled: true` 时
+档位有两份来源：配置里的 `executors.commands`（`reload.enabled: true` 时改条目自身的可改字段
+——超时、参数声明、条目增删——下一个防抖窗口就生效，改动条目内的执行许可字段会让整次重载被拒绝；
+关闭热重载时改它仍要重启进程），`executors.web_enabled: true` 时
 还可以在下面"档位的在线管理"一节那三个写端点上增删改，写完立即生效。开关、白名单与部署前提见 [部署文档](./deployment.md) 的"开启执行器"一节。
 
 ### 与 `/job-types` 的关系
@@ -1369,11 +1371,45 @@ GET /admin/runtime
     "global_capacity": 500,
     "per_job_capacity": 100,
     "job_capacity": 2000
+  },
+  "reload": {
+    "enabled": true,
+    "watched_path": "D:/app/configs/config.yaml",
+    "last_attempt_at": "2024-01-04T10:12:03.481+08:00",
+    "last_applied_at": "2024-01-04T10:12:03.483+08:00",
+    "result": "ok",
+    "error": "",
+    "applied_keys": ["logging.level", "scheduler.workers"],
+    "ignored_keys": ["scheduler.queue_capacity"],
+    "rejected_keys": [],
+    "watcher_error": ""
   }
 }
 ```
 
 只读，不含任务内容与凭据。`queue_length`/`running` 是瞬时值，用来看趋势不是用来审计的。
+
+`reload` 这一段是配置热重载最近一次的结论，**这台部署没打开 `reload.enabled` 时整个键缺省**
+（不是给一个空对象——空对象会被读成"启用过但从没重载过"）。十个字段的口径：
+
+| 字段 | 含义 |
+| --- | --- |
+| `enabled` | 这台进程启动时 `reload.enabled` 的取值。它是重启档，所以运行期改了文件里的这一项，这里也不变 |
+| `watched_path` | 监听器盯的那个文件的绝对路径；没建监听器时缺省 |
+| `last_attempt_at` | 最近一次重载尝试的时刻（`unchanged` 与 `rejected` 也算一次尝试） |
+| `last_applied_at` | **这一次**尝试里应用成功的时刻，只在 `result=ok` 且真换了东西时出现。它不是历史台账：随后再来一次失败的重载（`rejected`/`failed`），这个键就不再出现，因为整份读数是按次替换的快照。要看历史请翻日志里那条 `config reload applied` |
+| `result` | `ok`（改了并应用）/ `unchanged`（取值等价，什么都没动）/ `rejected`（整次作废：坏文件、未知键、触碰拒绝档）/ `failed`（应用中途失败，已逆序回滚）/ `degraded`（回滚自己又失败，现网可能是混合态）。空串表示启用过但从没尝试过 |
+| `error` | 这一次为什么没生效，一句话 + 底层原因原文；成功时缺省 |
+| `applied_keys` | 本次处理过的键路径。执行器档位按条目摊开，所以看到的是 `executors.commands.<档位名>.<字段>` 一整套而不是 `executors.commands`；执行器整节没打开时档位改动也出现在这里，另有一条 warn 说明"未生效" |
+| `ignored_keys` | 重启档的键：改了、接受了、没应用，重启才变 |
+| `rejected_keys` | 拒绝档的键。注意它列的是"当前与生效那份不一致的全部凭据/执行许可键"，不是"这次只改了哪一个" |
+| `watcher_error` | 监听器自身的故障（事件循环没在限期内退出、`Close` 报错等）；与重载结论分开记 |
+
+两个时间字段是 RFC3339Nano 字符串，零值不给键。三个键清单为空时序列化出 `null`（`omitempty`
+对 nil 切片的效果），消费方要把 `null` 与"缺键"当成同一件事——"没有内容"。
+
+本系列**没有新增任何端点**：`/admin/runtime` 仍是 ops 档专用（`ops` 角色或运维凭据），
+读端点仍不进写操作台账；配置里那三份凭据的取值不会出现在这段读数里。
 
 执行器打开时 `scheduler` 里多四个 `exec_` 前缀的字段：执行器专用池的 worker 数、正在跑几个、队列长度与容量，
 与同一对象里的 `workers`/`running`/`queue_length`/`queue_capacity`（普通池）分账。档位任务走独立队列，
@@ -1614,8 +1650,12 @@ GET /job-types
 }
 ```
 
-档位来自配置的 `executors.commands` 与 `executors.profiles_path` 那份文件，两份都在进程启动时注册，
-改前者要重启；后者在 `executors.web_enabled: true` 时可以用接口改，立即生效并在这里立刻出现
+档位来自配置的 `executors.commands` 与 `executors.profiles_path` 那份文件，两份都在进程启动时注册。
+`executors.commands` 什么时候要重启取决于 `reload.enabled`：关闭时（默认）改完要重启进程；打开时改条目
+自身的可改字段（超时、参数声明、条目增删）下一个防抖窗口就生效并在这里立刻出现，而改动条目内的执行许可
+字段（`kind`/`runtime`/`script` 等十五项）会让整次重载被拒绝，那种改动连同 `executors.workspace`/
+`runtime_allow`/`env_allow` 仍须重启（三档清单见[部署文档](./deployment.md) 的"配置热重载"）。
+`executors.profiles_path` 那份在 `executors.web_enabled: true` 时可以用接口改，立即生效并在这里立刻出现
 （见[档位的在线管理](#档位的在线管理)）。
 
 ## WebSocket 实时通信

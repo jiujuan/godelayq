@@ -133,7 +133,9 @@ go build -tags dashboard -o godelayq-server ./cmd/server
      `export X=$(go run ./cmd/gensecret)` 拿到的是纯密钥），再用 `GODELAYQ_SERVER_AUTH_JWT_SECRET`
      注入，systemd 下放进 `EnvironmentFile=/etc/godelayq/auth.env`（权限 0600）。
      轮换密钥会让全部已发令牌立即失效，所有人都要重新登录。账号本身不支持环境变量覆盖，
-     增删账号需重启进程。
+     增删账号需重启进程。这一点连配置热重载也不代劳：`reload.enabled: true` 时改动
+     `server.auth.users`（或 `server.auth.token`、`server.auth.jwt.secret`）会让**整次重载被拒绝**，
+     一项都不会应用，旧凭据照旧可用——见"配置热重载"一节。
    - **静态 token** `server.auth.token`：给脚本与 CI 用的全局口令，身份是 `machine`
      （能读写任务，没有 admin/ops 能力）。同样优先用 `GODELAYQ_SERVER_AUTH_TOKEN` 注入。
 2. 按人分配角色（`viewer`/`operator`/`admin`/`ops`）。最小可用的一组通常是：一个 `ops` 给值班、
@@ -541,6 +543,80 @@ level=WARN msg="observability event writer dropped records" dropped=497 path=./d
 `executors.output.dir` 同一处理。默认值 `./data/observe.sqlite` 在 `WorkingDirectory` 之下，
 只有你把它指到别处时才需要动这一项；配错的现场是启动直接失败并报
 `sqlite: create dir for ...` 之类的可读原因（实测三种：目录不可写、路径非法、路径指向已存在的目录）。
+
+## 配置热重载（可选）
+
+`reload.enabled` 决定进程要不要盯着配置文件变化（默认 `false`）。**关闭时一个监听器都不建，
+进程行为与本节不存在时一字不差**；`reload:` 整节不写就是这个默认。
+
+打开它意味着什么：能在本机改这个文件的人，从此不必重启就能改变并发数、留痕策略与
+`executors.commands` 里档位的内容。它把"改配置要重启"这条原本由重启窗口自带的审查环节
+去掉了，所以是否打开应当是一次部署决定，而不是排障时的临时手段。
+
+### 1. 三档归属：哪些改了立刻生效、哪些要重启、哪些会被拒绝
+
+判定单位是**叶子键**。下表是本机真实进程逐条实测过的口径（场景表见
+[TASK-R07 §10.4](./design/tasks/config-reload/task-r07-end-to-end-verification-and-docs.md)）。
+
+| 改了立刻生效（下一个防抖窗口） | 改了接受但不应用（进 `ignored_keys`，重启才变） | 改了整次作废（进 `rejected_keys`，一项都不应用） |
+| --- | --- | --- |
+| `logging.level`<br>`scheduler.workers`（运行期扩缩，缩容不打断在跑任务）<br>`scheduler.max_retry_delay`<br>`store.history_limit` / `store.history_ttl`（下一次写入的修剪用新值）<br>`observability.events.retention_*` / `observability.audit.retention_*`（下一个批量周期的淘汰用新值）<br>`executors.commands`（档位内容与条目增删；同名以配置侧为准）<br>`reload.debounce`（下一次事件起用新窗口） | `server.port`、`server.cors.*`、`server.auth.jwt.access_ttl` / `refresh_ttl`<br>`scheduler.queue_capacity`、`scheduler.shutdown_timeout`<br>`store.type` / `store.path` / `store.groups_path` / `store.flush_interval`<br>`logging.format`<br>`observability` 的总开关、`path`、两个 `flush_interval`、`queue_capacity`、`busy_timeout`、`synchronous`、三个子开关<br>`executors` 的总开关、`required_role`、`workspace`、`runtime_allow`、`env_allow`、`concurrency`、`queue_capacity`、`default_timeout`、`max_timeout`、`restore_policy`、`loader_allow`、`web_enabled`、`profiles_path`、`output.*`<br>`reload.enabled`（这一项本身属于重启档） | `server.auth.token`<br>`server.auth.users`<br>`server.auth.jwt.secret`<br>档位条目内的执行许可字段：`kind`、`runtime`、`script`、`program`、`fixed_args`、`cwd`、`env`、`env_allow`、`method`、`url_template`、`allowed_hosts`、`headers`、`header_allow`、`deny_private_ranges`、`max_redirects` |
+
+三条容易读错的口径：
+
+- **拒绝档的代价是"整次作废"**，不是"那一项不生效"。一次存盘里同时改了一个热更键和一个凭据键，
+  结果是 `rejected`，热更键也没有应用——旧凭据照旧可用，现网一套取值都不变。
+- `rejected_keys` 列的是**当前与权威不一致的全部凭据类键**，不是"这次只改了哪一个"。
+  先改 `server.auth.token` 再改 `server.auth.users`，第二次的清单会把两项都列出来
+  （比较的对象是"现在生效的那份"，不是"上一次的文件"）。
+- 档位那一条键在 `applied_keys` 里是**按条目摊开**的：加一条档位会给出一整套
+  `executors.commands.<档位名>.<字段>`，删掉一条时额外再给出容器路径 `executors.commands`。
+  读数里不会出现光秃秃的一条 `executors.commands`（新增/删除时）。
+
+### 2. 怎么看上一次重载的结论
+
+`GET /api/v1/admin/runtime`（ops 档）响应里的 `reload` 对象，十个字段：`enabled`、
+`watched_path`、`last_attempt_at`、`last_applied_at`、`result`、`error`、
+`applied_keys`、`ignored_keys`、`rejected_keys`、`watcher_error`。
+
+- `result` 只有五个取值：`ok`、`unchanged`、`rejected`、`failed`、`degraded`。
+  这段读数是**按次替换的快照**，只说最近一次尝试：一次 `ok` 之后再来一次 `rejected`，
+  `last_applied_at` 与 `applied_keys` 都会消失，不是"从没应用成功过"。要历史翻日志。
+  `unchanged` 是"存盘了但取值等价"，不算一次生效；`degraded` 只在**回滚自己又失败**时出现。
+- `result` 是空串表示"开关开着，但从没尝试过"；整个 `reload` 键不出现表示这台部署没打开热重载。
+- 时间字段是 RFC3339Nano 字符串，零值不给键。
+- 一次失败的重载会在日志里留下**两条** error 级记录：重载链自己按失败原因记一条（带步骤与
+  `hint`），监听器把返回的错误再记一条（带 `path`）。两条归因不同，按事件计数时请按
+  `path` + 时间窗去重，不要按 error 行数告警。
+
+本系列**没有新增任何端点**：`/admin/runtime` 仍是 ops 档，读端点仍不进写操作台账。
+
+### 3. 运维提示
+
+- **改配置前先在版本控制里留一份。** 坏文件（语法错、未知键、缩进错、被删）与**不再表达任何取值**的
+  文件都会被拒绝，进程一直停在旧配置上跑——这是设计行为，但也意味着"你以为改了，其实没改"。
+  修好文件后下一个窗口自动恢复，不需要重启。
+  "不再表达任何取值"这一类要说全：只剩空白、只剩注释、只剩 `---` / `...` 文档标记
+  （**带 BOM 或用 UTF-16 写出来的同一种也算**——PowerShell 的 `>` 默认就写带 BOM 的 UTF-16）、
+  只有键名而没有值（`logging:` 后面空着、`scheduler:` 下面只有 `workers: null`、`logging: {}`、
+  整份文件就是一个 `null`），以及把值写在第二份文档里（这一份配置只读第一份文档）。
+  这样的文件读出来是一份合法的"全部取默认值"的配置，不拦的话一次误清空就会把整台机器静默换成默认值。
+  反过来，**显式写出来的空列表**（比如 `executors.commands: []`）是"这一族清空"的正常取值，不会被拦；
+  而文件里**没写的其他键**照样会退回默认值并生效——那是"整份文件是唯一真相"的语义，见下一条。
+- **"把某个键从文件里删掉"不等于"让它空着"**：重载比较的是整份文件，没写的键会退回默认值并生效。
+  要让某一项回到默认，请显式写出它的默认取值。
+- `reload.enabled` 改了不生效（它是重启档），所以"运行期关掉监听"只能靠重启。
+- 进程启动时没读到可监听的文件（不给 `-config` 且 `configs/` 下没有 `config.yaml`/`config.yml`）
+  会记一条 warn 并照常服务，不建监听器。`core.LoadConfig` 认 `.json`/`.toml` 等多种拼写，
+  而监听器只认 `.yaml`/`.yml`：用 `configs/config.json` 这类部署打开热重载，会得到
+  "配置读到了、但没有文件可盯"的组合（warn + 不建监听器），改那个 `.json` 永远不会有反应。
+- **没有配置文件时，`GODELAYQ_*` 环境变量也不会生效**（实测，R07 场景 4A）：`LoadConfig` 只在
+  "读到配置文件"那一条分支上做精确解码，环境变量是绑在那次解码上的，所以一份文件都没有的进程
+  按代码默认值跑，`GODELAYQ_RELOAD_ENABLED=true` 也换不来监听器。要让环境变量起作用，
+  目录里得先有一份配置文件。
+- 缩容 `scheduler.workers` 之后，`/admin/runtime` 的 `scheduler.workers` 立刻是新值，
+  而真正在跑的协程要等任务重新流动才收敛；`scheduler.queue_capacity` 是启动期建通道时定下的，
+  运行期扩缩都不换通道，读数不跟随 `workers`。
 
 ## Systemd 服务配置
 

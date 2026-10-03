@@ -1,11 +1,12 @@
 # 配置热重载设计（改文件即生效，不必重启进程）
 
-> 状态：**设计已评审，未实施**。评审拍板的四条口径标 ★，见 §2。
+> 状态：**已实施（TASK-R01…R07 落地，2026-10-03 收口）**。评审拍板的四条口径标 ★，见 §2；
+> 实施后的落地位置在 §2 末尾，实现与本文明确不同的地方集中在 §14（含 22 个真实进程场景的实测结论）。
 > 冲突处理：本文与 `web-profile-design.md` 在"档位怎么生效"上同源（共用 `executor.Applier` 那条链），
 > 与 `executor-design.md`、`sqlite-observability-design.md` 不冲突——本文只改"配置取值什么时候被读"，
 > 不改任何执行侧语义。
 > 引用约定：正文只写 `文件`、`文件:行号` 与既有文档的 `§`，不写"上面那段"这类无法定位的指代。
-> 行号按 2026-10-02 的代码基线核过。
+> 行号按 2026-10-02 的代码基线核过；R01–R07 落地后行号整体下移，现行位置按 §14 与卡片 §10.1 的符号名定位。
 
 ## 1. 背景与目标
 
@@ -42,6 +43,48 @@
 | R8 | **执行许可字段进拒绝档**（档位内的 `deny_private_ranges` 等；顶层的 `executors.workspace`/`runtime_allow`/`env_allow` 在重启档，见 §6.4） | 处理函数把归一化后的 `ExecutorsConfig` 冻结在闭包里（`executor/register.go:87`、`executor/applier.go:175-183`），要让顶层许可字段对既有档位生效就得连它们一起重登记，"能执行什么"从此变成免重启通道。热重载范围已明确到"改档位内容"为止，改许可边界请重启 |
 | R9 | **重载结果只加进 `GET /api/v1/admin/runtime`，不开新端点** | 该端点已是 ops 档专用（`api/server.go:293-299`、`api/handlers_admin.go:15-45`），且已经承载"这次运行到底什么状态"的读数（调度器占用、事件缓冲占用）。新增的是一份 `reload` 对象：上次重载时间、结论、错误文案、被忽略的重启档键名 |
 | R10 | **`logging.level` 热更靠 `slog.LevelVar`，格式不改** | `parseLogLevel`（`core/logging.go:48-61`）已经在解析成 `slog.Level`，把 `HandlerOptions.Level` 从常量换成 `*slog.LevelVar` 即可运行期改级别，且不动 handler、不换 writer。`logging.format` 要换 handler 类型，牵连已在手的 logger 实例，归入重启档 |
+
+**落地位置**（TASK-R01…R07 实施后补写，按决策找代码；一律用符号名定位，行号会随后续改动漂移）：
+
+- R1 三档表：`core/config_reload.go` 的 `configClasses`（热更 11 条 + 重启 39 条的显式表）、
+  `rejectPrefixes`（三条凭据前缀）、`permissionCommandFields`（15 项执行许可字段）与
+  `hotCommandFields`（11 项可调字段）两份对偶清单、`classify` 与 `classifyChange`（后者管条目增删
+  与重命名那条 R01 卡面缺的判据）、`Diff`/`flattenLeaves`、`ReloadState`/`ReloadResult`。
+  守卫用例 `TestEveryLeafKeyIsClassed` 双向跑：每个叶子键必须有档、表里不许有摊不出来的键名。
+- R2 触发时机：`core/watch.go` 的 `ConfigWatcher`（`NewConfigWatcher` 只收绝对路径并要求文件存在、
+  `Run` 事件循环、`Close` 只等事件循环不等在途重载、`SetDebounce`、`State`、`MarkWatcherError`），
+  事件合并计时器在 `timers`/`debounceSlot`，`ReloadFunc` 的两条契约写在 `core/watch.go` 的注释上
+  （串行靠 `reloadMu`，不靠调用点）。默认值与下界在 `core/config.go`：`DefaultReloadDebounce = 500ms`、
+  `Validate` 里 50ms 的下界。手动触发端点一条都没加（本文与 R07 场景实测都核对过 404）。
+- R3 原子生效与逆序回滚：`cmd/server/reload.go` 的 `reloader.Reload`（八步固定顺序，第 0 步是 R07 补的那道问）、
+  `reloadStep`/`buildPlan`（键→落点的分派表，`claims` 支持精确名与前缀认领两种形态）、
+  `applyChange`（应用前压 undo 栈、失败逆序重放、回滚再失败才 `degraded`）、`unavailableOutcome`
+  （某节没启用时算 `ignored` 还是算失败）。"没有取值"那一判据在
+  `configFileCarriesNoValues` + `yamlCarriesNoValue`（按 YAML 结构判，BOM 与 UTF-16 由解析器自己认，
+  见 §14 的 D-R0702、D-R0709、D-R0711 与 D-R0715）。
+- R4 总开关默认关：`core/config.go` 的 `ReloadConfig` 与 `DefaultConfig`（`Enabled: false`）；
+  装配在 `cmd/server/main.go` 的 `if cfg.Reload.Enabled { ... }` 块，`api.WithReloadState` 的注入
+  条件与它同源。关闭时 `run()` 一个字节都不执行，`/admin/runtime` 连 `reload` 键都不给。
+- R5/R6 worker 扩缩：`core/scheduler.go` 的 `ResizeWorkers`（温和缩容：多出来的 worker 在循环开头
+  自己退场，在途任务不打断）、`targetWorkers`（`atomic.Int32`，`RuntimeStats.Workers` 读的就是它）。
+  `ResizeWorkers` 只有下限、没有上限，上限由重载链补：`cmd/server/reload.go` 的
+  `maxHotReloadWorkers = 4096` 与 `checkWorkerBound`（R03 交接的 D3）。队列容量仍是重启档。
+- R7 档位热更不要求 `web_enabled`：`executor/applier.go` 的 `ApplyConfig(candidate core.Config)`
+  （整表替换 config 批次并返回 `ApplyResult`）；`Applier` 的构造条件在 `cmd/server/main.go`
+  放宽成 `web_enabled || (reload.enabled && executors.enabled)`，而档位文件的打开条件一字未改。
+- R8 执行许可字段进拒绝档：判定在 `core/config_reload.go` 的 `permissionCommandFields`；
+  顶层三份白名单在 `configClasses` 里是重启档，`ApplyConfig` 加载新批次固定用启动时那份归一化配置
+  做 `LoadProfiles` 校验（R04），所以改顶层许可不会给新档位开出通路。
+  ⚠️ 全局 `executors.env_allow` 从不进 `LoadProfiles`（唯一读取点是执行期的 `executor/env.go`），
+  本文 §12 最后一条原来的说法已按实测收窄，见 §14 的 D-R0404。
+- R9 读数：`api/reload_state.go` 的 `ReloadStateReader`、`ReloadStatus`（十个字段，两个时间是
+  `api` 自己格式化的 RFC3339Nano 字符串，零值不给键）、`WithReloadState`、`reloadStatusOf`、
+  `formatReloadTime`；`api/handlers_admin.go` 的 `RuntimeResponse.Reload *ReloadStatus`。
+  链那侧的读数出口是 `cmd/server/reload.go` 的 `reloadStatusReader`（`attach`/`explain`/`State`）。
+  没有新增端点，读端点也不进写操作台账（`TestRuntimeReadDoesNotWriteAudit` 钉住）。
+- R10 级别热更：`core/logging.go` 的 `NewLoggerWithLevelVar`（把 `*slog.LevelVar` 交回装配方）与
+  `SetLogLevel(levelVar, level)`；`levelVar` 由 `cmd/server/main.go` 建 logger 时留住并传给重载链，
+  `logging.format` 仍在重启档。
 
 ## 3. 现状盘点（规划时基线，已核实）
 
@@ -171,9 +214,20 @@ type ReloadState struct {
 }
 ```
 
-三条约束：不含任何凭据内容（键名可以有，值不能有，对照 `store/sqlite/audit.go` 台账
-"不存请求体与 error 原文"的同一取向）；`Result` 是封闭枚举；这个对象是**进程内**状态，
-不入库——观测层的 `write_audit` 只记写操作，重载不是写操作。
+三条约束：不含任何**凭据**取值（键名可以有；`error` 与 `watcher_error` 是自由文本，其中可能回显
+非凭据的取值——写错的时长、撞名的档位名——那道闸门在产出文案的一侧，不在读口）；`Result` 是封闭枚举；
+这个对象是**进程内**状态，不入库——观测层的 `write_audit` 只记写操作，重载不是写操作（R07 实测：
+`GET /api/v1/admin/runtime` 三次不产生台账行，`rejected_keys` 与 `applied_keys` 都只在读数与日志里）。
+
+实施后的两处口径修正（详见 §14）：
+
+1. `AppliedKeys` 的注释写的是"本次真正生效的热更键"。执行器那一节有一种情况不是"生效"而是
+   "处理过但未生效"：`executors.enabled: false` 时改 `executors.commands`，链会把键记进
+   `AppliedKeys`、`LastAppliedAt` 也推进，另有一条 warn 说明"这一节没打开，本次不会生效"
+   （真实进程实测见 R07 场景 13）。读数里的 `applied_keys` 因此应当读作"本次重载处理过的键"。
+2. 一次失败的重载在日志里留下**两条** error 级记录：重载链按失败原因记一条（带步骤与 `hint`），
+   监听器把 `ReloadFunc` 返回的错误再记一条（带 `path`）。两者归因不同（步骤级 / 进程级），
+   按 error 行数告警的部署会重复计数，要按 `path` + 时间窗去重。
 
 ## 6. 分档表（本设计的核心交付）
 
@@ -471,7 +525,8 @@ newConfigWatcher func(path string, debounce time.Duration,
 - [ ] `reload.enabled=false`（默认）时：不建 watcher、`/admin/runtime` 无 `reload` 字段、
       全部行为与本设计之前一致。
 - [ ] 改 `logging.level` → 日志级别立刻变；改 `logging.format` → 记入 `ignored_keys`，级别不受影响。
-- [ ] 改 `scheduler.workers` 8→32→4：`/pools` 与 `/admin/runtime` 的 `Workers` 读数随之变；
+- [ ] 改 `scheduler.workers` 8→32→4：`/admin/runtime` 的 `scheduler.workers` 读数随之变
+      （R07 实测：`GET /api/v1/pools` 这个端点在本仓从来没有过，见 §14 的 D-R0701）；
       缩容期间在途任务不被取消；`-race -count=5 -timeout 30m` 跑绿。
 - [ ] 缩容窗口内 `deliver` 仍能投递（专门一条测试：target 已降、旧 worker 正在跑任务，新任务照样被取走）。
 - [ ] 改 `store.history_limit`/`history_ttl` → 下一次写入触发的 trim 用新值；改 `store.flush_interval` →
@@ -487,6 +542,11 @@ newConfigWatcher func(path string, debounce time.Duration,
 - [ ] 坏 YAML / 未知键 / `Validate` 不过 → 旧配置原样、`result=rejected`、`error` 带原因；
       修好文件后下一次事件自动恢复。
 - [ ] 文件被删或读不到 → 视为一次失败的重载，绝不退回默认值。
+- [ ] 文件不再表达任何取值——只剩空白/注释/文档分隔符（**含带 BOM 与 UTF-16 写出来的同一种**）、
+      只有键名没有值（`logging:`、`workers: null`、`logging: {}`、顶层 `null`）、或值写在第二份文档里
+      （viper 只读第一份）→ 同样作废、现网取值一字不动，`error` 给专门文案。
+      （R07 场景 16/16E 实测发现这里原本会静默退回默认值；判据改了三轮才修到底，
+      见 §14 的 D-R0702、D-R0709、D-R0711、D-R0715 与 R07 卡 §10.4 的 16F/16G/16H。）
 - [ ] 同一次存盘触发多个事件 → 防抖窗口内只重载一次；内容与 `applied` 等价 → `result=unchanged`，一个 setter 都不调（不重登记档位）。
 - [ ] 连续两次重载并发到达 → 被一把锁串行化，第二次能看到第一次的落盘结果。
 - [ ] watcher 出错（监听器关闭）→ `watcher_error` 有值且记 error，进程不停摆。
@@ -564,3 +624,115 @@ newConfigWatcher func(path string, debounce time.Duration,
 | P2 | `Applier` 构造条件放宽后，`web_enabled=false` 但 `reload.enabled=true` 时是否仍不打开档位文件 | 构造 `Applier`，但**不打开档位文件**：给它一个不依赖 store 的构造入口，`Apply`（store 路径）在那种部署里返回明确错误、`ApplyConfig` 照常可用。选这条的理由是 W01 的冒烟证据——`web_enabled=false` 的部署今天连 `profiles_path` 的父目录都不碰，为热更档位而去读它会破掉"关闭即惰性"。撞名判定在那种部署里只看 config 批次，与今天的运行态一致 | 只处理 config 批次、撞名判定推迟到下次启动 |
 | P3 | `reload.debounce` 默认值 | 500ms（比目录加载器的 100ms 宽：配置改错的代价高于多等 400ms） | 100ms，与 `core/load.go:94` 对齐 |
 | P4 | 被环境变量压住的键是否在日志里单列 | 不单列，统一走"本次无变化"文案（§5.3） | 单列一份 `overridden_by_env` 清单，需要在 `LoadConfig` 侧新增来源信息 |
+
+## 14. 与实现的偏离（R07 收口时逐条核对，2026-10-04）
+
+本节只记两类事：设计文本与落地代码不同的地方，以及任务卡的前提与实测不同的地方。
+行文里的行号是 2026-10-04 复核时的位置，之后的改动会让它漂移，所以每条都同时给了符号名。
+
+### 14.1 待拍板 P1–P5 的实际落地答案
+
+| # | 设计里的推荐值 | 落地答案 | 证据 |
+| --- | --- | --- | --- |
+| P1 | `Store` 接口加 `SetHistoryRetention` | **照推荐落地**：接口方法在 `core/store.go` 的 `Store` 里（`SetHistoryRetention(limit, ttl)`），实现是 `(*JSONFileStore).SetHistoryRetention`；测试替身按拍板时预见的代价一起补上了实现（`core/scheduler_test.go` 的 `mockStore`） | R02 卡 §10；R07 场景 8 实测（`store.history_limit` 1000→5 之后 `GET /api/v1/jobs?status=success` 的条数与 `/stats` 的 completed 同时收到新上界） |
+| P2 / README P5 | 构造 `Applier` 但不打开档位文件 | **照推荐落地**：新增不依赖 store 的构造入口 `executor.NewConfigApplier`，`Applier.Apply()`（store 路径）在那种部署里返回明确错误、`ApplyConfig` 照常可用；`cmd/server/main.go` 的构造条件是 `web_enabled \|\| (reload.enabled && executors.enabled)`，档位文件的打开条件一字未改 | R04 卡 D-R0403 登记了"`Apply()` 恒返回错误"这一后果并明确不修；R07 场景 13 在 `executors.enabled=false` 的部署里实测到档位改动只记不生效 |
+| P3 | 默认 500ms | **照推荐落地，并另加一条下界**：`core/config.go` 的 `DefaultReloadDebounce = 500 * time.Millisecond` 与 `minReloadDebounce = 50 * time.Millisecond`，后者由 `Validate` 拦（R07 场景 2 实测：`debounce: 10ms` 让进程启动即失败，错误文案同时给出下界与省略本项时的取值） | R01 卡；R07 场景 2 |
+| P4 | 不单列 | **照推荐落地**：全仓没有 `overridden_by_env` 这个名字（代码与文档一起 grep 过），环境变量压住的键走"本次无变化"那条结论。R07 场景 4A 另外测到一个更强的事实：**没有配置文件时环境变量整体不生效**（`LoadConfig` 只在读通文件那一支调 `UnmarshalExact`），所以这条拍板在今天那种部署里连"被压住"的机会都没有，见 D-R0706 | R07 场景 4A |
+
+### 14.2 落地形状与设计文本不同的地方
+
+1. **§5.4 的响应字段类型**：设计写的是 `RuntimeResponse.Reload *core.ReloadState`，落地是 `api` 自己声明的
+   `*ReloadStatus`（`api/reload_state.go`）。原因是 R05 交给 R06 的 D-R0502——`time.Time` 上的
+   `omitempty` 不生效，直接序列化 `core.ReloadState` 会把"从没应用过"落成 `"0001-01-01T00:00:00Z"`。
+   现在两个时间字段是 `api` 侧自己格式化的 RFC3339Nano 字符串（`formatReloadTime`），零值给空串并整个键缺省。
+   `core.ReloadState` 仍然留在 `core`，`api` 靠本地的 `ReloadStateReader` 接口拿它，依赖方向没变。
+2. **§5.4 的 `enabled` 出处**：落地是"建链时钉一次"的进程配置值（`WithReloadState(reader, enabled)` 的第二个
+   参数），不是 `State().Enabled`（D-R0503 的具体处置）。注入条件与"配置里开没开"绑，不与"watcher 建没建起来"绑。
+3. **§7.8 的关闭顺序**：设计写的是"SIGINT 之后、`server.Stop` 之前显式 `watcher.Close()`"三步。
+   落地是四步：`watcher.Close() → chain.Stop() → server.Stop(ctx) → scheduler.Stop()`（`cmd/server/main.go`
+   末段，注释就在那儿）。多出来的 `chain.Stop()` 拿一次重载链的串行锁，等的是在途那次重载走完——
+   R05 的 `Close` 明确不等 `ReloadFunc`，少这一步就会出现"关闭过程中档位还在注册"的交错。
+4. **§7.5 的签名核对**：`Registry.ApplyConfig(profiles []*Profile) error`（`executor/registry.go`）与
+   `Applier.ApplyConfig(candidate core.Config) (ApplyResult, error)`（`executor/applier.go`）与设计文本一字不差；
+   落地多出来的是构造入口（见 14.1 的 P2）与"冻结值取自哪一份"的注释修正，不是签名。
+5. **§7.6 的扁平化实现位置**：摊平在 `core/config_reload.go` 里，不在 `LoadConfig`——
+   `flattenLeaves` 是入口，`flattenStruct`（递归结构体）与 `flattenCommands`/`commandEntryName`（档位列表按
+   `executors.commands.<名字>.<字段>` 摊平）是两支，`splitCommandLeaf` 反过来把路径拆回名字与字段，
+   `Diff` 拿两份叶子表比对、`classifyChange` 决定归属档位。
+   "每个叶子键都必须有且只有一档"由 `TestEveryLeafKeyIsClassed` 守着（§8 第二条）。
+6. **§9 与 §12 关于 `env_allow` 的说法已按实测收窄**（R04 登记的 D-R0404）：`LoadProfiles` 只看每条档位自己声明的
+   `env_allow`，顶层那份全局 `executors.env_allow` 从不进那次校验，它的唯一读取点是执行期的 `executor/env.go`。
+   免重启新增档位真正的兜底是两条：`workspace`/`runtime_allow`/两个 timeout 由 `ApplyConfig` 用冻结值校验，
+   而 `env_allow` 靠处理函数闭包钉住（`syncHandlers` 传的是 `executorsNow()`）。本文 §2 落地块 R8 那条已改写成这个形状。
+7. **§8 验收清单里的 `/pools` 端点在本仓不存在**（D-R0701）：那条判据改取
+   `GET /api/v1/admin/runtime` 的 `scheduler` 对象——同一份 `RuntimeStats`，`workers`/`queue_capacity`/
+   `exec_workers`/`exec_queue_capacity` 都在。§8 那一行已就地改正。
+
+### 14.3 场景实测暴露出来的读数语义
+
+1. **`applied_keys` 要读作"本次重载处理过的键"**（D-R0605 的处置）：`executors.enabled=false` 时改档位，
+   键仍然进 `applied_keys`、`last_applied_at` 也会推进，随行的是一条 warn 说明这一节没打开（场景 13 实测）。
+   §5.4 已经按这个口径补了说明。
+2. **档位改动的键名是逐字段摊平的**（D-R0704）：加/删一条档位时 `applied_keys` 给的是
+   `executors.commands.<名字>.<字段>` 一串，不是卡面写的裸键 `executors.commands`；
+   只有整列表被清空那种才会看到容器路径本身。判据要按"含这一族前缀"写。
+3. **`rejected_keys` 是那一次重载里"与现网不同的全部拒绝档键"，是累计的**（D-R0705）：场景 15 连着改三次凭据，
+   第二次的清单是 `server.auth.token, server.auth.users`，第三次是三条全在。读它的人要知道这解释的是
+   "本次作废的原因"，不是"你刚改的那一条"。
+4. **`last_applied_at` 只属于成功的那一次尝试**（D-R0707）：一次 `ok` 之后再遇到 `rejected`/`failed`，
+   读数里这个键会消失（状态是按次替换的整份快照）。它不是"历史上最后一次应用"的台账，运维要看历史得翻日志。
+5. **防抖语义**（场景 22）：`reload.debounce` 可以热更，`core.ConfigWatcher.SetDebounce` 对**下一次排期**生效，
+   正在计时的这一次不改窗口（`core/watch.go` 里那条注释）。实测形状：800ms 窗口把间隔 400ms 的两次写入合并成
+   一次重载（`last_attempt_at` 只推进一次），同一个 400ms 间隔在 200ms 窗口下给出两次——所以"合并与否"判据
+   取的是窗口长度与写入间隔的大小关系，不是"两次写入是否挨着"。
+6. **不再表达任何取值的文件不会把现网换成默认值**（D-R0702，本卡的代码改动；BOM/UTF-16 那一半是 D-R0709、
+   标记与流式写法那一半是 D-R0711、"有键名没取值"与多文档那一半是 D-R0715）：
+   重载链在第 1 步读文件之前先做"这份文件还表达任何取值吗"的判断
+   （`cmd/server/reload.go` 的 `configFileCarriesNoValues` + `yamlCarriesNoValue`：**按 YAML 结构判**——
+   用 viper 同一族解析器把整份解析成 `any`，顶层是 nil、或映射里每个叶子都是 nil / 空映射，就算没表达；
+   标量与序列（哪怕 `commands: []`）算作者写下的取值；解析失败或文件读不出都**不判**，交回第 1 步那条统一口径）。
+   前两版是逐行扫文本，判不到这一族，第三轮复核才换到结构层。场景 16/16E 实测：
+   现网 `scheduler.workers` 停在文件里写的 7（代码默认 100），级别维度的证据是随后整份重写正常配置时
+   `result=ok` 且读数按新值换掉（说明监听器活着）。
+   配套用例是 `cmd/server/reload_test.go` 里那七条（链上五条 + 正向对照一条 + 直接量判据的一条，
+   合计 54 条可计数用例，清单在 R07 卡 §10.3）；判红点由七条变异 M1–M7 给出、每条的原始输出留档，
+   还原后 `reload.go` 的 sha256 与备份逐字一致。真进程侧证据是卡 §10.4 的 16F / 16G / 16H。
+7. **只写一部分键的文件仍会把没写的键退回默认值**（D-R0703，登记不修）：这是"整份文件是唯一真相"加上
+   R04 整表替换语义的必然结果，不是这条守卫能管的范围——它只认"一个取值都没有"。
+   `docs/deployment.md` 的运维提示里写了"删掉一个键等于把它改回默认值，要退回默认得显式写出每一项并重启"。
+
+### 14.4 R05/R06 交给 R07 的携带项的处置
+
+| 来源 | 内容 | R07 的处置 |
+| --- | --- | --- |
+| R02 的 D-R0203 | "设计 §6.1 把 `store.flush_interval` 列为热更键，与代码冲突，R07 要把它改到重启档" | **前提不成立**：初稿提交 `9909962` 的 §6.1 表就只有那 9 行热更键，`store.flush_interval` 从初稿起就在 §6.2 重启档那一串里（`git show 9909962:docs/design/config-reload-design.md` 可查）。没有任何文本要改，代码现状（`ClassRestart`）本来就与设计一致 |
+| R05 的 D-R0502 | 时间字段序列化形状 | R06 已收口（`api.ReloadStatus` 自格式化），本文 §5.4 的代码草图保留原样并在 14.2 第 1 条标注偏离 |
+| R05 的 D-R0503 | `enabled` 的出处 | R06 已收口（`WithReloadState` 的第二参数），见 14.2 第 2 条 |
+| R06 的 D-R0601 | 一次失败的重载留两条 error 级日志 | 已写进 §5.4 的约束段与 `docs/deployment.md` 的读数一节：两条归因不同（步骤级 / 进程级），按 `path` + 时间窗去重 |
+| R06 的 D-R0602 | 卡面"stdout 出现 debug 行"的判据在默认功能面达不成 | R06 期间已就地换成"级别拧到 error 后 INFO 行不再增长、拧回恢复"，R07 场景 5 用同一形状复测通过 |
+| R06 的 D-R0603 | `-config` 留空时只补 `.yaml`/`.yml` 两种拼写，viper 实际还认 `.json`/`.toml`/… | **维持登记不修**：本仓文档、示例与 `.gitignore` 只承诺 `configs/config.{yaml,yml}`。R07 场景 4B 实测到那条盲区的现场形状：目录里只放 `config.json` 时进程按"没读到配置文件"走，`reload` 读数给出 `watcher_error` 而不是静默失灵；已把这一条写进 `docs/deployment.md` 的运维提示 |
+| R06 的 D-R0604 | 手搓 `reloadDeps` 时"没有 Applier 但 executors 开着"会被算成"本节未启用" | **维持登记不修**：真实装配走 `cmd/server/main.go` 的构造条件到不了这一格（14.1 的 P2 那条条件必建 Applier），要改得先回答"Applier 建不出来时 executors 那一节算什么"，与本系列的三档结论冲突 |
+| R06 的 D-R0605 | 执行器未启用时档位改动仍进 `applied_keys` | 已按"读数读作处理过的键"收口（§5.4 说明段 + 14.3 第 1 条 + `docs/api.md` 的字段表），代码不改 |
+| R06 的 D-R0607 | §5.4 承诺 `error` 不含取值 | 已收窄成"不含**凭据**取值"（§5.4 约束段），非凭据取值（写错的时长、撞名的档位名）由产出方回显，`watcher_error` 同样是自由文本 |
+
+### 14.5 R07 新登记的缺陷
+
+| 编号 | 现场 | 处置 |
+| --- | --- | --- |
+| **D-R0701** | 卡 §3.1 与 §3.4 的判据写的是 `GET /api/v1/pools`，本仓没有这个端点（实测 404；`api/pools_stats_test.go` 测的是池的概念，不是路由） | **卡面就地改正 + 文档同步**：判据改取 `/admin/runtime` 的 `scheduler` 对象；§8 那一行同步；设计文档 §3 的现状盘点不受影响（它没提过这个端点） |
+| **D-R0702** | 配置文件不再表达任何取值时，重载链把"整份读通"当成一份全默认配置接受，`result=ok` 并把现网取值换回代码默认——有凭据的部署只是碰巧被拒绝档挡住，没凭据的部署（场景 16E 那种）会静默丢掉并发数、级别与档位表 | **本卡已修，改了三轮才修到底**：`cmd/server/reload.go` 的 `configFileCarriesNoValues` + `yamlCarriesNoValue`，在第 1 步之前**按 YAML 结构**判"还表达取值吗"，判据侧七条用例、判红点七条变异（R07 卡 §10.3，每条留原始输出），真进程复测见卡 §10.4 的 16/16E/16F/16H。第一版按文本判，留下 D-R0709（BOM/UTF-16）、D-R0711（标记与流式写法）、D-R0715（只有键名 / null / 空映射 / 多文档）三条，三条都记在本表里 |
+| **D-R0709** | D-R0702 第一版判据自身的漏口（第一轮 fresh-context 复核发现）：`strings.TrimSpace` 不认 U+FEFF，而 YAML 解析器容忍 BOM 与 UTF-16，所以"带 BOM 的只有注释"与 Windows PowerShell 5.1 的 `>` / `Out-File` 默认写出的带 BOM UTF-16LE 空文件会被判成"有内容"放过——守卫注释里举的那个现场正好从它脚边漏过去 | **本卡已修，修法后被 D-R0715 的重写吸收**：当时补的是 `configFileText`（自己还原三种 BOM/UTF-16 前缀 + 分隔符行按前缀认），终态里这个函数已删除——判据改用解析器之后这些编码由解析器自己认。这一族的复测留在 16F 与单元层的 BOM/UTF-16 四格 |
+| **D-R0703** | 只写一部分键的文件会把没写的键退回默认值 | **登记不修**：整份文件是唯一真相 + R04 整表替换的必然形状，动它等于改本系列的语义基线。处置是文档：`docs/deployment.md` 运维提示第 3 条 |
+| **D-R0704** | 卡 §3.1 场景 11/12/13 的判据"`applied_keys` 含 `executors.commands`"与落地不符：档位改动按逐字段摊平给出一串 `executors.commands.<名>.<字段>` | **卡面判据改正**（按前缀族判），并写进 14.3 第 2 条。不是代码缺陷：R01 的 `Diff` 判定单位就是叶子键（§6 开头那句） |
+| **D-R0705** | 卡 §3.1 场景 15 的判据"`rejected_keys` 各自给出对应键名"与实测不符：清单是那一次里全部与现网不同的拒绝档键，累计给出 | **卡面判据改正** + 写进 `docs/api.md` 的字段表与 14.3 第 3 条。不是代码缺陷：`Diff` 就是按"applied vs candidate 的整份差"判拒绝档 |
+| **D-R0706** | 卡 §3.1 场景 4 的"默认值部署"想用环境变量打开 `reload.enabled`，实测环境变量在**没有配置文件**时整组不生效（`LoadConfig` 只在 `ReadInConfig` 成功那一支走 `UnmarshalExact`） | **登记不修 + 文档**：这是 `LoadConfig` 的既有行为、不属于本系列范围；场景 4 拆成 4A（无文件：环境变量与开关都无从生效，进程按代码默认跑）与 4B（有文件但拼写不是 `.yaml`/`.yml`：走到 R06 §5.2 #13 那条 warn）。`docs/deployment.md` 的运维提示里补了同一件事 |
+| **D-R0707** | `docs/api.md` 的字段表把 `last_applied_at` 写成"最近一次应用成功的时刻；只在 `result=ok` 时推进"，读起来像历史值；实测一次失败的之后这个键消失 | **文档已改**：写成"本次这一次尝试里应用成功的时刻；随后的失败重载不再给这个键，要历史请翻日志"，并登记在 14.3 第 4 条。代码不改（按次替换整份快照是 R05/R06 定下的形状，改成历史台账需要新的字段与新的口径） |
+| **D-R0708** | 三处测量工具自己的错（不是产品行为）：`/api/v1/events` 的响应形状是 `{count,items,note}`、没有 `total`，场景 9 的第一版判据却拿 `total` 比；harness 里 `SetConsoleCtrlEvent` 在 Win32 根本不存在（投递 Ctrl+C 的那个 API 叫 `GenerateConsoleCtrlEvent`，前者是 pywin32 的包装名，ctypes 取不到）；场景 21 用 API 去读强杀之后的状态，而那时进程已经没了 | **改判据重跑**：事件按 `count`、台账按 `total`；Ctrl+C 换成 `GenerateConsoleCtrlEvent` 并打出现场三个返回值（结论见卡 §10.6 乙：这台机器投不进去）；场景 21 改成直接读 `data/jobs.json` 并把整数状态按 `core/job.go` 的 iota 翻回名字 |
+| **D-R0710** | D-R0702 那道守卫自己的注释过度承诺：写着"两次读之间被截断由 `Diff` 与拒绝档兜住、所以这里不加锁"，而空文件读出的全默认配置与生效那份必然不一致，`Diff` 只会把它当一批热更键应用掉——注释描述了实现没有提供的保证（第二轮 fresh-context 复核发现） | **本卡已修（只改注释）**：如实写成"窗口微秒级、撞上那一次本判据补不回来、下一次事件再判一次；真要收口得让 `core.LoadConfig` 接受内容入参"，那是 `core` 的接口改动，超出 R07「零生产代码变化」的目标 |
+| **D-R0711** | D-R0709 的"前缀匹配"改出了过头判据：`strings.HasPrefix(trimmed, "---")` 会把 `--- {logging: {level: debug}}` 这种标记后紧跟真取值的整行连内容一起跳掉，于是**一份有内容的单行流式配置**被判成"没有取值"而 `rejected`——守卫反过来误伤合法配置 | **本卡已修，同样被 D-R0715 的重写吸收**：当时补的是 `cutDocumentMarker`（剥掉标记后再看剩下的是什么），终态里这个函数已删除——标记、流式写法、多文档这些边界本来就该由结构解析回答。保留的形状搬进了 `TestConfigFileCarriesNoValuesShapes`，真进程侧是 16G |
+| **D-R0712** | 记录侧三条：变异名单只记数不记红名单、旧编号在终态字节上重跑时没写映射；卡内抄的验收 grep 命中清单按行号引用（本卡每编辑一次就漂一次）并漏记本卡自己的自命中；§10.3 的轮次说明留着占位读数 | **本卡已修（记录）**：grep 命中清单改成按内容引用、自命中逐条列出；轮次说明换成真实读数。变异那一条随判据重写作废——文本判据那套 M1/M2/M3b/M5/M6 整体不再有意义，终态名单是 M1–M7，红名单与原始输出一起留档（见 D-R0716） |
+| **D-R0713** | 流程侧：第三轮全量验证（00:59:38 起跑）与一条变异的还原过程重叠，无法证明那一轮编译读的是终态字节；同时验证脚本每轮截写同一个输出文件名，把最早那一轮的读数覆盖掉了 | **本卡已修**：判据重写之后在"已还原并核过 `sha256`"的字节上整轮再跑一遍（第五轮），卡与状态表只抄这一轮；每轮一个新文件名不再复用。口径同 R05 的 D-R0515：**变异与全量验证必须串行**，并行时任何一轮都不能当终态证据 |
+| **D-R0714** | 真进程的 22 条场景与 16E 跑在 00:44 那次构建的 `server.exe` 上，而第二、三轮又改过 `cmd/server/reload.go`，那一批读数字面上不是"终态字节"下的读数 | **登记 + 补测**：卡 §10.4 现场段如实写明新旧边界；01:45 用终态字节重建 `server.exe` 后重跑 16F、16G 并新增 16G 之外的 16H（专测 D-R0715 那一族）。1–22 与 16E 没有全批重跑，理由写在同一节：重写只改变"哪些文件被判成没取值"，那一批里只有 16 那一族走这条判据 |
+| **D-R0715** | 第三轮 fresh-context 复核发现：文本层的判据**判不到根**。`logging:` + `level:`（只有键名）、`scheduler: {workers: null}`、`logging: {}`、顶层 `null`、层层都是空键、以及"值写在第二份文档里"这六族，文本上有内容、`core.LoadConfig` 那里一律是一份全默认配置，链照走、`result=ok`、现网被换成代码默认——D-R0702 原样复现。复现方式：临时判据用 `go test -overlay` 挂进 `cmd/server`（不落仓库文件），同时问判据、`LoadConfig` 与整条链。判据侧另有三个洞：`configFileCarriesNoKeys` 返回 error 那一支零覆盖、守卫的日志与 `hint` 两行没有逐字断言、"该放过"的正向半边不覆盖空序列与标量 | **本卡已修**：判据换成按 YAML 结构判（用的就是 viper 那一族解析器，所以第 0 步与第 1 步答的是同一个问题），`configFileText` / `cutDocumentMarker` 一并删除，`gopkg.in/yaml.v3` 从 indirect 提到直接依赖（`go.sum` 未变，`go mod verify` + 交叉构建都跑过）。判据侧补三条：链上的 `TestReload_ValuelessFileIsSameConclusion`（7 格，每格先核 `LoadConfig` 真能读通）、`TestReload_StepOneShapesKeepTheirOwnWording`（Tab 缩进 / `----` 开头 / 不带 BOM 的 UTF-16 / 文件被删，判"两种脸色不串门"）、单元层的"文件不存在交回错误"那一格；守卫的日志与 `hint` 改成逐字断言 |
+| **D-R0716** | 记录不可复算（本轮复核发现）：卡说"四轮读数在四个文件里"，实际脚本每轮截写同名文件、最早一轮已被覆盖，两份文件是同一轮；变异名单说"脚本在 mut5.py / mut6.py"，而 mut5.py 的锚点在终态字节里不存在（它跑的是第一轮那份备份）、mut6.py 的循环是 `MUTS[1:]`（M1 从没被它跑过），七条变异都没有原始输出留档；另有三处小口径不一致（`0.333s` 与留档的 `0.258s`、把"工作树是 CRLF"的提醒用在这三个 LF 文件上、丁 那条补充 grep 只举三处命中而实际二十来行） | **本卡已修（记录）**：验证每轮一个新文件名、只认有留档的那一轮；变异在终态字节上整批重跑成 M1–M7，每条的原始输出留档在 `r07smoke/mut_final/M<n>.txt`，红/绿数与首个红消息由脚本从原始输出算出；三处小口径逐条改成与留档一致。旧的那套文本判据变异随实现一起作废 |
+| **D-R0717** | 跨文档矛盾（本轮复核发现）：设计文档 §2 落地位置 R3 仍写"七步固定顺序"（代码是八步）、§14.3/§14.5 写"三条用例 + 四个变异体"（终态是七条用例 + 七条变异）、R07 卡 DoD 里"设计文档 §14.5 每行都带前缀"不成立（那张表本来就是裸编号，前缀规则管的是卡内缺陷表）、本目录 README 的 R07 行写"两条补测 16E、16F"（终稿是三条，含 16H） | **本卡已修（文档）**：四处逐条对齐到终态；DoD 那句改成"卡内缺陷表每行带系列前缀，设计文档 §14.5 的编号本身已含系列号 R07"；`docs/deployment.md` 与 `docs/api.md` 里凡引用旧文案的地方一起换成终态那句 |

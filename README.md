@@ -297,8 +297,13 @@ godelayq/
 - **三种提交入口**：REST API、任务文件目录、代码内直接 `Schedule`
 - **执行器档位（默认关闭）**：档位注册成 `exec.<档位名>` 任务类型，到点直接跑脚本、跑已编译产物
   或发一个 HTTP 请求，不需要改代码；能执行什么由两份来源决定——配置的 `executors.commands`
-  （改完要重启）与档位文件 `executors.profiles_path`（`executors.web_enabled` 打开后由 ops 档在
-  控制台"档位"页增删改，**立即生效、活过重启**），两份合并时同名以配置为准。无论来自哪份，
+  与档位文件 `executors.profiles_path`（`executors.web_enabled` 打开后由 ops 档在
+  控制台"档位"页增删改，**立即生效、活过重启**），两份合并时同名以配置为准。`executors.commands`
+  什么时候要重启取决于 `reload.enabled`：关闭时（默认）改完要重启；打开时改条目自身的可改字段
+  （超时、参数声明、条目增删）下一个防抖窗口就生效，而条目内的执行许可字段（`runtime`/`script`/
+  `program`/`env`/`url_template` 等十五项）会让整次重载被拒绝，那种改动连同 `executors.workspace`/
+  `runtime_allow`/`env_allow` 仍须重启（分档表见 [配置热重载设计文档](./docs/design/config-reload-design.md) §6）。
+  无论来自哪份，
   **都不提供自由命令行，也不接受任务里内联源码**。参数声明（必填、正则、`secret`）、可用性探测、
   独立执行池与输出产物存储都在 `executor/` 包里；开关与部署前提见 [部署文档](./docs/deployment.md) 的"开启执行器"。
 - **上下文传递**：Handler 收到带 cancellation 与 timeout 的 `context.Context`
@@ -328,7 +333,9 @@ godelayq/
 
 - **控制台账号**：`server.auth.users` 声明账号（只存 bcrypt 哈希，用 `go run ./cmd/hashpassword` 生成），
   登录换 JWT：access token 默认 15 分钟、refresh token 默认 12 小时且一次一用；
-  登出会把当前 access token 立即拉黑，不等它自然过期。账号增删需重启进程。
+  登出会把当前 access token 立即拉黑，不等它自然过期。账号增删需重启进程：`reload.enabled: true`
+  也不会代劳这件事——凭据项（`server.auth.token`、`server.auth.users`、`server.auth.jwt.secret`）
+  一旦变化，整次重载会被拒绝，现网照旧按旧凭据跑（见 [部署文档](./docs/deployment.md) 的"配置热重载"）。
 - **静态 token**：`server.auth.token` 保留给脚本与 CI，身份是 `machine`——
   能读写任务，但不能强制暂停、不能删组、不能用运维端点。
 - **角色**：`viewer < operator < admin < ops`，路由级中间件把关；
@@ -502,7 +509,14 @@ observability:
     enabled: true             # write_audit 表：每个写请求一行台账（谁、什么身份、做了什么、成没成、多快）
     retention_count: 500000   # 保留条数；高频建任务的部署会先撞到条数上界而不是天数
     retention_age: 2160h      # 保留时长（默认 90 天）；0 表示不按时间淘汰
+reload:
+  enabled: false              # 配置热重载总开关（重启档：改了它本身不生效，必须重启）
+  debounce: 500ms             # 静默窗口：同一文件在这段时间内的多次写入合并成一次重载
 ```
+
+> `reload.enabled: true` 时，改 `configs/config.yaml` 不必重启：哪些键立刻生效、哪些要重启、
+> 哪些会让整次重载被拒绝，三档清单与运维口径见 [部署文档](./docs/deployment.md) 的"配置热重载"
+> 与 [配置热重载设计文档](./docs/design/config-reload-design.md) §6。默认关闭，关闭时一个监听器都不建。
 
 > 观测层的三个子开关只在总开关为真时生效，代价与备份口径见 [部署文档](./docs/deployment.md) 的"启用观测层"，
 > 表结构与读端点见 [观测层设计文档](./docs/design/sqlite-observability-design.md)。
@@ -539,3 +553,5 @@ observability:
   - 实施拆分：[档位在线管理任务卡 TASK-W01 … W09](./docs/design/tasks/web-profile/README.md)
 - [观测层设计文档](./docs/design/sqlite-observability-design.md)（可选的 SQLite 观测层：运行事件、产物索引与写操作审计三张表；**已实现，与设计不同处逐条标在该文 §15**）
   - 实施拆分：[观测层任务卡 TASK-S01 … S08](./docs/design/tasks/sqlite/README.md)
+- [配置热重载设计文档](./docs/design/config-reload-design.md)（改配置文件不必重启：三档归属（热更 / 重启 / 拒绝）、fsnotify 触发、全量校验后原子生效 + 逆序回滚，重载结论只看 `GET /api/v1/admin/runtime` 的 `reload`；**已实现（R01–R07）**，落地位置与实现偏离逐条标在该文）
+  - 实施拆分：[配置热重载任务卡 TASK-R01 … R07](./docs/design/tasks/config-reload/README.md)
