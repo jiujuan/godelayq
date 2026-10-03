@@ -48,7 +48,13 @@ type reloader struct {
         logger   *slog.Logger
 }
 
-// Reload 走完整条链。它同时是 core.ReloadFunc 的实现，因此必须自串行（R05 的契约）。
+// Reload 走完整条链，它就是交给 core.ConfigWatcher 的那个 ReloadFunc。
+//
+// 串行这件事分两层，别混（R05 已交付的事实）：
+//  1. watcher 持自己的 reloadMu 把"调用 + 保存状态"整段串行，所以同一个 watcher 不会并发调进来两次；
+//     （调用点是防抖计时器的协程，不是事件循环。）
+//  2. r.mu 保护的是**另一件事**：applied 这份权威同时被装配阶段与关停路径读，且链本身要能直接调
+//     ——§5.1 #11 就是用两个 goroutine 直接调 Reload 的，链必须自己站得住，不能指望上游替它串行。
 //
 // 七步，顺序固定：
 //  1. candidate, err := core.LoadConfig(cfgPath)
@@ -62,9 +68,10 @@ type reloader struct {
 //  6. 逐项应用热更档（§3.2 的顺序），每项成功后把它的 undo 压栈。
 //     任一项失败 → 逆序执行 undo，结论 failed（或 degraded，见 §3.3），applied 保持旧值，记 error。
 //  7. 全部成功 → applied = candidate，结论 ok（AppliedKeys 来自热更档），
-//     同时把 Restart 档的键名抄进 IgnoredKeys，记一条 info，并 SetDebounce(candidate.Reload.Debounce)。
+//     同时把 Restart 档的键名抄进 IgnoredKeys，记一条 info。
 //
-// 第 7 步末尾那句是 reload.debounce 能热更的唯一落点：窗口改了，下一次事件起用新值。
+// reload.debounce 不在第 7 步：它是 §3.2 顺序表里的 #2（早于任何可能失败的动作），落点是 setDebounce，
+// 窗口改了下一次事件起用新值；它的 undo 就是把窗口写回 applied 里那份旧值。
 func (r *reloader) Reload() (core.ReloadState, error)
 
 // 结论的保存与并发可读由 R05 的 ConfigWatcher 负责（Reload 把结论作为返回值交回它），
@@ -148,16 +155,31 @@ if cfg.Reload.Enabled {
         watcher, err := deps.newConfigWatcher(cfgPath, cfg.Reload.Debounce, reloader.Reload, deps.logger)
         ...
         go watcher.Run(ctx)
-        defer watcher.Close()  // 注意：见下面"关闭顺序"
 }
+// 关停不用 defer：收到信号之后按下面"关闭顺序"那一段的四步显式调用。
 ```
 
-**关闭顺序**：`watcher.Close()` 必须在 `server.Stop(ctx)` 与 `scheduler.Stop()` 之前完成
-（设计文档 §7.8）。落地形态不是 `defer`（`run()` 里的 defer 会晚于它们执行），
-而是在收到信号之后、`server.Stop` 之前显式调用；`reloader` 的链可能正在执行，
-`Close` 会等在途调用返回（R05 §3 已定这条）。这条顺序的用例判据：
-关闭日志里"watcher closed"这一条的时间戳早于"shutting down server"
-（用现成的 `logger` 属性 + 替身 watcher 记录调用流水，不靠读时钟）。
+**关闭顺序（本卡的一处卡面前提被 R05 的实现证伪，已按实现口径重写）**：
+`watcher.Close()` **不等在途的 `ReloadFunc` 调用返回**——这是 R05 的既定口径（卡 R05 §3 的 `Close` 注释
+与 `ReloadFunc` 契约第 1 条末尾：那一次调用可能正握着写链的锁，等它只会把关停拖死；R05 实测的变异也
+只证到"不再新起"，不证"绝不重叠"）。所以原写的"先 `Close` 就能保证链已收尾"不成立：`Close` 之后仍可能
+有一次 `ApplyConfig` 在改处理函数表，而那正是设计文档 §7.8 要避免的交错。
+
+补一个由 `reloader` 自己提供的收口入口，顺序变成四步：
+
+```go
+// Stop 等在途那一串走完，并让之后的调用直接返回（不再读配置、不再动任何落点）。
+// 形状：先 r.mu.Lock() —— 它就是整条链的串行锁，拿到它等于在途链已经交还；
+// 然后置一个 stopped 位点再解锁。此后就算有人直接调 Reload 也只是立刻返回一个空结论，
+// 不会有人新起一条链（触发源已被 watcher.Close() 断掉）。
+func (r *reloader) Stop()
+```
+
+调用次序：`watcher.Close()` → `reloader.Stop()` → `server.Stop(ctx)` → `scheduler.Stop()`；
+落地形态不是 `defer`（`run()` 里的 defer 会晚于它们执行），而是在收到信号之后显式按这个次序调。
+§5.2 #14 的判据随之改成**替身调用流水**的先后（watcher.Close 早于 reloader.Stop 早于 server.Stop
+早于 scheduler.Stop），不读时钟；§5.1 另加一条 **#12**：把某个落点卡在闸门上、另起协程调 `reloader.Stop()`，
+闸门放开之前 `Stop` 不得返回（这条判的是"等在途"那一半，与 R05 那条"只等循环"的判据正对着）。
 
 `newConfigWatcher` 作为 `runtimeDeps` 的一个函数值字段（默认实现就是 `core.NewConfigWatcher`），
 这样集成测试能塞一个假 watcher 进去驱动整条链，而不必真的等文件系统事件。
@@ -234,6 +256,10 @@ func WithReloadState(r ReloadStateReader) Option
 10. `TestReload_CommandsWithExecutorsDisabled`：执行器未启用而 `executors.commands` 变 →
     结论 `ok`、`AppliedKeys` 含该键、记一条 warn 说明"未启用，本次不生效"
     （§3.1 第三条特殊处理）。
+12. `TestReload_StopWaitsInFlightChain`：把 `setWorkers` 卡在一道闸门上、另起 goroutine 调 `reloader.Stop()`，
+    闸门放开之前 `Stop` 不得返回；放开之后 `Stop` 返回，且随后一次 `Reload` 立即返回空结论、
+    落点函数零调用（§3.4 的"等在途 + 拒绝后续"两半）。**注意 defer 次序**：开闸门的 `defer` 必须注册在
+    调 `Stop` 那条之后，否则失败路径上会等一个卡在已关闭闸门里的协程、整包撞到超时（R03/R05 各踩过一次）。
 11. `TestReload_ConcurrentReloadsSerialized`：两个 goroutine 同时 `Reload`，
     替身里记录"进入/离开"配对 → 断言两次的临界区不重叠，且第二次能看到第一次的结果
     （`applied` 已推进，所以第二次的 `Diff` 是 `unchanged`）。`-race` 必须干净。
@@ -245,8 +271,8 @@ func WithReloadState(r ReloadStateReader) Option
 13. `TestRun_WatcherNotStartedWithoutConfigFile`：`reload.enabled=true` 但启动时没读到文件
     （`-config` 指不到、`configs/config.yaml` 不存在的那种部署）→ 不起 watcher、
     记一条 warn、进程照常起来。
-14. `TestRun_WatcherClosedBeforeServerStop`：替身 watcher 与替身 server 各记录调用流水，
-    断言 `watcher.Close` 早于 `server.Stop` 早于 `scheduler.Stop`（§3.4 的关闭顺序）。
+14. `TestRun_CloseOrder`：替身 watcher、替身 reloader 与替身 server 各记录调用流水，
+    断言 `watcher.Close` 早于 `reloader.Stop` 早于 `server.Stop` 早于 `scheduler.Stop`（§3.4 的关闭顺序）。
 15. `TestRun_WatcherFailureDoesNotBlockStartup`：`newConfigWatcher` 返回错误 →
     `run()` 正常进入等待信号阶段，且有一条 error 日志。
 
@@ -293,7 +319,8 @@ func WithReloadState(r ReloadStateReader) Option
 - [ ] `degraded` 可达且可读（§5.1 #3），不是只在注释里存在的一个字符串。
 - [ ] `reload.enabled=false` 时零变化：不起 watcher（§5.2 #12）、`/admin/runtime` 无 `reload` 键
       （§5.4 #1）、全仓 `-race` 与之前同样绿。
-- [ ] 关闭顺序：先停 watcher，再关 server，再停调度器（§5.2 #14 的调用流水判据）。
+- [ ] 关闭顺序：先停 watcher，再收口重载链，再关 server，再停调度器（§5.2 #14 的调用流水判据），
+      且"链正卡在某个落点上时 `reloader.Stop()` 必须等它"有独立用例（§5.1 #12）。
 - [ ] `api` 侧只加了一个 Option 与一个字段，路由表与角色档位一字未改（`git diff api/server.go` 里
       `setupRoutes` 无变化），且没有新增 `auditActions` 行（§5.5 反证）。
 - [ ] 窄接口四项扩项后，`cmd/server` 的 `reload.go` 里**没有任何类型断言**
@@ -313,7 +340,7 @@ go build ./... && go vet ./...
 go test ./... -race -count=1
 ```
 
-预期：第一条列出 §5.1 的 11 条；第二条列出 §5.2 的 4 条；第三条含"没有 `reload` 键"那条。
+预期：第一条列出 §5.1 的 12 条；第二条列出 §5.2 的 4 条；第三条含"没有 `reload` 键"那条。
 若 `./api` 整包跑（不带 `-run`）耗时长，本卡只需 `-run` 过滤 + R07 再跑全量。
 
 ## 8. 不在本任务范围
