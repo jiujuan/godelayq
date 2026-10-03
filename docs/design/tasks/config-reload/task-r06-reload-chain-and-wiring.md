@@ -5,8 +5,13 @@
   R04（`Applier.ApplyConfig`）、R05（`ConfigWatcher`）
 - 涉及文件：`cmd/server/reload.go`（新增）、`cmd/server/reload_test.go`（新增）、
   `cmd/server/main.go`、`cmd/server/main_integration_test.go`（替身补方法）、
-  `api/reload_state.go`（新增）、`api/handlers_admin.go`、`api/server.go`（一个 Option）、
-  `api/handlers_admin_test.go`
+  `cmd/server/config_reload_smoke_test.go`（R02 留下的冒烟具，本卡换成生产链，见 §10.2 第 8 条）、
+  `cmd/server/main_test.go` 与 `cmd/server/profile_merge_test.go`（`defaultRuntimeDeps` 加参数后的跟进）、
+  `api/reload_state.go`（新增）、`api/reload_state_test.go`（新增）、`api/audit_test.go`
+  （`auditServer` 加可变参数，见 §10.5c 的 I-4）、`api/handlers_admin.go`、`api/server.go`（一个 Option）。
+  卡面原来点的 `api/handlers_admin_test.go` **一字未动**：§5.4 那三条用例要求判"键不存在"必须绕开
+  解码进结构体的 `decodeRuntime`，所以读面测试全部落在新增的 `api/reload_state_test.go` 里（复核轮抓到
+  这条清单与树不符，见 §10.5c 的 M-8）。
 - 预计规模：大（本系列把前面五张卡接成一条链，也是唯一同时动 `cmd` 与 `api` 的一张）
 
 ## 1. 任务目标
@@ -301,8 +306,15 @@ func WithReloadState(r ReloadStateReader) Option
    （与 W07 那次必须同步 `JSONEq` 期望值的情形不同，实现记录里如实写"零既有断言改动"）。
 2. `TestGetRuntime_ExposesReloadState`：注入一个假读口 → 响应里七个字段齐、`result` 是封闭取值之一。
 3. `TestGetRuntime_LeaksNoConfigValues`：假读口里放 `AppliedKeys:["server.auth.token"]` 与
-   一句含文件路径的 `Error`，断言响应里既没有旧取值也没有新取值
-   （把 canary 值塞进读口的返回值，再 `strings.Contains` 反证）。
+   一句含文件路径的 `Error`，断响应里有路径、有键名，而**服务自己配置里那三份凭据取值**
+   （静态 token、JWT 密钥、账号密码哈希）一处都不出现。
+   ~~把 canary 值塞进读口的返回值，再 `strings.Contains` 反证~~——这一句在执行时被证伪并删掉：
+   `reloadStatusOf` 是原样透出，塞进读口的取值必然出现在响应里，照字面写只会得到一条
+   判"透出成功"的假绿。取值不许进状态的闸门在产出方（`core.ChangedKey` 只带 `Path`），
+   这条用例守的是"api 这层不主动把配置值搬进读数"。缺陷表 D-R0606 记的就是这个卡面前提。
+4. 两条自由文本（`error` / `watcher_error`）要有**正向**判据（复核轮补）：注入的文本必须逐字出现在
+   响应里。没有这一条，"把 `Error: state.Error` 那一行删掉"这种改动能全绿通过，
+   而运维再也看不到失败原因——那正是本系列要破的静默（I3）。
 
 ### 5.5 不需要新审计行（一条反向用例）
 
@@ -312,21 +324,24 @@ func WithReloadState(r ReloadStateReader) Option
 
 ## 6. 完成标准（DoD）
 
-- [ ] §3.1 的七步顺序与三条判断全部落地，§5.1 的 11 条用例绿。
-- [ ] 应用顺序与 §3.2 那张表逐条一致，且 #1 那条用例断言的是**调用次序**而不是"都调过"。
-- [ ] 两条"什么都没动"的证据都在：拒绝档（§5.1 #4/#5 落点函数零调用）与
-      坏文件（§5.1 #6）；凭据那条还要在冒烟里用旧 token 反证一次（§5.3 最后一行）。
-- [ ] `degraded` 可达且可读（§5.1 #3），不是只在注释里存在的一个字符串。
-- [ ] `reload.enabled=false` 时零变化：不起 watcher（§5.2 #12）、`/admin/runtime` 无 `reload` 键
+- [x] §3.1 的七步顺序与三条判断全部落地，§5.1 的 12 条用例绿（实到 16 条，含三条附加守卫与一条上界边界）。
+- [x] 应用顺序与 §3.2 那张表逐条一致，且 #1 那条用例断言的是**调用次序**而不是"都调过"
+      （`assertExactCalls` 比的是整条流水的逐字相等）。
+- [x] 两条"什么都没动"的证据都在：拒绝档（§5.1 #4/#5 落点函数零调用）与
+      坏文件（§5.1 #6）；凭据那条还要在冒烟里用旧 token 反证一次（§5.3 最后一行：旧 200、新 401）。
+- [x] `degraded` 可达且可读（§5.1 #3），不是只在注释里存在的一个字符串。
+- [x] `reload.enabled=false` 时零变化：不起 watcher（§5.2 #12）、`/admin/runtime` 无 `reload` 键
       （§5.4 #1）、全仓 `-race` 与之前同样绿。
-- [ ] 关闭顺序：先停 watcher，再收口重载链，再关 server，再停调度器（§5.2 #14 的调用流水判据），
+- [x] 关闭顺序：先停 watcher，再收口重载链，再关 server，再停调度器（§5.2 #14 的调用流水判据），
       且"链正卡在某个落点上时 `reloader.Stop()` 必须等它"有独立用例（§5.1 #12）。
-- [ ] `api` 侧只加了一个 Option 与一个字段，路由表与角色档位一字未改（`git diff api/server.go` 里
+      真实进程侧那一轮没实测，原因与替代判据见 §10.6 第一条。
+- [x] `api` 侧只加了一个 Option 与一个字段，路由表与角色档位一字未改（`git diff api/server.go` 里
       `setupRoutes` 无变化），且没有新增 `auditActions` 行（§5.5 反证）。
-- [ ] 窄接口四项扩项后，`cmd/server` 的 `reload.go` 里**没有任何类型断言**
-      （`grep -n "\.(\*\|assert"  cmd/server/reload.go` 只允许命中测试替身相关行，理想是零命中）。
-- [ ] 冒烟表（§5.3）五行全部实测，逐行抄进 §10.4。
-- [ ] `go build ./...`、`go vet ./...`、`go test ./... -race -count=1` 全绿；
+- [x] 窄接口四项扩项后，`cmd/server` 的 `reload.go` 里**没有任何类型断言**
+      （`grep -n "\.(\*\|assert" cmd/server/reload.go` 零命中）。
+- [x] 冒烟表（§5.3）五行全部实测，逐行抄进 §10.4。第一行的"stdout 出现 debug 行"在默认功能面下
+      无站点可产出，已就地换成"级别拧到 error 后 INFO 行不再出现"的可判形状（D-R0602）。
+- [x] `go build ./...`、`go vet ./...`、`go test ./... -race -count=1` 全绿；
       `go test ./cmd/server -race -count=5 -timeout 30m` 无 flake；新增文件已 `gofmt -w`。
 
 ## 7. 验收方式
@@ -373,12 +388,354 @@ go test ./... -race -count=1
 
 ### 10.1 落地的接口与窄接口扩项清单
 
+**新增的类型与函数**（`cmd/server/reload.go`，除注明外都是包内私有）：
+
+| 名称 | 形状 | 谁用它 |
+| --- | --- | --- |
+| `reloadTargets` | 八个函数值（全部带 `error` 返回，见 §10.2 第 1 条） | `reloader` 唯一的下游视图 |
+| `reloadStep` / `buildPlan` | 一步 = 标签 + 认领的键路径（精确或前缀）+ `run` + `available` + `unavailable` | `applyChange` |
+| `reloadChain` | `Reload() (core.ReloadState, error)` / `Stop()` / `bindDebounce(configWatcherAPI)` | `run()` 与 §5.2 的替身 |
+| `reloader` | `mu` + `applied` + `processEnabled` + `cfgPath` + `targets` + `logger` + `stopped` | `newReloader(reloadDeps)` |
+| `reloadDeps` | `cfgPath` `applied` `store` `scheduler` `events` `audit` `applier` `executorsEnabled` `levelVar` `logger` | 装配方（`run()`） |
+| `configWatcherAPI` | `Run` `Close` `SetDebounce` `State` `MarkWatcherError` | 链的 #2 落点 + 读口 + §5.2 替身 |
+| `reloadStatusReader` | `attach` / `explain` / `State`，满足 `api.ReloadStateReader` | `api.WithReloadState` |
+| `maxHotReloadWorkers = 4096` + `checkWorkerBound` | 链的 #6 步内联调用 | R03 交接的 D3 |
+| 十一条键路径常量 | `keyLoggingLevel` … `keyReloadDebounce` | 分派表 + `TestReloadEveryHotKeyHasDispatchEntry` |
+
+**`api` 侧新增**：`ReloadStateReader`（接口）、`ReloadStatus`（十字段，两个时间是字符串）、
+`WithReloadState(r ReloadStateReader, enabled bool) Option`、`reloadStatusOf`、`formatReloadTime`；
+`Server` 多两个字段（`reloadState` / `reloadEnabled`），`RuntimeResponse` 多一个指针字段。
+`setupRoutes` 一字未改（DoD 倒数第三条按 `git diff` 核过）。
+
+**窄接口扩项（§3.3 那张表的落地形态）**：
+
+| 接口 | 新方法 | 真实实现 | 替身 |
+| --- | --- | --- | --- |
+| `schedulerAPI` | `ResizeWorkers(n int) error`、`SetRetryPolicy(p core.RetryPolicy)` | `*core.Scheduler`（R03、R02） | `spyScheduler` 两个方法都记进调用流水，另给 `concurrencyNow()` / `retryMaxDelay()` 两个读数口 |
+| `eventLogAPI` | `SetRetention(count int, age time.Duration)` | `*sqlite.EventLog` | `eventLogStub` + `setRetentionCalls()` |
+| `auditLogAPI` | `SetRetention(count int, age time.Duration)` | `*sqlite.AuditLog` | `auditLogStub` + `setRetentionCalls()` |
+| `core.Store` | 消费 R02 的 `SetHistoryRetention` | `*core.JSONFileStore` | `stubStore` + `retentionPairs()` |
+
+`runtimeDeps` 新增四个字段：`configPath`、`levelVar`、`newConfigWatcher`、`newReloadChain`、
+`reloadStatus`（五个，前两个是链的输入，后三个是装配点）；`defaultRuntimeDeps` 的签名随之
+加 `configPath` 与 `levelVar` 两个参数（既有四处调用点同步，见 §10.2 第 9 条）。
+
 ### 10.2 与本卡写法的差异（含既有断言被改动的逐条说明）
+
+1. **`reloadTargets` 里五只"不返回错误"的落点统一带 `error`**（卡 §3.2 给的是
+   `setRetry func(time.Duration)` 等五只无返回值）。不加它就做不到 §5.1 #3 那条
+   "`setRetry` 的 undo 失败 ⇒ `degraded`"，而 `degraded` 是 DoD 第四条明令要"可达且可读"的。
+   真实实现里这五只恒返回 `nil`，所以行为与卡面一致，只是形状统一。
+2. **`WithReloadState` 多一个 `enabled` 参数**（卡 §3.5 只有读口一位）。D-R0503 要的就是这件事：
+   `enabled` 只能来自进程配置，不能取自 `State()`。
+3. **`RuntimeResponse.Reload` 的类型是本地 `*ReloadStatus` 而不是 `*core.ReloadState`**
+   （卡 §3.5 写的是后者）。理由与设计文档 §5.4 的意图一致：`time.Time` 上的 `omitempty` 不生效，
+   直接序列化会把零值时间暴露成 `0001-01-01T00:00:00Z`（R05 交给本卡的 D-R0502）。
+   十个字段一一对应，只有两个时间换成 RFC3339Nano 字符串并且零值整个键不给。
+4. **"读文件失败"的结论是 `rejected`**（与卡 §3.1 第 1 步、§5.1 #6 一致）。
+   R02 那版冒烟具当时记的是 `failed` 加一条 `<配置文件读失败>` 占位键——那份形状在 `ReloadState`
+   里根本没有对应的字段（没有 `failed_keys`），随 miniature 链一起删掉了。
+5. **执行器未启用时不接档位落点**（卡 §3.1 第三条写的是"`ApplyConfig` 会返回错误，本卡特殊处理"）。
+   实现把这条判定提到建链时：`newReloader` 只在 `applier != nil && executorsEnabled` 时才装 `setCommands`，
+   于是"未启用"是一条计划期事实（`unavailableNotInEffect`），运行期不会真去调 `ApplyConfig`。
+   结论、键清单（键留在 `applied_keys`）与那条 warn 文案都和卡面一致；实现者当时按卡面留下的
+   `errTargetDisabled` 哨兵与 `errors.Is` 分支因此恒不可达，已删（缺陷表外的清理）。
+6. **`ReloadState.Enabled` 钉在建链时那一份**（卡 §3.1 只说"取进程配置"）。
+   第 7 步 `applied = candidate` 会把文件里那份新的 `reload.enabled` 一并带进权威（那正是"重启档
+   不重复报一遍"要的形状，§5.1 #8 也按它断），所以链不能再从 `applied` 读这一位，
+   否则一次改过 `reload.enabled` 的重载之后读数会翻成假。实现为 `reloader.processEnabled`，
+   并在 §5.1 #8 里加了"连着走两次、第二次仍说 true"的断言。api 的读数不受影响（第 2 条）。
+7. **`resolvedConfigPath` 在 `-config` 留空时试 `config.yaml` 与 `config.yml`**。
+   卡面没提这件事，但 `core.LoadConfig` 走的是 viper 的名字查找（两种拼写都认），
+   只试 `.yaml` 会让"用 config.yml 启动的部署"交回空串——热重载就此不接（有一条 warn，但那是"该接的没接"）。
+   viper 实际还支持 `.json`/`.toml`/…，那几种本仓库的文档与示例从不承诺，登记不修（D-R0603）。
+8. **冒烟具换成生产链**（README 的 R02 交接要求："接线后把 `applyCandidate` 换成生产重载链，场景清单留下"）。
+   `cmd/server/config_reload_smoke_test.go` 里 `reloadOutcome` / `reloadFromFile` / `applyCandidate` /
+   `hotEntries` / `applyHotKey` / `smokeConfig` 六个整体删除，换成 `newSmokeStack` 用 `newReloader`
+   接真 store / 真调度器 / 真 SQLite 两张表。八条用例的去向：六条原样保留（主冒烟八键、拒绝档、
+   重启档、无变化、坏文件、环境变量），两条换形状——`TestSmokeHotKeyWithoutEntryFailsLoud` 的
+   "表上没入口"在生产链上已经不是可表达的状态（八个落点由 `reloadDeps` 一次给定），它的场景由
+   §5.1 #13 `TestReload_MissingEntryFailsLoudly` 与 #17 的静态守卫承担；
+   `TestSmokeEntryReturningErrorKeepsAppliedBack` 升级为
+   `TestSmokeOverBoundWorkersRollBackEveryRealTarget`（R02 当时写明"半应用与回滚只能由 R06 用
+   排在后面、又会失败的入口来断"，这条就是那条断言，且四个真下游逐项核对回滚）。
+   现共 7 条 `TestSmoke*`。
+9. **既有断言被改动的逐条**（全部是签名跟进，不改变语义）：
+   `cmd/server/main_test.go` 两处、`cmd/server/profile_merge_test.go` 三处
+   `defaultRuntimeDeps(cfg, logger)` → `defaultRuntimeDeps(cfg, "", nil, logger)`；
+   `fileSpec` 加一个 `port` 字段（起点仍是 `"18080"`，`render` 的输出对既有用例逐字节不变）；
+   `api/reload_state_test.go` 的 canary 用例改走"配置账号 + 登录拿 JWT"的通道
+   （`/admin/runtime` 是 ops 档，静态 token 是 machine 档，直接请求会得到 401/403 而不是 200）。
+   除这些之外 `api` 既有的 `handlers_admin_test.go` 三条 `decodeRuntime` 用例一字未动，
+   `JSONEq` 类整对象断言这一包没有（DoD 第 5 条要求的"零既有断言改动"照 W07 先例如实记录为上一条）。
 
 ### 10.3 验证证据
 
+命令都在终态字节上跑；全量验证期间没有任何源文件被并行改动（R05 的 D-R0515 口径）。
+
+**§7 第一条** `go test ./cmd/server -run 'TestReload' -v -count=1` → 17 条 `--- PASS`、`ok 0.582s`：
+#1–#11 与 #12（`Stop`）全在，另加 #13 `MissingEntryFailsLoudly`、#14 `NoConfigPathIsNotSilence`、
+#15 `WorkerBoundBoundaryIsExact`（三个子档 4095/4096/4097）、#16 `TestReloadEveryHotKeyHasDispatchEntry`、
+#17 `TestReload_AbsurdWorkerCountFailsAndRollsBack`。
+（卡 §5.1 编号里 #12 与 #11 印反了顺序，且列了 11 项却写"12 条"，实际按功能分是 12 条 + 5 条附加。）
+
+**§7 第二条** 卡面写的是 `go test ./cmd/server -run 'TestRun_Watcher' -v`，那条模式只匹配到三条
+（`WatcherNotStartedWhenReloadDisabled` / `WatcherNotStartedWithoutConfigFile` /
+`WatcherFailureDoesNotBlockStartup`），§5.2 的另外三条名字里没有 `Watcher`。按 §5.2 的清单改成
+`-run 'TestRun_Watcher|TestRun_CloseOrder|TestRun_Wired|TestRun_ReloadReader'` 重跑：六条全 `--- PASS`、
+`ok 0.266s`（多出的是 `TestRun_CloseOrder`、`TestRun_WiredReloadChainReachesEveryTarget`、
+`TestRun_ReloadReaderFollowsTheWatcher`）。这是 §7 那条命令与 §5.2 编号对不齐，不是漏跑。
+
+**§7 第三条** `go test ./api -run 'TestGetRuntime|TestRuntimeReadDoesNotWriteAudit' -v`：五条全 `--- PASS`、
+`ok 0.444s`（§5.4 三条 + §5.5 一条 + `ReloadStateWithoutAnyAttempt`）。
+
+**冒烟（测试内）** `go test ./cmd/server -run TestSmoke -count=1` → 七条全 `--- PASS`，`ok 1.149s`。
+
+**§7 第四条** `go test ./cmd/server -race -count=5 -timeout 30m`：
+
+```
+ok  	godelayq/cmd/server	31.008s
+```
+
+**§7 第五条** `go build ./... && go vet ./...` 两条命令均无输出（BUILD_VET_CLEAN）。
+
+**§7 第六条** `go test ./... -race -count=1 -timeout 30m`（复核与复复核的全部改动之后整轮重跑）：
+
+```
+ok  	godelayq/api          114.907s
+ok  	godelayq/cmd/server     7.185s
+ok  	godelayq/core          20.562s
+ok  	godelayq/executor      22.248s
+ok  	godelayq/store/sqlite   4.006s
+（cmd/gensecret、cmd/hashpassword、examples/demo1、examples/demo2、web 无测试文件）
+```
+
+`api` 那一格的读数本卡内同一条命令四次分别是 149.019s / 147.181s / 103.878s / 114.907s——包里的 SQLite 与
+超时用例跟本机负载强相关，这张表只能当"本次真实输出"读、不能当基线；判据是五格全 `ok`
+（无 `--- FAIL`、无 data race 报告），每一次都成立。
+
+`gofmt -l` 只报 `core/` 那五个既有文件（本仓 CRLF 的已知误报，见项目记忆"验证口径"），本卡新增与改动的文件都不在其中。
+
+**`reload.go` 里没有类型断言**：`grep -n '\.(\*\|assert' cmd/server/reload.go` 零命中（DoD 倒数第二条）。
+
+**变异反验证（四十个变异体，只改 `cmd/server/reload.go`、`cmd/server/main.go`、
+`api/reload_state.go`、`api/handlers_admin.go`，每个跑完立刻从字节备份还原并核对 sha256）**：
+
+| 编号 | 改哪里 | 结论 | 判红的用例 |
+| --- | --- | --- | --- |
+| R01 | 拒绝档不早退 | RED | `TestSmokeRejectedKeyAbortsWholeReload`（先红的那条；单元侧 `TestReload_RejectsCredentialChange` 同红） |
+| R02 | 永远走 unchanged 分支 | RED | `TestSmokeHotReloadAppliesEveryHotKey` |
+| R03 | 成功后不推进 applied | RED | `TestSmokeUnchangedConfigIsNotAReload`（单元侧 `ConcurrentReloadsSerialized` 同红） |
+| R04 | 失败时不回滚 | RED | `TestSmokeOverBoundWorkersRollBackEveryRealTarget` |
+| R05 | 回滚按正序 | RED | `TestReload_RollbacksInReverseOnFailure` |
+| R06 | 失败那一步也被回滚（多撤一次） | RED | `TestReload_RollbacksInReverseOnFailure` |
+| R07 | 分派表漏项被静默接受 | RED | `TestReloadEveryHotKeyHasDispatchEntry` |
+| R08 | 应用顺序整个倒过来 | RED | `TestReload_AppliesEveryHotKey` |
+| R09 | 去掉并发数上界 | RED | `TestReload_AbsurdWorkerCountFailsAndRollsBack` |
+| R10 | 观测层未启用判成装配错误 | RED | `TestReload_ObservabilityKeysSkippedWhenDisabled` |
+| R11 | 执行器未启用判成装配错误 | RED | `TestReload_CommandsWithExecutorsDisabled` |
+| R12 | 档位键按精确名认领 | RED | `TestRun_WiredReloadChainReachesEveryTarget` |
+| R13 | 没应用任何键也填 LastAppliedAt | RED | `TestSmokeRestartKeysAreReportedNotApplied` |
+| R14 | 被跳过的键也算进 applied_keys | RED | `TestReload_ObservabilityKeysSkippedWhenDisabled` |
+| R15 | `Stop` 不置 `stopped` | RED | `TestReload_StopWaitsInFlightChain` |
+| R16 | `Stop` 之后仍照常走整条链 | RED | `TestReload_StopWaitsInFlightChain` |
+| R17 | 故意引一个不存在的标识符（构建失败对照） | RED-构建失败 | 脚本能分辨"跑不到断言"与"断言判红" |
+| S01 | 去上界（冒烟面） | RED | `TestSmokeOverBoundWorkersRollBackEveryRealTarget` |
+| S02 | 不回滚（冒烟面） | RED | 同一条 |
+| S03 | R14 的另一条命令面（`-run TestSmoke`） | 没判红 | **不是存活变异**：那一次改动里没有会被跳过的键，`hot` 与 `exceptKeys(hot, ignored)` 逐字节相同 ⇒ 等价变异。判红能力由 R14 提供，如实记在此处 |
+| S04 | 事件写入器落点缺席 | RED | `TestSmokeHotReloadAppliesEveryHotKey` |
+| S05 | 档位未启用被算进 ignored_keys | RED | `TestReload_CommandsWithExecutorsDisabled` |
+| M01 | 关闭时不收口链 | RED | `TestRun_WatcherNotStartedWithoutConfigFile`（`stops` 计数） |
+| M02 | 第一轮写成"删掉再插回原位" | 没判红 | **等价于没改**（新字节与旧字节同一位置）。第二轮换成 M02b |
+| M02b | 链收口挪到 `scheduler.Stop` 之后 | RED | `TestRun_CloseOrder` |
+| M03 | 不绑防抖落点 | RED | `TestRun_CloseOrder`（`binds` 计数） |
+| M04 | 读口不接 watcher | RED | `TestRun_ReloadReaderFollowsTheWatcher` |
+| M05 | `resolvedConfigPath` 只认 `.yaml` | RED | `TestResolvedConfigPath` |
+| A01 | 零值时间被格式化出去 | RED | `TestGetRuntime_ReloadStateWithoutAnyAttempt` |
+| A02 | `enabled` 取自 `State()` | RED | `TestGetRuntime_ExposesReloadState` |
+| A03 | Option 不记 `enabled` | RED | 同一条 |
+| A04 | 没注入读口也填 `reload` 对象 | RED | `TestGetRuntime_HasNoReloadFieldWhenNotInjected` |
+| B01 | `maxHotReloadWorkers` 改成 12 | RED | `TestReload_WorkerBoundBoundaryIsExact` |
+| B02 | 上界判定 off-by-one（`>` 改 `>=`） | RED | 同一条 |
+| W01 | 档位落点 `available: t.setCommands != nil` 改成恒假 | RED | `TestRun_WiredReloadChainReachesEveryTarget`（新的超时读数判据） |
+| W02 | 档位那一步的 `run` 换成空跑（不调 `ApplyConfig`） | RED | 同一条 |
+| C01 | `unmatched` 分支交回的 `ignored_keys` 去掉重启档清单 | RED | `TestReloadEveryHotKeyHasDispatchEntry` 第三条 |
+| A05 | `reloadStatusOf` 丢掉 `Error` 那一位 | RED | `TestGetRuntime_ExposesReloadState`（新加的正向判据） |
+| A06 | `reloadStatusOf` 丢掉 `WatcherError` 那一位 | RED | 同一条 |
+| A07 | 两个时间字段填同一个源头 | RED | 同一条（改成断逐字相等之后才红） |
+
+其中 W01/W02 是复核第一轮之后补的：这两条变异在复核前**判不出来**（当时那条断言只判"键还在表里"，
+而它启动注册时就在），补上取值判据之后才红——记在这里是为了说明"复核改了判据要连变异一起重跑"。
+A05/A06/A07 同理：`error`、`watcher_error` 与两个时间在复核前**没有任何正向判据**，
+把 `reloadStatusOf` 里那三行删掉全包都是绿的（复核抓到的一条 Important，见 §10.5c）。
+B01/B02/C01 同理，是补 `TestReload_WorkerBoundBoundaryIsExact` 与两条对称性断言之后新造的判据。
+四十条里三十八条判红；两条"没判红"的（S03、M02）在复跑时都确认是**等价变异**而不是漏判，
+处置与证据记在上表最后一列。全部跑完后四个被改文件与备份逐字节相同。
+
 ### 10.4 端到端冒烟实录（§5.3 五行，逐行给命令与观察到的字段）
+
+隔离目录 `%TEMP%\r06smoke`（`config.yaml` + `data/` 全在其中，端口 `18117` 先核过 IPv4/IPv6 都空闲），
+`server.exe` 由 `go build -o … ./cmd/server` 在终态字节上现编。凭据全部是本次自造的假值
+（静态 token、JWT 密钥、一个 ops 账号的 bcrypt 哈希），仓库的 `configs/config.yaml` 与 `data/` 一次都没被写。
+
+启动即留下这一行，说明监听器真的在跑：
+
+```
+level=INFO msg="config hot reload enabled" path=C:\Users\xing\AppData\Local\Temp\r06smoke\config.yaml debounce=200ms
+```
+
+`GET /api/v1/admin/runtime`（ops 档，先 `POST /api/v1/auth/login` 拿 JWT）的起点读数：
+
+```
+{"result": "", "applied_keys": null, ..., "watched_path": "…\\config.yaml", "enabled": true,
+ "workers": 4, "queue_capacity": 4}
+```
+
+即"开关开着、监听器在位、但从没尝试过"（`result` 空串是判据，两个时间键整个不给）。
+
+| # | 改的键 | 命令 | 观察到的读数 | 判据 |
+| --- | --- | --- | --- | --- |
+| 1 | `logging.level: info→debug` | `sed -i 's/^  level: info$/  level: debug/' config.yaml`；等 1.5s；`python probe.py runtime` | `result="ok"`、`applied_keys=["logging.level"]`；日志 `msg="config reload applied" applied_keys=logging.level` | 达标。**行为侧换了判据**：默认功能面里全仓只有六处 `logger.Debug`（都要执行器/观测层/队列满等前提），任何 HTTP 动作都产不出 debug 行，所以改用"级别真的跟着拧"的反证：再把文件改成 `level: error` → 等 1.2s → 一次 `GET /api/v1/jobs` 之后 `level=INFO` 行数 16→16（不增）；改回 `info` → 同样一次请求 17→18（恢复）。见 §10.6 未覆盖项与 D-R0602 |
+| 2 | `scheduler.workers: 4→12` | `sed -i 's/^  workers: 4$/  workers: 12/'` | `result="ok"`、`applied_keys=["scheduler.workers"]`、`scheduler.workers` 读数 **12**、`queue_capacity` 仍是 4 | 达标（R03 §3.4 的口径：并发读数变，队列通道不换） |
+| 3 | 写一份含未知键的 YAML | 覆盖成 `logging: {level: info, level_not_a_key: true}` | `result="rejected"`、`error="重新读取配置文件失败，本次重载作废、现网继续按当前生效的取值运行（…config.yaml）：parse config failed: … 'logging' has invalid keys: level_not_a_key"`、`workers` 仍是 **12**、INFO 行仍照常写（说明 `logging.level` 仍是上一步的 `info`） | 达标：`applied` 没退，两条新值都还在现网 |
+| 4 | 把该文件修好 | `cp config.good.yaml config.yaml` | `result="unchanged"`、`error=""`、`applied_keys=null`；日志 `msg="config reload found no change" note="取值以配置文件与环境变量的合并结果为准…"` | 达标（卡面接受 `ok` 或 `unchanged`；这里是 `unchanged`，因为坏文件从没推进过权威，修好就等于回到现网取值） |
+| 5 | `server.auth.token` 改一个新值 | `sed -i 's/OLD-static-token-8f2b/NEW-static-token-5c9d/'` | `result="rejected"`、`rejected_keys=["server.auth.token"]`、`error="改动触碰了拒绝档（凭据与执行许可字段），整次作废、一项都没有应用：server.auth.token；这类改动只能改完文件再重启进程"`；`GET /api/v1/jobs` 带**旧** token → HTTP 200，带**新** token → HTTP 401 | 达标，也是最硬的一条：拒绝档确实什么都没动 |
+
+整轮之后 `server.log` 里与热重载相关的行共八条（一次 enabled、三条 applied、两条 rejected 各配一条
+`config reload returned error`、一条 found no change、一条拒绝档的 error），逐条已在 #7 的原文里。
+临时目录在收口后删除；进程用 `taskkill /F` 收（Windows 侧无法把 SIGTERM 投给这种起法的控制台进程，
+四步关闭顺序的判据在 §5.2 #14 的替身流水上，见 §10.6）。
+
+**表外补的第六行（默认关闭那一档，DoD 第五条要求的真实进程证据）**：把同一份文件改成
+`reload: {enabled: false}` 再起一次进程（其余一字未动），核对"接线之后不开关时行为零变化"：
+
+```
+grep -ci "reload" off.log      → 0
+grep -ci "hot reload" off.log  → 0
+GET /api/v1/admin/runtime      → 整份响应里没有 "reload" 这个键
+                                 （读数取的是解出来的 map：reload 的十个字段全是 null/缺省，
+                                  而 scheduler.workers=12 等其余字段照旧在位）
+```
+
+即：`api.WithReloadState` 没被调用（注入条件是 `cfg.Reload.Enabled`，见 `main.go` 的 `newServer` 闭包），
+链与监听器一个都没建，`/admin/runtime` 的响应形状回到本系列之前。
+
+**表外补的第七行（`reload.debounce` 在真实进程里改到了真实监听器）**：这一条把 R05 与 R06 接起来，
+`§5.2` 的 #6 只能在替身 watcher 上判"值递过去了"，这里判的是"窗口真的变长了"。
+起进程（`debounce: 8s`，起点 `logging.level: info`），存一次盘把级别改成 `warn`，随后每秒读一次
+`/api/v1/admin/runtime`：
+
+```
+write at 17:12:03
++1s..+6s  result=""（还没应用）
++7s       result="ok"  applied_keys=["logging.level"]     ← 探针每次含一次 bcrypt 登录，
++8s..+11s 同上                                              真实间隔比标称秒数长，量到的是 ~8s 窗口
+```
+
+对照起点那份配置的 `debounce: 200ms`（前五行都是一存盘就在一秒内读到 `ok`）。
+同一轮里还顺带读到 §3.2 把 `logging.level` 排在 #1 的那条理由在真实进程里成立：
+级别换到 `warn` 之后，链自己那条 `msg="config reload applied"` 的 INFO 行不再出现在 stdout
+（整份日志里与 reload 相关的只剩启动时那一条 INFO）——也就是**这一次重载自己的日志跟着新级别走了**。
 
 ### 10.5 缺陷
 
+| 编号 | 严重度 | 现象 | 处置 |
+| --- | --- | --- | --- |
+| D-R0601 | Minor | 一次失败的重载在日志里留下**两条** `level=ERROR`：链自己按失败原因记一条（带 `hint`、步骤号），R05 的 `storeState` 又把 `ReloadFunc` 返回的 error 记一条（带 `path`）。按 error 行计数告警的部署会重复计数 | **登记不修**，归 R07 的文档同步：设计文档 §5.4/§8 的运维口径里写清"一次失败两行，二者归因不同（步骤级 / 进程级）"，要按事件计数请按 `path` + 时间窗去重 |
+| D-R0602 | Minor | 卡 §5.3 第 1 行的判据"stdout 出现 debug 行"在默认功能面下**无法达成**：全仓六处 `logger.Debug` 分别要执行器池满、观测层启用且映射缺项、启动期装载等前提，普通 HTTP 动作一条都触发不了 | **已修**（就地把判据换成"级别拧到 error 后 INFO 不再出现、拧回后恢复"，实测见 §10.4 第 1 行），并把卡面那句话改正为可判的形状 |
+| D-R0603 | Minor | `resolvedConfigPath` 在 `-config` 留空时只补 `config.yaml` / `config.yml` 两种拼写，而 `core.LoadConfig` 走 viper 的名字查找，理论上还认 `.json`/`.toml`/`.hcl`/… 十几种 | **登记不修**，归 R07：本仓的文档、示例与 `.gitignore` 只承诺 `configs/config.{yaml,yml}`（`configs/config.example.yaml` 是唯一样本），要为其余扩展名对齐得改 `LoadConfig` 的返回形状（交回"实际用了哪个文件"），那不是本卡的范围 |
+| D-R0604 | Minor | 建链时 `applier == nil && executorsEnabled == true` 会被算成"本节未启用"（键留在 `applied_keys` + 一条 not-in-effect 的 warn），说的却是另一件事。真实装配到不了这一格（`main.go` 的构造条件在 `reload && executors.enabled` 时必建 Applier），只有手搓 `reloadDeps` 的测试能造出来 | **登记不修**，归 R07：要在 `newReloader` 里把它降级成"装配缺入口"需要先回答"Applier 建不出来时 executors 那一节算什么"，与本卡的三档结论冲突 |
+| D-R0605 | Minor | 执行器未启用时那次档位改动留在 `applied_keys` 里，而 `LastAppliedAt` 也被填上——设计文档 §5.4 把这份清单写成"本次真的换上现网的键"，单看读数会以为档位换了（现场只有一条 warn 说没生效） | **登记不修**，归 R07 文档同步：要么把 §5.4 那句改成"已被本次重载处理、未生效的另有说明"，要么把这条键挪进 `ignored_keys` 并同时改卡 §3.1 第三条。本卡按卡面落地，不自己改口径 |
+| D-R0606 | Important（卡面缺陷） | §5.4 第 3 条要的"把 canary 值塞进读口的返回值，再 `strings.Contains` 反证"在这条路上不成立：`reloadStatusOf` 是原样透出，塞进读口的取值**必然**出现在响应里，那是正确行为而不是泄漏。照字面写出来的用例会得到一个只会判"透出成功"的假绿 | **卡面已就地改正**（见 §5.4 第 3 条那条的改写），并把这个前提写进用例自己的注释。真正能守的是"api 这层不主动搬配置值"+ 取值不进状态的闸门在 `core`（R01 的 `ChangedKey` 只带 `Path`） |
+| D-R0607 | Minor | 设计文档 §5.4 承诺 `error` 文本"不能含取值"，而 `core` 的若干校验错误串会回显**非凭据**取值（`reload.debounce ... got %v`、`duplicate name %q`、`executors.workspace %q`…），`watcher_error` 同样是调用方给的自由文本 | **登记不修**，归 R07 文档同步：把 §5.4 那句话收窄成"不含凭据取值"（凭据那一侧有更硬的机制：`core` 报带密字段只报空/长度，mapstructure 会洗掉解码错误里的取值），或者逐条整改产出方的文案。本卡不在这个范围里单方面改 |
+
+### 10.5b 复核轮（第一轮，`cmd/server` 侧）
+
+这一轮的复核没有抓到 Blocker/Important 级的正确性缺陷（三条不变量、关闭顺序、
+上界位置、分派守卫的非空转都是读代码核过的），六条 Minor 的处置逐条如下：
+
+| 复核发现 | 处置 |
+| --- | --- |
+| #1 应用循环里 `case unavailableFails:` 是死分支（前置检查第二条已经整次拦在前面） | **已修**：删掉那一支与随之永假的 `if failure != nil { break }`，换成一句"这里只可能是两种未启用脸色"的注释。留着的害处不是多四行，而是让人以为运行期还有第二条退路 |
+| #2 档位那一步（#7）排最后，它的 undo 在生产顺序里永远弹不到 | **登记**，进 §10.6：卡 §3.2 说的"逆序重放安全"在档位这一项上只有 R04 自己的可重入用例背书，链上没有用例走到 |
+| #3 执行器未启用时 `executors.commands` 留在 `applied_keys` 且 `LastAppliedAt` 被填，与设计 §5.4 那句"真的换上现网的键"读起来不一致 | **登记不修**，归 R07 文档同步（D-R0605）：这是卡 §3.1 第三条明令的形状（结论 ok + 键留在 applied + 一条 warn），要改的是设计文档那句话还是这张表，得一起定 |
+| #4 `unmatched` 那条前置检查交回的 `ignored_keys` 少了重启档清单，与姊妹分支（缺入口）不对称 | **已修**：补成 `mergeKeys(changedPaths(change.Restart))`，并给 `TestReload_MissingEntryFailsLoudly` 与 `TestReloadEveryHotKeyHasDispatchEntry` 第三条各补一条断言；变异反验证里把这一处改回去确实判红（见 §10.3 的 C01） |
+| #5 `TestRun_WiredReloadChainReachesEveryTarget` 的档位断言只判"exec.echo 还在表里"，而它启动注册时就在 | **已修**：改判**换进去的那一份取值**（起点 10s → 换完 3m），并在起点先核一次 10s 作对照。两个新变异体（`available: false` / `run` 空跑）改前都过、改后都红，见 §10.3 的 W01/W02 |
+| #6 D-R0601 那条双 ERROR 行 | 复核独立发现，与本卡自己登记的同一条，不重复计 |
+
+（`api` 侧那轮的发现与处置记在 §10.5c。）
+
+### 10.5c 复核轮（第二轮，`api` 侧）
+
+这一轮抓到的是**判据空转**那一类，四条 Important 全部落地。它同时核过并确认成立的前提也记在这里
+（都是读代码/读标准库核的，不是推断）：`encoding/json` 的 `isEmptyValue` 没有 `reflect.Struct` 分支，
+所以 D-R0502 那句"`time.Time` 上的 omitempty 不生效"在本工具链上成立；
+`setupRoutes` 与 `api/audit.go` 的 diff 为零（两个文件各只有新增行）；
+非测试源文件里没有新增任何写端点；凭据取值进不了响应这条有更硬的理由——
+`core/config.go` 报带密字段只报"空/长度"、`executor/profile.go` 回显的是 env 的**键**、
+而 mapstructure v2.4.0 会把 `ParseError`/`UnconvertibleTypeError`/strconv 错误里的取值洗掉。
+
+| 复核发现 | 严重度 | 处置 |
+| --- | --- | --- |
+| I-1 `error` 与 `watcher_error` 在五条用例里**一次都没有正向断言**：把 `reloadStatusOf` 里那两行删掉，`api` 全包仍绿，而运维看不到失败原因（I3 在这层静默破掉） | Important | **已修**：`TestGetRuntime_ExposesReloadState` 改成十个字段全给非空取值、十个键必须全出现、两条文本按相等断；`TestGetRuntime_ReloadStateWithoutAnyAttempt` 补 `watcher_error` 的相等断（那一格正是真实进程里最常见的"开关开着、监听器没建"）。新造的 A05/A06 两条变异复跑判红 |
+| I-2 卡 §5.4 第 3 条要的"把 canary 值塞进读口的返回值再反证"在这条路上是**反的**：读口给什么这一层就透出什么，塞进去必然出现在响应里。而该用例的前提断言只覆盖了 `watched_path` 一条通道、那段"清单里不许有取值"的循环读的是用例自己写的字符串，任何生产改动都判不出红 | Important | **卡面前提不成立，已就地改写卡面**（§5.4 第 3 条下面的 D-R0606）：这条用例真正能守的是"api 这层不主动把服务自己的配置值搬进读数"，canary 留在 `Security` 里判这一条；取值不进状态的闸门在产出方（`core.ChangedKey` 只带 `Path`）。空转的那段循环删掉前提依赖、改成"三份清单只许是键路径"的形状判据，并在注释里写清证得到/证不到什么 |
+| I-3 `handlers_admin.go` 那句"这条路径上唯一的外泄风险是 Error 文本：它来自配置层，那里只带键名与路径"是**假的**：`core` 的校验错误串里有回显非凭据取值的地方（`reload.debounce ... got %v`、`duplicate name %q`、`executors.workspace %q` 等），且 `watcher_error` 是第二条同样敞开的文本通道 | Important | **已修（注释）**：改成陈述这一层真正的保证 + 指明那道闸门在写文本的那一侧。**登记 D-R0607** 归 R07：设计文档 §5.4 那句"不能含取值"要么收窄成"不含凭据取值"，要么逐条整改产出方的错误文案——两者都不是本卡能单方面定的 |
+| I-4 `TestRuntimeReadDoesNotWriteAudit` 没注入读口，`GetRuntime` 里那段 `if s.reloadState != nil` 根本不执行，"读一次不写台账"测的是一条与本卡无关的路径 | Important | **已修**：`auditServer` 加可变参数透传给 `newSecurityServer`（既有调用点一字不动），该用例注入一份带 `error` 文本的读数，并先断响应里**确实有** `reload` 对象再断台账为空。它的正向对照（一次写留一行）复核确认为可靠 |
+| M-1 注释说"按十个断"而 `wantKeys` 只有八个字面量，封闭判据又另写一份十字面量 | Minor | **已修**：一份包级 `reloadStatusKeys` 两处共用 |
+| M-2 两个时间只判"能解析、非零"，把两个字段填反或都填同一源头都过 | Minor | **已修**：改判与 `Format(RFC3339Nano)` 逐字相等，解析判据保留在后面那个循环里 |
+| M-3 `Result 是封闭枚举` 这句注释在本层没有实现，用例又是"注入 ok 期望 ok"的同义反复 | Minor | **已修**：用例改成先判"属于那六个取值之一"再判相等；注释改成"取值由产出方限定，这一层原样透出，不做第二份白名单" |
+| M-4 `slices.Clone` 的理由写成"序列化之后还有人拿去打日志、比对"——不存在这样的消费者 | Minor | **已修**：改成真实理由（不把产出方的活数组递给编码器，D-R0514），并如实说明这条没有判据支撑（§10.6 那条未覆盖项保留） |
+| M-5 `WithReloadState` 的契约漏了两条调用方规则（只在 `reload.enabled=true` 时注入；不许传包了 nil 指针的读口） | Minor | **已修（文档两行）**。代码不加反射式判空——那是给编程错误兜底，与本仓风格冲突 |
+| M-6 "与台账 time 列的序列化口径一致"说过头：台账列是整数 `UnixMicro`，线格式是 `time.Time` 默认（微秒），这里是纳秒 | Minor | **已修**：改成"同一种格式家族，精度与存储形状都不同" |
+| M-7 一处未检查的 `raw["reload"].(map[string]any)` 断言（键没了会 panic 而不是干净失败）；canary 用例把 helper 已经解开的 body 又解一遍 | Minor | **已修**：两处都换成 `require` 与 helper 的第一返回值 |
+| M-8（复复核抓到）卡面"涉及文件"清单与真实改动不符：点名的 `api/handlers_admin_test.go` 一字未动，而实际新增/改动的 `api/reload_state_test.go`、`api/audit_test.go`、`cmd/server/config_reload_smoke_test.go` 三个都不在清单里 | Minor | **已修（卡面）**：清单按真实集合重写，并说明读面测试为什么落在新文件而不是 `handlers_admin_test.go`（§5.4 第 1 条要求绕开 `decodeRuntime`） |
+| 工作树卫生：`api/executor_profile_record_test.go` 与 `api/handlers_executor_profiles_test.go` 在 `git status` 里是 M，但 `git diff --numstat` 报 0 行内容差异（只有 CRLF 归一化） | — | 本卡提交时**不入这两个路径**（`--include` 只挑自己改过的文件），并在 §10.6 记一句 |
+
+### 10.5d 复复核轮（第二轮修复之后的独立复核）
+
+两处修复各交一份 fresh-context 复核复判。结论：**§10.5b/§10.5c 的 11 项修复全部 CLOSED**，
+三条不变量、导入边界（`go list -deps` 核过 `core` 不依赖 executor/store/sqlite/api，`api` 不依赖 cmd）、
+"默认关闭零变化"与 `setupRoutes` 零差异都被重新读代码确认；`go build`/`go vet` 在那份字节上干净。
+新留三条 Minor，逐条处置：
+
+| 复复核发现 | 处置 |
+| --- | --- |
+| 应用循环那个 `switch step.unavailable` 只有两支、没有 `default`：**将来**给 `unavailableOutcome` 加第四种取值时，带着它的步骤会悄悄 `continue`（键留在 `applied_keys` 却没应用），而且不会编译失败 | **已修（注释）**：在那支 switch 前加一条维护提醒。零值这一侧经复核确认是安全的——`unavailableFails` 是 `iota` 的第一个取值，新加的分支若忘了标 `unavailable` 会落到"缺入口"那条前置检查上，是响亮失败而不是静默跳过 |
+| 卡面"涉及文件"清单与真实改动不符 | **已修（卡面）**：清单重写，记为 §10.5c 的 M-8 |
+| 工作树里八个与本卡无关的脏路径（五个纯 CRLF、三个带真实差异） | **已修（记录）**：§10.6 那条改成逐一列名的版本；本卡提交按具名路径 `git add`，不用 `-A`/`.` |
+
+复复核里"无法在这轮重跑"的部分（四十个变异体的判红结论、§10.4 的真实进程实录、
+`resolvedConfigPath` 改前改后的对照）已明确标为读取代码与结构推断，不当作已复现的证据。
+
 ### 10.6 未覆盖项
+
+- **真实进程里的四步关闭顺序没有实测**：Windows 下这种起法收不到 SIGTERM，只能强杀。
+  判据由两处替代：§5.2 #14 用替身流水钉住"链收口"的位次，R05 的用例钉住真 watcher 的 `Close` 契约。
+  Linux 侧能真的送信号，那一轮的等价验证留给 R07 的 22 场景表。
+- **`executors.commands` 的热更在冒烟具（测试内那七条）里没走**：真 Applier 要登记表、产物存储与
+  脚本文件一整套，那一条由 §5.2 的 `TestRun_WiredReloadChainReachesEveryTarget` 用真 Applier +
+  真处理函数表判；冒烟配置文件里 `executors.enabled: false`，且文件头写明为什么不开。
+- **`reloadStatusOf` 里那三次 `slices.Clone` 的防御无法判别**：读侧复制的是马上要序列化的那份切片，
+  改成直接引用不会产生任何可观察差异（对应 R05 的 D-R0514 那条共享底层数组的口径）。
+- **canary 反证的通道限制**：`/admin/runtime` 要 ops 档，静态 token 是 machine 档，所以那条用例里的
+  token 取值只作为"配置里存在过的值"参与负向断言，不参与请求头；若将来有人把请求头原样回显进读数，
+  这条用例判不出来。
+- **`degraded` 只有替身能造**：八个真实落点里没有任何一个在"应用成功之后、用旧值重放时"会失败
+  （全是幂等的取值替换）。这是好事，但也意味着真下游上的 `degraded` 无法端到端复现，
+  §5.1 #3 就是它的唯一判据。
+- **两个"没判红"的变异体**（S03、M02）见 §10.3 表末列的等价性说明。
+- **档位那一步（#7）的 undo 在生产顺序里弹不到**：它排在最后，后面没有会失败的步骤，
+  所以"逆序重放到 `ApplyConfig` 这一项"在链的用例里从没被执行过（替身用例走到的是 #1–#4 那几只）。
+  这条性质的现有背书只有 R04 自己那两条"`ApplyConfig` 可重入且幂等"的用例，卡 §3.2 的推断成立但链上无判据。
+- **`api` 台账用例的读口注入靠的是 `auditServer` 新加的可变参数**：那条用例现在确实走到了
+  `if s.reloadState != nil` 里面（先断响应里有 `reload` 对象再断台账为空），
+  但"读一次不写台账"这件事在结构上由 `api/audit.go` 的 GET 早退还给保证——
+  该用例的真实增量是回归网与动作词表那一条循环。
+- **工作树里与本卡无关的脏文件一律不入本卡提交**（复复核逐条核过 `git diff --numstat`）：
+  内容差异为 0、只是 CRLF 归一化的有 `api/api_test.go`、`api/shutdown_test.go`、`api/sse.go`、
+  `api/executor_profile_record_test.go`、`api/handlers_executor_profiles_test.go`；
+  带着**真实**差异且属于别处的有 `web/vite.config.ts`（dev 端口 5173→5177）、
+  `data/jobs.json`（一条 `data_sync` 任务记录）、`data/groups.json`（未跟踪的新文件）。
+  本卡的提交按具名路径逐个 `git add`，不用 `git add -A`/`.`，因此这八个路径都不会进去；
+  它们留在工作树里等各自的处置，本卡不动。
+- **Linux/macOS 未实跑**（全系列同一条）。
