@@ -662,11 +662,17 @@ func TestReload_EmptyFileKeepsApplied(t *testing.T) {
 		t.Fatalf("result = %q, want %q", state.Result, core.ReloadRejected)
 	}
 	assertNoCalls(t, fx)
-	if !strings.Contains(state.Error, "一个键都没有") {
+	if !strings.Contains(state.Error, "没有表达任何取值") {
 		t.Fatalf("error 没说是空文件这一种（%q），运维会以为是又一次读坏", state.Error)
 	}
 	if !strings.Contains(state.Error, "现网继续按当前生效的取值运行") {
 		t.Fatalf("error 没说清现网怎么样：%q", state.Error)
+	}
+	// 日志那两行也要逐字核：只断 result 的话，把这条专门的 ERROR 行删掉、只留交回的 error 字段，
+	// 全包还是绿的（R06 复核在同一条系列上栽过一次）。
+	if logged := fx.log(); !strings.Contains(logged, "the config file carries no values") ||
+		!strings.Contains(logged, "不等于默认配置") {
+		t.Fatalf("拒绝日志没留下可读的结论：\n%s", logged)
 	}
 	if !reflect.DeepEqual(chain.applied, fx.applied) {
 		t.Fatal("空文件把 applied 改了——那等于整台机器静默换了一套值")
@@ -684,17 +690,16 @@ func TestReload_EmptyFileKeepsApplied(t *testing.T) {
 	assertExactCalls(t, fx, []string{"setLevel=debug"})
 }
 
-// TestReload_CommentsOnlyFileIsSameConclusion 补的是空文件那一判据的几个变体：只有注释、
-// 只有空白、只剩 YAML 的文档分隔符、分隔符后跟注释，以及带 BOM / UTF-16 写出来的同样内容。
-// 它们在 LoadConfig 那侧与空文件同一种结果（一份全默认配置），所以必须落进同一条拒绝判据，
-// 不能一种拒、一种应用。
+// TestReload_CommentsOnlyFileIsSameConclusion 补的是空文件那一判据的几个文本形状：只有注释、
+// 只有空白、只剩 YAML 的文档标记、标记后跟注释，以及带 BOM / UTF-16 写出来的同样内容。
+// 它们在 LoadConfig 那侧与空文件同一种结果（一份全默认配置），所以必须落进同一条拒绝判据。
 //
-// 为什么带上 BOM/UTF-16 这几格：strings.TrimSpace 不认 U+FEFF，而 YAML 解析器容忍 BOM 与
-// UTF-16——不先还原成文本再扫，"用 PowerShell 的 > 把文件写成带 BOM 的 UTF-16LE"这一格就会被
-// 当成"有内容"放过去，而那正是这条判据要拦的现场。
+// 为什么带上 BOM/UTF-16 这几格：判据用的是 YAML 解析器，它自己认得 BOM 与带 BOM 的 UTF-16，
+// 而 Windows PowerShell 5.1 的 `>` 与 Out-File 默认写的就是带 BOM 的 UTF-16LE——
+// "用重定向把文件清成只剩注释"这一格必须也被判成没取值，而不是"文件里有字就算有内容"。
 //
 // 每一格都同时核 error 文案：只看 result=rejected 不够——第 1 步读不进来也回 rejected，
-// 那说明这一格压根没进空文件判据。
+// 那说明这一格压根没进这条判据。
 func TestReload_CommentsOnlyFileIsSameConclusion(t *testing.T) {
 	utf16LE := func(s string) []byte {
 		out := []byte{0xFF, 0xFE}
@@ -716,7 +721,7 @@ func TestReload_CommentsOnlyFileIsSameConclusion(t *testing.T) {
 		raw  []byte
 	}{
 		{"只有注释", []byte(comments)},
-		{"只有空白", []byte("\n  \n\t\n")},
+		{"只有空白", []byte("\n  \n\n")},
 		{"只剩文档分隔符", []byte("---\n...\n")},
 		{"分隔符后跟注释", []byte("--- # 这一格还没填\n...\n")},
 		{"UTF-8 BOM 加注释", append([]byte{0xEF, 0xBB, 0xBF}, []byte(comments)...)},
@@ -736,7 +741,7 @@ func TestReload_CommentsOnlyFileIsSameConclusion(t *testing.T) {
 			if err == nil || state.Result != core.ReloadRejected {
 				t.Fatalf("交回 result=%q err=%v，应当是 rejected", state.Result, err)
 			}
-			if !strings.Contains(state.Error, "一个键都没有") {
+			if !strings.Contains(state.Error, "没有表达任何取值") {
 				t.Fatalf("result 对了但原因是别的事（%q）——这一格没进空文件判据", state.Error)
 			}
 			assertNoCalls(t, fx)
@@ -747,8 +752,125 @@ func TestReload_CommentsOnlyFileIsSameConclusion(t *testing.T) {
 	}
 }
 
-// TestReload_LeadingBOMDoesNotLookEmpty 是上一条的正向对照：带 BOM 但真有内容的文件不许被
-// 空文件判据拦下来。少了这一格，"凡是带 BOM 一律拒"这种过头实现也能全绿。
+// TestReload_ValuelessFileIsSameConclusion 是第三轮复核补的那一族：文件里有键名、结构也在，
+// 但一个取值都没有——`logging:` 后面空着、`workers: null`、`logging: {}`、整份就是一个 null、
+// 层层下去都是空键，以及"值写在第二份文档里"（viper 只读第一份）。
+//
+// 它们在 core.LoadConfig 那里同样是一份合法的全默认配置，所以和第 1 类落进同一条判据；
+// 差别在于这一族靠逐行扫文本永远扫不出来（第三轮复核就是用这个理由把第一版判据判回去的）。
+func TestReload_ValuelessFileIsSameConclusion(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  []byte
+	}{
+		{"只有键名", []byte("logging:\n  level:\n")},
+		{"显式 null 叶子", []byte("scheduler:\n  workers: null\n")},
+		{"空流映射", []byte("logging: {}\n")},
+		{"顶层 null", []byte("null\n")},
+		{"层层都是空键", []byte("a:\n  b:\n    c:\n")},
+		{"值写在第二份文档", []byte("---\n# 这一格还没填\n---\nlogging:\n  level: debug\n")},
+		{"带 BOM 的只有键名", append([]byte{0xEF, 0xBB, 0xBF}, []byte("scheduler:\n  workers:\n")...)},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newReloadFixture(t, baseSpec(), baseSpec())
+			chain := fx.build()
+
+			if err := os.WriteFile(fx.path, tc.raw, 0o600); err != nil {
+				t.Fatalf("写配置文件失败：%v", err)
+			}
+			// 这一族的成立前提是"第 1 步真能读通它"：读不通的话这里拦下的是别人的脸色，
+			// 判据本身就退化成"文件里有字就不许过"。
+			if _, err := core.LoadConfig(fx.path); err != nil {
+				t.Fatalf("LoadConfig 读不通这一格（%v），它压根走不到第 1 步之后", err)
+			}
+			state, err := fx.reload()
+			if err == nil || state.Result != core.ReloadRejected {
+				t.Fatalf("交回 result=%q err=%v，应当是 rejected", state.Result, err)
+			}
+			if !strings.Contains(state.Error, "没有表达任何取值") {
+				t.Fatalf("result 对了但原因是别的事（%q）——这一格没进空文件判据", state.Error)
+			}
+			assertNoCalls(t, fx)
+			if !reflect.DeepEqual(chain.applied, fx.applied) {
+				t.Fatal("把 applied 换了")
+			}
+		})
+	}
+}
+
+// TestReload_StepOneShapesKeepTheirOwnWording 管的是两种脸色不许串门：不是合法 YAML 的文件
+// （Tab 缩进、`----` 开头、不带 BOM 的 UTF-16）与读不出来的文件（被删），走的都是第 1 步那条
+// "重新读取配置文件失败"，不许被这条判据说成"没有表达任何取值"。
+//
+// 为什么要专门写这一条：判据对"读不懂"答 false 之后，第 1 步自然接住它，这条链的行为是对的；
+// 但如果哪天有人把判据改成"解析失败也当空文件"，现网就会收到一条误导性质的拒绝原因。
+func TestReload_StepOneShapesKeepTheirOwnWording(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		raw  []byte
+	}{
+		{"Tab 缩进的空白", []byte("\n \n\t\n")},
+		{"四个横杠开头不是标记", []byte("---- 这不是标记\nscheduler:\n  workers: 9\n")},
+		{"不带 BOM 的 UTF-16 注释", func() []byte {
+			out := []byte{}
+			for _, u := range utf16.Encode([]rune("# 只有注释\n")) {
+				out = binary.LittleEndian.AppendUint16(out, u)
+			}
+			return out
+		}()},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newReloadFixture(t, baseSpec(), baseSpec())
+			chain := fx.build()
+
+			if err := os.WriteFile(fx.path, tc.raw, 0o600); err != nil {
+				t.Fatalf("写配置文件失败：%v", err)
+			}
+			state, err := fx.reload()
+			if err == nil || state.Result != core.ReloadRejected {
+				t.Fatalf("交回 result=%q err=%v，应当是 rejected", state.Result, err)
+			}
+			if strings.Contains(state.Error, "没有表达任何取值") {
+				t.Fatalf("这一格本来读不通，不该说成空文件：%q", state.Error)
+			}
+			if !strings.Contains(state.Error, "重新读取配置文件失败") {
+				t.Fatalf("没走第 1 步那条统一口径：%q", state.Error)
+			}
+			assertNoCalls(t, fx)
+			if !reflect.DeepEqual(chain.applied, fx.applied) {
+				t.Fatal("把 applied 换了")
+			}
+		})
+	}
+
+	t.Run("文件被删", func(t *testing.T) {
+		fx := newReloadFixture(t, baseSpec(), baseSpec())
+		chain := fx.build()
+
+		if err := os.Remove(fx.path); err != nil {
+			t.Fatalf("删掉配置文件失败：%v", err)
+		}
+		state, err := fx.reload()
+		if err == nil || state.Result != core.ReloadRejected {
+			t.Fatalf("交回 result=%q err=%v，应当是 rejected", state.Result, err)
+		}
+		if strings.Contains(state.Error, "没有表达任何取值") {
+			t.Fatalf("文件被删不该被说成空文件：%q", state.Error)
+		}
+		if !strings.Contains(state.Error, "重新读取配置文件失败") {
+			t.Fatalf("没走第 1 步那条统一口径：%q", state.Error)
+		}
+		assertNoCalls(t, fx)
+		if !reflect.DeepEqual(chain.applied, fx.applied) {
+			t.Fatal("把 applied 换了")
+		}
+	})
+}
+
+// TestReload_LeadingBOMDoesNotLookEmpty 是上面几条的正向对照：带 BOM 但真有内容的文件不许被
+// 这条判据拦下来。少了这一格，"凡是带 BOM 一律拒"这种过头实现也能全绿。
 func TestReload_LeadingBOMDoesNotLookEmpty(t *testing.T) {
 	fx := newReloadFixture(t, baseSpec(), baseSpec())
 	fx.build()
@@ -766,31 +888,59 @@ func TestReload_LeadingBOMDoesNotLookEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("带 BOM 的正常配置被拒了：%v（error=%s）", err, state.Error)
 	}
-	if strings.Contains(state.Error, "一个键都没有") {
+	if strings.Contains(state.Error, "没有表达任何取值") {
 		t.Fatalf("带 BOM 的正常配置被判成空文件：%s", state.Error)
 	}
 	assertExactCalls(t, fx, []string{"setLevel=debug"})
 }
 
-// TestConfigFileCarriesNoKeysShapes 直接量判据本身，不走整条链。
+// TestReload_FlowMappingWithMarkerKeepsApplied 管的是另一个方向的过头实现：
+// `--- {logging: {level: debug}}` 这种"文档标记后面紧跟流式取值"的整行，
+// 前一轮那版按前缀跳分隔符的实现会连内容一起跳掉，于是真配置被误判成空文件。
+func TestReload_FlowMappingWithMarkerKeepsApplied(t *testing.T) {
+	fx := newReloadFixture(t, baseSpec(), baseSpec())
+	fx.build()
+
+	if err := os.WriteFile(fx.path, []byte("--- {logging: {level: debug}}\n"), 0o600); err != nil {
+		t.Fatalf("写流式配置失败：%v", err)
+	}
+	state, err := fx.reload()
+	if err != nil {
+		t.Fatalf("标记后面的真取值被拒了：%v（error=%s）", err, state.Error)
+	}
+	if strings.Contains(state.Error, "没有表达任何取值") {
+		t.Fatalf("这份文件明明有取值：%s", state.Error)
+	}
+	// 这一份只写了 logging.level，没写的键按"整份文件是唯一真相"退回默认（D-R0703），
+	// 所以流水不止一条；这里要判的是它被当成"有取值的一份配置"走完了整条链。
+	if state.Result != core.ReloadOK {
+		t.Fatalf("result = %q, want %q", state.Result, core.ReloadOK)
+	}
+	calls := fx.targets.recorded()
+	if !strings.Contains(strings.Join(calls, ","), "setLevel=debug") {
+		t.Fatalf("标记后面的取值没落到落点上：%v", calls)
+	}
+}
+
+// TestConfigFileCarriesNoValuesShapes 直接量判据本身，不走整条链。
 //
 // 存在的理由有两个：
-//   - 链上那三条用例（EmptyFile / CommentsOnly / LeadingBOM）只能证"被拒的那一次给了空文件文案"，
-//     证不到分隔符与流式写法这一族边界；复核发现 `--- {logging: {level: debug}}` 这种
-//     "标记后面跟着真取值"的行会被裸前缀匹配跳过去，边界就得有一条点到点的用例。
-//   - 反过来也要有"带着取值就不算空"的正向半边，否则"凡看不懂的都当空文件"这种实现能全绿。
-func TestConfigFileCarriesNoKeysShapes(t *testing.T) {
+//   - 链上那几条用例只能证"被拒的那一次给了空文件文案"，证不到这一族的边界在哪里：
+//     哪些形状算"没表达取值"、哪些算"表达了"（空序列是作者写的"这一族清空"，
+//     非映射标量、真取值、坏 YAML 都不归这条判据管）。
+//   - 判据的返回语义（读不出文件时交回错误）也要有一格点到点的用例，链上碰不到那一支。
+func TestConfigFileCarriesNoValuesShapes(t *testing.T) {
 	writeAndAsk := func(t *testing.T, raw []byte) bool {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), "config.yaml")
 		if err := os.WriteFile(path, raw, 0o600); err != nil {
 			t.Fatalf("write %q: %v", path, err)
 		}
-		noKeys, err := configFileCarriesNoKeys(path)
+		noValues, err := configFileCarriesNoValues(path)
 		if err != nil {
 			t.Fatalf("判据读不出自己写的文件：%v", err)
 		}
-		return noKeys
+		return noValues
 	}
 	utf16WithBOM := func(s string) []byte {
 		out := []byte{0xFF, 0xFE}
@@ -806,7 +956,7 @@ func TestConfigFileCarriesNoKeysShapes(t *testing.T) {
 		want bool
 	}{
 		{"空文件", []byte(""), true},
-		{"只有换行", []byte("\n  \n\t\n"), true},
+		{"只有换行与空格", []byte("\n  \n\n"), true},
 		{"只有注释", []byte("# 一会儿填回来\n"), true},
 		{"注释里带 #! 之类的前缀", []byte("#!/usr/bin/env 不是键\n"), true},
 		{"只有文档标记", []byte("---\n...\n"), true},
@@ -814,21 +964,52 @@ func TestConfigFileCarriesNoKeysShapes(t *testing.T) {
 		{"UTF-8 BOM 独存", []byte{0xEF, 0xBB, 0xBF}, true},
 		{"UTF-8 BOM 加注释", append([]byte{0xEF, 0xBB, 0xBF}, []byte("# 注释\n")...), true},
 		{"UTF-16LE 加注释", utf16WithBOM("# 注释\n"), true},
+		{"只有键名", []byte("logging:\n  level:\n"), true},
+		{"显式 null 叶子", []byte("scheduler:\n  workers: null\n"), true},
+		{"空流映射", []byte("logging: {}\n"), true},
+		{"顶层 null", []byte("null\n"), true},
+		{"层层都是空键", []byte("a:\n  b:\n    c:\n"), true},
+		{"非字符串键的空值", []byte("1:\n2:\n"), true},
+		{"值写在第二份文档", []byte("---\n# 占位\n---\nlogging:\n  level: debug\n"), true},
 
 		{"一行真取值", []byte("logging:\n  level: debug\n"), false},
 		{"流式映射跟在标记后面", []byte("--- {logging: {level: debug}}\n"), false},
 		{"流式映射单独一行", []byte("{scheduler: {workers: 9}}\n"), false},
+		{"带 BOM 的真取值", append([]byte{0xEF, 0xBB, 0xBF}, []byte("scheduler:\n  workers: 9\n")...), false},
+		{"显式空序列是作者意图", []byte("executors:\n  commands: []\n"), false},
+		{"空字符串也算写下来的取值", []byte("logging:\n  level: \"\"\n"), false},
+		{"顶层是标量", []byte("hello\n"), false},
 		{"四个横杠不是文档标记", []byte("---- 这不是标记\n"), false},
 		{"三个点后面紧跟键", []byte("...logging: x\n"), false},
-		{"带 BOM 的真取值", append([]byte{0xEF, 0xBB, 0xBF}, []byte("scheduler:\n  workers: 9\n")...), false},
+		{"Tab 缩进的空白读不懂不归这里判", []byte("\n \n\t\n"), false},
+		{"不带 BOM 的 UTF-16 读不懂不归这里判", func() []byte {
+			out := []byte{}
+			for _, u := range utf16.Encode([]rune("# 只有注释\n")) {
+				out = binary.LittleEndian.AppendUint16(out, u)
+			}
+			return out
+		}(), false},
 	} {
 		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			if got := writeAndAsk(t, tc.raw); got != tc.want {
-				t.Fatalf("configFileCarriesNoKeys = %v, want %v（原文 %q）", got, tc.want, string(tc.raw))
+				t.Fatalf("configFileCarriesNoValues = %v, want %v（原文 %q）", got, tc.want, string(tc.raw))
 			}
 		})
 	}
+
+	// 读不出文件那一支交回的是错误，不是 false：调用方据此走第 1 步那条统一口径，
+	// 不许把"文件不见了"说成"文件是空的"。
+	t.Run("文件不存在交回错误", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "no-such-config.yaml")
+		noValues, err := configFileCarriesNoValues(path)
+		if err == nil {
+			t.Fatal("文件不存在却没交回错误")
+		}
+		if noValues {
+			t.Fatal("读不出文件时不许判成空文件")
+		}
+	})
 }
 
 // TestReload_UnchangedDoesNotTouchExecutors 守住"每次存盘都重登记档位"这条退路：
