@@ -18,14 +18,18 @@ package main
 // 跨多次重载存活，塞进 main.go 会让那个文件同时承担装配与运行期行为两件事。
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf16"
 
 	"godelayq/core"
 	"godelayq/executor"
@@ -286,9 +290,89 @@ func (r *reloader) Stop() {
 	r.stopped = true
 }
 
+// configFileCarriesNoKeys 判断这份配置文件是否已经不表达任何取值：整份文件除了空白、
+// 注释与 YAML 的文档分隔符以外什么都不剩。
+//
+// 它只回答"空不空"这一件事，不判定内容对不对——那是 core.LoadConfig 第 1 步的活。
+// 读不出文件（被删、没权限）时把错误原样交回，调用方会走第 1 步那条统一口径，
+// 不在这里另报一份"文件读不到"。
+//
+// 剩下的口子只有一个，说清：这一判据与 core.LoadConfig 是**同一次存盘的两次读**，
+// 两者之间如果恰好被一次截断写入插进去，这次会按截断前的样子判过、随后把截断后的内容读成
+// 一份全默认配置并应用到现网（结论仍是 ok）。窗口是微秒级、要靠下一次存盘才可能撞上，
+// 而撞上的那一次没法在这里补判——除非让 LoadConfig 接受内容入参，那是另一张卡的事。
+func configFileCarriesNoKeys(path string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	for _, line := range strings.Split(configFileText(data), "\n") {
+		content := strings.TrimSpace(line)
+		if content == "" || strings.HasPrefix(content, "#") {
+			continue
+		}
+		if rest, ok := cutDocumentMarker(content); ok {
+			content = strings.TrimSpace(rest)
+			if content == "" || strings.HasPrefix(content, "#") {
+				continue
+			}
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+// cutDocumentMarker 剥掉一行开头的 YAML 文档标记（`---` / `...`），标记必须独占这一列或后面
+// 紧跟空白才算数。
+//
+// 为什么要单独抽出来：`--- # 还没填` 是一行分隔符，而 `--- {logging: {level: debug}}` 是一份
+// 写在流式映射里的真配置。只按前缀跳过分隔符会把后者也当成空行，那种文件是真有取值的。
+func cutDocumentMarker(content string) (string, bool) {
+	for _, marker := range [...]string{"---", "..."} {
+		if !strings.HasPrefix(content, marker) {
+			continue
+		}
+		rest := content[len(marker):]
+		if rest == "" || rest[0] == ' ' || rest[0] == '\t' {
+			return rest, true
+		}
+	}
+	return "", false
+}
+
+// configFileText 把配置文件原文换成可以逐行扫的文本。
+//
+// 为什么需要这一步：YAML 解析器容忍开头的 BOM，也认**带 BOM 的** UTF-16LE/BE（不带 BOM 的
+// UTF-16 它按 UTF-8 处理、直接报解析错，那一侧由第 1 步兜住，不在这里处理），而 Windows
+// PowerShell 5.1 的 `>` 与 Out-File 默认写的就是带 BOM 的 UTF-16LE。不先还原成文本，
+// "这份文件还表达取值吗"会对这一类形状答错（`BOM + 只有注释` 被当成"有内容"，于是空文件照样
+// 走完这条链换成默认取值），而这条判据要防的正是那种"看着像编辑器误操作"的现场。
+func configFileText(data []byte) string {
+	switch {
+	case bytes.HasPrefix(data, []byte{0xEF, 0xBB, 0xBF}):
+		return string(data[3:])
+	case bytes.HasPrefix(data, []byte{0xFF, 0xFE}), bytes.HasPrefix(data, []byte{0xFE, 0xFF}):
+		little := data[0] == 0xFF
+		words := make([]uint16, 0, len(data)/2)
+		for i := 2; i+1 < len(data); i += 2 {
+			if little {
+				words = append(words, binary.LittleEndian.Uint16(data[i:]))
+			} else {
+				words = append(words, binary.BigEndian.Uint16(data[i:]))
+			}
+		}
+		return string(utf16.Decode(words))
+	default:
+		return string(data)
+	}
+}
+
 // Reload 走完整条链，它就是交给 core.ConfigWatcher 的那个 ReloadFunc。
 //
-// 七步，顺序固定（卡 §3.1）：
+// 八步，顺序固定（前七步是卡 §3.1 那张表，第 0 步是 R07 场景 16E 补的那道问）：
+//  0. configFileCarriesNoKeys：整份文件只剩空白、注释与文档分隔符 → 结论 rejected，applied 不动。
+//     空文件在第 1 步那里是一份**合法的**"全部取默认值"的配置而不是读失败，不问这一句，
+//     "绝不退回默认值"就会从第 1 步的失败分支漏到成功分支上去（D-R0702）。
 //  1. core.LoadConfig(cfgPath)：失败（语法错、未知键、Validate 不过、文件被删）→ 结论 rejected，
 //     applied 不动。**绝不退回默认值**：那会让整台机器静默变成默认配置在跑。
 //  2. candidate.Normalized()：Diff 要求两侧都已归一化（D-R0102），否则 0 值与默认值的差别
@@ -328,6 +412,20 @@ func (r *reloader) Reload() (core.ReloadState, error) {
 		state.Error = msg
 		r.logger.Error("config reload rejected: no config file path is known", "hint",
 			"用 -config 指一个真实存在的文件，或放置 configs/config.yaml 后重启")
+		return state, errors.New(msg)
+	}
+
+	// 第 1 步之前先问一句：这份文件还表达任何取值吗。空文件在第 1 步那里是一份**合法的**
+	// "全部取默认值"的配置而不是读失败，不问这一句，"绝不退回默认值"就从失败分支漏到了成功分支。
+	// 现场量在 TASK-R07 场景 16E：无凭据部署写空文件之后结论是 ok，workers 从 7 变成代码默认的 100。
+	if noKeys, err := configFileCarriesNoKeys(r.cfgPath); err == nil && noKeys {
+		msg := fmt.Sprintf("配置文件里一个键都没有（空文件或只有注释），本次重载作废、现网继续按当前生效的取值运行（%s）：空文件会被读成一份全部取默认值的配置，要把取值退回默认请显式写出每一项并重启进程",
+			r.cfgPath)
+		state.Result = core.ReloadRejected
+		state.Error = msg
+		r.logger.Error("config reload rejected: the config file carries no keys",
+			"path", r.cfgPath,
+			"hint", "空文件不等于默认配置；这份文件恢复成有内容的样子即可自动恢复监听")
 		return state, errors.New(msg)
 	}
 
