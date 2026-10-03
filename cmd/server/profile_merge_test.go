@@ -193,7 +193,7 @@ func TestRun_CorruptProfileFileStopsStartupWithSelfHelp(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("{ this is not json"), 0o600))
 	cfg.Executors.ProfilesPath = path
 
-	profiles := defaultRuntimeDeps(cfg, quietLogger()).newExecutorProfileStore
+	profiles := defaultRuntimeDeps(cfg, "", nil, quietLogger()).newExecutorProfileStore
 	scheduler, _, err := runWithProfileStore(t, cfg, profiles)
 
 	require.Error(t, err)
@@ -211,7 +211,7 @@ func TestRun_RealProfileClosureToleratesMissingFile(t *testing.T) {
 	path := filepath.Join(dir, "nested", "exec-profiles.json")
 	cfg.Executors.ProfilesPath = path
 
-	store, err := defaultRuntimeDeps(cfg, quietLogger()).newExecutorProfileStore(cfg)
+	store, err := defaultRuntimeDeps(cfg, "", nil, quietLogger()).newExecutorProfileStore(cfg)
 	require.NoError(t, err, "还没人在页面上建过档位是正常状态")
 	records, err := store.List()
 	require.NoError(t, err)
@@ -232,7 +232,7 @@ func TestRun_WebDisabledNeverTouchesTheProfilesPath(t *testing.T) {
 
 	// 用真实的生产闭包而不是替身：本卡要断言的是"它一次都没被调用到"，
 	// 而闭包一旦被调用就会把 nested 目录建出来。
-	profiles := defaultRuntimeDeps(cfg, quietLogger()).newExecutorProfileStore
+	profiles := defaultRuntimeDeps(cfg, "", nil, quietLogger()).newExecutorProfileStore
 	scheduler, _, err := runWithProfileStore(t, cfg, profiles)
 	require.NoError(t, err)
 

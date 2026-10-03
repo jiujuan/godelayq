@@ -77,6 +77,15 @@ type Server struct {
 	// console 是嵌入的前端产物根；nil 表示这次部署只提供 API（开发形态）。
 	// 它同时决定鉴权中间件是否豁免静态资源——登录页本身也是产物的一部分。
 	console fs.FS
+	// reloadState 是配置热重载最近一次结论的读口；nil 表示这台服务器没启用热重载，
+	// /admin/runtime 于是连 reload 这个键都不给（见 RuntimeResponse.Reload）。
+	// 注入方是 cmd/server 的那个读口句柄，它自己转发给 core.ConfigWatcher。
+	// 这里只有读面：热重载只由文件变化触发，本卡不新增任何写端点。
+	reloadState ReloadStateReader
+	// reloadEnabled 是**进程配置**里的 reload.enabled，与 reloadState 一起注入。
+	// 它单独存一份而不是取 State().Enabled：读数要说的是"这台进程的配置开关是什么"，
+	// 而"开关开着、监听器没建起来"那种部署的 State() 里那位是假的（R05 的 D-R0503）。
+	reloadEnabled bool
 
 	// baseCtx 传给每个请求；Stop 取消它即可让 SSE 等长连接立即收尾
 	baseCtx    context.Context

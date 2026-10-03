@@ -25,6 +25,12 @@ type RuntimeResponse struct {
 	EventHistory EventHistoryStats `json:"event_history"`
 	// SchedulingSuspendedNote 只在挂起时给一句话解释，避免运维误读成"服务卡死"
 	SchedulingSuspendedNote string `json:"scheduling_suspended_note,omitempty"`
+	// Reload 是配置热重载最近一次的结论；整个字段缺省表示这台服务器没启用热重载。
+	//
+	// 指针 + omitempty 才有这个语义：值类型会给出 {"result":""} 一个空对象，
+	// 那会被读成"启用过但从没重载过"，而这里想说的是一个都没开启。
+	// 类型是本地那份而不是 core.ReloadState，理由见 api/reload_state.go 顶部（D-R0502）。
+	Reload *ReloadStatus `json:"reload,omitempty"`
 }
 
 // GetRuntime GET /api/v1/admin/runtime
@@ -39,6 +45,14 @@ func (s *Server) GetRuntime(c *gin.Context) {
 	}
 	if stats.Suspended {
 		resp.SchedulingSuspendedNote = "due jobs are not dispatched until unsuspend; restart clears it"
+	}
+	// 读口没注入时整个 reload 键不出现（未启用热重载的部署）。
+	// 这一层只保证一件事：**不主动把服务自己的配置值搬进读数**（用例见 reload_state_test.go 的
+	// TestGetRuntime_LeaksNoConfigValues）。两段自由文本（error / watcher_error）由产出方组成、
+	// 这里原样透出，其中的非凭据取值（例如操作者写错的时长、重名的档位）可能被回显——
+	// 那道闸门在写文本的那一侧，不在这一行注释里（缺陷表 D-R0607）。
+	if s.reloadState != nil {
+		resp.Reload = reloadStatusOf(s.reloadState.State(), s.reloadEnabled)
 	}
 
 	c.JSON(http.StatusOK, resp)

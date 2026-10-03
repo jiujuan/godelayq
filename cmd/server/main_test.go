@@ -332,7 +332,7 @@ func TestHandlers_LogPayload(t *testing.T) {
 }
 
 func TestDefaultRuntimeDeps(t *testing.T) {
-	deps := defaultRuntimeDeps(core.DefaultConfig(), slog.Default())
+	deps := defaultRuntimeDeps(core.DefaultConfig(), "", nil, slog.Default())
 
 	if deps.newStore == nil || deps.newScheduler == nil || deps.newExecutorRegistry == nil ||
 		deps.newArtifactStore == nil || deps.newObservabilityDB == nil ||
@@ -353,7 +353,7 @@ func TestDefaultNewStore_CreatesUsableStore(t *testing.T) {
 	cfg.Store.Path = filepath.Join(t.TempDir(), "jobs.json")
 	cfg.Store.FlushInterval = 10 * time.Millisecond
 
-	store, err := defaultRuntimeDeps(cfg, slog.Default()).newStore()
+	store, err := defaultRuntimeDeps(cfg, "", nil, slog.Default()).newStore()
 	if err != nil {
 		t.Fatalf("expected store creation to succeed, got %v", err)
 	}
@@ -404,4 +404,67 @@ func assertPanics(t *testing.T, fn func()) {
 	}()
 
 	fn()
+}
+
+// TestResolvedConfigPath 判"热重载该盯哪个文件"（TASK-R06 §3.4、设计文档 §5.2）。
+// 两种拼写都要认：core.LoadConfig 在 -config 留空时走 viper 的名字查找，configs/config.yml
+// 同样是"启动时真正读到的那一份"，只试 .yaml 会让那种部署的热重载悄悄不接。
+func TestResolvedConfigPath(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "config.yaml")
+	require.NoError(t, os.WriteFile(real, []byte("server:\n  port: \"18080\"\n"), 0o600))
+
+	absDir, err := filepath.Abs(dir)
+	require.NoError(t, err)
+
+	t.Run("explicit file", func(t *testing.T) {
+		assert.Equal(t, absDir+string(filepath.Separator)+"config.yaml",
+			filepath.Clean(resolvedConfigPath(real)))
+	})
+	t.Run("explicit missing file is not a watched path", func(t *testing.T) {
+		assert.Equal(t, "", resolvedConfigPath(filepath.Join(dir, "nope.yaml")))
+	})
+	t.Run("explicit directory is not a watched path", func(t *testing.T) {
+		assert.Equal(t, "", resolvedConfigPath(dir))
+	})
+
+	for _, tc := range []struct {
+		name string
+		file string
+		want string
+	}{
+		{"yaml spelling", "config.yaml", "config.yaml"},
+		{"yml spelling", "config.yml", "config.yml"},
+	} {
+		t.Run("fallback finds "+tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			require.NoError(t, os.Mkdir(filepath.Join(root, "configs"), 0o755))
+			require.NoError(t, os.WriteFile(filepath.Join(root, "configs", tc.file),
+				[]byte("server:\n  port: \"18080\"\n"), 0o600))
+			t.Chdir(root)
+
+			got := resolvedConfigPath("")
+			require.NotEmpty(t, got, "留空时没找到 "+tc.file+"，热重载会不接而不报错")
+			assert.Equal(t, filepath.Join("configs", tc.want), filepath.Base(filepath.Dir(got))+string(filepath.Separator)+filepath.Base(got))
+			assert.True(t, filepath.IsAbs(got), "交回的不是绝对路径：%q", got)
+		})
+	}
+
+	t.Run("yaml wins when both spellings exist", func(t *testing.T) {
+		root := t.TempDir()
+		require.NoError(t, os.Mkdir(filepath.Join(root, "configs"), 0o755))
+		for _, name := range []string{"config.yaml", "config.yml"} {
+			require.NoError(t, os.WriteFile(filepath.Join(root, "configs", name),
+				[]byte("server:\n  port: \"18080\"\n"), 0o600))
+		}
+		t.Chdir(root)
+
+		assert.Equal(t, "config.yaml", filepath.Base(resolvedConfigPath("")),
+			"与 core.LoadConfig 的扩展名次序不一致：viper 先试 yaml")
+	})
+
+	t.Run("no file at all", func(t *testing.T) {
+		t.Chdir(t.TempDir())
+		assert.Equal(t, "", resolvedConfigPath(""))
+	})
 }

@@ -1,14 +1,21 @@
 package main
 
-// 配置热重载的冒烟测试：把 R01 的判据与 R02 的六个运行期入口串起来跑一遍。
+// 配置热重载的冒烟测试：一条生产重载链（cmd/server/reload.go 的 reloader）接在**真实下游**上跑。
 //
-// R06 才把监听器与 /admin/runtime 接上来，所以这里自带一个 miniature 重载器 applyCandidate：
-// 它按 TASK-R02 §10.1 那张"热更键 → 入口 → 生效时机"的表，把一份从磁盘读进来的新配置过一遍
-// core.Diff，再逐键调用对应的入口。这张表在这里第一次被当成接口使用——签名对不上就编译不过。
+// 与同包另外两组用例的分工：
+//   - cmd/server/reload_test.go：落点全是替身，判的是链自己的算法（顺序、回滚、结论、读数）；
+//   - main_integration_test.go 的 §5.2 那组：真链 + 替身下游，判的是装配（谁被递到谁）与关闭顺序；
+//   - 本文件：真链 + 真 store / 真调度器 / 真 SQLite 两张表，判的是**行为真的变了**。
 //
-// 判据一律取行为（日志真的按新级别出、留痕真的按新上限淘汰、两张观测表真的按新条数剪），
-// 分类结果只作为"该调哪个入口"的路由证据。R06 接线之后本文件的 applyCandidate 应被生产重载链替换，
-// 场景清单留下。
+// 判据一律取行为（日志按新级别出、留痕按新上限淘汰、两张表按新条数剪），
+// 分类结果只作为"该调哪个入口"的路由证据。R02 那版自带的 miniature 重载器（applyCandidate）
+// 在 R06 接线后被删掉：从本文件起，被验的那条链就是进程里跑的那一条。
+//
+// 档位落点（executors.commands → Applier.ApplyConfig）不在本文件：真 Applier 要的是登记表、
+// 产物存储与脚本文件那一整套，而它由 §5.2 的 TestRun_WiredReloadChainReachesEveryTarget
+// 用真 Applier + 真处理函数表判过。这里的用例因此一律不碰 executors.*，配置里也把
+// executors.enabled 关着（本 harness 没有 applier，那条键若被改动会报"未启用、本次不生效"，
+// 会把"没测"混进"测过"的读数里）。
 
 import (
 	"bytes"
@@ -16,7 +23,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -53,8 +59,12 @@ func (s *logSink) Reset() {
 	s.buf.Reset()
 }
 
-// smokeStack 是一份真实装配出来的最小运行面：日志器 + 调度器 + JSON 存储 + 观测层两个写入器。
+// smokeStack 是一份真实装配出来的运行面：日志器 + 调度器 + JSON 存储 + 观测层两个写入器，
+// 外加接在它们上面的那条生产重载链。
 type smokeStack struct {
+	t         *testing.T
+	dir       string
+	path      string
 	logs      *logSink
 	logger    *slog.Logger
 	levelVar  *slog.LevelVar
@@ -64,14 +74,58 @@ type smokeStack struct {
 	events    *sqlite.EventLog
 	bus       *core.EventBus
 
-	// applied 是"当前生效的那一份"，只有重载成功才往前推（系列不变量 I1）。
-	applied core.Config
+	// chain 是被验的那个对象本身：生产构造函数造出来的真链，落点全是上面这些真下游。
+	chain *reloader
 }
 
-func newSmokeStack(t *testing.T, cfg core.Config) *smokeStack {
+// smokeBaseSpec 是冒烟起点那份配置。八个热更键各给一个可对照的起点值，两条时长都放 0
+// （起点数据都是刚刚写的，不让时间维度顺手剪掉，条数判据才只反映条数入口的作用）。
+func smokeBaseSpec() fileSpec {
+	spec := baseSpec()
+	spec.reloadEnabled = "true"
+	spec.obsEnabled = "true"
+	// 见文件头：本 harness 没有 applier，档位那条键不在冒烟的场景清单里。
+	spec.execEnabled = "false"
+	spec.level = "info"
+	spec.workers = "2"
+	spec.retryDelay = "60s"
+	spec.historyLimit = "100"
+	spec.historyTTL = "0s"
+	spec.eventCount = "1000"
+	spec.eventAge = "0s"
+	spec.auditCount = "1000"
+	spec.auditAge = "0s"
+	return spec
+}
+
+// smokeChange 在**冒烟起点**之上改几项。单元用例那份 specChange 的起点是 baseSpec
+// （观测层关着、执行器开着），从那里改出来的候选会顺带改掉本文件不关心的十几条键，
+// applied_keys 的期望就再也对不上了，所以本文件另起一份起点。
+func smokeChange(tune func(*fileSpec)) fileSpec {
+	spec := smokeBaseSpec()
+	tune(&spec)
+	return spec
+}
+
+// newSmokeStack 把 spec 落成配置文件、读回来当 applied，再按 cmd/server 启动时的同一条形状
+// 建运行面并把生产重载链接上去。配置文件与 core.Config 出自同一次 LoadConfig，
+// 所以不会有"内存里那份与文件里那份分叉"的起点。
+func newSmokeStack(t *testing.T, spec fileSpec) *smokeStack {
 	t.Helper()
 
-	stack := &smokeStack{logs: &logSink{}, applied: cfg}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	stack := &smokeStack{t: t, dir: dir, path: path, logs: &logSink{}}
+	stack.write(spec)
+
+	cfg, err := core.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v\n%s", err, spec.render(dir, filepath.Join(dir, "ws"), "node"))
+	}
+	cfg = cfg.Normalized()
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("Validate: %v", err)
+	}
 
 	logger, levelVar, err := core.NewLoggerWithLevelVar(cfg.Logging.Level, cfg.Logging.Format, stack.logs)
 	if err != nil {
@@ -133,7 +187,52 @@ func newSmokeStack(t *testing.T, cfg core.Config) *smokeStack {
 	stack.audit = audit
 	t.Cleanup(func() { _ = audit.Close() })
 
+	// 接链：与 run() 里那一次调用同一份 reloadDeps 形状，只是 applier 这一位空着（见文件头）。
+	stack.chain = newReloader(reloadDeps{
+		cfgPath:          path,
+		applied:          cfg,
+		store:            store,
+		scheduler:        scheduler,
+		events:           events,
+		audit:            audit,
+		applier:          nil,
+		executorsEnabled: cfg.Executors.Enabled,
+		levelVar:         levelVar,
+		logger:           logger,
+	})
 	return stack
+}
+
+// write 把一份 spec 覆盖到链要读的那个文件上（等价于"运维存了一次盘"）。
+func (s *smokeStack) write(spec fileSpec) {
+	s.t.Helper()
+
+	executable, err := os.Executable()
+	if err != nil {
+		s.t.Fatalf("os.Executable: %v", err)
+	}
+	content := spec.render(s.dir, filepath.Join(s.dir, "ws"), executable)
+	if err := os.WriteFile(s.path, []byte(content), 0o600); err != nil {
+		s.t.Fatalf("write config: %v", err)
+	}
+}
+
+// reload 走一次生产链。这里不调 watcher：本文件判的是链与真下游，
+// "事件到链"那一段由 R05 的用例与 §5.2 的装配用例分别负责。
+func (s *smokeStack) reload() core.ReloadState {
+	s.t.Helper()
+
+	state, err := s.chain.Reload()
+	if err != nil && state.Result == core.ReloadOK {
+		s.t.Fatalf("链交回错误却报成功：%v", err)
+	}
+	return state
+}
+
+// wantApplied 断 applied_keys 恰好是 want 那份（顺序就是 core.Diff 的路径字典序）。
+func wantApplied(t *testing.T, state core.ReloadState, want []string) {
+	t.Helper()
+	assertSameList(t, "applied_keys", state.AppliedKeys, want)
 }
 
 // retryPolicyFor 与 cmd/server 启动时同一条构造方式（main.go 用 scheduler.max_retry_delay 建它）。
@@ -141,201 +240,30 @@ func retryPolicyFor(cfg core.Config) core.RetryPolicy {
 	return &core.ExponentialBackoffRetry{MaxDelay: cfg.Scheduler.MaxRetryDelay}
 }
 
-// reloadOutcome 是一次 miniature 重载的结果。前三个键名列表与 `result` 对齐 R06 要交出去的
-// `core.ReloadState`（applied_keys / ignored_keys / rejected_keys / result）；
-// `failedKeys` 与下面那个读失败占位标记是本 harness 自己的形状——`ReloadState` 没有
-// failed_keys，失败原因走它的 `error` 字符串字段（设计文档 §5.4），R06 接线时按那边收口。
-type reloadOutcome struct {
-	appliedKeys  []string
-	ignoredKeys  []string
-	rejectedKeys []string
-	failedKeys   []string
-	result       core.ReloadResult
+// eightHotKeys 是主冒烟那一次改动应当一次走到的八条热更键路径
+// （R02 §10.1 那张表的全部内容：五个入口 + 成对给值的时长/年龄那几条第二位）。
+var eightHotKeys = []string{
+	"logging.level",
+	"observability.audit.retention_age",
+	"observability.audit.retention_count",
+	"observability.events.retention_age",
+	"observability.events.retention_count",
+	"scheduler.max_retry_delay",
+	"store.history_limit",
+	"store.history_ttl",
 }
 
-// reloadFromFile 是 applyCandidate 的外层：先读文件，读不进来就整次失败、一条都不应用。
-// "新配置读不进来"那条路只有经过这里才有失败形状，否则用例只能复述起点状态。
-func (s *smokeStack) reloadFromFile(path string) reloadOutcome {
-	candidate, err := core.LoadConfig(path)
-	if err != nil {
-		// 读失败没有键路径可报，用固定标记占位，保证 failed_keys 不为空、日志能归因。
-		return reloadOutcome{
-			result:     core.ReloadFailed,
-			failedKeys: []string{"<配置文件读失败>"},
-		}
-	}
-	return s.applyCandidate(candidate.Normalized())
-}
-
-// applyCandidate 走 R06 将要走的那几步：Diff 分类 → 有拒绝项就整次作废 →
-// 先整批查表确认每条热更键都有入口 → 逐键调运行期入口 → 全部成功才把 applied 往前推。
+// TestSmokeHotReloadAppliesEveryHotKey 是主冒烟：一次改动把八条热更键全部走一遍，
+// 逐个验证**真实下游**的行为真的变了——这是 R01+R02 合起来对外承诺的那件事，
+// 从本卡起由生产链兑现（R02 那版是冒烟具自己写的 miniature 链）。
 //
-// 半途失败（入口返回错误）时本 harness **不做回滚**：逐项逆序回滚（不变量 I2 的后半句）
-// 是 R06 的交付物，这里只如实报出"哪一条失败了、已应用的是哪几条、applied 没动"，
-// 免得冒烟具自己先立一套与 R06 不同的语义。
-//
-// 应用顺序取的是 `core.Diff` 给出的路径字典序，这只是本 harness 的取法：设计 §4 的 I2
-// 要求 R06 按依赖顺序应用。下面有用例断到"失败键之后的键没被继续应用"，那条断言的语义是
-// 循环在失败处停下，与顺序无关；但它选的"失败键之后那一条"（`store.history_limit`）是按
-// 本 harness 的取法挑的，R06 换成依赖顺序时要跟着换键名。
-func (s *smokeStack) applyCandidate(candidate core.Config) reloadOutcome {
-	change := core.Diff(s.applied, candidate)
-	outcome := reloadOutcome{result: core.ReloadOK}
-
-	switch {
-	case !change.HasChanges():
-		outcome.result = core.ReloadUnchanged
-		return outcome
-	case change.HasRejections():
-		// 不变量 I2：有拒绝项就一条都不应用。
-		for _, key := range change.Reject {
-			outcome.rejectedKeys = append(outcome.rejectedKeys, key.Path)
-		}
-		outcome.result = core.ReloadRejected
-		return outcome
-	}
-
-	entries := s.hotEntries()
-
-	// 先整批查表再应用：有一条热更键没有入口就是装配错误，一条都不该碰到现网。
-	// （入口自己返回错误是另一种形状——已经应用的那几条留在那里不回滚，走第二个循环的分支。）
-	for _, key := range change.Hot {
-		if _, ok := entries[key.Path]; !ok {
-			outcome.result = core.ReloadFailed
-			outcome.failedKeys = append(outcome.failedKeys, key.Path)
-			return outcome
-		}
-	}
-
-	for _, key := range change.Hot {
-		if err := s.applyHotKey(key.Path, candidate); err != nil {
-			outcome.result = core.ReloadFailed
-			outcome.failedKeys = append(outcome.failedKeys, key.Path)
-			return outcome
-		}
-		outcome.appliedKeys = append(outcome.appliedKeys, key.Path)
-	}
-
-	// 重启档不应用，只如实报告"这些键要重启才生效"（不变量 I3：静默就是缺陷）。
-	for _, key := range change.Restart {
-		outcome.ignoredKeys = append(outcome.ignoredKeys, key.Path)
-	}
-
-	s.applied = candidate
-	return outcome
-}
-
-// hotEntries 是 TASK-R02 §10.1 那张表的代码形态：热更键 → 入口。
-// 表只写这一份：查入口与做应用都从这里取，避免"键名清单"在两处各自漂。
-// 表里没写的键不会被应用（调用方按 ok 判定），以此避免"以后加了个热更键却没给入口，冒烟静默跳过"。
-// 反过来（表上加了键却没有用例走它）由主用例把表上的键名集合与期望清单逐条比过一次来挡。
-func (s *smokeStack) hotEntries() map[string]func(core.Config) error {
-	return map[string]func(core.Config) error{
-		"logging.level": func(cfg core.Config) error {
-			return core.SetLogLevel(s.levelVar, cfg.Logging.Level)
-		},
-		"scheduler.max_retry_delay": func(cfg core.Config) error {
-			s.scheduler.SetRetryPolicy(retryPolicyFor(cfg))
-			return nil
-		},
-		"store.history_limit": func(cfg core.Config) error {
-			s.store.SetHistoryRetention(cfg.Store.HistoryLimit, cfg.Store.HistoryTTL)
-			return nil
-		},
-		"store.history_ttl": func(cfg core.Config) error {
-			s.store.SetHistoryRetention(cfg.Store.HistoryLimit, cfg.Store.HistoryTTL)
-			return nil
-		},
-		"observability.events.retention_count": func(cfg core.Config) error {
-			s.events.SetRetention(cfg.Observability.Events.RetentionCount, cfg.Observability.Events.RetentionAge)
-			return nil
-		},
-		"observability.events.retention_age": func(cfg core.Config) error {
-			s.events.SetRetention(cfg.Observability.Events.RetentionCount, cfg.Observability.Events.RetentionAge)
-			return nil
-		},
-		"observability.audit.retention_count": func(cfg core.Config) error {
-			s.audit.SetRetention(cfg.Observability.Audit.RetentionCount, cfg.Observability.Audit.RetentionAge)
-			return nil
-		},
-		"observability.audit.retention_age": func(cfg core.Config) error {
-			s.audit.SetRetention(cfg.Observability.Audit.RetentionCount, cfg.Observability.Audit.RetentionAge)
-			return nil
-		},
-	}
-}
-
-// applyHotKey 走 hotEntries 里的入口；表里没有这条键时返回带键名的错误，让日志能归因。
-func (s *smokeStack) applyHotKey(path string, cfg core.Config) error {
-	entry, ok := s.hotEntries()[path]
-	if !ok {
-		return fmt.Errorf("热更键 %q 在 TASK-R02 §10.1 的表里没有对应入口", path)
-	}
-	return entry(cfg)
-}
-
-// smokeConfig 写一份落在 temp 目录里的配置并读回来：路径全部指向用例自己的目录，
-// 没写的键由 core 的默认值补。level 传空串表示不写 logging 一节。
-func smokeConfig(t *testing.T, dir, level string, tune func(core.Config) core.Config) core.Config {
-	t.Helper()
-
-	logging := ""
-	if level != "" {
-		logging = fmt.Sprintf("logging:\n  level: %s\n", level)
-	}
-
-	content := logging + `
-store:
-  type: json
-  path: ` + filepath.Join(dir, "jobs.json") + `
-  groups_path: ` + filepath.Join(dir, "groups.json") + `
-observability:
-  enabled: true
-  path: ` + filepath.Join(dir, "observe.sqlite") + `
-  events:
-    enabled: true
-  audit:
-    enabled: true
-`
-	path := filepath.Join(dir, "config.yaml")
-	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-		t.Fatalf("write config: %v", err)
-	}
-
-	cfg, err := core.LoadConfig(path)
-	if err != nil {
-		t.Fatalf("LoadConfig: %v", err)
-	}
-	cfg = cfg.Normalized()
-	if err := cfg.Validate(); err != nil {
-		t.Fatalf("Validate: %v", err)
-	}
-	if tune != nil {
-		cfg = tune(cfg)
-	}
-	return cfg
-}
-
-// TestSmokeHotReloadAppliesEveryHotKey 是主冒烟：一次改动把 §10.1 表上的
-// **八条热更键路径全部走一遍**（五个写入口 + 时长/年龄那几条成对的第二元素），
-// 逐个验证行为真的变了——这是 R01 与 R02 合起来对外承诺的那件事。
-// 每个键名字面量都要被走到一次，否则键名写错了没人发现（入口查不到只会走"缺入口"分支，
-// 而那条分支在别的用例里才断）。
+// 断 applied_keys 恰好等于这八条，同时就是"链上没有第二条路走到这些下游"的证据：
+// 链的分派表与 core 的分档表谁先漂一步，这里就会红（cmd/server 侧的守卫另有
+// TestReloadEveryHotKeyHasDispatchEntry，那条判的是静态覆盖，这条判的是真的跑过）。
 func TestSmokeHotReloadAppliesEveryHotKey(t *testing.T) {
-	dir := t.TempDir()
-	applied := smokeConfig(t, dir, "info", func(cfg core.Config) core.Config {
-		cfg.Store.HistoryLimit = 100
-		cfg.Store.HistoryTTL = 0 // 不按时间淘汰
-		cfg.Scheduler.MaxRetryDelay = time.Minute
-		cfg.Observability.Events.RetentionCount = 1000
-		cfg.Observability.Events.RetentionAge = 0
-		cfg.Observability.Audit.RetentionCount = 1000
-		cfg.Observability.Audit.RetentionAge = 0
-		return cfg
-	})
-	stack := newSmokeStack(t, applied)
+	stack := newSmokeStack(t, smokeBaseSpec())
 
-	// 先把旧值跑出可观察的形状：debug 写不出来、留痕四条全在、两张表各四条。
+	// 先把起点跑成可观察的形状：debug 写不出来、留痕四条全在、两张表各四条。
 	writeAtLevel(stack, slog.LevelDebug, "hidden at info")
 	if strings.Contains(stack.logs.String(), "hidden at info") {
 		t.Fatal("冒烟起点不对：info 级别的日志器写出了 debug 记录")
@@ -344,61 +272,42 @@ func TestSmokeHotReloadAppliesEveryHotKey(t *testing.T) {
 	seedEvents(t, stack, 4)
 	seedAudit(t, stack, 4)
 
-	candidate := applied
-	candidate.Logging.Level = "debug"
-	candidate.Scheduler.MaxRetryDelay = 5 * time.Second
-	candidate.Store.HistoryLimit = 2
-	// 两条时长都放到 24h：起点数据都是刚刚写的，不会被时间维度顺手剪掉，
-	// 于是"条数维度剪到 2"这条判据仍然只反映条数入口的作用。
-	candidate.Store.HistoryTTL = 24 * time.Hour
-	candidate.Observability.Events.RetentionCount = 2
-	candidate.Observability.Events.RetentionAge = 24 * time.Hour
-	candidate.Observability.Audit.RetentionCount = 2
-	candidate.Observability.Audit.RetentionAge = 24 * time.Hour
+	stack.write(smokeChange(func(s *fileSpec) {
+		s.level = "debug"
+		s.retryDelay = "5s"
+		s.historyLimit = "2"
+		s.historyTTL = "24h"
+		s.eventCount = "2"
+		s.eventAge = "24h"
+		s.auditCount = "2"
+		s.auditAge = "24h"
+	}))
 
-	outcome := stack.applyCandidate(candidate)
-
-	if outcome.result != core.ReloadOK {
-		t.Fatalf("result = %q, want %q（failed=%v rejected=%v）",
-			outcome.result, core.ReloadOK, outcome.failedKeys, outcome.rejectedKeys)
+	state := stack.reload()
+	if state.Result != core.ReloadOK {
+		t.Fatalf("result = %q, want %q（error=%q）", state.Result, core.ReloadOK, state.Error)
 	}
-	wantApplied := []string{
-		"logging.level",
-		"observability.audit.retention_age",
-		"observability.audit.retention_count",
-		"observability.events.retention_age",
-		"observability.events.retention_count",
-		"scheduler.max_retry_delay",
-		"store.history_limit",
-		"store.history_ttl",
+	wantApplied(t, state, eightHotKeys)
+	if state.LastAppliedAt.IsZero() {
+		t.Fatal("真的应用了却不给 LastAppliedAt")
 	}
-	assertSameList(t, "applied keys", outcome.appliedKeys, wantApplied)
 
-	// 期望清单必须与表上的键名集合逐条相等，否则这份字面清单会与 hotEntries() 各自漂：
-	// 表上多出一条（R03/R04 会往里加键）而这里没跟着改，就是"加了入口却没人走过它"。
-	var entryKeys []string
-	for path := range stack.hotEntries() {
-		entryKeys = append(entryKeys, path)
-	}
-	sort.Strings(entryKeys)
-	assertSameList(t, "keys in hotEntries()", entryKeys, wantApplied)
-
-	// 1. 日志级别：下一条日志就按 debug 出，且 info 仍出。
+	// 1. 日志级别：下一条记录就按 debug 出，且 info 仍出。
 	writeAtLevel(stack, slog.LevelDebug, "debug visible")
 	if !strings.Contains(stack.logs.String(), "debug visible") {
-		t.Fatalf("改到 debug 之后记录仍被挡在门外：%q", stack.logs.String())
+		t.Fatalf("改到 debug 之后记录仍被挡在门外：\n%s", stack.logs.String())
 	}
 	writeAtLevel(stack, slog.LevelInfo, "info visible")
 	if !strings.Contains(stack.logs.String(), "info visible") {
 		t.Fatal("info 记录在 debug 级别下反而写不出来")
 	}
 
-	// 2. 重试上限：读数换成新值（排期行为由 core 包里的用例证明，这里只证入口接得上）。
+	// 2. 重试上限：调度器上读回来的就是新值（排期行为由 core 包的用例证明，这里只证接得上）。
 	if got := stack.scheduler.RetryPolicyMaxDelay(); got != 5*time.Second {
 		t.Fatalf("RetryPolicyMaxDelay = %v, want 5s", got)
 	}
 
-	// 3. 留痕上限：下一次写入触发的 trim 用 2。
+	// 3. 留痕：起点那四条不该被这次改动顺手剪掉（setter 不动已有数据），下一次写入才用新上限。
 	requireSnapshotCount(t, stack, 4, "setter 之后不该自己重排已有留痕")
 	writeTerminalSnapshot(t, stack, "after-apply")
 	requireSnapshotCount(t, stack, 2, "新上限要在下一次写入生效")
@@ -413,247 +322,256 @@ func TestSmokeHotReloadAppliesEveryHotKey(t *testing.T) {
 }
 
 // TestSmokeRejectedKeyAbortsWholeReload 守住不变量 I1 与 I2：
-// 一次改动里混进凭据键时整次作废，本来会生效的键也一条都不应用，
-// 而被拒的键名要能被读数拿到（不能让"被拒"这件事静默）。
+// 一次改动里混进凭据键时整次作废，本来会生效的键一条都不应用，而被拒的键名要能被读数拿到
+// （不能让"被拒"这件事静默）。行为侧的判据才是这条用例的价值：级别与上限都照旧。
 func TestSmokeRejectedKeyAbortsWholeReload(t *testing.T) {
-	dir := t.TempDir()
-	applied := smokeConfig(t, dir, "info", func(cfg core.Config) core.Config {
-		cfg.Store.HistoryLimit = 100
-		return cfg
-	})
-	stack := newSmokeStack(t, applied)
+	stack := newSmokeStack(t, smokeBaseSpec())
 
-	candidate := applied
-	candidate.Logging.Level = "debug"       // 本来会热更
-	candidate.Store.HistoryLimit = 3        // 本来会热更
-	candidate.Server.Auth.Token = "rotated" // 拒绝档：凭据
+	stack.write(smokeChange(func(s *fileSpec) {
+		s.token = "rotated-token"
+		s.level = "debug"    // 本来会热更
+		s.historyLimit = "3" // 本来会热更
+	}))
 
-	outcome := stack.applyCandidate(candidate)
-
-	if outcome.result != core.ReloadRejected {
-		t.Fatalf("result = %q, want %q", outcome.result, core.ReloadRejected)
+	state := stack.reload()
+	if state.Result != core.ReloadRejected {
+		t.Fatalf("result = %q, want %q", state.Result, core.ReloadRejected)
 	}
-	assertSameList(t, "rejected keys", outcome.rejectedKeys, []string{"server.auth.token"})
-	if len(outcome.appliedKeys) != 0 {
-		t.Fatalf("被拒的那次仍然应用了 %v，整次作废没守住", outcome.appliedKeys)
+	assertSameList(t, "rejected_keys", state.RejectedKeys, []string{"server.auth.token"})
+	if len(state.AppliedKeys) != 0 {
+		t.Fatalf("被拒的那次还有 applied_keys = %v", state.AppliedKeys)
+	}
+	if !strings.Contains(state.Error, "一项都没有应用") {
+		t.Fatalf("error 文案没交代什么都没动：%q", state.Error)
+	}
+	if strings.Contains(state.Error, "rotated-token") {
+		t.Fatalf("error 里带出了凭据取值：%q", state.Error)
 	}
 
-	// 行为侧两条判据：级别仍是 info、留痕上限仍是 100。
+	// 级别仍是 info：debug 写不出来。
 	writeAtLevel(stack, slog.LevelDebug, "should not appear")
 	if strings.Contains(stack.logs.String(), "should not appear") {
 		t.Fatal("被拒的重载把日志级别也改了")
 	}
+	// 留痕上限仍是 100：五条都在。
 	seedTerminalSnapshots(t, stack, 5)
 	requireSnapshotCount(t, stack, 5, "旧的 100 条上限要原样留着")
-
-	if stack.applied.Server.Auth.Token != applied.Server.Auth.Token {
+	// applied 没被推进：链里那份权威仍然对应起点。
+	if stack.chain.applied.Server.Auth.Token != "" {
 		t.Fatal("失败的重载把 applied 往前推了，违反不变量 I1")
 	}
 }
 
-// TestSmokeRestartKeysAreReportedNotApplied 守住重启档的可见性：一条都不应用，
-// 但键名要出现在 ignored_keys 里，不能静默。
+// TestSmokeRestartKeysAreReportedNotApplied 守住重启档的可见性（不变量 I3）：
+// 一条都不应用，但键名要出现在 ignored_keys 里，而且结论仍是 ok。
 func TestSmokeRestartKeysAreReportedNotApplied(t *testing.T) {
-	dir := t.TempDir()
-	applied := smokeConfig(t, dir, "info", nil)
-	stack := newSmokeStack(t, applied)
+	stack := newSmokeStack(t, smokeBaseSpec())
+	// 起点：调度器按启动期那一份装配（队列通道是 Start 那一刻建的，这里也没 Start）。
+	before := stack.scheduler.RuntimeStats()
 
-	candidate := applied
-	candidate.Server.Port = "9090"
-	candidate.Observability.Enabled = false
+	// 只改文件，不改装配：两条重启档存一次盘不该换掉任何东西。
+	stack.write(smokeChange(func(s *fileSpec) {
+		s.port = "9090"
+		s.queueCapacity = "88"
+	}))
 
-	outcome := stack.applyCandidate(candidate)
-
-	if outcome.result != core.ReloadOK {
-		t.Fatalf("result = %q, want %q（重启档不该把整次判失败）", outcome.result, core.ReloadOK)
+	state := stack.reload()
+	if state.Result != core.ReloadOK {
+		t.Fatalf("result = %q, want %q（重启档不该把整次判失败；error=%q）",
+			state.Result, core.ReloadOK, state.Error)
 	}
-	if len(outcome.appliedKeys) != 0 {
-		t.Fatalf("重启档被当成热更应用了：%v", outcome.appliedKeys)
+	if len(state.AppliedKeys) != 0 {
+		t.Fatalf("重启档被当成热更应用了：%v", state.AppliedKeys)
 	}
-	assertSameList(t, "ignored keys", outcome.ignoredKeys, []string{"observability.enabled", "server.port"})
+	assertSameList(t, "ignored_keys", state.IgnoredKeys,
+		[]string{"scheduler.queue_capacity", "server.port"})
+	if !state.LastAppliedAt.IsZero() {
+		t.Fatalf("一个落点都没动却给了 LastAppliedAt = %v", state.LastAppliedAt)
+	}
+	// 真下游对照：并发与队列容量都不因为存了一次盘而变（监听中的服务不是链能换的东西）。
+	after := stack.scheduler.RuntimeStats()
+	if after.QueueCapacity != before.QueueCapacity || after.Workers != before.Workers {
+		t.Fatalf("重启档改到了运行面上：%+v → %+v", before, after)
+	}
 }
 
 // TestSmokeUnchangedConfigIsNotAReload 守住"文件被 touch 但内容没变"不该算一次重载：
-// 判据是 core.Diff，而不是文件事件或内容哈希。
+// 判据是 core.Diff，而不是文件事件或内容哈希。连着走两次同一份文件，第二次必须 unchanged。
 func TestSmokeUnchangedConfigIsNotAReload(t *testing.T) {
-	dir := t.TempDir()
-	applied := smokeConfig(t, dir, "info", nil)
-	stack := newSmokeStack(t, applied)
+	stack := newSmokeStack(t, smokeBaseSpec())
+	stack.write(smokeChange(func(s *fileSpec) { s.level = "debug" }))
 
-	outcome := stack.applyCandidate(applied.Normalized())
-	if outcome.result != core.ReloadUnchanged {
-		t.Fatalf("result = %q, want %q", outcome.result, core.ReloadUnchanged)
+	if first := stack.reload(); first.Result != core.ReloadOK {
+		t.Fatalf("起点那次应当真的应用一条：%+v", first)
 	}
-	if len(outcome.appliedKeys) != 0 || len(outcome.ignoredKeys) != 0 {
-		t.Fatalf("unchanged 那次不该有任何键：%+v", outcome)
+	// 文件一个字都没再改，只是又存了一次盘（等价于 touch）：不算一次重载。
+	second := stack.reload()
+	if second.Result != core.ReloadUnchanged {
+		t.Fatalf("result = %q, want %q", second.Result, core.ReloadUnchanged)
+	}
+	if len(second.AppliedKeys) != 0 || len(second.IgnoredKeys) != 0 {
+		t.Fatalf("unchanged 那次不该有任何键：%+v", second)
+	}
+	if !second.LastAppliedAt.IsZero() {
+		t.Fatalf("unchanged 不该推进 LastAppliedAt：%v", second.LastAppliedAt)
 	}
 }
 
-// TestSmokeHotKeyWithoutEntryFailsLoud 是 §10.1 那张表上的保险丝，两层都要判：
-// 入口查不到这条键时要返回带键名的错误；而一次改动里只要有一条热更键没有入口，
-// 整次就一条都不应用（缺入口是装配错误，不该让别的键先改到现网上去）。
-func TestSmokeHotKeyWithoutEntryFailsLoud(t *testing.T) {
-	dir := t.TempDir()
-	applied := smokeConfig(t, dir, "info", nil)
-	stack := newSmokeStack(t, applied)
+// TestSmokeOverBoundWorkersRollBackEveryRealTarget 是 R02 那版冒烟写不出来的一条：
+// 链在半路失败，而失败点在八个落点中间。生产链这时必须逆序把**已经落到真下游上的**
+// 每一项写回旧值——留痕上限、两张表的条数、日志级别都各归其位，applied 不前推。
+//
+// 选的失败点是 scheduler.workers 的荒谬取值（链上的上界判定拦住它，它自己在 Validate 之后）：
+// 排在前面的 #1/#4/#5 都已真的改到现网，排在后面的 #7 压根不该被碰。
+func TestSmokeOverBoundWorkersRollBackEveryRealTarget(t *testing.T) {
+	stack := newSmokeStack(t, smokeBaseSpec())
 
-	// scheduler.workers 属 R03，此刻还不在表上。
-	err := stack.applyHotKey("scheduler.workers", applied)
-	if err == nil {
-		t.Fatal("表里没有入口的键被静默接受了")
+	// 起点先跑成已知形状：debug 写不出来，两张表各四条（新上限 2 会把它们剪成两条，
+	// 所以"回滚成功"在这三处都读得出来）。
+	seedTerminalSnapshots(t, stack, 4)
+	seedEvents(t, stack, 4)
+	seedAudit(t, stack, 4)
+
+	stack.write(smokeChange(func(s *fileSpec) {
+		s.level = "debug"
+		s.retryDelay = "5s"
+		s.historyLimit = "2"
+		s.historyTTL = "24h"
+		s.eventCount = "2"
+		s.eventAge = "24h"
+		s.auditCount = "2"
+		s.auditAge = "24h"
+		s.workers = "100000"
+	}))
+
+	state := stack.reload()
+	if state.Result != core.ReloadFailed {
+		t.Fatalf("result = %q, want %q（applied=%v error=%q）",
+			state.Result, core.ReloadFailed, state.AppliedKeys, state.Error)
 	}
-	if !strings.Contains(err.Error(), "scheduler.workers") {
-		t.Fatalf("错误里没有键名，日志无法归因：%v", err)
+	if !strings.Contains(state.Error, "上界") {
+		t.Fatalf("error 没说是上界拦住的：%q", state.Error)
+	}
+	if len(state.AppliedKeys) != 0 {
+		t.Fatalf("失败那次的 applied_keys = %v，那些已被回滚", state.AppliedKeys)
 	}
 
-	candidate := applied
-	candidate.Scheduler.Workers = 6   // 热更键，但本卡没给入口（R03 才交付 ResizeWorkers）
-	candidate.Logging.Level = "debug" // 有入口：预检失败时它也一条都不该被应用
-
-	outcome := stack.applyCandidate(candidate)
-
-	if outcome.result != core.ReloadFailed {
-		t.Fatalf("result = %q, want %q", outcome.result, core.ReloadFailed)
-	}
-	assertSameList(t, "failed keys", outcome.failedKeys, []string{"scheduler.workers"})
-	if len(outcome.appliedKeys) != 0 {
-		t.Fatalf("缺入口的那一次不该应用任何键：%v", outcome.appliedKeys)
-	}
+	// 回滚之后的真实现场，一项一项读：
+	// 1. 级别回到 info（debug 写不出来，info 仍写得出）。
+	stack.logs.Reset()
 	writeAtLevel(stack, slog.LevelDebug, "must stay hidden")
 	if strings.Contains(stack.logs.String(), "must stay hidden") {
-		t.Fatal("缺入口的那一次把日志级别也改了")
+		t.Fatal("回滚没把日志级别写回去")
+	}
+	writeAtLevel(stack, slog.LevelInfo, "info still works")
+	if !strings.Contains(stack.logs.String(), "info still works") {
+		t.Fatalf("回滚把级别载体写坏了：\n%s", stack.logs.String())
+	}
+	// 2. 重试上限回到 60s。
+	if got := stack.scheduler.RetryPolicyMaxDelay(); got != 60*time.Second {
+		t.Fatalf("RetryPolicyMaxDelay = %v, want 回到 60s", got)
+	}
+	// 3. 留痕上限回到 100：起点那四条一条都没被剪（上限换成 2 之后没有新的写入来触发淘汰），
+	//    再写五条也全留着——回滚没发生的话这里只剩 2 条。
+	for i := 0; i < 5; i++ {
+		writeTerminalSnapshot(t, stack, fmt.Sprintf("after-rollback-%d", i))
+	}
+	requireSnapshotCount(t, stack, 9, "留痕上限要跟着回滚回到 100")
+	// 4. 事件表回到 1000 条：再落一次盘仍剩全部（没回去的话 prune 会剪到 2）。
+	publishEvent(t, stack, "event-after-rollback")
+	requireTableCount(t, stack.events, 5, "事件表回到 1000/0")
+	// 5. 台账同上。
+	appendAuditRow(t, stack)
+	requireTableCount(t, stack.audit, 5, "台账回到 1000/0")
+
+	// applied 没有被推进：下一次重载仍然把这八条当成待应用的改动。
+	if stack.chain.applied.Logging.Level != "info" {
+		t.Fatalf("失败那次推进了 applied：level = %q", stack.chain.applied.Logging.Level)
 	}
 }
 
-// TestSmokeBrokenConfigFailsWithoutTouchingTheStack 证明"新配置读不进来"是一次可报告的失败，
-// 而不是"什么都没发生"：一份解码不了的配置（这里往 logging 一节里塞了一个不认识的键，
-// `LoadConfig` 走的 `UnmarshalExact` 会把它拒掉）经 reloadFromFile 得到 result=failed
-// 与一条可归因的失败项，运行面继续按上一次成功的配置工作。
-// 起点先把级别热更到 debug，再喂这份坏文件——这样"仍然按改过的配置工作"才是判据，
-// 而不是无动作可推翻的起点复述。
-func TestSmokeBrokenConfigFailsWithoutTouchingTheStack(t *testing.T) {
-	dir := t.TempDir()
-	applied := smokeConfig(t, dir, "info", func(cfg core.Config) core.Config {
-		cfg.Store.HistoryLimit = 100
-		return cfg
-	})
-	stack := newSmokeStack(t, applied)
+// TestSmokeBrokenConfigKeepsTheRunningValues 证明"新配置读不进来"是一次可报告、
+// 可自愈的失败，而不是"什么都没发生"：一份解码不了的配置（往 logging 一节里塞一个不认识的键，
+// LoadConfig 的 UnmarshalExact 会拒）给出 result=rejected 与一条含路径的 error，
+// 运行面继续按上一次成功的配置工作；把文件修好，下一个窗口内不需要任何人干预就自动恢复。
+func TestSmokeBrokenConfigKeepsTheRunningValues(t *testing.T) {
+	stack := newSmokeStack(t, smokeBaseSpec())
 
-	good := applied
-	good.Logging.Level = "debug"
-	if outcome := stack.applyCandidate(good); outcome.result != core.ReloadOK {
-		t.Fatalf("起点热更失败：%+v", outcome)
+	// 起点先把级别热更到 debug，再喂坏文件——这样"仍按改过的配置工作"才是判据，
+	// 而不是无动作可推翻的起点复述。
+	stack.write(smokeChange(func(s *fileSpec) { s.level = "debug" }))
+	if first := stack.reload(); first.Result != core.ReloadOK {
+		t.Fatalf("起点热更失败：%+v", first)
 	}
+	stack.logs.Reset()
 	writeAtLevel(stack, slog.LevelDebug, "applied before the broken file")
 	if !strings.Contains(stack.logs.String(), "applied before the broken file") {
 		t.Fatal("起点没把级别改到 debug，后面的判据就没有对照")
 	}
 
-	broken := filepath.Join(dir, "broken.yaml")
-	if err := os.WriteFile(broken, []byte("logging:\n  level_not_a_key: debug\n"), 0o600); err != nil {
+	if err := os.WriteFile(stack.path, []byte("logging:\n  level_not_a_key: debug\n"), 0o600); err != nil {
 		t.Fatalf("write broken: %v", err)
 	}
+	stack.logs.Reset()
+	state := stack.reload()
 
-	outcome := stack.reloadFromFile(broken)
+	if state.Result != core.ReloadRejected {
+		t.Fatalf("result = %q, want %q（坏文件是整次作废，不是半套）", state.Result, core.ReloadRejected)
+	}
+	if !strings.Contains(state.Error, "level_not_a_key") {
+		t.Fatalf("error 没带上配置层的原文，运维看不出是哪一次读坏：%q", state.Error)
+	}
+	if !strings.Contains(state.Error, "现网继续按当前生效的取值运行") {
+		t.Fatalf("error 没说清现网怎么样：%q", state.Error)
+	}
+	if !strings.Contains(stack.logs.String(), "level=ERROR") {
+		t.Fatalf("坏文件没记 error 级日志：\n%s", stack.logs.String())
+	}
 
-	if outcome.result != core.ReloadFailed {
-		t.Fatalf("result = %q, want %q", outcome.result, core.ReloadFailed)
-	}
-	if len(outcome.failedKeys) == 0 {
-		t.Fatal("读失败没有可归因的失败项，日志会看不出是哪一次坏了")
-	}
-	if len(outcome.appliedKeys) != 0 {
-		t.Fatalf("读失败的那一次不该应用任何键：%v", outcome.appliedKeys)
-	}
-
-	// 现网继续按上一次成功的配置工作：debug 仍写得出来、留痕上限仍是 100。
+	// 现网继续按上一次成功的配置工作：debug 仍写得出来。
 	stack.logs.Reset()
 	writeAtLevel(stack, slog.LevelDebug, "still debug")
 	if !strings.Contains(stack.logs.String(), "still debug") {
 		t.Fatal("坏配置把已经生效的级别带跑了")
 	}
+	// 留痕上限仍是起点的 100：五条都留着。
 	seedTerminalSnapshots(t, stack, 5)
 	requireSnapshotCount(t, stack, 5, "坏配置之后旧的留痕上限要原样留着")
-
-	if stack.applied.Logging.Level != "debug" {
-		t.Fatalf("applied 被坏配置改写了：level = %q", stack.applied.Logging.Level)
-	}
-}
-
-// TestSmokeEntryReturningErrorKeepsAppliedBack 覆盖"入口存在但返回错误"那一支：
-// 这里给一个 parseLogLevel 认不出的级别名（真链路上 Validate 会先拦住，本用例刻意不调它），
-// 只为把这条分支的返回值形状固定下来。断三件事：这条键被报成失败、循环在它这里就停了
-// （排在它后面的键一条都没应用）、applied 没有前推。
-//
-// 本用例造不出"半应用"的状态：表上只有 logging.level 那一个入口会返回错误，
-// 而它在 Diff 的有序路径里排最前，所以走到失败时必然还没应用任何键。
-// 设计 §4 的不变量 I2 要的是"按依赖顺序应用 + 中途失败逐项回滚"，
-// 半应用与回滚只能由 R06 用排在后面、又会失败的入口来断。
-func TestSmokeEntryReturningErrorKeepsAppliedBack(t *testing.T) {
-	dir := t.TempDir()
-	applied := smokeConfig(t, dir, "info", func(cfg core.Config) core.Config {
-		cfg.Store.HistoryLimit = 100
-		return cfg
-	})
-	stack := newSmokeStack(t, applied)
-
-	candidate := applied
-	candidate.Store.HistoryLimit = 2    // 它排在失败键之后，所以本次不会被应用
-	candidate.Logging.Level = "verbose" // 入口会返回错误，而且它排在最前
-
-	outcome := stack.applyCandidate(candidate)
-
-	if outcome.result != core.ReloadFailed {
-		t.Fatalf("result = %q, want %q", outcome.result, core.ReloadFailed)
-	}
-	assertSameList(t, "failed keys", outcome.failedKeys, []string{"logging.level"})
-	if len(outcome.appliedKeys) != 0 {
-		t.Fatalf("applied keys = %v, want 空（失败处应当停住，后面的键不该被接着应用）",
-			outcome.appliedKeys)
-	}
-	if stack.applied.Store.HistoryLimit == 2 {
-		t.Fatal("失败的重载把 applied 往前推了，违反不变量 I1")
+	if stack.chain.applied.Logging.Level != "debug" {
+		t.Fatalf("applied 被坏配置改写了：level = %q", stack.chain.applied.Logging.Level)
 	}
 
-	// 行为侧同一条判据：store.history_limit 的入口没被跑到，运行面的上限仍是 100，
-	// 四条留痕一条都不会被剪掉（若上限已被换成 2，写完四条之后只剩 2 条）。
-	// 这里证明的是"这一步没执行"；"执行了就要用候选配置里的值"那一半由主用例证明。
-	seedTerminalSnapshots(t, stack, 4)
-	requireSnapshotCount(t, stack, 4, "失败键之后的热更项不该被继续应用")
-
-	// 现网：级别既没被写坏也没被清空，仍是 info（debug 出不来）。
-	writeAtLevel(stack, slog.LevelDebug, "must stay hidden")
-	if strings.Contains(stack.logs.String(), "must stay hidden") {
-		t.Fatal("失败的 SetLogLevel 把级别载体改坏了")
+	// 修好文件即自动恢复（设计文档 §8 那一条）：不需要任何人干预，下一次就成功。
+	stack.write(smokeChange(func(s *fileSpec) {
+		s.level = "debug"
+		s.retryDelay = "9s"
+	}))
+	recovered := stack.reload()
+	if recovered.Result != core.ReloadOK {
+		t.Fatalf("修好文件之后没有自动恢复：%+v", recovered)
+	}
+	assertSameList(t, "恢复那次的 applied_keys", recovered.AppliedKeys, []string{"scheduler.max_retry_delay"})
+	if got := stack.scheduler.RetryPolicyMaxDelay(); got != 9*time.Second {
+		t.Fatalf("RetryPolicyMaxDelay = %v, want 9s", got)
 	}
 }
 
 // TestSmokeEnvOverrideReachesTheSameEntries 守住设计 §5.3 的口径：
-// 环境变量覆盖与文件改动走的是同一条应用路径。
+// 环境变量覆盖与文件改动走的是同一条应用路径（链每读一次都会重新绑 GODELAYQ_*）。
 func TestSmokeEnvOverrideReachesTheSameEntries(t *testing.T) {
-	dir := t.TempDir()
-	applied := smokeConfig(t, dir, "info", func(cfg core.Config) core.Config {
-		cfg.Scheduler.MaxRetryDelay = time.Minute
-		return cfg
-	})
-	stack := newSmokeStack(t, applied)
+	stack := newSmokeStack(t, smokeBaseSpec())
 
 	t.Setenv("GODELAYQ_LOGGING_LEVEL", "debug")
 	t.Setenv("GODELAYQ_SCHEDULER_MAX_RETRY_DELAY", "7s")
 
-	candidate, err := core.LoadConfig(filepath.Join(dir, "config.yaml"))
-	if err != nil {
-		t.Fatalf("LoadConfig with env: %v", err)
-	}
-	candidate = candidate.Normalized()
-
-	outcome := stack.applyCandidate(candidate)
-	if outcome.result != core.ReloadOK {
-		t.Fatalf("result = %q, want ok（rejected=%v）", outcome.result, outcome.rejectedKeys)
+	// 文件一个字都没改：这一次变化全部来自环境变量。
+	state := stack.reload()
+	if state.Result != core.ReloadOK {
+		t.Fatalf("result = %q, want ok（error=%q）", state.Result, state.Error)
 	}
 	for _, key := range []string{"logging.level", "scheduler.max_retry_delay"} {
-		if !containsString(outcome.appliedKeys, key) {
-			t.Fatalf("applied keys %v 里没有 %q", outcome.appliedKeys, key)
+		if !containsKey(state.AppliedKeys, key) {
+			t.Fatalf("applied_keys = %v，少了 %q", state.AppliedKeys, key)
 		}
 	}
 	if got := stack.scheduler.RetryPolicyMaxDelay(); got != 7*time.Second {
@@ -662,6 +580,15 @@ func TestSmokeEnvOverrideReachesTheSameEntries(t *testing.T) {
 	writeAtLevel(stack, slog.LevelDebug, "from env")
 	if !strings.Contains(stack.logs.String(), "from env") {
 		t.Fatal("环境变量覆盖的级别没有落到运行面")
+	}
+
+	// 环境变量这一层压住之后，文件里的同一处改动就读成无变化——设计 §5.3 与待拍板 P4 说的那件事。
+	stack.write(smokeChange(func(s *fileSpec) {
+		s.level = "debug"
+		s.retryDelay = "7s"
+	}))
+	if again := stack.reload(); again.Result != core.ReloadUnchanged {
+		t.Fatalf("环境变量压住的键被算成了一次改动：%+v", again)
 	}
 }
 
@@ -788,13 +715,4 @@ func assertSameList(t *testing.T, label string, got, want []string) {
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("%s = %v, want %v", label, got, want)
 	}
-}
-
-func containsString(list []string, want string) bool {
-	for _, item := range list {
-		if item == want {
-			return true
-		}
-	}
-	return false
 }

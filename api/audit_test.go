@@ -63,12 +63,14 @@ func (a *auditCapture) only(t *testing.T) AuditEntry {
 func (a *auditCapture) reset() { a.entries = nil }
 
 // auditServer 造一台带账号鉴权与台账替身的服务器，并注册那条空处理器。
-func auditServer(t *testing.T, capture *auditCapture) *Server {
+// 末尾的 opts 透传给 newSecurityServer：需要再挂一个可选依赖的用例（例如 /admin/runtime
+// 的 reload 读口）不必重抄这里那三行装配。
+func auditServer(t *testing.T, capture *auditCapture, opts ...Option) *Server {
 	t.Helper()
 
 	sec := accountsSecurity(t)
 	sec.Auth.Token = testToken
-	srv := newSecurityServer(t, sec, WithAuditLog(capture, capture))
+	srv := newSecurityServer(t, sec, append([]Option{WithAuditLog(capture, capture)}, opts...)...)
 	registerNopHandler(srv)
 	return srv
 }

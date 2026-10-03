@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -29,8 +30,14 @@ type schedulerAPI interface {
 	// LookupHandler 是注册档位前的查重入口：执行器写的是调度器里那张注册表，
 	// 只靠 RegisterJobHandler 这一个写入口看不到已注册的键。
 	LookupHandler(jobType string) (core.Handler, bool)
+	// SetConcurrency/SetQueueCapacity 是启动期装配用的（Start 之后调用只记一条 warn 并忽略）。
 	SetConcurrency(n int)
 	SetQueueCapacity(n int)
+	// ResizeWorkers 与 SetRetryPolicy 是配置热重载的两个落点（TASK-R03、R02）：
+	// 与上面那对的分别就在这里——它们专给运行期用，改完真的生效。
+	// 上界不在调度器里（R03 §10.5 的 D3 只有 n<=0 的下限），由重载链补，见 reload.go。
+	ResizeWorkers(n int) error
+	SetRetryPolicy(p core.RetryPolicy)
 	// SetExecConcurrency/SetExecQueueCapacity 把执行器池的规模交给调度器（TASK-E13）。
 	// 执行器没打开时传 0：调度器连队列和协程都不建，进程与拆池之前完全一致。
 	SetExecConcurrency(n int)
@@ -85,6 +92,9 @@ type eventLogAPI interface {
 	Dropped() int64
 	Events(jobID string, limit int) ([]core.Event, error)
 	Recent(limit int) ([]core.Event, error)
+	// SetRetention 是 observability.events.retention_* 两个键的热更落点（TASK-R02、R06）：
+	// 下一个批量周期的淘汰用新值，不重启也不换连接。
+	SetRetention(count int, age time.Duration)
 }
 
 type signalNotifier func(chan<- os.Signal, ...os.Signal)
@@ -100,6 +110,9 @@ type auditLogAPI interface {
 	Dropped() int64
 	Append(api.AuditEntry) error
 	Query(api.AuditFilter) ([]api.AuditEntry, int, error)
+	// SetRetention 是 observability.audit.retention_* 两个键的热更落点（TASK-R02、R06），
+	// 与事件写入器同形：下一个批量周期的淘汰用新值。
+	SetRetention(count int, age time.Duration)
 }
 
 // observabilityAPI 是装配好的观测层写入器集合，作为 newServer 的最后一个参数交给服务。
@@ -125,8 +138,25 @@ type profileStoreAPI struct {
 	applier *executor.Applier
 }
 
+// configApplier 取出档位同步器，profiles 整体为 nil 时交回 nil。
+// 写成 nil 接收者的方法而不是在调用点判空：重载链的两个装配分支（建链、传给 api）都要取它，
+// 而"没装配档位依赖"是一种正常状态，判空写三遍就会有一遍漏掉。
+func (p *profileStoreAPI) configApplier() *executor.Applier {
+	if p == nil {
+		return nil
+	}
+	return p.applier
+}
+
 type runtimeDeps struct {
-	config       core.Config
+	config core.Config
+	// configPath 是启动时真正读到的那个配置文件的绝对路径；空串表示进程在用代码默认值
+	// （-config 没给、configs/config.yaml 也不存在）。热重载只盯这一份（设计文档 §5.2）：
+	// 启动后凭空创建一个 configs/config.yaml 不该变成配置来源。
+	configPath string
+	// levelVar 是 logging.level 的热更载体，来自 main() 里的 core.NewLoggerWithLevelVar。
+	// 为 nil 时那一步以错误收口（SetLogLevel 自己拒 nil 载体），不会 panic。
+	levelVar     *slog.LevelVar
 	newStore     func() (core.Store, error)
 	newScheduler func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI
 	// newExecutorRegistry 建档位登记表（加载 + 探测）。它必须显式提供：
@@ -167,15 +197,42 @@ type runtimeDeps struct {
 	newAuditLog func(db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (auditLogAPI, error)
 	newServer   func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry,
 		artifacts *executor.ArtifactStore, obs *observabilityAPI, profiles *profileStoreAPI) (serverAPI, error)
+	// 配置热重载（TASK-R06）的三处装配点。全部是函数值或可替换句柄，与上面那些闭包同一种风格：
+	// 集成测试因此能塞一个假 watcher 进去驱动整条链，而不必真的等一次文件系统事件。
+	//
+	// newConfigWatcher 的默认实现就是 core.NewConfigWatcher，交回的是接口而不是具体类型：
+	// 关闭顺序那条用例（§5.2 #14）要把"关掉监听器"记进调用流水，用真 watcher 记不出来。
+	newConfigWatcher func(path string, debounce time.Duration, onReload core.ReloadFunc,
+		logger *slog.Logger) (configWatcherAPI, error)
+	// newReloadChain 建那条链。nil 时 run() 用真实实现（reloadDeps → newReloader），
+	// 只有需要观察"收口"这一步的测试才替换它——链本身的行为由 cmd/server/reload_test.go 直接测。
+	newReloadChain func(d reloadDeps) reloadChain
+	// reloadStatus 是 /admin/runtime 的 reload 读数来源。defaultRuntimeDeps 建好它并被
+	// newServer 的那个闭包捕获（注入点在服务构造时），run() 稍后把建起来的 watcher 塞进去
+	// （watcher 要拿 reloader.Reload 当回调，而那条链要在服务能接请求之后才开始工作）。
+	// 整体为 nil 只可能出现在测试手搓的 runtimeDeps 字面量里，run() 会自己补一个。
+	reloadStatus  *reloadStatusReader
 	notifySignals signalNotifier
 	timeout       time.Duration
 	logger        *slog.Logger
 }
 
-// defaultRuntimeDeps 把配置注入各构造闭包，run() 本身不再关心具体取值来源
-func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
+// defaultRuntimeDeps 把配置注入各构造闭包，run() 本身不再关心具体取值来源。
+//
+// configPath 与 levelVar 是热重载链要用的两样东西，都只能来自 main()：
+// 前者是"盯哪个文件"的唯一答案（设计文档 §5.2），后者是 logging.level 的热更载体
+// （logger 必须由 NewLoggerWithLevelVar 建出来，否则运行期换级别无从下手）。
+func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.LevelVar, logger *slog.Logger) runtimeDeps {
+	// reloadStatus 在这里建而不是在 run() 里：newServer 那个闭包要在服务构造时就把读口交给 api，
+	// 而 watcher 得到 server.Start() 之后才建（那条链不该在服务还没监听时就开始改现网）。
+	// 两边靠这个晚绑定的句柄对齐，见 runtimeDeps.reloadStatus 的注释。
+	reloadStatus := &reloadStatusReader{path: configPath}
+
 	return runtimeDeps{
-		config: cfg,
+		config:       cfg,
+		configPath:   configPath,
+		levelVar:     levelVar,
+		reloadStatus: reloadStatus,
 		newStore: func() (core.Store, error) {
 			return core.NewJSONFileStoreWithOptions(cfg.Store.Path, core.StoreOptions{
 				Interval:     cfg.Store.FlushInterval,
@@ -302,8 +359,27 @@ func defaultRuntimeDeps(cfg core.Config, logger *slog.Logger) runtimeDeps {
 					api.WithExecutorProfileApplier(profiles.applier),
 				)
 			}
+			// 重载状态的读口。注入条件与"开关开没开"绑，而不是与"watcher 建没建起来"绑：
+			// 后者没建起来的那些部署（没有可盯的文件、构造失败）恰恰要能被人读到结论，
+			// 未启用的部署才该整个键都不出现（卡 §5.4 第 1 条）。
+			// enabled 那一位给的是 cfg 里的进程配置，不是 State().Enabled（R05 的 D-R0503）。
+			if cfg.Reload.Enabled {
+				opts = append(opts, api.WithReloadState(reloadStatus, cfg.Reload.Enabled))
+			}
 			return api.NewServer(coreScheduler, store, port, security, logger, opts...), nil
 		},
+		newConfigWatcher: func(path string, debounce time.Duration, onReload core.ReloadFunc,
+			logger *slog.Logger) (configWatcherAPI, error) {
+			watcher, err := core.NewConfigWatcher(path, debounce, onReload, logger)
+			if err != nil {
+				// 必须显式返回 nil 而不是那个类型化的空指针：装了 (*core.ConfigWatcher)(nil) 的
+				// 接口值不等于 nil，调用方的判空会失效（对照 newObservabilityDB 的同一条注释）。
+				return nil, err
+			}
+			return watcher, nil
+		},
+		// newReloadChain 留空：run() 在 nil 时用真实实现（newReloader）。装配方不需要
+		// 把这条链换成别的什么，只有测试需要包一层记流水。
 		notifySignals: signal.Notify,
 		timeout:       cfg.Scheduler.ShutdownTimeout,
 		logger:        logger,
@@ -321,20 +397,65 @@ func main() {
 		log.Fatalf("load config failed: %v", err)
 	}
 
-	logger, err := core.NewLogger(cfg.Logging.Level, cfg.Logging.Format, os.Stdout)
+	// 级别载体随 logger 一起建：没有它，logging.level 的热更就没有可拧的螺丝（R02）。
+	// 换级别不换 logger 实例，所以 slog.SetDefault 之后经包级 Default() 的那一路会一起跟上。
+	logger, levelVar, err := core.NewLoggerWithLevelVar(cfg.Logging.Level, cfg.Logging.Format, os.Stdout)
 	if err != nil {
 		log.Fatalf("init logging failed: %v", err)
 	}
 	// 让第三方库与示例 handler 的包级 slog 调用走同一份配置
 	slog.SetDefault(logger)
 
-	if err := run(defaultRuntimeDeps(cfg, logger)); err != nil {
+	if err := run(defaultRuntimeDeps(cfg, resolvedConfigPath(*configPath), levelVar, logger)); err != nil {
 		// Go 1.26 起标准库 log 桥接到 slog.Default()：走 log.Fatal 只会留下一条
 		// 级别为 INFO 的记录，按 level=error 采集的告警不会触发。
 		// 所以先用配置好的日志器按 error 级记一次，退出码由 os.Exit 给出。
 		logger.Error("server exited with error", "error", err)
 		os.Exit(1)
 	}
+}
+
+// resolvedConfigPath 定出热重载该盯哪个文件（设计文档 §5.2）。
+//
+// 规则只有一条：只盯启动时真正读到的那一份。-config 显式给的路径优先；留空时按约定的
+// core.DefaultConfigPath 找，找不到就交回空串——那种部署用的是代码默认值，
+// 而"启动后凭空创建一个 configs/config.yaml"不该变成新的配置来源（它也不该被盯）。
+//
+// 留空那一路要试 .yaml 与 .yml 两个拼写，与 core.LoadConfig 的查找口径一致：
+// 那里走的是 viper 的 SetConfigName("config")，只试 .yaml 会在部署用的是 config.yml 时
+// 交回空串——热重载就此悄悄不接（有一条 warn，但"该接的没接"仍是我们不接受的形状）。
+//
+// 交回绝对路径：core.NewConfigWatcher 只收绝对路径，而 fsnotify 上报的也是绝对路径，
+// 留着相对写法会让"盯哪个文件"取决于进程当时的运行目录。
+// 绝对化失败（Getwd 出问题）时交回空串，等同于"没有文件可盯"那条 warn 路径。
+func resolvedConfigPath(flagPath string) string {
+	if flagPath == "" {
+		for _, candidate := range []string{
+			core.DefaultConfigPath,
+			strings.TrimSuffix(core.DefaultConfigPath, ".yaml") + ".yml",
+		} {
+			if path, ok := usableConfigFile(candidate); ok {
+				return path
+			}
+		}
+		return ""
+	}
+	path, _ := usableConfigFile(flagPath)
+	return path
+}
+
+// usableConfigFile 判断这个路径是不是一个可盯的普通文件，是则交回绝对路径。
+// 目录与读不出信息的都算"没有这个文件"：前者 fsnotify 会盯上一整棵子树，后者交给 LoadConfig 报错。
+func usableConfigFile(candidate string) (string, bool) {
+	info, err := os.Stat(candidate)
+	if err != nil || info.IsDir() {
+		return "", false
+	}
+	abs, err := filepath.Abs(candidate)
+	if err != nil {
+		return "", false
+	}
+	return abs, true
 }
 
 func run(deps runtimeDeps) error {
@@ -362,6 +483,13 @@ func run(deps runtimeDeps) error {
 	// 档位文件只在 web_enabled 时才是必需依赖：默认关闭的部署一个文件都不碰，
 	// 少配这个闭包不该改变行为（DoD 的"行为与本卡之前一致"）。
 	if deps.config.Executors.WebEnabled && deps.newExecutorProfileStore == nil {
+		return fmt.Errorf("runtime dependencies are incomplete")
+	}
+	// 监听器的构造闭包按"这次要不要用它"判断必需性，与 newEventLog 同一取向：
+	// 只有开关打开、且启动时真的读到了那个文件才会用到它（没有文件可盯的部署本来就不建监听器，
+	// 少配闭包不该改变行为）。真要用却少了它，后果是"改了文件永远不生效而日志上看不出来"，
+	// 所以停在启动期。
+	if deps.config.Reload.Enabled && deps.configPath != "" && deps.newConfigWatcher == nil {
 		return fmt.Errorf("runtime dependencies are incomplete")
 	}
 
@@ -632,6 +760,38 @@ func run(deps runtimeDeps) error {
 
 	installRestoreGuard(scheduler, cfg)
 
+	// 配置热重载的链（TASK-R06）。整个 if 块在 reload.enabled=false（默认）时一个字节都不执行：
+	// 不建链、不建 goroutine，进程行为与本系列之前一致。
+	//
+	// 建在这里而不是建在 watcher 旁边：它要引用 store、调度器、两个观测层写入器、档位同步器与
+	// 级别载体，这几样到这里才齐；而它被调到的最早时机是 server.Start() 之后（下面那段）。
+	var (
+		chain   reloadChain
+		watcher configWatcherAPI
+	)
+	if cfg.Reload.Enabled {
+		if deps.reloadStatus == nil {
+			// 只有测试手搓的 runtimeDeps 字面量会走到这里：attach/explain 得有地方写结论。
+			deps.reloadStatus = &reloadStatusReader{path: deps.configPath}
+		}
+		build := deps.newReloadChain
+		if build == nil {
+			build = func(d reloadDeps) reloadChain { return newReloader(d) }
+		}
+		chain = build(reloadDeps{
+			cfgPath:          deps.configPath,
+			applied:          cfg,
+			store:            store,
+			scheduler:        scheduler,
+			events:           events,
+			audit:            audit,
+			applier:          profiles.configApplier(),
+			executorsEnabled: cfg.Executors.Enabled,
+			levelVar:         deps.levelVar,
+			logger:           deps.logger,
+		})
+	}
+
 	scheduler.Start()
 
 	if err := server.Start(); err != nil {
@@ -639,11 +799,62 @@ func run(deps runtimeDeps) error {
 		return err
 	}
 
+	// 监听器在服务开始监听之后才起、才跑循环：那条链会换处理函数表、改并发数，
+	// 在服务还没监听时就开始改现网，等于给"启动到就绪"这段窗口加了一条没人看着的写路径。
+	//
+	// 三种"起不来/起不了"的部署都继续提供服务，不阻止启动（卡 §3.4）：
+	// 热重载是便利，不是承重结构，因它起不来而让进程拒启等于把新能力变成新故障面。
+	// 但每一种都要留下说得出口的结论（I3）：一条日志，加进 /admin/runtime 的 reload 对象。
+	if chain != nil {
+		if deps.configPath == "" {
+			deps.logger.Warn("config hot reload is enabled but no config file was loaded at startup",
+				"hint", "用 -config 指一个真实存在的文件，或放置 configs/config.yaml 后重启；"+
+					"在此之前进程按当前生效的取值一直跑下去，改文件不会有任何反应")
+			deps.reloadStatus.explain("", "reload.enabled=true，但进程启动时没有读到任何配置文件，监听器没有建立")
+		} else {
+			started, err := deps.newConfigWatcher(deps.configPath, cfg.Reload.Debounce, chain.Reload, deps.logger)
+			if err != nil {
+				deps.logger.Error("config watcher failed to start, serving without hot reload",
+					"error", err, "path", deps.configPath)
+				deps.reloadStatus.explain(deps.configPath, "监听器没有建立："+err.Error())
+			} else {
+				watcher = started
+				// 顺序要紧：读口先接上，链先拿到防抖落点，最后才放事件循环进来。
+				// 这三步都早于 go Run，所以没有任何并发方看得到"半条链"。
+				deps.reloadStatus.attach(watcher)
+				chain.bindDebounce(watcher)
+				go watcher.Run(context.Background())
+				deps.logger.Info("config hot reload enabled",
+					"path", deps.configPath, "debounce", cfg.Reload.Debounce)
+			}
+		}
+	}
+
 	quit := make(chan os.Signal, 1)
 	deps.notifySignals(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
 	deps.logger.Info("shutting down server")
+
+	// 关闭顺序四步（卡 §3.4，判据是 §5.2 #14 的那条调用流水）：
+	//
+	//	watcher.Close() → chain.Stop() → server.Stop(ctx) → scheduler.Stop()
+	//
+	// 为什么写成显式一段而不是 defer：run() 里已有的那几条 defer（观测层写入器、观测库、任务存储）
+	// 晚于这里执行，而重载链必须在它们之前彻底停手——往已关闭的连接上写留痕是 deferred bug。
+	// 为什么第二步不可省：R05 的 Close 明确**不等**在途的那次 ReloadFunc（它可能正握着写链的锁，
+	// 等它只会把关停拖死），所以 Close 返回之后仍可能有一次 ApplyConfig 在改处理函数表，
+	// 而那正是设计文档 §7.8 要避免的交错。chain.Stop() 拿一次链的串行锁，等于等在途那一串走完。
+	if watcher != nil {
+		if err := watcher.Close(); err != nil {
+			// 事件循环没在有界时间内退出：这既是一条 error，也要留在读数里让人事后读得到（I3）。
+			watcher.MarkWatcherError(err.Error())
+			deps.logger.Error("failed to close config watcher", "error", err)
+		}
+	}
+	if chain != nil {
+		chain.Stop()
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), deps.timeout)
 	defer cancel()

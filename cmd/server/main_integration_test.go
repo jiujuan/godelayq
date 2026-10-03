@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -677,14 +679,38 @@ func (s *observabilityStub) Close() error {
 	return s.closeErr
 }
 
+// retentionCall 是一次 SetRetention 的入参对。两个观测层写入器替身共用这份记录形状：
+// R02 的口径是"条数与时长必须一起给"，所以记成一对而不是两条独立流水。
+type retentionCall struct {
+	count int
+	age   time.Duration
+}
+
 // eventLogStub 是事件写入器的替身：它只回答"关了几次、什么时候关的、丢了多少"，
 // 以及"是不是同一个实例被交给了服务"。真实写入器的读写行为在 store/sqlite 与 api
 // 两侧各有用例，这里守的是装配与关停顺序。
 type eventLogStub struct {
+	mu         sync.Mutex
 	closeCalls int
 	dropped    int64
 	closeErr   error
 	order      *[]string
+	retentions []retentionCall
+}
+
+// SetRetention 是 observability.events.retention_* 的热更落点替身（eventLogAPI 的扩项）。
+// 真实的淘汰行为在 store/sqlite 的热点用例里，这里只记"接没接上、给了什么值"。
+func (s *eventLogStub) SetRetention(count int, age time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retentions = append(s.retentions, retentionCall{count: count, age: age})
+}
+
+// setRetentionCalls 交回调用流水的副本（用例读它，不碰替身内部）。
+func (s *eventLogStub) setRetentionCalls() []retentionCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]retentionCall(nil), s.retentions...)
 }
 
 func (s *eventLogStub) Close() error {
@@ -706,10 +732,26 @@ func (s *eventLogStub) Recent(int) ([]core.Event, error) { return nil, nil }
 // auditLogStub 是台账写入器的替身：装配用例只关心"交出去的是不是同一个实例"、
 // 关了几次、什么时候关的。真实的写入与查询在 store/sqlite 有用例。
 type auditLogStub struct {
+	mu         sync.Mutex
 	closeCalls int
 	dropped    int64
 	closeErr   error
 	order      *[]string
+	retentions []retentionCall
+}
+
+// SetRetention 是 observability.audit.retention_* 的热更落点替身（auditLogAPI 的扩项）。
+func (s *auditLogStub) SetRetention(count int, age time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retentions = append(s.retentions, retentionCall{count: count, age: age})
+}
+
+// setRetentionCalls 交回调用流水的副本。
+func (s *auditLogStub) setRetentionCalls() []retentionCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]retentionCall(nil), s.retentions...)
 }
 
 func (s *auditLogStub) Close() error {
@@ -1033,7 +1075,7 @@ func TestRun_ObservabilityEnabledOpensAndClosesForReal(t *testing.T) {
 			opened = db
 			return db, nil
 		},
-		newLog: defaultRuntimeDeps(core.DefaultConfig(), slog.Default()).newEventLog,
+		newLog: defaultRuntimeDeps(core.DefaultConfig(), "", nil, slog.Default()).newEventLog,
 		// 装配完成、服务未起：此刻事件写入器已经挂上总线，发两条就该进库
 		onServer: func(bus *core.EventBus) {
 			bus.Publish(core.Event{Type: core.EventJobScheduled, JobID: "job-real",
@@ -1827,6 +1869,15 @@ type spyScheduler struct {
 	// 用于断言"注册早于守卫、守卫早于 Start"这条硬顺序——TASK-W05 的档位合并按它把关。
 	// guardSetBeforeStart 只能说钩子早于 Start，说不出 handler 是不是在钩子之前登记的。
 	calls []string
+	// resizeCalls 与 retryPolicy 是重载链两个落点的流水（TASK-R06）：前者按调用顺序记并发数，
+	// 后者记最后换上去的那个策略实例。
+	resizeCalls []int
+	retryPolicy core.RetryPolicy
+	// resizeErr 让用例把"扩缩失败"这一形状造出来（回滚路径要靠它）。
+	resizeErr error
+	// order 非空时把 Stop 记进共享的关闭顺序表（与 stubStore.order 同一种判据）。
+	// 关闭顺序那条用例（§5.2 #14）判的是四步的先后，读时钟判不出来，只能记流水。
+	order *[]string
 	// eventBus 是替身调度器自带的总线：观测层的事件写入器从这里取订阅入口，
 	// 用例也可以在装配完成之后往它上头发事件，看写入链路是不是真的通了。
 	eventBus *core.EventBus
@@ -1856,6 +1907,52 @@ func (s *spyScheduler) SetQueueCapacity(n int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.queueCapacity = n
+}
+
+// ResizeWorkers 与 SetRetryPolicy 是重载链那两个落点的替身（schedulerAPI 的扩项，TASK-R06 §3.3）。
+// 它们把调用记进同一份 calls 流水：装配用例要判的是"链确实接在这两扇门上"，
+// 而真实的扩缩与换策略行为在 core 包里已有成套用例（TASK-R03 §5、R02 §5）。
+// resizeErr 非空时把错误原样交回，用来驱动"应用失败 → 逆序回滚"那条装配路径。
+func (s *spyScheduler) ResizeWorkers(n int) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resizeCalls = append(s.resizeCalls, n)
+	s.calls = append(s.calls, fmt.Sprintf("resize_workers:%d", n))
+	if s.resizeErr != nil {
+		return s.resizeErr
+	}
+	// 与真实调度器同一条读数口径：期望并发是 RuntimeStats.Workers 读的那一位。
+	s.concurrency = n
+	return nil
+}
+
+func (s *spyScheduler) SetRetryPolicy(p core.RetryPolicy) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retryPolicy = p
+	s.calls = append(s.calls, "set_retry_policy")
+}
+
+// concurrencyNow 交回替身记下的期望并发。ResizeWorkers 与 SetConcurrency 都写这一格，
+// 所以"热更有没有递到调度器"读它就够了；真调度器那侧的读数口径由
+// core/scheduler_resize_test.go 与 RuntimeStats 的用例守。
+func (s *spyScheduler) concurrencyNow() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.concurrency
+}
+
+// retryMaxDelay 交回换进去的那个策略实例的上限读数（非指数退避时给 0）。
+// 这里用类型断言读的是**测试替身自己存的那个值**，不是生产代码的分支——
+// 生产侧同一条读数是 Scheduler.RetryPolicyMaxDelay()，它自带折 0 的口径（D-R0202）。
+func (s *spyScheduler) retryMaxDelay() time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	backoff, ok := s.retryPolicy.(*core.ExponentialBackoffRetry)
+	if !ok {
+		return 0
+	}
+	return backoff.MaxDelay
 }
 
 func (s *spyScheduler) SetEventPreviewLimit(n int) {
@@ -1907,6 +2004,9 @@ func (s *spyScheduler) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.stopCalls++
+	if s.order != nil {
+		*s.order = append(*s.order, "scheduler.Stop")
+	}
 }
 
 func (s *spyScheduler) RegisterHandler(jobType string, handler core.Handler) {
@@ -1982,6 +2082,8 @@ type fakeServer struct {
 	startCalls int
 	stopCalls  int
 	stopCtx    context.Context
+	// order 非空时把 Stop 记进共享的关闭顺序表（与 stubStore.order 同一种判据，§5.2 #14 用）。
+	order *[]string
 }
 
 func newFakeServer() *fakeServer {
@@ -2011,6 +2113,9 @@ func (s *fakeServer) Stop(ctx context.Context) error {
 	defer s.mu.Unlock()
 	s.stopCalls++
 	s.stopCtx = ctx
+	if s.order != nil {
+		*s.order = append(*s.order, "server.Stop")
+	}
 	return s.stopErr
 }
 
@@ -2024,6 +2129,7 @@ type stubStore struct {
 	snapshots  []core.JobSnapshot
 	loadErr    error
 	order      *[]string
+	retentions []retentionCall
 }
 
 func newStubStore() *stubStore {
@@ -2056,8 +2162,19 @@ func (s *stubStore) Flush() error {
 }
 
 // SetHistoryRetention 是替身：淘汰行为在 core 包里用真存储验证（core/store_hot_test.go），
-// 这里只需要接口完整。
-func (s *stubStore) SetHistoryRetention(limit int, ttl time.Duration) {}
+// 但"链有没有把成对的两个值一起递给 store"要在装配面判，所以这里记下每一对入参。
+func (s *stubStore) SetHistoryRetention(limit int, ttl time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.retentions = append(s.retentions, retentionCall{count: limit, age: ttl})
+}
+
+// retentionPairs 交回 SetHistoryRetention 的调用流水副本（用例读它，不碰替身内部）。
+func (s *stubStore) retentionPairs() []retentionCall {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]retentionCall(nil), s.retentions...)
+}
 
 func (s *stubStore) Close() error {
 	s.mu.Lock()
@@ -2099,4 +2216,629 @@ func artifactStoreFromConfig(cfg core.Config, logger *slog.Logger) (*executor.Ar
 // newCaptureLogger 返回把文本日志写进 sb 的日志器，供断言运行期日志内容
 func newCaptureLogger(sb *strings.Builder) *slog.Logger {
 	return slog.New(slog.NewTextHandler(sb, nil))
+}
+
+// ---------------------------------------------------------------------------
+// TASK-R06 §5.2：热重载的装配与关闭顺序
+// ---------------------------------------------------------------------------
+
+// fakeConfigWatcher 是 configWatcherAPI 的替身。
+//
+// 它把装配方递进来的 onReload 交回用例：装配用例因此能在**不收任何文件系统事件**的情况下
+// 驱动整条链（真等 fsnotify 既慢又是这台机器上的 flake 源，而本卡要判的是接线对不对）。
+// Run 不阻塞——真实实现跑的是事件循环，替身只需证明"被叫过一次、参数是谁递进来的"。
+type fakeConfigWatcher struct {
+	mu        sync.Mutex
+	runs      int
+	closes    int
+	debounce  []time.Duration
+	marked    []string
+	closeErr  error
+	state     core.ReloadState
+	onReload  core.ReloadFunc
+	gotPath   string
+	gotWindow time.Duration
+	order     *[]string
+}
+
+func newFakeConfigWatcher(path string, window time.Duration, onReload core.ReloadFunc) *fakeConfigWatcher {
+	return &fakeConfigWatcher{onReload: onReload, gotPath: path, gotWindow: window}
+}
+
+func (f *fakeConfigWatcher) Run(ctx context.Context) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.runs++
+}
+
+func (f *fakeConfigWatcher) Close() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.closes++
+	if f.order != nil {
+		*f.order = append(*f.order, "watcher.Close")
+	}
+	return f.closeErr
+}
+
+func (f *fakeConfigWatcher) SetDebounce(d time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.debounce = append(f.debounce, d)
+}
+
+func (f *fakeConfigWatcher) State() core.ReloadState {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.state
+}
+
+func (f *fakeConfigWatcher) MarkWatcherError(msg string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.marked = append(f.marked, msg)
+	f.state.WatcherError = msg
+}
+
+// trigger 模拟一次防抖到期：调用装配进来的那条链，并把它交回的结论原样转给用例
+// （真实实现里这一步由 watcher 存进自己的状态，这里也照做，好让 State 的断言不空转）。
+func (f *fakeConfigWatcher) trigger() (core.ReloadState, error) {
+	f.mu.Lock()
+	onReload := f.onReload
+	f.mu.Unlock()
+
+	if onReload == nil {
+		return core.ReloadState{}, errors.New("替身 watcher 没拿到 onReload，接线断了")
+	}
+	state, err := onReload()
+
+	f.mu.Lock()
+	// 与真实 storeState 同两条归属：WatchedPath 由 watcher 写、WatcherError 只由 watcher 写。
+	state.WatchedPath = f.gotPath
+	f.state = state
+	f.mu.Unlock()
+	return state, err
+}
+
+// counters 交回 Run / Close 的次数与看到的入参（一次取齐，避免用例分散加锁）。
+func (f *fakeConfigWatcher) counters() (runs, closes int, path string, window time.Duration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.runs, f.closes, f.gotPath, f.gotWindow
+}
+
+func (f *fakeConfigWatcher) setDebounceCalls() []time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]time.Duration(nil), f.debounce...)
+}
+
+func (f *fakeConfigWatcher) markedErrors() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.marked...)
+}
+
+// spyReloadChain 包住真实那条链，只为把"收口"与"接防抖落点"两步记进调用流水。
+//
+// 为什么要包而不是直接用 *reloader：关闭顺序那条判据（§5.2 #14）要看 reloader.Stop 的位次，
+// 而真实实现不会往测试的顺序表里写东西。Reload 走内嵌的那一份，行为与被替身换掉之前一致。
+type spyReloadChain struct {
+	*reloader
+	mu    sync.Mutex
+	order *[]string
+	stops int
+	binds int
+}
+
+func (s *spyReloadChain) Stop() {
+	s.mu.Lock()
+	s.stops++
+	if s.order != nil {
+		*s.order = append(*s.order, "reloader.Stop")
+	}
+	s.mu.Unlock()
+	s.reloader.Stop()
+}
+
+func (s *spyReloadChain) bindDebounce(watcher configWatcherAPI) {
+	s.mu.Lock()
+	s.binds++
+	s.mu.Unlock()
+	s.reloader.bindDebounce(watcher)
+}
+
+func (s *spyReloadChain) counters() (stops, binds int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stops, s.binds
+}
+
+// reloadRunFixture 是一台"开了热重载"的装配台：配置文件真的落在临时目录里（链要读它），
+// 监听器与链都是替身，下游仍是这个文件里既有的那些替身。
+type reloadRunFixture struct {
+	deps       runtimeDeps
+	cfg        core.Config
+	dir        string
+	workspace  string
+	executable string
+	path       string
+	logs       *logSink
+	watcher    *fakeConfigWatcher
+	chain      *spyReloadChain
+	status     *reloadStatusReader
+	order      []string
+	scheduler  *spyScheduler
+	store      *stubStore
+	events     *eventLogStub
+	audit      *auditLogStub
+	server     *fakeServer
+	registry   *executor.Registry
+
+	watcherCalls int
+	watcherErr   error
+	watcherClose error
+
+	signalOnce sync.Once
+	registered chan struct{}
+	signalMu   sync.Mutex
+	signalCh   chan<- os.Signal
+	runErr     error
+	done       chan struct{}
+}
+
+// newReloadRunFixture 装好那台装配台。spec 决定这份配置文件里哪些节启用；
+// 配置文件与 core.Config 都从同一次 LoadConfig 出来，避免"内存里那份"与"文件里那份"分叉。
+func newReloadRunFixture(t *testing.T, spec fileSpec) *reloadRunFixture {
+	t.Helper()
+
+	dir := t.TempDir()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	workspace := filepath.Join(dir, "ws")
+	// 档位那一节的脚本要真实存在：链条最后一步会走 executor.LoadProfiles 的严格校验，
+	// 缺文件就是"这台机器跑不了这条档位"，探测与注册都会失败。
+	if err := os.MkdirAll(filepath.Join(workspace, "scripts"), 0o750); err != nil {
+		t.Fatalf("mkdir workspace: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "scripts", "echo.mjs"),
+		[]byte("console.log('ok')\n"), 0o600); err != nil {
+		t.Fatalf("write script: %v", err)
+	}
+
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte(spec.render(dir, workspace, executable)), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+	cfg, err := core.LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	cfg = cfg.Normalized()
+
+	logs := &logSink{}
+	logger, levelVar, err := core.NewLoggerWithLevelVar(cfg.Logging.Level, cfg.Logging.Format, logs)
+	if err != nil {
+		t.Fatalf("NewLoggerWithLevelVar: %v", err)
+	}
+
+	fx := &reloadRunFixture{
+		cfg:        cfg,
+		dir:        dir,
+		workspace:  workspace,
+		executable: executable,
+		path:       path,
+		logs:       logs,
+		status:     &reloadStatusReader{path: path},
+		registered: make(chan struct{}),
+	}
+	fx.scheduler = newSpyScheduler()
+	fx.scheduler.order = &fx.order
+	fx.store = newStubStore()
+	fx.store.order = &fx.order
+	fx.events = &eventLogStub{}
+	fx.audit = &auditLogStub{}
+	fx.server = newFakeServer()
+	fx.server.order = &fx.order
+
+	db := &observabilityStub{path: filepath.Join(dir, "observe.sqlite")}
+	registry, err := executor.NewRegistry(cfg, logger)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	fx.registry = registry
+
+	fx.deps = runtimeDeps{
+		config:       cfg,
+		configPath:   path,
+		levelVar:     levelVar,
+		logger:       logger,
+		timeout:      30 * time.Millisecond,
+		reloadStatus: fx.status,
+		newStore:     func() (core.Store, error) { return fx.store, nil },
+		newScheduler: func(core.Store, core.RetryPolicy, *core.EventBus) schedulerAPI { return fx.scheduler },
+		newExecutorRegistry: func(core.Config, *slog.Logger) (*executor.Registry, error) {
+			return registry, nil
+		},
+		newArtifactStore:   artifactStoreFromConfig,
+		newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) { return db, nil },
+		newArtifactIndex: func(observabilityDB, core.ObservabilityConfig, string, *slog.Logger) (executor.ArtifactIndexer, error) {
+			return &artifactIndexStub{}, nil
+		},
+		newEventLog: func(*core.EventBus, observabilityDB, core.ObservabilityConfig, *slog.Logger) (eventLogAPI, error) {
+			return fx.events, nil
+		},
+		newAuditLog: func(observabilityDB, core.ObservabilityConfig, *slog.Logger) (auditLogAPI, error) {
+			return fx.audit, nil
+		},
+		newServer: func(schedulerAPI, core.Store, string, *executor.Registry,
+			*executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
+			return fx.server, nil
+		},
+		notifySignals: func(ch chan<- os.Signal, sig ...os.Signal) {
+			fx.signalMu.Lock()
+			fx.signalCh = ch
+			fx.signalMu.Unlock()
+			fx.signalOnce.Do(func() { close(fx.registered) })
+		},
+		newConfigWatcher: func(p string, window time.Duration, onReload core.ReloadFunc,
+			_ *slog.Logger) (configWatcherAPI, error) {
+			fx.watcherCalls++
+			if fx.watcherErr != nil {
+				return nil, fx.watcherErr
+			}
+			watcher := newFakeConfigWatcher(p, window, onReload)
+			watcher.order = &fx.order
+			watcher.closeErr = fx.watcherClose
+			fx.watcher = watcher
+			return watcher, nil
+		},
+		newReloadChain: func(d reloadDeps) reloadChain {
+			fx.chain = &spyReloadChain{reloader: newReloader(d), order: &fx.order}
+			return fx.chain
+		},
+	}
+	return fx
+}
+
+// waitForReady 等到 run() 走到"等信号"那一步。监听器是在那之前建的（server.Start 之后），
+// 所以返回时 watcher 与链都已经就位或已经明确放弃建立。
+func (fx *reloadRunFixture) waitForReady(t *testing.T) {
+	t.Helper()
+	select {
+	case <-fx.registered:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("run() 没走到等信号阶段，日志：\n%s", fx.logs.String())
+	}
+}
+
+// trigger 让替身 watcher 模拟一次防抖到期，把整条链走完。
+func (fx *reloadRunFixture) trigger(t *testing.T) core.ReloadState {
+	t.Helper()
+	if fx.watcher == nil {
+		t.Fatal("监听器没建起来，无法驱动链")
+	}
+	state, err := fx.watcher.trigger()
+	if err != nil {
+		t.Fatalf("链交回了错误：%v（state=%+v）", err, state)
+	}
+	return state
+}
+
+// shutdown 送一次 SIGTERM 并等 run() 返回。
+func (fx *reloadRunFixture) shutdown(t *testing.T) {
+	t.Helper()
+	fx.signalMu.Lock()
+	ch := fx.signalCh
+	fx.signalMu.Unlock()
+	if ch == nil {
+		t.Fatal("notifySignals 没被调过")
+	}
+	ch <- syscall.SIGTERM
+	select {
+	case <-fx.done:
+	case <-time.After(60 * time.Second):
+		t.Fatalf("run() 没返回，日志：\n%s", fx.logs.String())
+	}
+}
+
+// start 在后台跑 run()；用例随后自己决定何时送信号。
+func (fx *reloadRunFixture) start(t *testing.T) {
+	t.Helper()
+	fx.done = make(chan struct{})
+	go func() {
+		fx.runErr = run(fx.deps)
+		close(fx.done)
+	}()
+	t.Cleanup(func() {
+		// 任何一条早退路径都不许把 run() 留在那儿等信号：送一次，然后收尸。
+		select {
+		case <-fx.done:
+		default:
+			fx.signalMu.Lock()
+			ch := fx.signalCh
+			fx.signalMu.Unlock()
+			if ch != nil {
+				ch <- syscall.SIGTERM
+			}
+			<-fx.done
+		}
+		if fx.runErr != nil {
+			t.Errorf("run() 返回错误：%v", fx.runErr)
+		}
+	})
+}
+
+func (fx *reloadRunFixture) logged() string { return fx.logs.String() }
+
+// writeSpec 把一份新配置覆盖到链要读的那个文件上（模拟"运维存了一次盘"）。
+func (fx *reloadRunFixture) writeSpec(t *testing.T, spec fileSpec) {
+	t.Helper()
+	if err := os.WriteFile(fx.path,
+		[]byte(spec.render(fx.dir, fx.workspace, fx.executable)), 0o600); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+}
+
+// TestRun_WatcherNotStartedWhenReloadDisabled 是"默认关闭"这条拍板口径在装配面的落点：
+// 开关关着时构造闭包一次都不该被调用、链也不该建，且既有断言全部不变。
+func TestRun_WatcherNotStartedWhenReloadDisabled(t *testing.T) {
+	spec := baseSpec()
+	spec.reloadEnabled = "false"
+	spec.obsEnabled = "true"
+	fx := newReloadRunFixture(t, spec)
+	fx.cfg.Reload.Enabled = false
+	fx.deps.config = fx.cfg
+	fx.deps.configPath = "" // 让依赖完整性检查也走到"没开就不需要闭包"那一支
+
+	fx.start(t)
+	fx.waitForReady(t)
+	fx.shutdown(t)
+
+	if fx.watcherCalls != 0 {
+		t.Fatalf("reload.enabled=false 却建了 %d 次监听器", fx.watcherCalls)
+	}
+	if fx.watcher != nil {
+		t.Fatal("reload.enabled=false 却有一个 watcher 活着")
+	}
+	if fx.chain != nil {
+		t.Fatal("reload.enabled=false 却建了重载链")
+	}
+	if logged := fx.logged(); strings.Contains(logged, "reload") || strings.Contains(logged, "hot reload") {
+		t.Fatalf("未启用的部署里不该出现任何热重载痕迹：\n%s", logged)
+	}
+	// 既有行为一条不许变：注册、启动、关停都照旧。
+	if fx.scheduler.startCalls != 1 || fx.server.stopCalls != 1 || fx.scheduler.stopCalls != 1 {
+		t.Fatalf("装配主链路变了：start=%d serverStop=%d schedulerStop=%d",
+			fx.scheduler.startCalls, fx.server.stopCalls, fx.scheduler.stopCalls)
+	}
+}
+
+// TestRun_WatcherNotStartedWithoutConfigFile 是设计文档 §5.2 的另一半：
+// 进程用默认值启动（没有可盯的文件）时不起监听器、记一条 warn、服务照常提供。
+func TestRun_WatcherNotStartedWithoutConfigFile(t *testing.T) {
+	spec := baseSpec()
+	spec.obsEnabled = "true"
+	fx := newReloadRunFixture(t, spec)
+	fx.deps.configPath = "" // 启用了开关，但启动时没读到任何文件
+
+	fx.start(t)
+	fx.waitForReady(t)
+	fx.shutdown(t)
+
+	if fx.watcherCalls != 0 {
+		t.Fatalf("没有可盯的文件却调了监听器构造闭包 %d 次", fx.watcherCalls)
+	}
+	logged := fx.logged()
+	if !strings.Contains(logged, "no config file was loaded") {
+		t.Fatalf("没记下这条决定（I3）：\n%s", logged)
+	}
+	if state := fx.status.State(); state.WatcherError == "" {
+		t.Fatal("/admin/runtime 的读口说不出为什么没有监听器")
+	}
+	// 链还是要建（它没有监听器也能被装配阶段直接调），但不能有人在跑。
+	if fx.chain == nil {
+		t.Fatal("链没建：那种部署里读口至少要能解释清楚状态")
+	}
+	if stops, binds := fx.chain.counters(); stops != 1 || binds != 0 {
+		t.Fatalf("没有 watcher 时应当只收口不绑落点，实际 stops=%d binds=%d", stops, binds)
+	}
+}
+
+// TestRun_CloseOrder 判的是 §3.4 那四步的先后，判据取自调用流水而不是时钟：
+// watcher.Close → reloader.Stop → server.Stop → scheduler.Stop，四步都早于 defer 链里的 store.Close。
+// 少任何一步、把 reloader.Stop 挪到 server.Stop 之后、或让重载链在任务存储已关之后还动手，
+// 这条用例都要红。
+func TestRun_CloseOrder(t *testing.T) {
+	spec := baseSpec()
+	spec.obsEnabled = "true"
+	fx := newReloadRunFixture(t, spec)
+
+	fx.start(t)
+	fx.waitForReady(t)
+
+	if _, closes, _, _ := fx.watcher.counters(); closes != 0 {
+		t.Fatalf("还没收信号就把监听器关了（closes=%d）", closes)
+	}
+	if _, binds := fx.chain.counters(); binds != 1 {
+		t.Fatalf("防抖落点应当被绑上一次，实际 binds=%d", binds)
+	}
+
+	fx.shutdown(t)
+
+	// 末尾那一条 "store" 是 run() 里 defer 链关的任务存储：四步收口全部早于它，
+	// 这顺带证明了"重载链不会在存储已关之后再往 store 里写热更值"。
+	want := []string{"watcher.Close", "reloader.Stop", "server.Stop", "scheduler.Stop", "store"}
+	if !reflect.DeepEqual(fx.order, want) {
+		t.Fatalf("关闭顺序 = %v, want %v", fx.order, want)
+	}
+	// 链收口之后不许再有任何落点动作：这里判的是"watcher 关了以后链真的停了手"。
+	if stops, _ := fx.chain.counters(); stops != 1 {
+		t.Fatalf("reloader.Stop 应当恰好一次，实际 %d", stops)
+	}
+	if state := fx.status.State(); state.Result != "" {
+		t.Fatalf("这条用例没触发过重载，读数却是 %q", state.Result)
+	}
+}
+
+// TestRun_WatcherFailureDoesNotBlockStartup 守住"热重载是便利不是承重结构"：
+// 监听器构造失败时进程照常提供服务，并且这条结论在日志与读数里都说得出口。
+func TestRun_WatcherFailureDoesNotBlockStartup(t *testing.T) {
+	spec := baseSpec()
+	spec.obsEnabled = "true"
+	fx := newReloadRunFixture(t, spec)
+	fx.watcherErr = errors.New("watch directory failed: permission denied")
+
+	fx.start(t)
+	fx.waitForReady(t)
+	fx.shutdown(t)
+
+	if fx.watcherCalls != 1 {
+		t.Fatalf("构造闭包应当被调一次，实际 %d 次", fx.watcherCalls)
+	}
+	logged := fx.logged()
+	if !strings.Contains(logged, "config watcher failed to start") {
+		t.Fatalf("构造失败没记成 error：\n%s", logged)
+	}
+	if state := fx.status.State(); !strings.Contains(state.WatcherError, "permission denied") {
+		t.Fatalf("读数里看不出监听器为什么没建：%+v", state)
+	}
+	// 服务照旧走完启动与关停（不是拒启、也不是卡在关停上）。
+	if fx.scheduler.startCalls != 1 || fx.server.startCalls != 1 || fx.scheduler.stopCalls != 1 {
+		t.Fatalf("启动/关停主链路被监听器故障带跑了：start=%d http=%d stop=%d",
+			fx.scheduler.startCalls, fx.server.startCalls, fx.scheduler.stopCalls)
+	}
+	if stops, binds := fx.chain.counters(); stops != 1 || binds != 0 {
+		t.Fatalf("没有 watcher 时不该绑落点，实际 stops=%d binds=%d", stops, binds)
+	}
+}
+
+// TestRun_WiredReloadChainReachesEveryTarget 是本卡"接线对不对"的正面判据：
+// 从监听器递进来的那次回调出发，八个落点必须各就各位——
+// 日志级别改到载体上、并发数进调度器、重试策略进调度器、留痕进 store、
+// 两张观测表各进自己的写入器、防抖窗口进 watcher、档位整表替换进 Applier。
+//
+// 这里全部用真实下游（真调度器接口、真 Applier、真登记表），替身只在那四个"接口面"上：
+// 判的是"链把哪个值递给了谁"，而不是"链自己算得对不对"（那是 reload_test.go 的事）。
+func TestRun_WiredReloadChainReachesEveryTarget(t *testing.T) {
+	base := baseSpec()
+	base.obsEnabled = "true"
+	fx := newReloadRunFixture(t, base)
+
+	fx.start(t)
+	fx.waitForReady(t)
+	defer fx.shutdown(t)
+
+	// 起点先把现网跑成一个已知形状：SetConcurrency 走过一次、并发就是配置里那份 4。
+	// （判"热更把它换成 9"必须有对照，否则替身里的 0 也能被读成"没递到"。）
+	if got := fx.scheduler.concurrencyNow(); got != 4 {
+		t.Fatalf("起点并发 = %d, want 4", got)
+	}
+	if start, ok := fx.registry.Lookup("exec.echo"); !ok || start.Timeout != 10*time.Second {
+		t.Fatalf("起点档位超时 = %+v ok=%v, want 10s（没有对照就判不出热更换了什么）", start, ok)
+	}
+
+	// 把候选配置换到磁盘上（链读的就是这一份）。
+	candidate := specChange(func(s *fileSpec) {
+		s.level = "debug"
+		s.debounce = "250ms"
+		s.retryDelay = "7s"
+		s.historyLimit = "3"
+		s.historyTTL = "48h"
+		s.workers = "9"
+		s.eventCount = "11"
+		s.eventAge = "12h"
+		s.auditCount = "13"
+		s.auditAge = "14h"
+		s.commandTimeout = "3m"
+	})
+	fx.writeSpec(t, candidate)
+
+	state := fx.trigger(t)
+	if state.Result != core.ReloadOK {
+		t.Fatalf("result = %q, want ok（error=%q）", state.Result, state.Error)
+	}
+	if len(state.AppliedKeys) != 11 {
+		t.Fatalf("applied_keys = %v, want 那 11 条热更键", state.AppliedKeys)
+	}
+
+	// 1. 日志级别：载体被拧到新级别——判据是"debug 记录写得出来"。
+	fx.logs.Reset()
+	fx.deps.logger.Debug("wired-level-probe")
+	if !strings.Contains(fx.logs.String(), "wired-level-probe") {
+		t.Fatalf("级别没接到载体上：\n%s", fx.logs.String())
+	}
+
+	// 2. 并发数：调度器的期望并发变 9（R03 §3.4 的读数口径）。
+	if got := fx.scheduler.concurrencyNow(); got != 9 {
+		t.Fatalf("RuntimeStats 的并发读数 = %d, want 9", got)
+	}
+	// 3. 重试策略：换进去的那个实例的读数。
+	if got := fx.scheduler.retryMaxDelay(); got != 7*time.Second {
+		t.Fatalf("重试上限 = %v, want 7s", got)
+	}
+	// 4. 留痕：成对的两个值一起进 store。
+	pairs := fx.store.retentionPairs()
+	if len(pairs) != 1 || pairs[0].count != 3 || pairs[0].age != 48*time.Hour {
+		t.Fatalf("store.SetHistoryRetention 流水 = %v, want 一条 3/48h", pairs)
+	}
+	// 5. 两张观测表各走各的入口，同样是成对给值。
+	if calls := fx.events.setRetentionCalls(); len(calls) != 1 ||
+		calls[0].count != 11 || calls[0].age != 12*time.Hour {
+		t.Fatalf("事件写入器的 SetRetention 流水 = %v", calls)
+	}
+	if calls := fx.audit.setRetentionCalls(); len(calls) != 1 ||
+		calls[0].count != 13 || calls[0].age != 14*time.Hour {
+		t.Fatalf("台账写入器的 SetRetention 流水 = %v", calls)
+	}
+	// 6. 防抖窗口：下一次事件起用新值（这里判"确实递给了 watcher"）。
+	if got := fx.watcher.setDebounceCalls(); len(got) != 1 || got[0] != 250*time.Millisecond {
+		t.Fatalf("watcher.SetDebounce 流水 = %v, want 一条 250ms", got)
+	}
+	// 7. 档位：真 Applier 把登记表换过了。判的是**换进去的那一份取值**，不是"键还在不在"——
+	//    exec.echo 在启动注册时就已经在表里，只断它在场的话这条对链的改动永远判不出红。
+	if !containsKey(fx.scheduler.registeredKeys(), "exec.echo") {
+		t.Fatalf("档位处理函数不在调度器里：%v", fx.scheduler.registeredKeys())
+	}
+	profile, ok := fx.registry.Lookup("exec.echo")
+	if !ok {
+		t.Fatal("登记表里没有 exec.echo")
+	}
+	if profile.Timeout != 3*time.Minute {
+		t.Fatalf("登记表里那份档位的生效超时 = %v, want 换进去的 3m（起点是 10s）", profile.Timeout)
+	}
+	if !containsKey(state.AppliedKeys, "executors.commands.echo.timeout") {
+		t.Fatalf("applied_keys = %v，少了档位那条", state.AppliedKeys)
+	}
+}
+
+// TestRun_ReloadReaderFollowsTheWatcher 判读口那半边：
+// watcher 在的时候读数转发它，且 reload.enabled 这一位来自进程配置而不是 State()。
+func TestRun_ReloadReaderFollowsTheWatcher(t *testing.T) {
+	spec := baseSpec()
+	spec.obsEnabled = "true"
+	fx := newReloadRunFixture(t, spec)
+
+	fx.start(t)
+	fx.waitForReady(t)
+	fx.shutdown(t)
+
+	fx.watcher.mu.Lock()
+	fx.watcher.state = core.ReloadState{Enabled: false, Result: core.ReloadOK, AppliedKeys: []string{"logging.level"}}
+	fx.watcher.mu.Unlock()
+
+	state := fx.status.State()
+	if state.Result != core.ReloadOK || len(state.AppliedKeys) != 1 {
+		t.Fatalf("读口没把 watcher 的状态转出来：%+v", state)
+	}
+	if state.Enabled {
+		t.Fatal("读口不该改写 Enabled：那一位由 api.WithReloadState 从进程配置给（D-R0503）")
+	}
+	// 关键的一条：State().Enabled 是假的时候，读口的 reload.enabled 仍然是配置里那份真值。
+	// 这条判据的正面在 api 那侧（TestGetRuntime_ExposesReloadState），这里判的是不越权。
+	if got := fx.watcher.State().Enabled; got {
+		t.Fatal("夹具失效：替身里那份 Enabled 应当是假")
+	}
 }
