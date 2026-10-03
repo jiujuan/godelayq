@@ -51,8 +51,11 @@ type ReloadStatus struct {
 	// 这一层原样透出，不做第二份白名单——想在这里加一道枚举校验就得同步维护两份清单。
 	Result string `json:"result"`
 	Error  string `json:"error,omitempty"`
-	// AppliedKeys 是最近一次真的换上现网的键；IgnoredKeys 是改了但要重启的键；
-	// RejectedKeys 是那一次导致整次作废的键。三份都只含键名。
+	// AppliedKeys 是本次重载处理过的键——注意"处理过"不等于"生效"：executors.enabled=false
+	// 时改档位，键照样在这里出现，另有一条 warn 说明这一节没打开（D-R0605）。
+	// IgnoredKeys 是改了但要重启的键；RejectedKeys 是那一次导致整次作废的键，
+	// 它是"本次与现网不同的全部拒绝档键"的累计清单，不是"你刚改的那一条"（D-R0705）。
+	// 三份都只含键名。
 	AppliedKeys  []string `json:"applied_keys,omitempty"`
 	IgnoredKeys  []string `json:"ignored_keys,omitempty"`
 	RejectedKeys []string `json:"rejected_keys,omitempty"`
