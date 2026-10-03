@@ -3,12 +3,16 @@ package core
 // 本文件是 TASK-R05 的用例集：验证 ConfigWatcher 的触发、合并、只认目标文件、
 // rename/删除/关闭、状态保存与 WatcherError 归属、防抖窗口可改、并发读与 panic 隔离。
 //
-// 评审返工后补上的四组判据（详见卡 §10.2、§10.3、§10.5）：
-//   - ctx 取消这条 Run 退出路径也要停计时器、关句柄（CtxCancelStopsScheduling，要求 11 的另一半）；
+// 评审返工后补上的判据（详见卡 §10.2、§10.3、§10.5）：
+//   - ctx 取消这条 Run 退出路径也要停计时器、关句柄、置 closed（CtxCancelStopsScheduling，要求 11 的另一半，
+//     末尾还直接调一次 trigger 验短路本身——只删 closed 置真的变异只有那一步判得红）；
 //   - ReloadFunc 的调用被 reloadMu 串行（ReloadCallsAreSerialized）；
+//   - 写"重载结果"与写"监听器健康"两头并发时都不丢更新（StateWritesDoNotLoseEachOther，要求 10 的并发那一半）；
+//   - 表里那条计时器已到期时 schedule 会换代而不是裸 Reset（ReplacesExpiredDebounceTimer）；
 //   - basename 取磁盘真实拼写，大小写错配的 -config 路径不会静默失效（ResolveDiskFileName、MatchesOnDiskNameCasing）；
 //   - 第二次 Run 立即返回而不是 close-of-closed-channel panic（SecondRunDoesNotPanic）；
-//   - 要求 3（同字节也调）与要求 9 的全字段透传各有断言；Close 后直接调 trigger 也短路。
+//   - 要求 3（同字节也调）与要求 9 的全字段透传各有断言；Close 后直接调 trigger 也短路；
+//     ConcurrentStateReads 先等第一次重载真跑起来再起读协程，读与重载确实重叠。
 //
 // 两条判据约定（卡 §5 helper 约定 + 本机 Windows 时间抖动）：
 //   - 一切等待都是"10ms 轮询 + 有界超时"，超时即 t.Fatal 并打印已收到的次数，绝不 sleep 后盲断言；
@@ -555,6 +559,64 @@ func TestConfigWatcher_WatcherErrorVisible(t *testing.T) {
 	}
 }
 
+// TestConfigWatcher_MarkWatcherErrorKeepsLastReload 覆盖要求 10 的另一半，并且是**顺序形状**：
+// MarkWatcherError 只许改 WatcherError 一个字段，上一次重载交回的结论必须整份留着。
+//
+// 为什么还要这条、并发那条不算：并发那条（StateWritesDoNotLoseEachOther）测的是丢更新，
+// 而丢更新要求 storeState 的"读快照—写快照"那几条指令之间正好被插进去一次。本机实测
+// 把 stateMu 那对加解锁整个删掉、跑 5000 轮 × 5 次都没撞到（见 §10.3 的 MA 与 §10.5 D-R0520），
+// 所以它只能当回归网、不能当判红点；这条用例判的是同一段合并逻辑**少带字段**那一半，
+// 判红点是变异 ME（MarkWatcherError 从空快照起步），每次都红。
+func TestConfigWatcher_MarkWatcherErrorKeepsLastReload(t *testing.T) {
+	f := newWatcherFixture(t, 100*time.Millisecond)
+	attempt := time.Now()
+	last := attempt.Add(-30 * time.Second)
+	f.preset.Store(&ReloadState{
+		Enabled:       true,
+		Result:        ReloadUnchanged,
+		Error:         "keep me",
+		AppliedKeys:   []string{"logging.level"},
+		IgnoredKeys:   []string{"server.port"},
+		RejectedKeys:  []string{"server.auth.token"},
+		LastAttemptAt: attempt,
+		LastAppliedAt: last,
+	})
+
+	f.mustWrite(t, "server:\n  port: 2\n")
+	f.waitFor(t, 1, 2*time.Second)
+
+	f.w.MarkWatcherError("listener died")
+	got := f.w.State()
+
+	if got.WatcherError != "listener died" {
+		t.Errorf("WatcherError 应被写成 listener died，实际 %q", got.WatcherError)
+	}
+	if got.Result != ReloadUnchanged {
+		t.Errorf("Result 应保持上一次重载的 unchanged，实际 %q", got.Result)
+	}
+	if got.Error != "keep me" {
+		t.Errorf("Error 应保持原样，实际 %q", got.Error)
+	}
+	if want := []string{"logging.level"}; !reflect.DeepEqual(got.AppliedKeys, want) {
+		t.Errorf("AppliedKeys 应保持 %v，实际 %v", want, got.AppliedKeys)
+	}
+	if want := []string{"server.port"}; !reflect.DeepEqual(got.IgnoredKeys, want) {
+		t.Errorf("IgnoredKeys 应保持 %v，实际 %v", want, got.IgnoredKeys)
+	}
+	if want := []string{"server.auth.token"}; !reflect.DeepEqual(got.RejectedKeys, want) {
+		t.Errorf("RejectedKeys 应保持 %v，实际 %v", want, got.RejectedKeys)
+	}
+	if !got.LastAttemptAt.Equal(attempt) || !got.LastAppliedAt.Equal(last) {
+		t.Errorf("两个时间字段应保持原值，实际 LastAttemptAt=%v LastAppliedAt=%v", got.LastAttemptAt, got.LastAppliedAt)
+	}
+	if !got.Enabled {
+		t.Error("Enabled 应保持 true")
+	}
+	if got.WatchedPath != f.path {
+		t.Errorf("WatchedPath 应保持监听路径，实际 %q", got.WatchedPath)
+	}
+}
+
 // TestConfigWatcher_PanicDoesNotKillLoop 覆盖要求 13：ReloadFunc panic 不打挂事件循环，
 // 转成 WatcherError + error 日志，后续写入仍能触发。对应 §9 风险表第三行。
 func TestConfigWatcher_PanicDoesNotKillLoop(t *testing.T) {
@@ -661,12 +723,15 @@ func TestConfigWatcher_ConcurrentStateReads(t *testing.T) {
 			time.Sleep(time.Millisecond)
 		}
 	}
+	// 先让重载真跑起来一次，再起读协程：少了这一步，两轮 200 次读完全可能在第一次触发之前就跑完，
+	// 那条用例就只剩"-race 没报错"这一件事可说了（读与写到底有没有重叠无从证明）。
+	f.waitFor(t, 1, 2*time.Second)
+
 	wg.Add(2)
 	go reader()
 	go reader()
 
 	// 读协程跑满约 200ms，期间写协程每隔 80ms 触发一次重载，两者重叠——-race 必须干净。
-	f.waitFor(t, 1, 2*time.Second)
 	close(stop)
 	wg.Wait()
 	if e := writeErr.Load(); e != nil {
@@ -725,14 +790,17 @@ func TestConfigWatcher_CloseStopsTimersWithoutLoop(t *testing.T) {
 }
 
 // TestConfigWatcher_CtxCancelStopsScheduling 覆盖要求 11 的 ctx 那一半：
-// 取消 ctx 让 Run 返回后，未触发的防抖计时器必须已经停掉，onReload 不再被计时器打进来。
+// 取消 ctx 让 Run 返回后，未触发的防抖计时器必须已经停掉、句柄必须已经关过、
+// 而且计时器到点后的那个入口本身要短路。
 //
-// 修复前只在 Close 里清 timers，而 closed 位点也只由 Close 置真：
-// 写入排上 200ms 的窗口 → 立刻取消 ctx → Run 返回、loopDone 关闭，
-// 到点后 trigger 看到的 closed 仍是假，于是重载在循环退出之后才起——正是要求 11 反着写的形状。
+// 三条判据的**先后次序是这条用例的一部分**（都必须在 Close 之前、且紧接循环返回就做）：
+//   - 停表判据若拖到静默窗口之后，claim 会让那条到期回调自己把表项摘掉，"Run 的 defer 忘了停表"
+//     的变异就变绿了（本轮实测，见 §10.5 D-R0519）；
+//   - 短路判据若在 Close 之后做，Close 自己置的 closed 会把"Run 退出没置 closed"的变异遮住。
+//
+// 窗口取 1s：让"循环刚返回"与"计时器到点"之间留出足够距离，次序判据才不被时间冲淡。
 func TestConfigWatcher_CtxCancelStopsScheduling(t *testing.T) {
-	// 窗口取 200ms：留出确定性的一截，让我们能在到期之前取消。
-	f := newWatcherFixture(t, 200*time.Millisecond)
+	f := newWatcherFixture(t, 1*time.Second)
 	f.mustWrite(t, "server:\n  port: 8080\n")
 
 	// 前置条件：计时器确实进了表。少了这一步就可能"取消得比排期还早"，
@@ -742,30 +810,175 @@ func TestConfigWatcher_CtxCancelStopsScheduling(t *testing.T) {
 	f.cancel()
 	f.waitLoopReturned(t, 2*time.Second)
 
-	// "Run 返回"之后不允许任何新的重载起来：先记下当前次数当基线
-	// （取消与到期之间那一瞬真跑了一次也算既有事实），再等两个窗口判它没有增加。
-	base := int(f.calls.Load())
-	f.expectStays(t, base, 500*time.Millisecond)
-
-	// 结构化旁证一：ctx 退出路径自己也清了 timers（Run 的 defer）。
+	// 结构化旁证一（紧接循环返回）：ctx 退出路径自己也停了计时器。
 	f.w.mu.Lock()
 	n := len(f.w.timers)
 	f.w.mu.Unlock()
 	if n != 0 {
-		t.Fatalf("Run 因 ctx 取消返回后 timers 应为空，实际残留 %d 个", n)
+		t.Fatalf("Run 因 ctx 取消返回后 timers 应为空，实际残留 %d 个（窗口还有 1s，绝不可能是到期后被自己摘掉的）", n)
 	}
 
 	// 结构化旁证二：同一条 defer 也关掉了 fsnotify 句柄，判据是"句柄已关"本身。
 	// 不能用"再调一次 Close 返回 nil"来证——已关与未关的 Close 都返回 nil（v1.9.0 各后端先查 closed 位点），
-	// 那条断言分不出变异体。v1.9.0 的 AddWith 在已关的句柄上返回 ErrClosed（backend_windows.go:110-112），
+	// 那条断言分不出变异体。v1.9.0 的 AddWith 在已关的句柄上返回 ErrClosed（backend_windows.go:111-113），
 	// 所以往同一个目录再挂一次监听拿到错误才是真证据。
 	if err := f.w.watcher.Add(f.dir); err == nil {
 		t.Error("Run 因 ctx 取消返回后 fsnotify 句柄应已关闭：对同一目录调 Add 应返回错误，却成功挂上了新监听")
 	}
-	// Close 依赖这条契约：事件循环先关过句柄之后，Close 再关一次仍然返回 nil（Run 注释第 2 条）。
+
+	// 结构化旁证三：这条退出路径也置了 closed，所以计时器到点后的入口本身已经短路。
+	// 这一步绕开计时器、直接打 trigger；此时还没有任何人调过 Close，closed 只可能是 Run 置的。
+	base := int(f.calls.Load())
+	f.w.trigger()
+	f.expectStays(t, base, 200*time.Millisecond)
+
+	// 行为判据：Run 返回之后自然路径也不许有任何重载（窗口还没到点，这一条等的是它到点）。
+	f.expectStays(t, base, 500*time.Millisecond)
+
+	// 收口：Close 依赖这条契约——事件循环先关过句柄之后，Close 再关一次仍然返回 nil（Run 注释第 2 条）。
 	if err := f.w.Close(); err != nil {
 		t.Errorf("句柄已由 Run 关闭，Close 再关一次应幂等返回 nil，实际 %v", err)
 	}
+}
+
+// TestConfigWatcher_StateWritesDoNotLoseEachOther 覆盖要求 10 的**并发**那一半：
+// 写"重载结果"的那一头（callReload→storeState）与写"监听器健康"的那一头（MarkWatcherError，
+// 由事件循环在 fsnotify 出错或通道关闭时调）同时在跑时，两边写的字段都必须留下。
+//
+// 为什么单靠既有的 WatcherErrorVisible 不够：那条用例是**顺序**调这两处的，
+// 而这两处原本都是不带同步的"读快照—改—整份换指针"。丢更新的形状有两种，这里都能撞到：
+//   - storeState 用 onReload 之前读到的旧快照写回，把刚记进去的 WatcherError 抹掉或抹成过时的编号；
+//   - MarkWatcherError 用早期快照写回，把刚完成的这次重载的 Result 抹回初值的空串。
+//
+// 修复前的实现里 reloadMu 挡不住第二头（事件循环不取那把锁），所以这条判的不是 reloadMu 的 scope，
+// 而是 stateMu（见 §10.5 D-R0516）。
+func TestConfigWatcher_StateWritesDoNotLoseEachOther(t *testing.T) {
+	f := newWatcherFixture(t, 100*time.Millisecond)
+	const rounds = 500
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			f.w.callReload()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < rounds; i++ {
+			f.w.MarkWatcherError(fmt.Sprintf("watcher error %d", i))
+		}
+	}()
+	wg.Wait()
+
+	st := f.w.State()
+	// fixture 交回的预设状态是 Result=ok；初值（从未重载过）是空串，被旧快照抹回去就会看到空串。
+	if st.Result != ReloadOK {
+		t.Errorf("Result 应始终是重载链写进去的 ok（被某次带旧快照的 MarkWatcherError 抹回去了），实际 %q", st.Result)
+	}
+	// storeState 必须把 WatcherError 原样带过去，且不能带成过时的编号。
+	if want := fmt.Sprintf("watcher error %d", rounds-1); st.WatcherError != want {
+		t.Errorf("WatcherError 应为最后写进去的 %q，实际 %q（丢了更新）", want, st.WatcherError)
+	}
+	if st.WatchedPath != f.path {
+		t.Errorf("WatchedPath 应恒为监听路径，实际 %q", st.WatchedPath)
+	}
+}
+
+// TestConfigWatcher_ReplacesExpiredDebounceTimer 守住防抖表项的换代：表里那条计时器**已经到期**时，
+// schedule 必须换一条新的，而不是把它原地 Reset 继续留着。
+//
+// 自然形态的窗口很窄（计时器到期与它自己的回调摘掉表项之间），所以这里直接把那个状态造出来：
+// 表里放一条**回调已经跑完、表项却还留着**的 time.AfterFunc。这跟自然 race 留下的形状一致
+// （那张表里就是一条不会再有任何动作的已到期计时器）。
+// 注意不能用 time.NewTimer 造：go1.26 里"已到期但通道值没人收"的 NewTimer 仍算 active，
+// Reset 返回真（实测 A 形 true / B 排空后 false / C AfterFunc 跑完 false），造出来的不是同一个状态。
+//   - 修复前：走裸 timer.Reset(d) 那一支并 return，表项还是这条与防抖表毫无关系的死计时器——
+//     它到点不会调 ReloadFunc，于是这次排期永远不生效，此后同路径的每次写入都只是原地 Reset
+//     （监听器还在、事件也认得，但再也不重载）；
+//   - 修复后：Reset 返回假 → Stop 掉那条、换成新的 AfterFunc → 一个窗口之后正好打进一次重载。
+//
+// 判据是行为（收到一次重载调用），不是私有字段。自然窗口里"旧回调与新表项抢同一格"那一段
+// 由 claim 的身份比对兜住，它的确定性判据见 CloseStopsTimersWithoutLoop（关停后到点的回调不再触发），
+// 其余只能结构性推理（§10.6）。
+func TestConfigWatcher_ReplacesExpiredDebounceTimer(t *testing.T) {
+	f := newWatcherFixture(t, 30*time.Millisecond)
+	base := int(f.calls.Load())
+
+	// 缓冲 4：修复前后这条死计时器都可能被重新 arm 一到两次，回调不能因为没人收而卡在协程里。
+	fired := make(chan struct{}, 4)
+	dead := &debounceSlot{gen: 4242}
+	dead.timer = time.AfterFunc(time.Nanosecond, func() { fired <- struct{}{} })
+	f.w.mu.Lock()
+	f.w.timers[f.w.path] = dead
+	f.w.mu.Unlock()
+
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("前置条件失败：那条已到期计时器的回调没有跑，构造不出表项留着但计时器已死的形状")
+	}
+
+	f.w.schedule(f.w.path)
+	f.waitFor(t, base+1, 2*time.Second)
+
+	f.w.mu.Lock()
+	cur, stillThere := f.w.timers[f.w.path]
+	f.w.mu.Unlock()
+	if stillThere && cur == dead {
+		t.Error("表里仍是那个已到期、且序号还是 4242 的死表项：schedule 没有换代，此后这条路径的排期永远不会打进 ReloadFunc")
+	}
+}
+
+// TestConfigWatcher_OldFiredCallbackDoesNotStealTheNewSlot 覆盖 claim 的身份比对：
+// 一条已经到期的旧计时器，它的回调如果在新那条登记进表之后才跑到认领那一步，
+// 既不许触发第二次重载，也不许把新那条的表项删掉（删了就变成一条没人认得、也停不住的孤儿）。
+//
+// 自然形态下这是"事件在计时器到期与旧回调摘表项之间挤进来"的窄窗口，这里用实现自己的三个入口
+// （schedule / arm / claim 所在的这张表）把同一个状态确定性造出来：
+//  1. schedule 排一条 30ms 的窗口；
+//  2. 测试协程抢住 w.mu 并等过窗口——旧回调到点、走到认领那一步、堵在 w.mu 上；
+//  3. 仍在持 mu 的状态下调 arm（arm 的契约就是"调用方必须持 mu"，与 schedule 走的是同一句话），
+//     登记一条一小时后才到点的新表项，并把它的指针拿出来当比对目标；
+//  4. 放锁，旧回调继续跑。
+//
+// 判据两条：调用次数不增加（旧回调不该再触发一次重载）、表里剩的仍是那条新计时器
+// （旧回调不许把它摘掉）。去掉身份比对的变异两条一起红。
+func TestConfigWatcher_OldFiredCallbackDoesNotStealTheNewSlot(t *testing.T) {
+	f := newWatcherFixture(t, 30*time.Millisecond)
+	base := int(f.calls.Load())
+
+	f.w.schedule(f.w.path)
+
+	f.w.mu.Lock()
+	// 让旧计时器确定到期：它的回调这会儿应该正堵在下面那次 Unlock 之后的认领上。
+	time.Sleep(80 * time.Millisecond)
+	f.w.arm(f.w.path, time.Hour)
+	fresh := f.w.timers[f.w.path]
+	f.w.mu.Unlock()
+	if fresh == nil {
+		f.w.mu.Unlock()
+		t.Fatal("前置条件失败：arm 之后表里应有一条新表项")
+	}
+
+	// 给旧回调走完的时间，再判两条结果。
+	time.Sleep(100 * time.Millisecond)
+	if n := int(f.calls.Load()); n != base {
+		t.Errorf("旧的那条到期回调又触发了一次重载：调用次数从 %d 变成 %d（身份比对失效）", base, n)
+	}
+	f.w.mu.Lock()
+	cur, ok := f.w.timers[f.w.path]
+	f.w.mu.Unlock()
+	if !ok || cur != fresh {
+		t.Error("表里当前那条计时器被旧的回调摘掉了：新排期成了停不住的孤儿（身份比对失效）")
+	}
+
+	// 收口：把这条一小时后才到点的计时器停掉并从表里摘走，免得留到 Close 之后。
+	f.w.mu.Lock()
+	fresh.timer.Stop()
+	delete(f.w.timers, f.w.path)
+	f.w.mu.Unlock()
 }
 
 // TestConfigWatcher_ReloadCallsAreSerialized 覆盖 ReloadFunc 契约第 1 条：调用被 watcher 串行。
@@ -864,10 +1077,13 @@ func TestConfigWatcher_ResolveDiskFileName(t *testing.T) {
 		{"config.YAML", "config.yaml"},
 	}
 	for _, c := range cases {
-		got, err := resolveDiskFileName(dir, c.in)
+		got, listed, err := resolveDiskFileName(dir, c.in)
 		if err != nil {
 			t.Errorf("resolveDiskFileName(%q) 报错: %v", c.in, err)
 			continue
+		}
+		if !listed {
+			t.Errorf("resolveDiskFileName(%q) 应报列得出来，实际 listed=false", c.in)
 		}
 		if got != c.want {
 			t.Errorf("resolveDiskFileName(%q) 应返回磁盘拼写 %q，实际 %q", c.in, c.want, got)
@@ -875,12 +1091,16 @@ func TestConfigWatcher_ResolveDiskFileName(t *testing.T) {
 	}
 
 	// 目录里没有对应条目：返回错误而不是静默回退成入参拼写——回退等于把"永不触发"请回来。
-	if _, err := resolveDiskFileName(dir, "other.yaml"); err == nil {
-		t.Error("目录里没有对应条目时应返回错误")
+	// 判据用"确实列得出来"那一条路径：同目录里已有 config.yaml，所以列目录一定成功。
+	if _, listed, err := resolveDiskFileName(dir, "other.yaml"); err == nil || !listed {
+		t.Errorf("目录里列得出但没有匹配项时应返回错误（listed 仍为真），实际 listed=%v err=%v", listed, err)
 	}
-	// 目录列不出来：同样报错。
-	if _, err := resolveDiskFileName(filepath.Join(dir, "no-such-dir"), "config.yaml"); err == nil {
-		t.Error("目录列不出来时应返回错误")
+
+	// 目录列不出来（这里是"根本不是目录"这种必然失败的形式，跨平台都能构造）：
+	// 回退成入参拼写、listed=false、不返回错误——0711 的目录与"可读不可列"的 ACL 走的是同一支，
+	// 那种部署以前就能起 watcher，不能因为本卡的解析而连构造都失败。
+	if got, listed, err := resolveDiskFileName(disk, "SomeName.yaml"); err != nil || listed || got != "SomeName.yaml" {
+		t.Errorf("列不出目录时应回退成入参拼写并不报错，实际 got=%q listed=%v err=%v", got, listed, err)
 	}
 
 	// 精确相等优先于折叠匹配：只有大小写敏感的卷上造得出来（两个只差大小写的不同文件）。
@@ -899,8 +1119,9 @@ func TestConfigWatcher_ResolveDiskFileName(t *testing.T) {
 		t.Logf("本机卷大小写不敏感（目录里仍只有 %d 条，Config.yaml 覆盖的就是 config.yaml），跳过『精确相等优先』这一支", len(entries))
 		return
 	}
-	if got, err := resolveDiskFileName(dir, "Config.yaml"); err != nil || got != "Config.yaml" {
-		t.Errorf("目录里有精确同名条目时应返回它本身，实际 %q (err=%v)", got, err)
+	got, listed, err := resolveDiskFileName(dir, "Config.yaml")
+	if err != nil || !listed || got != "Config.yaml" {
+		t.Errorf("目录里有精确同名条目时应返回它本身，实际 got=%q listed=%v err=%v", got, listed, err)
 	}
 }
 

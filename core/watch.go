@@ -69,18 +69,27 @@ type ConfigWatcher struct {
 	// debounce 可运行期改（reload.debounce 是热更档），所以是原子纳秒。
 	debounce atomic.Int64
 
-	// state 是"最新一份重载状态"，一次换指针读写；closed/started 是关停与启动位点。
+	// state 是"最新一份重载状态"，一次换指针读；写入是"读—改—写"，要配 stateMu 一起看（下条）。
+	// closed/started 是关停与启动位点。
 	state   atomic.Pointer[ReloadState]
 	closed  atomic.Bool
 	started atomic.Bool
 
+	// stateMu 只保护"读快照—改两个字段—换指针"这一段，不保护读（读仍然是无锁的 atomic.Pointer）。
+	// 为什么不用 CompareAndSwap 重试：两个写方改的是同一份快照的两个不同侧面
+	// （callReload→storeState 写重载结果，事件循环与 MarkWatcherError 写 WatcherError），
+	// 而 storeState 手里那份候选值来自**更早**的 onReload，整份覆盖会把它没看过的那一半写回旧值——
+	// CAS 只保证"不覆盖更新的指针"，不保证"两边写的字段都在"。锁的粒度只到几次赋值，
+	// 绝不包住 onReload，所以一次慢重载不会挡住事件循环记故障，也不会拖住 Close 的 5s 上界。
+	stateMu sync.Mutex
+
 	watcher *fsnotify.Watcher
 
-	// mu 保护 timers 的读写；timers 按目标文件路径合并短时间内的多次事件，
-	// 形状照 core/load.go 的 pendingLoads（同路径旧计时器 Reset 或重建）。
+	// mu 保护 timers 与 seq 的读写；timers 按目标文件路径合并短时间内的多次事件，
+	// 形状照 core/load.go 的 pendingLoads（同路径旧计时器 Reset，或换掉已到期的那一条）。
 	mu     sync.Mutex
-	timers map[string]*time.Timer
-
+	timers map[string]*debounceSlot
+	seq    uint64
 	// reloadMu 串行化 ReloadFunc 的调用与紧随其后的状态保存。触发者是计时器协程，
 	// 两个防抖窗口的到期可以重叠（前一次还在跑、后一次已到期并重新计时），没有这把锁
 	// 就会出现"旧结果覆盖新结果"。它只排序调用、不 join 在途调用：Close 不持也不等这把锁，
@@ -123,9 +132,9 @@ func NewConfigWatcher(path string, debounce time.Duration, onReload ReloadFunc, 
 
 	// basename 用磁盘上的真实拼写而不是入参里的那一段：Windows/macOS 默认卷大小写不敏感，
 	// 用户手打的 -config 路径可以写成 Config.yaml，os.Stat 成功但 fsnotify 上报的是磁盘拼写，
-	// 精确比对就会永不命中（详见 resolveDiskFileName）。解析不出来是部署级问题，直接报错。
+	// 精确比对就会永不命中（详见 resolveDiskFileName）。
 	dirname := filepath.Dir(path)
-	basename, err := resolveDiskFileName(dirname, filepath.Base(path))
+	basename, listed, err := resolveDiskFileName(dirname, filepath.Base(path))
 	if err != nil {
 		return nil, err
 	}
@@ -136,9 +145,18 @@ func NewConfigWatcher(path string, debounce time.Duration, onReload ReloadFunc, 
 		basename: basename,
 		onReload: onReload,
 		logger:   resolveLogger(logger),
-		timers:   make(map[string]*time.Timer),
+		timers:   make(map[string]*debounceSlot),
 		stopCh:   make(chan struct{}),
 		loopDone: make(chan struct{}),
+	}
+
+	if !listed {
+		// 目录列不出来、但目标文件本身能打开（POSIX 上 0711 的目录只给遍历不给列表，Windows 上
+		// "可以读文件但不可以列目录"的 ACL 同理）：退回入参拼写并记一条 warn。
+		// 这正是本卡之前的行为，比拒绝构造好——热重载是便利，不该因为这一条把它变成新的故障面；
+		// 入参拼写与磁盘拼写一致时（绝大多数部署）监听照常工作，不一致时就是上面那段说的情形。
+		w.logger.Warn("config watcher: watch directory is not listable, using the given file name spelling",
+			"directory", dirname, "basename", basename, "path", path)
 	}
 	w.debounce.Store(int64(debounce))
 
@@ -172,35 +190,44 @@ func NewConfigWatcher(path string, debounce time.Duration, onReload ReloadFunc, 
 //   - 不做大小写不敏感的内容/路径规范化，也不管 YAML 内部的键；
 //   - 不管"文件被改名成另一种大小写拼写"——那是重新部署，本类型构造期一次性解析；
 //   - 不处理同一目录里两个只差大小写的不同文件：那种卷本身不允许，
-//     在大小写敏感的卷上精确相等那一路已经选定了 os.Stat 命中的那一份。
+//     在大小写敏感的卷上精确相等那一路已经选定了 os.Stat 命中的那一份；
+//   - **只做大小写折叠，不做 Unicode 规范化**：macOS/APFS 把文件名按 NFD 存，
+//     用户在 -config 里打 NFC 的 "café.yaml" 时 os.Stat 由文件系统规范化兜住、能成功，
+//     而目录列出来的拼写与它 EqualFold 不相等 → 这里返回错误。这是显式选择的退化
+//     （构造失败由 R06 记成一条 error、进程照常服务），不去猜规范化形式。
+//
+// 目录列不出来时（权限只给遍历不给列表）返回 (入参拼写, false, nil)：调用方记一条 warn 后继续，
+// 这比拒绝构造好——见 NewConfigWatcher 里那段注释。只有"列出来了、但没有匹配项"才是错误。
 //
 // 拆成独立函数也是为了让用例在任何平台都能验：用例造一个 config.yaml、传 CONFIG.yaml，
 // 在大小写敏感的 Linux 上走的是"读目录后折叠匹配"这同一条代码路径。
-func resolveDiskFileName(dirname, name string) (string, error) {
+func resolveDiskFileName(dirname, name string) (string, bool, error) {
 	entries, err := os.ReadDir(dirname)
 	if err != nil {
-		return "", fmt.Errorf("config watcher: read watch directory %q failed: %w", dirname, err)
+		return name, false, nil
 	}
 	folded := ""
 	for _, entry := range entries {
 		if entry.Name() == name {
-			return name, nil
+			return name, true, nil
 		}
 		if folded == "" && strings.EqualFold(entry.Name(), name) {
 			folded = entry.Name()
 		}
 	}
 	if folded != "" {
-		return folded, nil
+		return folded, true, nil
 	}
-	return "", fmt.Errorf("config watcher: no entry in %q matches file name %q", dirname, name)
+	return "", true, fmt.Errorf("config watcher: no entry in %q matches file name %q", dirname, name)
 }
 
 // Run 启动事件循环，直到 ctx 取消或 Close 被调用。它阻塞，调用方负责 go。
 // ctx 与 stopCh 两个停止源都要支持：优雅关闭走 Close（同步，等事件循环返回；按卡 §3 它
 // 不等在途重载），而测试用 context.WithCancel 更方便。
 //
-// 两条退出路径的收口一样（defer 顺序：先关 fsnotify 句柄、再停计时器、最后关 loopDone）：
+// 两条退出路径的收口一样（defer 执行次序：置 closed → 关 fsnotify 句柄 → 停计时器 → 关 loopDone）：
+//  0. `closed.Store(true)` —— `trigger`/`schedule` 的短路看的就是这个位点，而 `Close` 之外
+//     只有这一处置它；不置的话 ctx 取消那条路径上短路永不生效（要求 11 的 D-R0517）；
 //  1. stopTimers —— 卡要求 11 说的是"Run 返回后不再有计时器回调进入 onReload"，
 //     ctx 取消同样是 Run 返回，不能只有 Close 那条路停表；
 //  2. 关 fsnotify 句柄 —— 否则只用 ctx 停的调用方要把目录句柄一直漏到有人调 Close。
@@ -216,16 +243,23 @@ func (w *ConfigWatcher) Run(ctx context.Context) {
 	if !w.started.CompareAndSwap(false, true) {
 		return
 	}
-	// loopDone 关闭 = 事件循环确已返回，给 Close 的有界等待与测试的结构化证明用。
+	// defer 的登记顺序即退场的反序，最终执行次序是：
+	//   closed 置真 → 关 fsnotify 句柄 → 停计时器 → 关 loopDone
+	// closed 必须最先置真：要求 11 说的是"Run 返回后不再有计时器回调进入 onReload"，
+	// 而 trigger/schedule 的短路看的正是这个位点。只在 Close 里置真的话，ctx 取消那条退出路径
+	// 上 closed 永远是假，短路对这条路完全不生效（§10.5 D-R0517）。
+	// loopDone 关闭 = 事件循环确已返回、且下面三件事都做完，给 Close 的有界等待与测试的结构判据用。
 	defer close(w.loopDone)
 	defer w.stopTimers()
 	defer func() {
-		if w.watcher != nil {
-			if err := w.watcher.Close(); err != nil {
-				w.logger.Error("failed to close config watcher on run exit", "error", err)
-			}
+		// v1.9.0 各后端都先查 closed 位点、重复调用返回 nil（backend_windows.go:91-94，
+		// inotify/kqueue/fen 走 shared.close()），所以这里关过之后 Close 再关一次是安全的，
+		// 本文件就依赖这一点而不另设 once。
+		if err := w.watcher.Close(); err != nil {
+			w.logger.Error("failed to close config watcher on run exit", "error", err)
 		}
 	}()
+	defer func() { w.closed.Store(true) }()
 
 	events := w.watcher.Events
 	errs := w.watcher.Errors
@@ -277,33 +311,75 @@ func (w *ConfigWatcher) handleEvent(event fsnotify.Event) {
 	w.schedule(w.path)
 }
 
+// debounceSlot 是防抖表里的一项：一条计时器 + 它的身份序号。
+//
+// 为什么要有序号，而不是让回调拿自己的 *time.Timer 去比：`t = time.AfterFunc(d, f)` 是
+// 先建计时器、后把返回值赋给 t，而 f 里读的那个 t 与那次赋值之间没有任何同步关系
+// （按 Go 内存模型不构成 happens-before，是个形式上的数据竞争，窗口虽然极窄但存在）。
+// 序号在**建计时器之前**就算好，并按值闭包进去，回调只读表里的 gen——读的是同一个整数，
+// 不存在那个窗口。
+type debounceSlot struct {
+	timer *time.Timer
+	gen   uint64
+}
+
 // schedule 在防抖窗口结束时触发一次重载；窗口内的重复事件只保留一次触发。
-// 形状照 core/load.go 的 scheduleLoad（同路径计时器 Reset 后重建），不另发明一套。
+// 主体形状照 core/load.go 的 scheduleLoad（同路径的旧计时器 Reset），不另发明一套；
+// 差别只有一处，而且是必需的（卡 §3 那句"旧计时器 Stop 后重建"说的就是这个，load.go 那份反而没做）：
+// Reset 返回假表示那条计时器**已经到期**，表里留着的是一个不会再打进 ReloadFunc 的死表项，
+// 必须换一条新的（见下面的注释与 §10.5 D-R0518）。
 func (w *ConfigWatcher) schedule(path string) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	// 关停后不再排期：Close 已把 closed 置真，之后的任何事件都不该再生出计时器。
+	// 关停后不再排期：Close 与 Run 的退出都把 closed 置真，之后的任何事件都不该再生出计时器。
 	if w.closed.Load() {
 		return
 	}
 	d := time.Duration(w.debounce.Load())
-	if timer, ok := w.timers[path]; ok {
-		// 新窗口从下一个事件起生效：已在计时的这一次不改窗口，不值得为它重新计时。
-		timer.Reset(d)
-		return
+	if slot, ok := w.timers[path]; ok {
+		if slot.timer.Reset(d) {
+			// 已在计时的这一次只改窗口，不换计时器：新窗口从下一个事件起生效。
+			return
+		}
+		// 走到这里说明这条已经到期（或已被 Stop）：它自己那次回调正在路上或已经跑过，
+		// 表项却还没被摘掉。Reset 会把它重新 arm 一次，这里顺手 Stop 掉，免得空跑一趟回调；
+		// 真正兜住"旧回调不该再触发"的是 claim 的序号比对，不是这次 Stop
+		// （Stop 对一个已经取到 mu 的回调无能为力）。
+		slot.timer.Stop()
 	}
-	w.timers[path] = time.AfterFunc(d, func() {
-		w.forget(path)
+	// 表里没有，或有但已经死了：换一条新的登记进去。
+	w.arm(path, d)
+}
+
+// arm 建一条到点后按序号认领的防抖计时器，并登记为该路径的当前计时器。调用方必须持 w.mu。
+func (w *ConfigWatcher) arm(path string, d time.Duration) {
+	w.seq++
+	gen := w.seq
+	slot := &debounceSlot{gen: gen}
+	w.timers[path] = slot
+	slot.timer = time.AfterFunc(d, func() {
+		if !w.claim(path, gen) {
+			return
+		}
 		w.trigger()
 	})
 }
 
-// forget 在计时器触发后摘掉该路径的记录，让下一轮写入能重新排期。
-func (w *ConfigWatcher) forget(path string) {
+// claim 认领这一次到期：只有当表里那一项的序号正是自己这一个时，才摘掉表项并让调用方继续触发。
+// 两个用途（都对应"上一代计时器还留着"的形状）：
+//   - 关停之后挤进来的那次回调不再新起重载：Close 与 Run 退出的 stopTimers 会把表项清空；
+//   - 一条已经到期的旧计时器被 schedule 换代之后，旧的那次回调既不触发第二次重载，
+//     也不会把新那一项误删——少了这个序号比对，同一批事件可以走出两次重载，
+//     而新排期会因为表项被旧回调删掉变成停不住、也没人认得的孤儿（§10.5 D-R0518）。
+func (w *ConfigWatcher) claim(path string, gen uint64) bool {
 	w.mu.Lock()
-	delete(w.timers, path)
-	w.mu.Unlock()
+	defer w.mu.Unlock()
+	if cur, ok := w.timers[path]; ok && cur.gen == gen {
+		delete(w.timers, path)
+		return true
+	}
+	return false
 }
 
 // stopTimers 停掉所有在计时的防抖计时器并从 map 删除，照 core/load.go 的 stopLoaders 写法。
@@ -313,8 +389,8 @@ func (w *ConfigWatcher) forget(path string) {
 // 就等于让 ctx 那条路留下能打进 ReloadFunc 的计时器。
 func (w *ConfigWatcher) stopTimers() {
 	w.mu.Lock()
-	for path, timer := range w.timers {
-		timer.Stop()
+	for path, slot := range w.timers {
+		slot.timer.Stop()
 		delete(w.timers, path)
 	}
 	w.mu.Unlock()
@@ -323,9 +399,11 @@ func (w *ConfigWatcher) stopTimers() {
 // trigger 是计时器到点后的入口（计时器协程上跑）；关停后短路，保证 closed 置真之后
 // 不再**新起**一次 ReloadFunc 调用。
 //
-// 这条短路有一个无法在本卡消掉的残余竞态：回调可能刚好在 closed 置真的前一瞬通过检查，
-// 于是一次关停后开始的调用成为可能。窗口只有几条指令宽，且 Close 已先停掉 timers；
-// 用例 TestConfigWatcher_CloseIdempotent 会在 Close 返回后直接调 trigger 验短路本身。
+// 还有一层兜底在 claim 里：停表会清空表项，于是已经取到 mu 之外、正准备认领到期的那条回调
+// 认领不到自己，直接返回——这条路径连 trigger 都进不来。剩下的残余窗口只有一种：回调在 closed
+// 置真与 claim 之前都通过了检查，这一次调用仍会跑完。短路保证的是"不再新起"，不是"绝不重叠"；
+// 用例 TestConfigWatcher_CloseIdempotent 与 TestConfigWatcher_CtxCancelStopsScheduling
+// 会在关停/取消返回之后直接调 trigger 验短路本身。
 func (w *ConfigWatcher) trigger() {
 	if w.closed.Load() {
 		return
@@ -340,7 +418,7 @@ func (w *ConfigWatcher) trigger() {
 // 两次调用并发跑、后发起的那次先返回、反而被前一次的旧结果覆盖 State()（ReloadFunc 契约第 1 条）。
 // 这把锁只排序、不 join：Close 不等它，握锁中的重载因此拖不死关停。
 //
-// ReloadFunc panic 不能打挂进程（卡 §9 风险表第一行）：调用点是计时器协程，那上面没有别的
+// ReloadFunc panic 不能打挂进程（卡 §9 风险表第三行）：调用点是计时器协程，那上面没有别的
 // recover，未捕获的 panic 会顺带整个进程崩溃（不是"只死事件循环"）。这里 recover 转成
 // WatcherError + error 日志。panic 意味着 ReloadFunc 没有交回状态，只记 WatcherError、
 // 不把半截状态当一次重载尝试存进去。
@@ -376,9 +454,13 @@ func (w *ConfigWatcher) callReload() {
 //     这样"读端点看到的最后一个故障"不会被下一次成功重载抹掉；
 //   - WatchedPath 由 watcher 拥有：无论交回的这份里它是什么，都改写成监听的绝对路径。
 //
+// 这两条"取已有值"的读—改—写整段在 stateMu 里做：另一头的事件循环（MarkWatcherError）随时可能
+// 换指针，用不带锁的旧快照整份写回会把对方的那一半抹掉（见 stateMu 字段注释与 §10.5 D-R0516）。
+//
 // ReloadFunc 返回错误时仍然保存它交回的状态（错误可能只写在 State.Error 里），
 // 并额外记一条 error 日志（error、path 两个属性，卡要求 12）。
 func (w *ConfigWatcher) storeState(state ReloadState, err error) {
+	w.stateMu.Lock()
 	if prev := w.state.Load(); prev != nil {
 		state.WatcherError = prev.WatcherError
 	} else {
@@ -386,6 +468,7 @@ func (w *ConfigWatcher) storeState(state ReloadState, err error) {
 	}
 	state.WatchedPath = w.path
 	w.state.Store(&state)
+	w.stateMu.Unlock()
 
 	if err != nil {
 		w.logger.Error("config reload returned error", "error", err, "path", w.path)
@@ -403,11 +486,9 @@ func (w *ConfigWatcher) Close() error {
 		// schedule/trigger 据此短路，timer.Stop 之后到点也不再调 ReloadFunc。
 		w.closed.Store(true)
 		close(w.stopCh)
-		if w.watcher != nil {
-			// 事件循环可能已经先关过（ctx 取消那条 defer）：v1.9.0 各后端重复 Close 返回 nil。
-			if err := w.watcher.Close(); err != nil {
-				w.logger.Error("failed to close config watcher", "error", err)
-			}
+		// 事件循环可能已经先关过（ctx 取消那条 defer）：v1.9.0 各后端重复 Close 返回 nil。
+		if err := w.watcher.Close(); err != nil {
+			w.logger.Error("failed to close config watcher", "error", err)
 		}
 		// 清计时器：Stop 后从 map 删掉，Close 后 timers 为空。
 		w.stopTimers()
@@ -417,7 +498,12 @@ func (w *ConfigWatcher) Close() error {
 
 // waitForLoop 有界等待事件循环返回。Run 从未启动时直接返回——没有循环可等。
 // 用 loopDone 通道而不是 runtime.NumGoroutine 差值判关停：同包其它测试会留下在途协程，
-// 进程级计数在本机 -race -count=5 下会 ±1 抖动（卡 §10.2 第 1 条、D-R05 的取舍）。
+// 进程级计数在本机 -race -count=5 下会 ±1 抖动（卡 §10.2 第 1 条）。
+//
+// 一个要说清的口径：started 由 `go Run` 的那个协程自己置真，所以如果 Close 赶在它被调度之前，
+// 这里判成"没跑过循环"直接返回 nil，而循环随后还是会跑一会儿再退出——此时"Close 等到事件循环
+// 返回"并不成立。真正的保证来自另一个位点：Close 先把 closed 置真，跑起来的循环认得这个位点
+// （events 通道关闭时不当故障处理），且它一退出就自己停表、关句柄。卡 §6 第三条写的是这个形状。
 func (w *ConfigWatcher) waitForLoop() error {
 	if !w.started.Load() {
 		return nil
@@ -466,9 +552,12 @@ func (w *ConfigWatcher) State() ReloadState {
 // 例如事件循环退出（watcher 死亡）这种"重载没跑但监听已经没了"的情形。
 //
 // 只改 WatcherError 一个字段：其余状态（含上一次重载的 Result）原样保留，
-// 这样监听器故障不会顺手抹掉最近一次重载的结论。
+// 这样监听器故障不会顺手抹掉最近一次重载的结论。读—改—写整段在 stateMu 里做（同 storeState）。
 func (w *ConfigWatcher) MarkWatcherError(msg string) {
 	w.logger.Error("config watcher error", "error", msg, "path", w.path)
+
+	w.stateMu.Lock()
+	defer w.stateMu.Unlock()
 
 	cur := w.state.Load()
 	var next ReloadState
