@@ -18,8 +18,14 @@ import (
 // （快照里存的是原始 payload 字节，见 core.JobSnapshot.Payload）。
 //
 // 它的字段集合就是 payload 允许的键集合：解码时按这张表逐个筛键，
-// 所以 {"cmd":"ls"}、{"script":"evil.sh"}、{"url":"http://internal"} 这类"自己指定执行内容"的写法
-// 在第一步就被拒绝，不需要等档位解释。这是设计文档 §2 的 D1/D2 两条口径的落地位置。
+// 所以 {"cmd":"ls"} 这类"自己指定执行内容"的写法在第一步就被拒绝，不需要等档位解释。
+// 这是设计文档 §2 的 D1/D2 两条口径的落地位置。
+//
+// 唯一的例外是四条内置自由执行档位（executor/adhoc.go）：它们的顶层键集合里多了
+// script / url 两项，而这两项正是"跑哪个文件、打到哪里"。例外之所以还守得住 D1/D2，
+// 靠的是三件事同时成立——整节开关默认关闭、提交身份门槛是 executors.required_role、
+// 取值本身在提交期与执行期各判一遍（路径落在允许的目录内、地址过主机与网段守卫）。
+// 用户自建的档位（配置文件里或页面上建的）一条都没放宽。
 type Submission struct {
 	// Args 是 script/binary 档位的具名参数值，键必须是档位声明过的参数名。
 	Args map[string]string
@@ -48,6 +54,18 @@ type Submission struct {
 	// 单列一个字段而不是让执行侧把文本再解析一遍：写法与上限已在同一次校验里判过，
 	// 解析在这里不可能失败，执行侧拿到的是判过上限的那个值。
 	TimeoutValue time.Duration
+
+	// Script 是内置自由执行档位（exec.php / exec.python / exec.shell）这一次执行要跑的脚本，
+	// 绝对路径写法。判据与来源见 executor/adhoc.go 的 checkAdhocScript；非内置档位恒为空。
+	Script string
+
+	// URL 是内置 http 档位（exec.http）要请求的整条地址，规范化后的写法。
+	// 判据见 checkAdhocURL；非内置档位恒为空。
+	//
+	// 单列一个字段而不是当成一个 params 参数：URL 占位符的值禁止 ":" "/" 等字符
+	// （urlParamForbidden，防止一个值改掉整条 URL 的结构），那对占位符是对的规则，
+	// 但整条地址本来就长这个样。
+	URL string
 }
 
 // positionalKey 是 args 里承载位置参数的保留键。它不是档位能声明的参数名
@@ -68,8 +86,13 @@ var ErrWrongKind = errors.New("profile kind does not produce a command line")
 
 // submissionFieldNames 是 payload 允许的顶层键集合。档位类型还会进一步收窄它
 // （见 ValidateSubmission 的 kind 分支），这里管的是"这个键根本不该出现在 payload 里"。
+//
+// script 与 url 在这张表里出现，只是为了让它们走到"这条档位不接收这个键"那条错误文本上去，
+// 而不是撞上"未知键"这种更含糊的说法：真正接收它们的只有内置自由执行档位，
+// 判据与拒绝分支都在 takeAdhocLocation 那一段。
 var submissionFieldNames = map[string]bool{
 	"args": true, "env": true, "params": true, "headers": true, "body": true, "timeout": true,
+	"script": true, "url": true,
 }
 
 // decodeStrict 解码一段 JSON 并给出可用的错误信息。
@@ -117,6 +140,12 @@ func ValidateSubmission(p *Profile, payload []byte) (*Submission, error) {
 	}
 	var rawArgs, rawParams map[string]json.RawMessage
 	if err := decodeSubmissionFields(fields, sub, &rawArgs, &rawParams); err != nil {
+		return nil, err
+	}
+
+	// 内置自由执行档位在这里收下任务给出的位置：判据只有一份（takeAdhocLocation），
+	// 提交期与执行期都走它。非内置档位收到 script/url 时由同一段给出可操作的拒绝文本。
+	if err := takeAdhocLocation(p, fields, sub); err != nil {
 		return nil, err
 	}
 
@@ -186,6 +215,11 @@ func decodeSubmissionFields(fields map[string]json.RawMessage, sub *Submission,
 				sub.Body = raw
 			}
 			continue
+		case adhocLocationKey, adhocLocationURL:
+			// 位置键由 takeAdhocLocation 直接收：它是"档位有没有这个键"的判据之一，
+			// 在这里解码会让非内置档位收到 script 时先报出一个 JSON 类型错误，
+			// 而不是"这条档位不接受 script"。
+			continue
 		}
 		if err := decodeStrict(raw, target, key); err != nil {
 			return err
@@ -195,7 +229,13 @@ func decodeSubmissionFields(fields map[string]json.RawMessage, sub *Submission,
 }
 
 // submissionKeys 返回该档位的 payload 允许出现的顶层键，用于错误信息。
+//
+// 内置自由执行档位的键集合与普通档位完全不同（位置 + timeout，没有 args/params/env/...），
+// 所以这里必须按 Adhoc 分支，否则"该档位接受哪些键"这句提示会是错的。
 func submissionKeys(p *Profile) []string {
+	if p.Adhoc {
+		return []string{p.AdhocLocationKey, "timeout"}
+	}
 	if p.Kind == KindHTTP {
 		return []string{"params", "headers", "body", "timeout"}
 	}
@@ -538,7 +578,15 @@ func (p *Profile) Render(sub *Submission) ([]string, error) {
 	case KindScript:
 		// 解释器名交给执行侧（E09 可以用探测得到的绝对路径替换它）；
 		// 脚本一定用绝对路径：子进程的工作目录由 cmd.Dir 决定，相对路径会指向别处。
-		argv = []string{p.Runtime, p.ScriptPath}
+		//
+		// 内置自由执行档位用的是任务带来的那一个绝对路径（takeAdhocLocation 已经把它
+		// 判成绝对写法并确认文件存在）；argv 仍然是数组直传、不经过 shell，
+		// 所以"路径里有空格"依然是一个元素而不是两次参数。
+		script := p.ScriptPath
+		if p.Adhoc {
+			script = sub.Script
+		}
+		argv = []string{p.Runtime, script}
 	case KindBinary:
 		if p.ProgramPath != "" {
 			argv = []string{p.ProgramPath}

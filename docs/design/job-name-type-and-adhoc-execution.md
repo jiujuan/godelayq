@@ -64,7 +64,7 @@
 | D6 | **adhoc 档位键名：`exec.php`、`exec.python`、`exec.shell`、`exec.http`** | 名字要能直接当界面标签的锚点，也必须是合法档位名（`exec.shell` 的解释器由配置项指定，默认 `bash`）。注意不能用 `exec.adhoc.php` 这种带点的写法——点不在档位名字符集里（`core/executor_profile_store.go:22`） |
 | D7 | **执行位置走 payload 顶层的 `script` / `url` 两个新键，不走 `args`/`params`** | 两条理由。①技术：HTTP 的整条 URL 放进 `params` 必然被拒，占位符值禁止 `:` `/`（`executor/args.go:406-434`，禁字符集 `urlParamForbidden`）。②语义：位置是"跑哪个可执行体"的身份，不是参数值；D7（`web-profile-design.md:38`）正是按这条区分身份与参数。放进 `args` 会让"参数"里混进一个决定执行体的键 |
 | D8 | **路径解析复用 `PathAnywhere`，文件存在性在提交期判一次、执行前由探测再判一次** | `PathAnywhere` 与 `resolveAnywhere`（`executor/profile.go:55`、`:959`）在 TASK-W02 已经实现并只给 Web 侧档位用过，语义正好是"允许本机任意路径，只要求能算出绝对路径"。再判一次是因为提交与执行之间隔着一段时间，文件可能已经不在了；现成的 `fileCheckReason`（`executor/probe.go:115`）就是这一条 |
-| D9 | **URL 仍保留三层守卫，放宽的只有"主机可以在提交时决定"** | ①scheme 只允许 http/https、URL 里不许带凭据（`executor/http.go:247` `fillTemplate`）；②主机白名单（`hostAllowed`，`executor/profile.go:885`）由配置项给，空列表按"不限主机"处理，但这条放宽会让 `checkAllowedHosts`（`:744`）现存的"不允许为空"规则对 adhoc 档位绕开，需要显式分支而不是改坏既有档位；③地址范围守卫**不放宽**：拒回环、私网、链路本地（含云主机元数据地址 169.254.169.254）、组播与 100.64.0.0/10（`executor/http.go:744` `refusalReason`），只有配置显式打开 `url_allow_private` 才整条关闭 |
+| D9 | **URL 仍保留三层守卫，放宽的只有"主机可以在提交时决定"** | ①scheme 只允许 http/https、URL 里不许带凭据（`executor/http.go:267` `checkTarget`）；②主机白名单（`hostAllowed`，`executor/profile.go:885`）由配置项给，空列表按"不限主机"处理，但这条放宽会让 `checkAllowedHosts`（`:744`）现存的"不允许为空"规则对 adhoc 档位绕开，需要显式分支而不是改坏既有档位；③地址范围守卫**不放宽**：拒回环、私网、链路本地（含云主机元数据地址 169.254.169.254）、组播与 100.64.0.0/10（`executor/http.go:744` `refusalReason`），只有配置显式打开 `url_allow_private` 才整条关闭 |
 | D10 | **adhoc 的提交身份门槛复用 `executors.required_role`（默认 admin），不新增角色键** | 阶梯已经存在（`configs/config.example.yaml:80-83`）。再加一个键会出现"两个门槛取哪个"的问题。要放宽的是"执行位置从哪来"这一件事，不是"谁能提交" |
 | D11 | **整套 adhoc 由 `executors.adhoc.enabled` 控制，默认 false；打开要求 `executors.enabled=true`** | 与 `executors.web_enabled` 同一条口径，那条"两个开关必须一起"的规则现在落在 `core/config.go:477`（`web-profile-design.md` 的落地位置段写的 `:459` 已经漂移）。关闭时四条内置档位一条都不注册，接口与页面看不出任何变化 |
 | D12 | **`GET /api/v1/job-types` 形状不动，新增信息全部放 `GET /executors`** | job-types 的响应形状已被 `docs/api.md`、swagger 注释与既有用例钉住（`api/handlers.go:528-532`），而前端本来就同时读这两份（`web/src/components/jobs/JobForm.vue:81-92`）。要加的只有"这条档位是不是 adhoc、位置输入框该叫什么、填什么形态"三项，属于档位属性，放档位列表里最自然 |
@@ -93,7 +93,7 @@
 | 地址范围守卫 | `executor/http.go:744` `refusalReason`、`:705` `allowedIP` | 回环/私网/链路本地/组播/100.64.0.0/10 一律拒 |
 | payload 顶层键集合 | `executor/args.go:71-73`、`:96` `ValidateSubmission` | 只认 `args`/`env`/`params`/`headers`/`body`/`timeout` |
 | argv 组装 | `executor/args.go:531` `Render` | script 档位的 argv 前两项是 `p.Runtime, p.ScriptPath`（`:541`） |
-| URL 组装 | `executor/http.go:230` `renderURL`、`:247` `fillTemplate`、`:273` `renderRaw` | 模板来自档位 `URLTemplate` |
+| URL 组装 | `executor/http.go:230` `renderURL`、`:251` `resolveTarget`、`:267` `checkTarget`、`:290` `renderRaw` | 模板来自档位 `URLTemplate` |
 | 档位注册 | `executor/register.go:52` `Register`、`:139` `Handler`、`:153` `handlerFor` | 键冲突先全量检查再写入；按 kind 分流 |
 | 内置处理函数 | `cmd/server/main.go:895-913` `registerHandlers` | 四个示例 + 全部档位 |
 | 配置结构 | `core/config.go:220` `ExecutorsConfig`、`:294` `ExecutorCommand` | adhoc 新节要挂在 `ExecutorsConfig` 下面 |
@@ -233,16 +233,20 @@ func BuildAdhocProfiles(cfg core.Config, ec core.ExecutorsConfig, mode PathMode)
 
 ```go
 // checkAdhocScript 判"这条任务要跑哪个文件"，返回解析后的绝对路径。
-func checkAdhocScript(p *Profile, raw string, ec core.ExecutorsConfig) (string, error)
+func checkAdhocScript(p *Profile, raw string) (string, error)
 ```
 
 判据依次是：非空 → 无控制字符（复用 `containsControl`，`executor/profile.go:1138`）→
-无 shell 元字符（复用 `firstShellSpecial`，`:1129`）→ 能算出绝对路径（复用 `resolveAnywhere`，`:959`）→
+无 shell 元字符（新函数 `firstPathSpecial`，`executor/adhoc.go:367`：与 `firstShellSpecial`
+（`executor/profile.go:1204`）同一份字符集，只放开反斜杠，因为 Windows 的绝对路径必带它）→
+能算出绝对路径（复用 `resolveAnywhere`，`:959`）→
 命中 `executors.adhoc.path_prefixes` 前缀之一（空列表=不限）→ 扩展名在允许集合内
 （`executors.adhoc.require_extension` 打开时）→ 文件存在且是普通文件（复用 `fileCheckReason`，
 `executor/probe.go:115`）。
 
-`Submission`（`executor/args.go:23`）加一个字段 `Script string` 承接结果；
+`Submission`（`executor/args.go:29`）加一个字段 `Script string` 承接结果；两个入口判据都是
+`takeAdhocLocation`（`executor/adhoc.go:201`，在 `ValidateSubmission` 的 `executor/args.go:148` 调用）；
+需要的三样取值（workspace、允许的目录、扩展名）由 N04 构造时写进 `Profile` 字段，函数不再收配置；
 `submissionFieldNames`（`:71-73`）加 `"script"` 与 `"url"` 两个键，但只有 adhoc 档位接受：
 非 adhoc 档位带这两个键仍然报"payload 的键不被这条档位接受"，错误文案里列出允许键（`:109`）。
 
@@ -255,18 +259,26 @@ argv 仍然是数组直传、不经过 shell，这一条不变（`:529` 注释�
 `Submission` 加 `URL string`。校验函数同文件：
 
 ```go
-// checkAdhocURL 判"这条任务要打到哪里"，返回清洗后的地址。
-func checkAdhocURL(p *Profile, raw string, ec core.ExecutorsConfig) (*url.URL, error)
+// checkAdhocURL 判"这条任务要打到哪里"，返回清洗后的地址写法（string）。
+func checkAdhocURL(p *Profile, raw string) (string, error)
 ```
+
+返回字符串而不是 `*url.URL`：执行侧 `resolveTarget` 会在 `checkTarget` 里再解析一次并判
+scheme、凭据与名单（`executor/http.go:251`、`:267`），提交侧拿着结构体没有消费者。
 
 判据：无空白与控制字符 → `url.Parse` → scheme 只允许 http/https → 不许带 `user:pass`
 → 主机非空 → 命中 `executors.adhoc.url_hosts`（空=不限）→ 记录解析后的规范化地址。
 **地址范围守卫不在这里做**，因为 DNS 解析结果要在真正发请求前判才有意义，
 现成的 `allowedIP`/`refusalReason`（`executor/http.go:705`、`:744`）已经负责这件事，继续用它。
 
-`HTTPRunner.fillTemplate`（`executor/http.go:247`）在 `p.Adhoc` 时改为直接返回 `sub.URL`
-经 `hostAllowed`（`executor/profile.go:885`）的那一支；`renderRaw`（`:273`）与打码路径
-（`renderURL`，`:230` 的 `recorded`）对 adhoc 走同一份地址的打码写法，产物文件里记的还是同一条地址。
+`HTTPRunner` 的地址链拆成 `resolveTarget`（`executor/http.go:251`）与 `checkTarget`（`:267`）：
+前者按 `p.Adhoc` 分流——内置档位直接把 `sub.URL` 送进 `checkTarget`，普通档位先 `renderRaw`
+（`executor/http.go:290`）再送进同一条判断；原 `fillTemplate` 因此没有保留（只剩两行的副本会把
+"真正要访问的地址怎么判"复制成两条链）。`checkTarget` 里的四道判据（scheme、主机非空、凭据、
+`hostAllowed` 名单）两条来源都跑，名单判据写成"有名单才判"：空名单只可能来自 `url_hosts` 留空，
+而 `executors.commands` 的 http 档位仍然必须有非空名单（`checkAllowedHosts`，`executor/profile.go:812`）。
+打码路径（`renderURL`，`executor/http.go:230` 的 `recorded`）对 adhoc 走同一份地址：
+内置档位不声明 secret 参数，产物文件里记的就是那条地址本身。
 
 ### 5.6 接口面与元数据（TASK-N06）
 

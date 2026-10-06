@@ -155,6 +155,11 @@ type Profile struct {
 	// AdhocExtensions 是脚本位置允许的扩展名（小写、含点）；为空表示不要求。
 	// 取值来自 executors.adhoc.require_extension：关掉要求时这里就是空的。
 	AdhocExtensions []string
+
+	// AdhocPathPrefixes 是任务给出的脚本路径允许落在的目录（绝对、已 Clean 的写法）。
+	// 为空表示不限目录。放在档位对象上而不是让校验去读配置，是为了让提交期与执行期
+	// 拿到的是同一份答案，也保住 ValidateSubmission 的签名不必多一个参数。
+	AdhocPathPrefixes []string
 }
 
 // HandlerKey 返回注册进调度器的键。

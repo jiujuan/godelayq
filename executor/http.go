@@ -228,7 +228,7 @@ func (r *HTTPRunner) logRun(key string, job *core.Job, meta core.ExecMeta) {
 // 不归响应层的掩码管，见 TASK-E16 §3.3 第 3 条），
 // 但把口令抄进一份"给人排查用的请求记录"里没有收益，能不留就不留。
 func (r *HTTPRunner) renderURL(sub *Submission) (*url.URL, string, error) {
-	target, err := r.fillTemplate(sub.Params)
+	target, err := r.resolveTarget(sub)
 	if err != nil {
 		return nil, "", err
 	}
@@ -243,26 +243,44 @@ func (r *HTTPRunner) renderURL(sub *Submission) (*url.URL, string, error) {
 	return target, recorded, nil
 }
 
-// fillTemplate 渲染并校验真正要访问的地址。
-func (r *HTTPRunner) fillTemplate(values map[string]string) (*url.URL, error) {
-	rendered, err := r.renderRaw(values)
+// resolveTarget 给出这一次真正要访问的地址。
+//
+// 两条来源共用同一份判据（checkTarget）：scheme、凭据、主机、主机白名单。
+// 内置自由执行档位的那条地址来自任务的 payload（sub.URL，已由 takeAdhocLocation 判过一遍），
+// 但这里仍然要判：提交与执行之间隔着一段时间，而这一层是"真正建连之前"的最后一道地址判断。
+func (r *HTTPRunner) resolveTarget(sub *Submission) (*url.URL, error) {
+	if r.profile.Adhoc {
+		return r.checkTarget(sub.URL)
+	}
+
+	rendered, err := r.renderRaw(sub.Params)
 	if err != nil {
 		return nil, err
 	}
+	return r.checkTarget(rendered)
+}
 
+// checkTarget 判一条已经成形的地址：scheme、主机非空、不带凭据、主机命中白名单。
+//
+// 地址是判据的输入而不是输出的一部分，所以错误文本里不回显它：
+// 模板带值之后可能是 /orders/<口令>，而这条错误会进事件、响应与日志。
+func (r *HTTPRunner) checkTarget(rendered string) (*url.URL, error) {
 	target, err := url.Parse(rendered)
 	if err != nil {
-		return nil, fmt.Errorf("rendered url is not a valid URL: %w", err)
+		return nil, fmt.Errorf("request url is not a valid URL: %w", err)
 	}
 	if target.Host == "" || target.Scheme != "http" && target.Scheme != "https" {
-		// 不回显 rendered：模板带值之后可能是 /orders/<口令>，错误文本会进事件与接口
-		return nil, errors.New("rendered url has no valid scheme or host")
+		return nil, errors.New("request url has no valid scheme or host")
 	}
 	if target.User != nil {
 		// 模板阶段已拒绝凭据，值里也过不了 urlParamForbidden（含 @ 与 :）；这条是第三层
 		return nil, errors.New("request URL must not carry user credentials")
 	}
-	if !hostAllowed(target.Host, r.profile.AllowedHosts) {
+	// 空列表 = 不限主机，而这一取值只可能来自内置自由执行档位（executors.adhoc.url_hosts 留空）：
+	// executors.commands 里的 http 档位必须有非空 allowed_hosts，那一条判据在 profile.go 的
+	// checkAllowedHosts 上，一字未改。写成"有名单才判"而不是"内置档位才判"，
+	// 是因为前者不可能放松普通档位的名单，后者会被复制成两份规则。
+	if len(r.profile.AllowedHosts) > 0 && !hostAllowed(target.Host, r.profile.AllowedHosts) {
 		return nil, fmt.Errorf("host %q is not in the profile's allowed_hosts", target.Host)
 	}
 	return target, nil

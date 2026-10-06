@@ -176,5 +176,62 @@ go build ./... && go vet ./...
 
 ## 10. 实现记录（执行时补写）
 
-| # | 与卡片的偏离 | 原因 |
+落地：`executor/adhoc.go`（`takeAdhocLocation`/`checkAdhocScript`/`checkAdhocURL`/
+`firstPathSpecial`/`adhocPathPrefixes`）、`executor/args.go`（`Submission.Script`/`URL`、
+`submissionFieldNames`（`:93`）加两键、`decodeSubmissionFields`（`:218`）跳过位置键、
+`submissionKeys`（`:235`）的 adhoc 分支、`ValidateSubmission`（`:148`）插入 `takeAdhocLocation`、
+`Render`（`:587`）的 argv 分支）、`executor/http.go`（`resolveTarget`（`:251`）与
+`checkTarget`（`:267`）：模板路径与任务路径共用同一份地址判据）、
+`executor/profile.go`（`Profile.AdhocPathPrefixes`）、新测试 `executor/adhoc_validation_test.go`（12 个顶层用例）。
+
+| # | 与卡面的偏离 | 原因 |
 | --- | --- | --- |
+| 1 | `checkAdhocScript` / `checkAdhocURL` 都不收 `ec core.ExecutorsConfig`，签名是 `(p *Profile, raw string)` | 判据需要的三样（workspace、允许的目录、扩展名 / 主机名单）在 N04 构造时已经落在 `Profile` 字段上。再传一份 `ec` 就成了"档位读字段、校验读配置"两个来源，而同一次执行里这两份可以不一样（`ValidateSubmission` 的签名也没有这个参数，为它加参数要动到 api 与执行侧全部调用点） |
+| 2 | §3.2 第 3 步"复用 `firstShellSpecial`"改成新函数 `firstPathSpecial`（`executor/adhoc.go:367`），字符集只少一个反斜杠 | 卡面自相矛盾：§5 的路径通过组要求"反斜杠"通过，而 `firstShellSpecial`（`executor/profile.go:1204`）把 `\` 列为 shell 元字符——Windows 的绝对路径必带它。其余八个字符（分号、竖线、与号、反引号、美元符、大于号、小于号、换行回车）一个没减，argv 直传不过 shell 那条底线（D3）也没动 |
+| 3 | `checkAdhocURL` 返回 `string`（规范化写法），不是 §3.3 签名的 `*url.URL` | `Submission` 里存的都是能直接比较与序列化的简单值，payload 掩码与任务快照按字符串处理；执行侧 `resolveTarget` 会在 `checkTarget` 里再解析一次并判 scheme、凭据与名单，`*url.URL` 在提交侧没有任何消费者 |
+| 4 | "另一类型的位置键"与"缺位置键"两条规则合成一段循环（`takeAdhocLocation` 的 `:213`） | 于是 `{"type":"exec.php","payload":{"url":"..."}}` 的 400 文本说的是"url 不被 php 接收、这条档位收 script 与 timeout"，而不是"缺 script"。卡面 §3.1 要求两条各有一处用例——`TestAdhocSubmission_KeyOwnership` 两条都在，措辞按实际输出断言 |
+| 5 | `decodeSubmissionFields` 对 `script`/`url` 走 `continue`（`executor/args.go:218`），`submissionFieldNames` 里加这两键只为了让它们走到"这条档位不接受这个键"那句文本上 | 若在解码阶段按形状解码，普通档位收到 `"script":{...}` 会先报出 JSON 类型错误，把更有用的那句挡掉。这也是本卡返工过一次的地方：漏掉 `continue` 时 `TestValidateSubmission_UnknownKeys` 报 `json: Unmarshal(nil)` |
+| 6 | §3.4 表里的 `fillTemplate` 没有保留，改动落成新函数 `resolveTarget` | adhoc 分支与模板分支合完之后 `fillTemplate` 只剩两行、与 `resolveTarget` 的非 adhoc 分支逐字相同。留两份等于把"真正要访问的地址怎么判"复制成两条链，`renderURL` 只需要一个入口 |
+| 7 | 执行期的主机名单判断由 `ValidateSubmission` 重跑那一遍先拦下（`is not in executors.adhoc.url_hosts`），`checkTarget` 的那句（`is not in the profile's allowed_hosts`）在同一调用链上随后再判 | 卡面 §3.4 要求执行期三道判据继续跑——确实继续跑，只是先撞上的是重校验那道。用例 `TestHTTPRunner_AdhocHostGuardRunsAtExecution` 断言的是结果：没有连接、没有解析、永久失败、摘要与错误同源 |
+| 8 | §3.5 落定在"重跑判据 → invalid submission → 永久失败"，不是"起进程失败" | 执行侧对 payload 重跑的是同一个 `takeAdhocLocation`，文件在执行期消失时根本走不到 `cmd.Start`：不起进程、不留产物文件。用例因此断言 `job.Exec.Artifact != core.ArtifactAvailable`，而不是去读 `a1.meta.json` |
+| 9 | `checkTarget` 的名单判断写成"有名单才判"（`len(AllowedHosts) > 0`），不写成"内置档位才判" | 空名单只可能来自 `executors.adhoc.url_hosts` 留空（`executors.commands` 的 http 档位必须有非空名单，那条判据在 `checkAllowedHosts`，一字未改）。写成"有名单才判"不可能放松普通档位，写成"内置才判"会被复制成两份规则 |
+
+DoD 核对：
+
+1. §3.1 四项归属规则逐条有用例：`TestAdhocSubmission_KeyOwnership`（五种组合）+
+   `TestSubmissionKeys_ListedByProfileKind`（内置两档各返回 `["script","timeout"]` / `["url","timeout"]`，
+   普通 script/http 档位的允许键列表分别仍是 `args, env, timeout` 与 `params, headers, body, timeout`，
+   不含 `script`/`url`）。
+2. 非法路径/URL 全在 `ValidateSubmission` 拒：`TestAdhocSubmission_ScriptLocationRejected`（12 条）、
+   `TestAdhocSubmission_URLLocationRejected`（9 条）。"400 时任务没有进堆"由 api 侧的门禁保证（N02 已把
+   `gateExecutorSubmission` 改成按 `HandlerKey` 取档位并复用同一次 `ValidateSubmission`），
+   本卡的执行侧证据是 `TestRunner_AdhocScriptGoneAtExecutionIsPermanent`：判据失败时不起进程、不留产物。
+3. `Render` 与地址链的非 adhoc 输出未变：`TestRender_NonAdhocUnchanged` 断言 `[bash, <绝对脚本>, --day=today]`，
+   既有用例零改动，`go test ./executor ./api ./core` 全绿（executor 24.1s / api 23.1s / core 19.6s）。
+4. 执行期两层地址守卫仍生效：`TestHTTPRunner_AdhocRefusesPrivateAddress`（127.0.0.1 与 169.254.169.254 各一条，
+   `errAddressRefused` + `hits==0` + 一条 warn；对照条 `url_allow_private=true` 时 `hits==1`）与
+   `TestHTTPRunner_AdhocHostGuardRunsAtExecution`（收紧名单后 `hits==0`、`lookups==0`）。
+5. 位置在执行期消失的重试行为按上表第 8 条落定，用例为 `TestRunner_AdhocScriptGoneAtExecutionIsPermanent`。
+6. `go build ./...`、`go vet ./...` 无输出；`go test -race -timeout 30m ./executor ./api ./core` 绿
+   （executor 27.2s / api 222.8s / core 21.7s，2026-10-06）。
+
+变异反向验证两次（`go test -overlay`，中间态副本在 `n05probe`，真实工作树未改）：
+
+1. 把 `checkAdhocScript` 的 `withinDirectory(prefix, absolute)` 换成 `strings.HasPrefix(absolute, prefix)` ⇒
+   `TestAdhocSubmission_PathPrefixesLimitTheDirectory` 在 `scripts-evil` 那条报
+   `An error is expected but got nil`（风险表第 2 条的判据确有牙）。
+2. 把 `adhocCommand` 的 `denyPrivate := !ec.Adhoc.URLAllowPrivate` 换成 `denyPrivate := false` ⇒
+   `TestHTTPRunner_AdhocRefusesPrivateAddress/169.254.169.254` 报 `expected 0 actual 1`（真建了连），
+   并失去那条 warn；同组的 `TestAdhocProfiles_PrivateRangeSwitchReachesProfile` 同时变红。
+
+手工验收（卡片 §7，临时目录）：`TestRunner_AdhocScriptRunsJobPath` 已经把这一条自动化了——
+`exec.shell` 跑 `<workspace>/jobs one/print path.sh`，脚本 `printf 'ran:%s\n' "$0"`，
+产物 `.out` 里读到 `ran:C:\...\jobs one\print path.sh`，路径含空格仍是一个 argv 元素。
+"用不存在的路径提交拿 400"由 `TestAdhocSubmission_ScriptLocationRejected` 的"文件不存在"那一条覆盖
+（错误文本 `script file "..." does not exist`）。
+
+本卡新增用例清单（`executor/adhoc_validation_test.go`）：路径通过组 7 种写法、路径拒绝组 12 条、
+限定目录与相似前缀目录、扩展名要求可关（对照两条）、URL 通过组 5 条、URL 拒绝组 9 条（含不回显整条地址）、
+键归属 5 组、`submissionKeys` 三档对照、超时上限三条、adhoc argv 两条、非 adhoc argv 回归、
+私网拒连两条 + 放开对照、执行期名单收紧、产物里的地址原样、掩码不吞位置、执行期文件消失的永久失败。
+
