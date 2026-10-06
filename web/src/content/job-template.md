@@ -7,9 +7,14 @@
 
 | 成分 | 说明 | 填错的后果 |
 |---|---|---|
-| **任务名称** | 就是**任务类型**，必须是后端已注册的 handler 名。控制台下拉的候选来自 `GET /api/v1/job-types` | `400 unknown job type` / `job type 'xxx' not registered` |
+| **任务名称** | 给人看的**标签**：汉字、英文字母与数字，最长 64 个字符，可以起中文名。它不参与查找，跑什么由下面的任务类型决定 | `400 invalid job name` |
+| **任务类型** | 这条任务**跑什么**：后端已注册的 handler 名，或执行器档位的注册键（`exec.<档位名>`）。控制台下拉的候选来自 `GET /api/v1/job-types` | `400 unknown job type` / `job type 'xxx' not registered` |
 | **触发时间** | 相对延迟 / 绝对时间 / Cron 周期，三选一。都不填＝立即执行 | `400 invalid time format` |
-| **payload** | 自由 JSON，字段含义完全由该任务类型的 handler 决定；**执行器任务（名称以 `exec.` 开头）例外**，它的顶层键是固定的，见 §12 | 控制台只校验"是不是合法 JSON" |
+| **payload** | 自由 JSON，字段含义完全由该任务类型的 handler 决定；**执行器任务（类型以 `exec.` 开头）例外**，它的顶层键是固定的，见 §12 | 控制台只校验"是不是合法 JSON" |
+
+请求体里名称与类型是两个字段（`name` / `type`）。**省略 `type` 是旧写法**：那时 `name` 兼作类型，
+也不套标签规则（`payment_check` 这类带下划线的既有名字仍然能用）。控制台的表单两项都给，
+所以从页面上建的任务一律是新写法。
 
 可选项：分组标签、单次执行超时、最大重试次数、重试间隔。
 
@@ -258,7 +263,7 @@ handler 拿到的是原始字节，通常按结构体去解，标量与数组多
 | 执行器档位与可用性 | `GET /api/v1/executors`（执行器关闭时回 `{"enabled":false,"profiles":[]}`，不是错误） |
 | 某次尝试的输出正文 | `GET /api/v1/jobs/{id}/result?stream=out&from=tail`（响应不缓存） |
 
-## 12. 执行器任务（名称以 `exec.` 开头）怎么写
+## 12. 执行器任务（类型以 `exec.` 开头）怎么写
 
 这类任务不调用代码里注册的 handler，而是执行声明好的**档位**（profile）。
 能执行什么由两个地方决定：配置的 `executors.commands`，以及档位文件
@@ -269,7 +274,7 @@ HTTP 请求三种形态，**没有自由命令行，也不接收源码现场编�
 
 | 前提 | 说明 |
 |---|---|
-| 执行器已开启 | 配置里 `executors.enabled: true`，关闭时下拉里没有任何 `exec.` 任务类型 |
+| 执行器已开启 | 配置里 `executors.enabled: true`，关闭时下拉里没有任何 `exec.` 类型（第二、三组都空） |
 | 档位已声明 | 在线档位（"档位"页）建完即生效、重启后仍在。配置的 `executors.commands`：`reload.enabled: true` 时改条目自身的可改字段（超时、参数声明、条目增删）下一个防抖窗口就生效；改条目内的执行许可字段（用哪个程序、跑哪个脚本、发到哪里、注入哪些凭据）会让整次重载被拒绝，那种改动连同执行器的工作目录与两份白名单仍须重启进程。`reload.enabled: false`（默认）时改配置一律要重启 |
 | 身份够档 | 提交需要 `executors.required_role`（默认 `admin`）及以上；不够时服务端回 403 |
 
@@ -411,7 +416,45 @@ HTTP 档位在建立连接之前就会拒掉回环、私网与元数据地址（
 要给 HTTP 档位传凭据，走请求头：把它声明成 `secret` 参数并放进 `header_allow`。
 请求体（`body`）没有"哪个键是凭据"的声明能力，不会被掩码。
 
-### 12.4 跑完之后看什么
+### 12.4 自由执行类型（打开 `executors.adhoc` 时）
+
+配置里 `executors.adhoc.enabled: true`（默认关闭）时，类型下拉多出第三组
+**自由执行（位置由任务给出）**：`exec.php`、`exec.python`、`exec.shell`、`exec.http`。
+它们与上面那些档位是同一套东西（同一份参数判据、同一个执行池、同一套超时与产物规则），
+区别只有一处：**跑哪个文件、打到哪条地址写在任务里**，而不是写在档位定义里。
+
+表单上选中这类类型时会多出一个输入框（标题与范围说明由后端给，`GET /executors` 的
+`location.label` / `location.hint`）。请求体的 payload 顶层只有两个键可写：
+
+| 键 | 适用类型 | 含义 |
+|---|---|---|
+| `script` | `exec.php` / `exec.python` / `exec.shell` | 要跑的脚本文件路径。绝对路径与相对 `executors.workspace` 的写法都行；落在哪些目录、要不要扩展名由 `executors.adhoc.path_prefixes` 与 `require_extension` 决定 |
+| `url` | `exec.http` | 整条地址（`http` / `https`，不能带 `user:pass`）。允许哪些主机由 `executors.adhoc.url_hosts` 决定（留空为不限） |
+| `timeout` | 全部 | 与上面那张键表同一条规则，仍受 `executors.max_timeout` 约束 |
+
+`args` / `env` / `params` / `headers` / `body` 在这一组类型里一律不接受，多写一个键整条 400。
+
+```json
+{
+  "name": "昨晚的对账",
+  "type": "exec.php",
+  "delay": "1m",
+  "payload": { "script": "D:\\work\\reconcile.php" }
+}
+```
+
+两条要紧的边界：
+
+- **地址范围守卫没放宽**：`exec.http` 在建连之前照样拒回环、私网、链路本地（含云主机
+  元数据地址）与组播地址；只有 `executors.adhoc.url_allow_private: true` 才整条关闭。
+- **文件判两次**：提交时文件不存在直接 400；提交成功后文件被删，执行时会按"参数问题"
+  判为永久失败，不重试。
+
+整节关闭时这四条类型不存在，下拉与 `GET /api/v1/job-types` 的样子和之前一致。
+打开它意味着"够 `executors.required_role` 的身份可以让这台机器执行它提交的路径、
+请求它提交的地址"，进程启动日志里会为此留下几条 warn 说明当前的范围。
+
+### 12.5 跑完之后看什么
 
 - 详情页的**执行结果**区块：类别、退出码或 HTTP 状态码、耗时、输出是否被截断、产物文件在不在。
 - 输出正文点"标准输出 / 标准错误"才读取（那是磁盘上的文件，不随详情页一起取）。

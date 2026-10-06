@@ -10,6 +10,11 @@ export type RoleName = 'viewer' | 'operator' | 'admin' | 'ops'
 export interface Job {
   id: string
   name: string
+  /**
+   * 任务类型：决定这条任务跑什么（代码里注册的 Handler 名，或执行器档位的注册键）。
+   * 空表示旧写法——请求体没带 type，名称兼作类型，此时按 name 查档位（见 api/dto.go 同一条口径）。
+   */
+  type?: string
   status: JobStatus
   group?: string
   trigger_at: string
@@ -140,6 +145,30 @@ export interface ExecutorProfile {
    * http 档位与"program 写成 PATH 程序名"的 binary 档位没有这个键。
    */
   path_display?: string
+  /**
+   * 这条是不是自由执行档位（executors.adhoc 打开时那四条内置档位）。
+   * 普通档位是 false 而这个键照样给出：缺键分不出"普通档位"与"后端还不认识自由执行档位"。
+   */
+  adhoc?: boolean
+  /**
+   * 只有 adhoc 档位给：执行位置由任务的 payload 给出，这一项说的是那个输入框。
+   * 界面以"有没有 location"作为唯一判据，不再自己认 exec.php 这类键名（TASK-N06/N07）。
+   */
+  location?: ExecutorProfileLocation
+}
+
+/** 自由执行档位的位置输入说明（api.ProfileLocation） */
+export interface ExecutorProfileLocation {
+  /** payload 顶层的键名：script | url */
+  key: string
+  /** 位置的形态：path | url，决定输入框的提示与前端那一层形态检查 */
+  kind: 'path' | 'url' | string
+  /** 输入框标题，含扩展名要求（后端已经拼好，前端只呈现） */
+  label: string
+  /** 内置四条恒为 true：没有位置就不知道跑什么 */
+  required: boolean
+  /** 这份部署对取值范围的说法（限定目录、主机名单、地址守卫） */
+  hint: string
 }
 
 /** 档位的位置参数规则（ExecutorPositionalResponse） */
@@ -290,7 +319,13 @@ export interface ErrorResponse {
 
 /** POST /jobs 请求体（CreateJobRequest） */
 export interface CreateJobRequest {
+  /** 给人看的标签：汉字、英文字母与数字，最长 64 个字符（判据在 core.ValidateJobName） */
   name: string
+  /**
+   * 跑什么：代码里注册的 Handler 名或执行器档位的注册键。
+   * 省略是旧写法——那时 name 兼作类型，且 name 不套标签规则（设计文档 §D4 的兼容）。
+   */
+  type?: string
   delay?: string
   trigger_at?: string
   cron_expr?: string
@@ -454,6 +489,9 @@ export interface RuntimeInfo {
 
 export interface ListJobsQuery {
   status?: JobStatus
+  /** 按类型筛（后端比的是 Job.HandlerKey()：带 type 用 type，旧写法回退名称） */
+  type?: string
+  /** 按名称标签筛：后端是精确匹配，不是子串 */
   name?: string
   /** 传空串=只看未分组；不传=不过滤（与后端 GetQuery 的区分一致） */
   group?: string

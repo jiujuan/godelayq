@@ -187,5 +187,70 @@ grep -rn "已注册的任务类型" web/src
 
 ## 10. 实现记录（执行时补写）
 
+落地：`web/src/api/types.ts`（`Job.Type`、`CreateJobRequest.Type`、`ListJobsQuery.Type`、
+`ExecutorProfile.Adhoc` / `.Location`、新接口 `ExecutorProfileLocation`）、`web/src/api/jobs.ts`
+（`listJobs` 的查询参数逐字段清单里加 `type`）、`web/src/display.ts`（`jobTypeOf`）、
+`web/src/components/ui/UiSelect.vue`（`SelectOption.group` 与 `<optgroup>` 渲染路径）、
+`web/src/components/jobs/JobForm.vue`（三字段与三分组、位置输入框、编辑模式只读化）、
+`web/src/components/jobs/JobTable.vue`（"类型"列）、`web/src/components/jobs/JobFilterBar.vue`
+（类型下拉 + 名称文本框）、`web/src/views/JobDetailView.vue`（类型行与位置行）、
+`web/src/views/JobsView.vue`（筛选状态与地址栏回写各加一个 `type`）、
+`web/src/content/job-template.md`（§1 拆成名称与类型两行、新增 §12.4 自由执行类型）。
+后端零改动。
+
 | # | 与卡片的偏离 | 原因 |
 | --- | --- | --- |
+| 1 | 类型下拉的三组**全部**用 `<optgroup>`，占位项"请选择任务类型"留在分组外平铺 | 卡面 §3.2 的图示把三组并列；原生 `select` 的占位项放进分组会让人以为它是一个可提交的类型。`UiSelect` 的分组是新加的可选能力，一项都不带 `group` 时渲染路径与改动前逐字相同（其余下拉不受影响） |
+| 2 | 名称正则写成 `^[\p{Script=Han}A-Za-z0-9]{1,64}$`（卡面是 `\p{Han}`） | 本仓库的 `vue-tsc` 不认 `\p{Han}` 这个别名（`TS1529 Unknown Unicode property name`），`Script=Han` 是同一份 Unicode 数据的正式写法；判据仍与 `core.ValidateJobName` 同源，常量处注释指向 `core/job_name.go` |
+| 3 | 位置输入框的 `placeholder` 由前端给举例（两种后缀各一个），`location.hint` 仍作输入框下方的说明 | 卡面 §3.1 让"占位与提示都用 `location.hint`"，但后端那句 hint 是整段范围说明（"只能选这些目录里的文件：…"），塞进占位会把两行文字挤成一行灰字，且范围一变整句都要重排。举例给两种后缀是因为四条内置档位共用一个占位，对 `exec.php` 说"就像 report.sh 那样填"会说错 |
+| 4 | 没有新增 `profiles` prop：`JobForm` 沿用自己在 TASK-E18 起就有的 `GET /executors` 查询，`JobsView` 继续只传 `jobTypes` | 卡面 §3.5 让两种做法二选一并记录。档位表、`required_role`、不可用原因本来就在同一份响应里，再经宿主转一遍会让抽屉的入参变成两份真相 |
+| 5 | 列表、详情、编辑三处的旧写法回退统一走 `jobTypeOf()`（`web/src/display.ts`） | 与后端 `Job.HandlerKey()` 同一条判据（`type` 空则用名称）。三处各写一份 `job.type \|\| job.name` 的话，将来加第三种回退就又要改三处 |
+| 6 | 详情页多读一次 `GET /executors`（`staleTime` 5 分钟），只为拿位置行的标题 | 位置标题带扩展名清单（`脚本路径（.sh、.bash）`），后端已经拼好；前端再拼一遍就是复制一份规则（README 共同口径第 2 条）。缓存键 `queryKeys.executors` 本来就有，不会每次进详情都打一遍接口 |
+| 7 | 筛选条的类型下拉候选仍是 `GET /job-types` 的全量，不给"不可用"标注、也不按角色收口 | 筛选是查询条件而不是提交入口：档位在这台机器不可用，历史上用它的任务照样筛得出来；按角色收口会让 operator 看不见已经存在的档位任务 |
+| 8 | 编辑模式那条只读段落在旧写法任务下不再重复打印名称 | 实测（00:22）看到 `payment_check·payment_check（旧写法：名称就是类型）`：类型为空时"名称·类型"退化成同一词两遍。改为类型为空只给名称 + 旧写法说明 |
+| 9 | 位置的前端检查是三条：必填、控制字符（`U+0000`–`U+001F`、`U+007F`）、URL 的 scheme | 卡面 §3.1 只要求"URL 检查 scheme、路径检查非空"。加控制字符一条是因为服务端判据里换行与回车本来就在 shell 元字符表内（`executor/adhoc.go:367` `firstPathSpecial`），这类值不可能来自真实路径，输入时就说明比提交后 400 省一轮。路径里的空格、相对 workspace 的写法、上跳再下来的写法一律放过，拒绝权仍在服务端 |
+| 10 | 名称与位置的错误在字段为空时就显示（未加"碰过才说"） | 既有口径：改动前那个名称下拉的 `:error="nameMissing ? '必须选择一个任务类型' : null"` 同样是即时显示，本卡没有引入新行为，也没有顺手改掉它 |
+| 11 | 新增的 §12.4 与既有那节"跑完之后看什么"撞了同一编号，收尾复核时改成 §12.5 | 写卡时只说了"新增一节讲自由执行类型"，没规定编号；`grep "^### 12\."` 才看出两个 12.4 并排。文中没有指向旧编号的交叉引用（`grep "12\.4\|12\.5"` 只剩两条标题） |
+
+DoD 核对：
+
+1. **没有任何一处前端再按 `exec.` 前缀判档位**：`grep -rn "startsWith('exec" web/src` 零命中；
+   分流判据是"选中类型的档位对象有没有 `location`"（`JobForm.vue` 的 `locationSpec`）。
+2. 名称与类型分别落到 `name` 与 `type`，adhoc 的 `payload` 就是 `{"script":…}` / `{"url":…}`，
+   证据是浏览器里 `POST /api/v1/jobs` 的请求体原文（见下面实测记录 ②）。
+3. 列表同时显示名称与类型，筛选条给的是"类型下拉 + 名称文本框"，
+   网络请求里确实是 `?type=` 与 `?name=`（下面 ⑤）。
+4. 编辑模式名称、类型、位置均只读，且写明"名称与类型不可修改，要换就新建一条"（下面 ⑦）。
+5. `grep -rn "已注册的任务类型" web/src` 零命中；`job-template.md` 的 §1 已按新事实重写。
+6. 图标全部来自 lucide（本次未新增图标），样式只用既有令牌（未新增令牌，未改 `:root`）。
+
+界面实测（内嵌形态：`-tags dashboard` 的 `godelayq-server.exe`，端口 8123，配置与数据目录在
+`%TEMP%\n07smoke`，`executors.enabled: true` + `executors.adhoc.enabled: true`，
+`required_role: admin`，档位 `hello_sh`（两条参数：`day` 必填、`token` secret）与 `absent_py`（脚本不存在））：
+
+| # | 卡片 §5 的那一项 | 观测结果 |
+| --- | --- | --- |
+| ① | 中文名称 + `exec.php` + 不存在的路径 | 表单允许提交（"创建任务"未 disabled），`POST /api/v1/jobs` → **400**，抽屉不关，顶部 `role=alert` 是后端原文：`invalid executor payload：payload key "script": script file "nope_missing.php" does not exist`；位置输入框下方另有一句"后端拒了这条取值，原文见表单顶部的错误说明"（同一句拒绝按 `payload key "script"` 归位到这个字段，不重复贴原文） |
+| ② | 改成存在的路径 | `POST` → **201**，请求体原文：`{"name":"界面实测脚本","type":"exec.php","payload":{"script":"C:/Users/xing/AppData/Local/Temp/n07smoke/ws/reconcile.php"},"delay":"10m"}`；列表表头 `名称 / 类型`，该行显示 `界面实测脚本` 与 `exec.php` |
+| ③ | 切到 `payment_check` | 位置栏消失，JSON 编辑器（`textarea`，标签"payload 合法 JSON，字段由该任务类型的 Handler 定义"）出现 |
+| ④ | 切到普通档位 | `exec.hello_sh`：位置只读展示 `print_path.sh` + "位置来自档位定义，任务只给参数。"，参数表单两栏（`day（必填） · 命令行参数` 是文本框、`token · 命令行参数` 是 `type=password`），未填 `day` 时"创建任务" disabled；填齐后 `POST` → **201**，请求体 `{"name":"档位参数实测","type":"exec.hello_sh","payload":{"args":{"day":"2026-10-07","token":"sekret123"}},"delay":"10m"}`，该任务到终态 success（服务端日志 `exit_code=0`）。`exec.absent_py` 在同一个下拉里可见但 `disabled`，标签是 `exec.absent_py（不可用：script file "not_deployed.py" does not exist）` |
+| ⑤ | 按类型筛与按名称筛各一次 | 类型下拉选 `exec.php` → `GET /api/v1/jobs?type=exec.php&limit=50&offset=0`，表里只剩两条 exec.php；名称文本框输入"档位参数实测" → `GET /api/v1/jobs?name=%E6%A1%A3%E4%BD%8D…&limit=50&offset=0`，只剩一条；地址栏同步写成 `/jobs?type=exec.php` 与 `/jobs?name=…` |
+| ⑥ | 详情显示位置 | `exec.php` 那条：`任务类型 exec.php`、`脚本路径（.php） C:/Users/…/reconcile.php`；`exec.shell` 那条的标题是 `脚本路径（.sh、.bash）`（同一份后端 label）；旧写法那条（请求体 `{"name":"payment_check"}`、不带 `type`）显示 `payment_check（旧写法：名称就是类型）` 且**没有**位置行 |
+| ⑦ | 编辑模式名称与类型只读 | 名称、类型、位置三处都是文本段落，没有可编辑控件；`exec.shell` 那条段落是 `编辑分隔符检查·exec.shell（名称与类型不可修改，要换就新建一条）`，位置另起一行 `脚本路径（.sh、.bash）：C:/Users/…/print_path.sh`；档位任务的参数区仍是既有那段掩码说明 |
+| 权限 | `operator` 身份打开同一页 | 退出 admin01、登录 oper01（`required_role: admin`）后，新建抽屉的类型下拉只剩占位项 + "普通任务"一组（`data_sync`、`email_send`、`payment_check`、`report_generate`），第二、三组整体不出现；选中 `payment_check` 之后下方给出说明"执行器档位与自由执行类型需要 admin 及以上才能提交，当前身份的下拉里没有它们。"（未选类型时这一句被同一位置的必填提示挡住——`UiSelect` 是 error 优先于 hint，既有实现） |
+| 未观测 | toast、折叠动画等秒级现象 | 应用内标签页被隐藏时时钟节流，一律标**未观测**（既有实测口径）。`cancelled` 状态的行仍然不出现在列表里（取消即删记录），本卡未覆盖 |
+
+构建与回归：
+
+- `cd web && npx vue-tsc --noEmit` 退出码 0；`npm run build` 成功，
+  上表那批实测跑在 `web/dist/index.html` 时间戳 `2026-10-07 00:25:45` 的产物上，
+  随后 `go build -tags dashboard ./cmd/server` 产出的二进制时间戳 `2026-10-07 00:25:47`
+  （内嵌的是 `web/dist`，顺序必须是先前端再 Go）。§12.4 编号撞车修掉之后又重了一次，
+  最终产物是 `web/dist/index.html 00:39:26` 与二进制 `00:39:28`，
+  任务模板页复核：`12.4 自由执行类型（打开 executors.adhoc 时）` 与 `12.5 跑完之后看什么` 各一处。
+- 后端回归 `go test ./api ./core ./executor -race -timeout 30m` 全绿：
+  `ok godelayq/api 212.311s`、`ok godelayq/core 21.107s`、`ok godelayq/executor 24.728s`（2026-10-07）。
+
+环境说明（照实记）：`%TEMP%\n07smoke` 在 00:15–00:18 之间被系统回收掉 `config.yaml` 与 `ws/`
+（`data/` 与二进制仍在），按原样重建后重跑了受影响的步骤；重建的 `config.yaml` 与两份脚本内容与回收前
+一致（`hello_sh` 的两条参数是回收之前就已加进去的那份），因此 ④ 与 ⑤ 的两条 201 是重建之后重新取得的。

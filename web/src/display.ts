@@ -13,6 +13,16 @@ export function shortJobId(id: string): string {
   return id.length > 8 ? id.slice(-8) : id
 }
 
+/**
+ * 一条任务的类型（跑什么）。
+ *
+ * 新写法直接给 `type`；旧写法的请求体没有 type，那时名称兼作类型，
+ * 后端的 `Job.HandlerKey()` 也是这条回退规则（core/job.go），界面跟着它走。
+ */
+export function jobTypeOf(job: { name: string; type?: string }): string {
+  return job.type?.trim() || job.name.trim()
+}
+
 function parsed(iso: string): Date | null {
   const value = new Date(iso)
   return Number.isNaN(value.getTime()) ? null : value

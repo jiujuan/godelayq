@@ -7,10 +7,14 @@
  *
  * 触发方式三选一在提交时塌缩成一个：后端看到 delay / trigger_at / cron_expr 只应有一个非空。
  *
- * 选中 exec.* 档位时（TASK-E18 §3.3）payload 不再是手写 JSON，而是按 GET /executors 给出的
+ * 名称与类型是两件事（TASK-N02）：名称只是给人看的标签，类型才是"跑什么"——
+ * 代码里注册的 Handler 名、`executors.commands` 声明的档位，或 `executors.adhoc` 那四条自由执行档位。
+ * 选中档位类型时（TASK-E18 §3.3）payload 不再是手写 JSON，而是按 GET /executors 给出的
  * 档位声明生成的参数表单：必填、默认值、格式、允许的环境变量与请求头、能不能带请求体，
  * 全部来自那个响应——前端不复制第二份规则，副本迟早和配置漂移。
- * 只有新建走这张表单：编辑模式下执行器任务的参数值在读取响应里是掩码后的（TASK-E16），
+ * 自由执行档位再多一项：位置输入框（跑哪个文件、打到哪条地址），它的键名、标题与范围说明
+ * 也全部来自那份响应里的 location（TASK-N06/N07），拒绝权在服务端。
+ * 只有新建走这些表单：编辑模式下执行器任务的参数值在读取响应里是掩码后的（TASK-E16），
  * 回填进来的是一串 ***，把它当原值提交等于把凭据写成字面量，所以编辑照旧给 JSON 编辑器。 */
 import { computed, reactive, ref, watch } from 'vue'
 import { RouterLink } from 'vue-router'
@@ -24,10 +28,12 @@ import UiSelect from '../ui/UiSelect.vue'
 import { listExecutors } from '../../api/executors'
 import { queryKeys } from '../../api/keys'
 import { usePermission } from '../../composables/usePermission'
+import { jobTypeOf } from '../../display'
 import type {
   CreateJobRequest,
   ExecutorArgSpec,
   ExecutorProfile,
+  ExecutorProfileLocation,
   Job,
   UpdateJobRequest,
 } from '../../api/types'
@@ -56,8 +62,30 @@ const emit = defineEmits<{
 
 const UNGROUPED = ''
 
+/** 任务名称的字符集与长度：与 core.ValidateJobName（core/job_name.go）同一条规则。
+ *  服务端仍然会判一遍并把 400 原文回显到表单顶部，这里只求少跑一次明显错误的提交。
+ *  写成 \p{Script=Han} 而不是 \p{Han}：两者同源数据，后者 TypeScript 的正则检查器不认。 */
+const JOB_NAME_RULE = /^[\p{Script=Han}A-Za-z0-9]{1,64}$/u
+
+/**
+ * 编辑模式下那条自由执行任务的位置：值在 payload 顶层（`script` 或 `url`）。
+ * 只做展示用（只读），不回填成可编辑输入框——编辑模式给的是 JSON 编辑器，
+ * 那一侧的既有理由见文件头；改位置由人在 JSON 里改。
+ */
+function locationFromPayload(payload: unknown): string {
+  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) return ''
+  const record = payload as Record<string, unknown>
+  for (const key of ['script', 'url']) {
+    const value = record[key]
+    if (typeof value === 'string' && value !== '') return value
+  }
+  return ''
+}
+
 const form = reactive({
   name: props.job?.name ?? '',
+  jobType: props.job ? jobTypeOf(props.job) : '',
+  location: locationFromPayload(props.job?.payload),
   triggerMode: (props.job ? 'at' : 'delay') as TriggerMode,
   delay: '10m',
   triggerAt: toLocalInput(props.job?.trigger_at),
@@ -106,17 +134,54 @@ const executorRequiredRole = computed(() => executorsQuery.data.value?.required_
 const canSubmitExecutor = computed(() => permission.canSubmitExecutorJobs(executorRequiredRole.value))
 
 /**
- * 选中 exec.* 档位时的声明；普通任务与普通模式下都是 null。
+ * 选中类型对应的档位声明；普通任务与普通模式下都是 null。
  *
- * 判"是不是档位"用的是注册键前缀，与后端 core.ExecPrefix 同一条写法。
+ * 判"是不是档位"用的是 GET /executors 里有没有这个注册键，不再看名称前缀：
+ * 名称与类型解耦之后（TASK-N02），标签里查不到任何档位，前缀判据会跟着一起失效。
  * 模式限制成 create 的理由写在文件头：编辑模式里响应给的参数值是掩码后的，
  * 回填等于把 *** 当原值提交。
  */
 const profile = computed<ExecutorProfile | null>(() => {
   if (props.mode !== 'create') return null
-  const key = form.name.trim()
-  if (!key.startsWith('exec.')) return null
+  const key = form.jobType.trim()
+  if (!key) return null
   return profiles.value.find((item) => item.key === key) ?? null
+})
+
+/**
+ * 这条选中档位的位置输入说明（TASK-N06 的 location）。
+ * 有它就意味着"跑哪个文件、打到哪里由这条任务给出"，表单换成一个位置输入框。
+ */
+const locationSpec = computed<ExecutorProfileLocation | null>(() => profile.value?.location ?? null)
+
+/**
+ * 位置输入框的举例。后端没把扩展名清单单独给前端（只在 location.label 里带了一句），
+ * 所以这里举两种后缀，避免对 exec.php 说"就像 report.sh 那样填"这种错位示例；
+ * 真正允许的扩展名写在标签括号里，范围说明在下方 hint。
+ */
+const locationPlaceholder = computed(() =>
+  locationSpec.value?.kind === 'url'
+    ? 'https://hook.example.com/orders/7'
+    : 'D:\\work\\report.php 或 /srv/app/run.sh',
+)
+
+/**
+ * 编辑模式那条任务的档位（只为只读展示位置与类型而查，不给参数表单）。
+ * 后端禁改类型（api/handlers.go 的 UpdateJob），所以这一份只用来把 payload 的键名说清楚。
+ */
+const editProfile = computed<ExecutorProfile | null>(() => {
+  if (props.mode !== 'edit') return null
+  const key = form.jobType.trim()
+  if (!key) return null
+  return profiles.value.find((item) => item.key === key) ?? null
+})
+
+/** 选中档位时的"跑的是哪个文件 / 哪条地址"：后端给的写法原样展示，前端不拼路径 */
+const profileTarget = computed(() => {
+  const spec = profile.value ?? editProfile.value
+  if (!spec) return null
+  if (spec.location) return null
+  return spec.path_display || spec.url || null
 })
 
 type EntryRow = { key: string; value: string }
@@ -145,6 +210,7 @@ watch(
     headerRows.value = []
     bodyText.value = ''
     execTimeout.value = ''
+    form.location = ''
     if (!next) return
     for (const spec of next.args) {
       // secret 参数连档位声明的默认值都不预填：那也是一个凭据，不该出现在输入框和 DOM 里
@@ -268,8 +334,37 @@ const profileUnavailable = computed(() => {
   return spec && !spec.runtime_ok ? spec.reason || '这台机器现在跑不了这个档位' : null
 })
 
+/**
+ * 位置输入框的检查：必填 + 一条形态提示。
+ *
+ * 只做形态检查，范围与合法性一概由服务端判（路径落在哪些目录、地址打到哪些主机、
+ * 文件在不在，前端都不知道也不该猜）；检查出来的问题写成一句提示，
+ * 而拒绝权在 POST /jobs 那一侧，400 的原文会回到表单顶部。
+ */
+const locationError = computed(() => {
+  const spec = locationSpec.value
+  if (!spec) return null
+  const value = form.location.trim()
+  if (value === '') return spec.required ? `请填写${spec.label}` : null
+  if (/[\u0000-\u001f\u007f]/.test(value)) {
+    return '取值里不能有控制字符（路径里的空格是允许的）'
+  }
+  if (spec.kind === 'url' && !/^https?:\/\/\S+$/i.test(value)) {
+    return '写法是完整地址，以 http:// 或 https:// 开头'
+  }
+  return null
+})
+
+/** 后端关于位置的拒绝同样落到这个输入框下（原文仍在表单顶部，那里才是排查依据） */
+const locationDisplayError = computed(() => {
+  const spec = locationSpec.value
+  if (!spec) return null
+  return locationError.value ?? serverErrorFor(`payload key "${spec.key}"`)
+})
+
 const executorErrors = computed(() => [
   profileUnavailable.value,
+  locationError.value,
   ...Object.values(argErrors.value),
   positionalError.value,
   envError.value,
@@ -316,13 +411,24 @@ function dropPositional(index: number): void {
  * 这里仍然给 JSON 编辑器而不是参数表单，是因为读取响应给的 secret 参数是 ***（TASK-E16），
  * 回填进输入框再保存等于把"星号"当成凭据原文提交。给一张空白参数表会让人以为参数丢了，
  * 也不对；所以留 JSON 原文 + 一句明确说明，改哪个键由人决定。
+ *
+ * 判据是"这条任务的类型在不在登记表里"（档位对象给的就是这件事），不是名称前缀。
  */
-const isExecutorJobEdit = computed(() => props.mode === 'edit' && form.name.trim().startsWith('exec.'))
+const isExecutorJobEdit = computed(() => props.mode === 'edit' && editProfile.value !== null)
 
 /** 档位任务的 payload 组装；调用方保证此刻没有校验错误 */
 function buildExecutorPayload(): Record<string, unknown> {
   const spec = profile.value
   if (!spec) return {}
+
+  // 自由执行档位只带位置与可选超时：它没有参数声明，args/env/params/headers/body 一律不收
+  // （收了的拒绝文本由服务端给，见 executor/adhoc.go 的 takeAdhocLocation）
+  if (spec.location) {
+    const payload: Record<string, unknown> = { [spec.location.key]: form.location.trim() }
+    const timeout = execTimeout.value.trim()
+    if (timeout !== '') payload.timeout = timeout
+    return payload
+  }
 
   const payload: Record<string, unknown> = {}
   const values: Record<string, unknown> = {}
@@ -408,12 +514,27 @@ const triggerError = computed(() => {
   return null
 })
 
-const nameMissing = computed(() => props.mode === 'create' && form.name === '')
+/**
+ * 名称与类型两项的缺判据。
+ *
+ * 名称是标签（可以与类型同名，也可以完全不相关），类型才是"跑什么"。
+ * 两者在请求体里是两个字段（TASK-N02），这里也各判各的。
+ */
+const nameMissing = computed(() => props.mode === 'create' && form.name.trim() === '')
+const typeMissing = computed(() => props.mode === 'create' && form.jobType.trim() === '')
+
+const nameError = computed(() => {
+  if (props.mode !== 'create') return null
+  if (nameMissing.value) return '请填写任务名称'
+  if (!JOB_NAME_RULE.test(form.name)) return '只能是汉字、英文字母与数字，最长 64 个字符（不能有空格、标点或符号）'
+  return null
+})
 
 const canSubmit = computed(
   () =>
     !props.busy &&
-    !nameMissing.value &&
+    !nameError.value &&
+    !typeMissing.value &&
     !triggerError.value &&
     !payloadError.value &&
     executorErrors.value.every((error) => error === null) &&
@@ -421,37 +542,53 @@ const canSubmit = computed(
 )
 
 /**
- * 任务类型下拉。
+ * 任务类型下拉，三组（TASK-N07 §3.2）。
  *
- * 执行器档位按 GET /executors 的两条结论处理：
- *   - 当前身份不够 required_role：整条不出现（入口体验，服务端 403 才是边界）；
+ * 分组判据全部来自 GET /executors 的那份档位表：带 location 的是自由执行档位，
+ * 在表里但没有 location 的是声明式档位，不在表里的就是代码里注册的普通任务类型。
+ * 前端不再按 exec. 前缀判——名称与类型解耦之后那条前缀判据既不该出现在标签上，
+ * 也不该出现在这里。
+ *
+ * 两条既有口径照旧：
+ *   - 当前身份不够 required_role：档位两组整体不出现（入口体验，服务端 403 才是边界）；
  *   - 档位在这台机器不可用：留着可见但选不动，标签直接写原因——
  *     让人看见"配置里有但跑不了"比藏起来更有用，藏起来会让人以为配置没生效。
  */
-const nameOptions = computed(() => {
-  const options: { value: string; label: string; disabled?: boolean }[] = [
-    { value: '', label: '请选择任务类型' },
-  ]
+const typeOptions = computed(() => {
+  type Option = { value: string; label: string; disabled?: boolean; group?: string }
+  const plain: Option[] = []
+  const declared: Option[] = []
+  const free: Option[] = []
+
   for (const name of props.jobTypes) {
     const spec = profiles.value.find((item) => item.key === name)
     if (!spec) {
-      options.push({ value: name, label: name })
+      plain.push({ value: name, label: name, group: '普通任务' })
       continue
     }
     if (!canSubmitExecutor.value) continue
-    options.push({
+    const option: Option = {
       value: name,
-      label: spec.runtime_ok ? `${name}（执行器档位）` : `${name}（不可用：${spec.reason}）`,
+      label: spec.runtime_ok ? name : `${name}（不可用：${spec.reason}）`,
       disabled: !spec.runtime_ok,
-    })
+    }
+    if (spec.location) free.push(option)
+    else declared.push(option)
   }
-  return options
+
+  // 组名是界面语言，与后端的 kind/source 这些取值无关；空数组的组不给组名，
+  // 于是 UiSelect 那边也不会渲染一个空分组。首选项"请选择任务类型"留在分组外平铺：
+  // 它不是一个可提交的类型，放进 optgroup 会让人以为它也属于某一组。
+  const groups: Option[] = [{ value: '', label: '请选择任务类型' }, ...plain]
+  if (declared.length > 0) groups.push(...declared.map((item) => ({ ...item, group: '执行器档位' })))
+  if (free.length > 0) groups.push(...free.map((item) => ({ ...item, group: '自由执行（位置由任务给出）' })))
+  return groups
 })
 
 const hiddenExecutorHint = computed(() => {
   if (props.mode !== 'create') return null
   if (!executorRequiredRole.value || canSubmitExecutor.value) return null
-  return `执行器档位（exec. 开头）需要 ${executorRequiredRole.value} 及以上才能提交，当前身份的下拉里没有它们。`
+  return `执行器档位与自由执行类型需要 ${executorRequiredRole.value} 及以上才能提交，当前身份的下拉里没有它们。`
 })
 
 const groupOptions = computed(() => [
@@ -508,7 +645,12 @@ function submit(): void {
     return
   }
 
-  const body: CreateJobRequest = { name: form.name, payload, group }
+  const body: CreateJobRequest = {
+    name: form.name.trim(),
+    type: form.jobType.trim(),
+    payload,
+    group,
+  }
   if (form.triggerMode === 'delay') body.delay = form.delay.trim()
   if (form.triggerMode === 'at') {
     const parsed = new Date(form.triggerAt)
@@ -550,26 +692,67 @@ function createGroup(): void {
       {{ serverError }}
     </p>
 
-    <UiSelect
-      v-if="mode === 'create'"
-      label="任务名称（= 已注册的任务类型）"
-      :model-value="form.name"
-      :options="nameOptions"
-      :disabled="busy"
-      :error="nameMissing ? '必须选择一个任务类型' : null"
-      :hint="
-        hiddenExecutorHint ??
-        (jobTypes.length === 0
-          ? '后端没有注册任何任务类型，先加载 handler 或检查 job 目录配置'
-          : undefined)
-      "
-      @update:model-value="form.name = $event"
-    />
+    <template v-if="mode === 'create'">
+      <UiInput
+        label="任务名称"
+        :model-value="form.name"
+        :disabled="busy"
+        placeholder="每晚对账"
+        :error="nameError"
+        hint="名称只是给人看的标签，跑什么由下面的任务类型决定；只能用汉字、英文字母与数字，最长 64 个字符"
+        @update:model-value="form.name = $event"
+      />
+
+      <UiSelect
+        label="任务类型"
+        :model-value="form.jobType"
+        :options="typeOptions"
+        :disabled="busy"
+        :error="typeMissing ? '请选择任务类型' : null"
+        :hint="
+          hiddenExecutorHint ??
+          (jobTypes.length === 0
+            ? '后端没有注册任何任务类型，先加载 handler 或检查 job 目录配置'
+            : undefined)
+        "
+        @update:model-value="form.jobType = $event"
+      />
+
+      <!-- 自由执行类型：跑哪个文件、打到哪条地址由这条任务给（TASK-N07 §3.1） -->
+      <UiInput
+        v-if="locationSpec"
+        :label="`${locationSpec.label}（必填）`"
+        :model-value="form.location"
+        :disabled="busy"
+        :placeholder="locationPlaceholder"
+        :error="locationDisplayError"
+        :hint="locationSpec.hint"
+        @update:model-value="form.location = $event"
+      />
+
+      <!-- 声明式档位的位置写在档位定义里：这里只读展示后端给的写法 -->
+      <div v-else-if="profileTarget" class="flex flex-col gap-1.5">
+        <span class="text-sm font-medium text-[var(--color-text)]">这个档位跑的是</span>
+        <p class="break-all text-sm text-[var(--color-text-muted)]"><code>{{ profileTarget }}</code></p>
+        <p class="text-xs text-[var(--color-text-muted)]">位置来自档位定义，任务只给参数。</p>
+      </div>
+    </template>
+
     <div v-else class="flex flex-col gap-1.5">
-      <span class="text-sm font-medium text-[var(--color-text)]">任务名称</span>
-      <p class="text-sm text-[var(--color-text-muted)]">
+      <span class="text-sm font-medium text-[var(--color-text)]">任务名称与类型</span>
+      <p class="break-all text-sm text-[var(--color-text-muted)]">
         <code>{{ form.name }}</code>
-        <span class="ml-2 text-xs">（名称与 cron 不可修改，要换就新建一条）</span>
+        <!-- 旧写法任务的类型就是名称，重复打印一遍只会让人以为是两个不同的值 -->
+        <template v-if="job?.type">
+          <span class="mx-2">·</span>
+          <code>{{ form.jobType }}</code>
+        </template>
+        <span v-if="!job?.type" class="ml-2 text-xs">（旧写法：名称就是类型）</span>
+        <span class="ml-2 text-xs">（名称与类型不可修改，要换就新建一条）</span>
+      </p>
+      <p v-if="editProfile?.location" class="break-all text-sm text-[var(--color-text-muted)]">
+        <span class="text-xs">{{ editProfile.location.label }}：</span>
+        <code>{{ form.location || '这份 payload 里没有位置' }}</code>
       </p>
     </div>
 
@@ -639,7 +822,9 @@ function createGroup(): void {
     </fieldset>
 
     <div class="flex items-center justify-between">
-      <span class="text-sm font-medium text-[var(--color-text)]">{{ profile ? '档位参数' : 'payload 写什么' }}</span>
+      <span class="text-sm font-medium text-[var(--color-text)]">
+        {{ locationSpec ? '这条任务的位置与超时' : profile ? '档位参数' : 'payload 写什么' }}
+      </span>
       <RouterLink
         :to="{ name: 'job-template' }"
         target="_blank"
@@ -651,9 +836,10 @@ function createGroup(): void {
     </div>
 
     <!--
-      选中 exec.* 档位时，payload 的结构由档位声明决定，所以这里按 GET /executors 的规格生成输入项：
+      选中档位类型时，payload 的结构由档位声明决定，所以这里按 GET /executors 的规格生成输入项：
       必填标记、默认值预填、格式提示都来自那份响应，前端不复制规则（TASK-E18 §3.3 第 1 条）。
-      组装出的 payload 顶层键固定是档位任务那几种（args / env / params / headers / body / timeout），
+      声明式档位组装出的顶层键固定是那几种（args / env / params / headers / body / timeout），
+      自由执行档位只带位置与 timeout（位置键名由响应的 location.key 给，TASK-N06/N07），
       写错的键会在提交期被服务端整条拒掉，因此这里不给自由 JSON 入口。
     -->
     <template v-if="profile">
@@ -662,137 +848,145 @@ function createGroup(): void {
         这台机器现在跑不了这个档位：{{ profileUnavailable }}。提交同样会被服务端拒，请先补上脚本或程序。
       </p>
 
-      <p v-if="profile.has_secret_args" class="text-xs text-[var(--color-text-muted)]">
-        这个档位声明了 secret 参数：这类值在任务详情、列表与输出预览里都不会回显，
-        留空就表示这次不提交它（档位自己声明的默认值仍由后端使用）。
+      <p v-if="locationSpec" class="text-xs text-[var(--color-text-muted)]">
+        这条类型只收位置（payload 顶层的 <code>{{ locationSpec.key }}</code>）与单次超时：
+        参数、环境变量与请求头都不接受，填了会在提交期被整条拒掉。
       </p>
 
-      <div class="flex flex-col gap-3">
-        <UiInput
-          v-for="arg in profile.args"
-          :key="arg.name"
-          :label="`${arg.name}${arg.required ? '（必填）' : ''} · ${valueSection === 'params' ? 'URL 参数' : '命令行参数'}`"
-          :model-value="argValues[arg.name] ?? ''"
-          :type="arg.secret ? 'password' : 'text'"
-          :autocomplete="arg.secret ? 'new-password' : 'off'"
+      <template v-if="!locationSpec">
+        <p v-if="profile.has_secret_args" class="text-xs text-[var(--color-text-muted)]">
+          这个档位声明了 secret 参数：这类值在任务详情、列表与输出预览里都不会回显，
+          留空就表示这次不提交它（档位自己声明的默认值仍由后端使用）。
+        </p>
+
+        <div class="flex flex-col gap-3">
+          <UiInput
+            v-for="arg in profile.args"
+            :key="arg.name"
+            :label="`${arg.name}${arg.required ? '（必填）' : ''} · ${valueSection === 'params' ? 'URL 参数' : '命令行参数'}`"
+            :model-value="argValues[arg.name] ?? ''"
+            :type="arg.secret ? 'password' : 'text'"
+            :autocomplete="arg.secret ? 'new-password' : 'off'"
+            :disabled="busy"
+            :error="argDisplayError(arg.name)"
+            :hint="argHint(arg)"
+            @update:model-value="argValues[arg.name] = $event"
+          />
+          <p v-if="profile.args.length === 0" class="text-xs text-[var(--color-text-muted)]">
+            这个档位没有具名参数。
+          </p>
+        </div>
+
+        <!-- 位置参数只属于进程档位：http 的 payload 没有 args 这一层，后端会直接拒 -->
+        <fieldset v-if="profile.positional && profile.kind !== 'http'" class="flex flex-col gap-2">
+          <legend class="mb-1 text-sm font-medium text-[var(--color-text)]">
+            位置参数（最多 {{ profile.positional.max }} 个）
+          </legend>
+          <div v-for="(value, index) in positionalValues" :key="index" class="flex items-end gap-2">
+            <UiInput
+              :model-value="value"
+              :disabled="busy"
+              :placeholder="`第 ${index + 1} 个`"
+              @update:model-value="positionalValues[index] = $event"
+            />
+            <UiButton variant="ghost" size="sm" :disabled="busy" @click="dropPositional(index)">
+              <X :size="14" aria-hidden="true" />
+              移除
+            </UiButton>
+          </div>
+          <div class="self-start">
+            <UiButton
+              variant="ghost"
+              size="sm"
+              :disabled="busy || positionalValues.length >= profile.positional.max"
+              @click="positionalValues = [...positionalValues, '']"
+            >
+              <Plus :size="14" aria-hidden="true" />
+              加一个位置参数
+            </UiButton>
+          </div>
+          <p v-if="positionalError" class="text-xs text-[var(--color-status-failed)]">{{ positionalError }}</p>
+          <p v-else class="text-xs text-[var(--color-text-muted)]">
+            按顺序拼进命令行；格式：{{ profile.positional.pattern }}
+          </p>
+        </fieldset>
+
+        <fieldset v-if="profile.kind === 'http'" class="flex flex-col gap-2">
+          <legend class="mb-1 text-sm font-medium text-[var(--color-text)]">
+            请求头（只列档位允许的：{{ profile.header_allow?.length ? profile.header_allow.join('、') : '无' }}）
+          </legend>
+          <div v-for="(row, index) in headerRows" :key="`h${index}`" class="flex items-end gap-2">
+            <UiSelect
+              :model-value="row.key"
+              :options="headerKeyOptions"
+              :disabled="busy"
+              class="w-56"
+              @update:model-value="row.key = $event"
+            />
+            <UiInput
+              :model-value="row.value"
+              :disabled="busy"
+              placeholder="取值"
+              @update:model-value="row.value = $event"
+            />
+            <UiButton variant="ghost" size="sm" :disabled="busy" @click="dropRow('header', index)">
+              <X :size="14" aria-hidden="true" />
+            </UiButton>
+          </div>
+          <div class="self-start">
+            <UiButton variant="ghost" size="sm" :disabled="busy || !headerKeyOptions.length" @click="addHeaderRow">
+              <Plus :size="14" aria-hidden="true" />
+              加一个请求头
+            </UiButton>
+          </div>
+          <p v-if="headerError" class="text-xs text-[var(--color-status-failed)]">{{ headerError }}</p>
+        </fieldset>
+
+        <PayloadEditor
+          v-if="profile.kind === 'http' && profile.body_mode && profile.body_mode !== 'none'"
+          v-model="bodyText"
+          label="请求体"
           :disabled="busy"
-          :error="argDisplayError(arg.name)"
-          :hint="argHint(arg)"
-          @update:model-value="argValues[arg.name] = $event"
+          :error="bodyError"
+          :hint="
+            profile.body_mode === 'json'
+              ? '这个档位要求 JSON 对象或数组，Content-Type 会由执行器按 json 模式补上'
+              : '任意合法 JSON 值，按原样字节发送'
+          "
         />
-        <p v-if="profile.args.length === 0" class="text-xs text-[var(--color-text-muted)]">
-          这个档位没有具名参数。
-        </p>
-      </div>
 
-      <!-- 位置参数只属于进程档位：http 的 payload 没有 args 这一层，后端会直接拒 -->
-      <fieldset v-if="profile.positional && profile.kind !== 'http'" class="flex flex-col gap-2">
-        <legend class="mb-1 text-sm font-medium text-[var(--color-text)]">
-          位置参数（最多 {{ profile.positional.max }} 个）
-        </legend>
-        <div v-for="(value, index) in positionalValues" :key="index" class="flex items-end gap-2">
-          <UiInput
-            :model-value="value"
-            :disabled="busy"
-            :placeholder="`第 ${index + 1} 个`"
-            @update:model-value="positionalValues[index] = $event"
-          />
-          <UiButton variant="ghost" size="sm" :disabled="busy" @click="dropPositional(index)">
-            <X :size="14" aria-hidden="true" />
-            移除
-          </UiButton>
-        </div>
-        <div class="self-start">
-          <UiButton
-            variant="ghost"
-            size="sm"
-            :disabled="busy || positionalValues.length >= profile.positional.max"
-            @click="positionalValues = [...positionalValues, '']"
-          >
-            <Plus :size="14" aria-hidden="true" />
-            加一个位置参数
-          </UiButton>
-        </div>
-        <p v-if="positionalError" class="text-xs text-[var(--color-status-failed)]">{{ positionalError }}</p>
-        <p v-else class="text-xs text-[var(--color-text-muted)]">
-          按顺序拼进命令行；格式：{{ profile.positional.pattern }}
-        </p>
-      </fieldset>
+        <fieldset v-if="profile.kind !== 'http'" class="flex flex-col gap-2">
+          <legend class="mb-1 text-sm font-medium text-[var(--color-text)]">
+            环境变量（只列档位允许的：{{ profile.env_allow.length ? profile.env_allow.join('、') : '无' }}）
+          </legend>
+          <div v-for="(row, index) in envRows" :key="`e${index}`" class="flex items-end gap-2">
+            <UiSelect
+              :model-value="row.key"
+              :options="envKeyOptions"
+              :disabled="busy"
+              class="w-56"
+              @update:model-value="row.key = $event"
+            />
+            <UiInput
+              :model-value="row.value"
+              :disabled="busy"
+              placeholder="取值"
+              @update:model-value="row.value = $event"
+            />
+            <UiButton variant="ghost" size="sm" :disabled="busy" @click="dropRow('env', index)">
+              <X :size="14" aria-hidden="true" />
+            </UiButton>
+          </div>
+          <div class="self-start">
+            <UiButton variant="ghost" size="sm" :disabled="busy || !envKeyOptions.length" @click="addEnvRow">
+              <Plus :size="14" aria-hidden="true" />
+              加一个环境变量
+            </UiButton>
+          </div>
+          <p v-if="envError" class="text-xs text-[var(--color-status-failed)]">{{ envError }}</p>
+        </fieldset>
 
-      <fieldset v-if="profile.kind === 'http'" class="flex flex-col gap-2">
-        <legend class="mb-1 text-sm font-medium text-[var(--color-text)]">
-          请求头（只列档位允许的：{{ profile.header_allow?.length ? profile.header_allow.join('、') : '无' }}）
-        </legend>
-        <div v-for="(row, index) in headerRows" :key="`h${index}`" class="flex items-end gap-2">
-          <UiSelect
-            :model-value="row.key"
-            :options="headerKeyOptions"
-            :disabled="busy"
-            class="w-56"
-            @update:model-value="row.key = $event"
-          />
-          <UiInput
-            :model-value="row.value"
-            :disabled="busy"
-            placeholder="取值"
-            @update:model-value="row.value = $event"
-          />
-          <UiButton variant="ghost" size="sm" :disabled="busy" @click="dropRow('header', index)">
-            <X :size="14" aria-hidden="true" />
-          </UiButton>
-        </div>
-        <div class="self-start">
-          <UiButton variant="ghost" size="sm" :disabled="busy || !headerKeyOptions.length" @click="addHeaderRow">
-            <Plus :size="14" aria-hidden="true" />
-            加一个请求头
-          </UiButton>
-        </div>
-        <p v-if="headerError" class="text-xs text-[var(--color-status-failed)]">{{ headerError }}</p>
-      </fieldset>
-
-      <PayloadEditor
-        v-if="profile.kind === 'http' && profile.body_mode && profile.body_mode !== 'none'"
-        v-model="bodyText"
-        label="请求体"
-        :disabled="busy"
-        :error="bodyError"
-        :hint="
-          profile.body_mode === 'json'
-            ? '这个档位要求 JSON 对象或数组，Content-Type 会由执行器按 json 模式补上'
-            : '任意合法 JSON 值，按原样字节发送'
-        "
-      />
-
-      <fieldset v-if="profile.kind !== 'http'" class="flex flex-col gap-2">
-        <legend class="mb-1 text-sm font-medium text-[var(--color-text)]">
-          环境变量（只列档位允许的：{{ profile.env_allow.length ? profile.env_allow.join('、') : '无' }}）
-        </legend>
-        <div v-for="(row, index) in envRows" :key="`e${index}`" class="flex items-end gap-2">
-          <UiSelect
-            :model-value="row.key"
-            :options="envKeyOptions"
-            :disabled="busy"
-            class="w-56"
-            @update:model-value="row.key = $event"
-          />
-          <UiInput
-            :model-value="row.value"
-            :disabled="busy"
-            placeholder="取值"
-            @update:model-value="row.value = $event"
-          />
-          <UiButton variant="ghost" size="sm" :disabled="busy" @click="dropRow('env', index)">
-            <X :size="14" aria-hidden="true" />
-          </UiButton>
-        </div>
-        <div class="self-start">
-          <UiButton variant="ghost" size="sm" :disabled="busy || !envKeyOptions.length" @click="addEnvRow">
-            <Plus :size="14" aria-hidden="true" />
-            加一个环境变量
-          </UiButton>
-        </div>
-        <p v-if="envError" class="text-xs text-[var(--color-status-failed)]">{{ envError }}</p>
-      </fieldset>
+      </template>
 
       <UiInput
         label="单次执行超时（写进 payload）"

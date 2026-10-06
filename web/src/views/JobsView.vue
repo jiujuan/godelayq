@@ -60,9 +60,10 @@ const permission = usePermission()
  * group= 与不带 group 是两回事（未分组 vs 不过滤），所以这里必须区分空串与缺席。
  */
 function initialFilters(): ListJobsQuery {
-  const { status, name, group } = route.query
+  const { status, type, name, group } = route.query
   const next: ListJobsQuery = {}
   if (typeof status === 'string' && status !== '') next.status = status as JobStatus
+  if (typeof type === 'string' && type !== '') next.type = type
   if (typeof name === 'string' && name !== '') next.name = name
   if (typeof group === 'string') next.group = group
   return next
@@ -78,6 +79,7 @@ watch(filters, (next) => {
 
   const query: Record<string, string> = {}
   if (next.status) query.status = next.status
+  if (next.type) query.type = next.type
   if (next.name) query.name = next.name
   if (next.group !== undefined) query.group = next.group
   void router.replace({ name: 'jobs', query })

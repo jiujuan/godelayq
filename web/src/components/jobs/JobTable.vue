@@ -5,7 +5,7 @@ import { computed } from 'vue'
 import { FileText, Loader, Pencil, RotateCcw, SkipForward, SquarePen, Trash2 } from 'lucide-vue-next'
 import JobStatusBadge from './JobStatusBadge.vue'
 import type { Job, JobStatus } from '../../api/types'
-import { formatDateTime, shortJobId } from '../../display'
+import { formatDateTime, jobTypeOf, shortJobId } from '../../display'
 import { formatCountdown, useNowTick } from '../../composables/useCountdown'
 
 type ActionKey = 'open' | 'edit' | 'pause' | 'resume' | 'cancel' | 'retry' | 'force-pause'
@@ -161,6 +161,7 @@ function dispatch(job: Job, action: RowAction): void {
           </th>
           <th class="px-2 py-2.5">ID</th>
           <th class="px-2 py-2.5">名称</th>
+          <th class="px-2 py-2.5">类型</th>
           <th class="px-2 py-2.5">分组</th>
           <th class="px-2 py-2.5">状态</th>
           <th class="px-2 py-2.5">触发时间</th>
@@ -189,6 +190,10 @@ function dispatch(job: Job, action: RowAction): void {
             <code class="text-xs text-[var(--color-text-muted)]">{{ shortId(job.id) }}</code>
           </td>
           <td class="px-2 py-2.5 font-medium">{{ job.name }}</td>
+          <td class="px-2 py-2.5">
+            <!-- 类型是"跑什么"那个注册键；旧写法（请求体没带 type）时名称兼作类型，jobTypeOf 跟着后端回退 -->
+            <code class="text-xs">{{ jobTypeOf(job) }}</code>
+          </td>
           <td class="px-2 py-2.5">{{ job.group || '—' }}</td>
           <td class="px-2 py-2.5"><JobStatusBadge :status="job.status" /></td>
           <td class="px-2 py-2.5">

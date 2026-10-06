@@ -18,13 +18,14 @@ import UiConfirm from '../components/ui/UiConfirm.vue'
 import UiDrawer from '../components/ui/UiDrawer.vue'
 import UiEmptyState from '../components/ui/UiEmptyState.vue'
 import { fetchJob, fetchJobTypes, pauseJob, retryJob, resumeJob, cancelJob, forcePauseJob, updateJob } from '../api/jobs'
+import { listExecutors } from '../api/executors'
 import { listGroups } from '../api/groups'
 import { ApiError } from '../api/client'
 import { queryKeys } from '../api/keys'
 import { useJobEvents } from '../composables/useJobEvents'
 import { usePermission } from '../composables/usePermission'
 import { useToastStore } from '../stores/toast'
-import { formatDateTime, shortJobId } from '../display'
+import { formatDateTime, jobTypeOf, shortJobId } from '../display'
 import type { Job, UpdateJobRequest } from '../api/types'
 
 const route = useRoute()
@@ -133,8 +134,36 @@ const payloadText = computed(() => {
   return typeof payload === 'string' ? payload : JSON.stringify(payload, null, 2)
 })
 
-/** 任务类型名是不是执行器档位的注册键（前缀只在 core.ExecPrefix 一处定义，这里跟着它走） */
-const isExecutorJob = computed(() => (job.value?.name ?? '').trimStart().startsWith('exec.'))
+/**
+ * 这条任务跑的是不是某个档位：判据是"类型在不在 GET /executors 的登记表里"，
+ * 不再看名称前缀——名称与类型解耦之后（TASK-N02），前缀判据既读不到标签里的东西，
+ * 也不该由前端复制一份键名规则。
+ */
+const executorsQuery = useQuery({
+  queryKey: queryKeys.executors,
+  queryFn: listExecutors,
+  staleTime: 5 * 60_000,
+})
+
+/** 类型那个注册键（旧写法时后端与这里都回退到名称） */
+const jobType = computed(() => (job.value ? jobTypeOf(job.value) : ''))
+
+const jobProfile = computed(
+  () =>
+    executorsQuery.data.value?.profiles.find((item) => item.key === jobType.value && !item.degraded) ??
+    null,
+)
+
+const isExecutorJob = computed(() => jobProfile.value !== null)
+
+/** 自由执行任务的位置：值在 payload 顶层，键名由档位的 location 给 */
+const jobLocation = computed(() => {
+  const spec = jobProfile.value?.location
+  const payload = job.value?.payload
+  if (!spec || !payload || typeof payload !== 'object' || Array.isArray(payload)) return null
+  const value = (payload as Record<string, unknown>)[spec.key]
+  return typeof value === 'string' && value !== '' ? value : null
+})
 
 const fields = computed(() => {
   const current: Job | null = job.value
@@ -142,6 +171,14 @@ const fields = computed(() => {
   return [
     { label: '任务 ID', value: current.id, mono: true },
     { label: '名称', value: current.name },
+    {
+      label: '任务类型',
+      value: current.type?.trim() ? current.type : `${jobType.value}（旧写法：名称就是类型）`,
+      mono: true,
+    },
+    ...(jobLocation.value
+      ? [{ label: jobProfile.value?.location?.label ?? '执行位置', value: jobLocation.value, mono: true }]
+      : []),
     { label: '分组', value: current.group || '未分组' },
     { label: '触发时间', value: formatDateTime(current.trigger_at) },
     { label: '创建时间', value: formatDateTime(current.created_at) },

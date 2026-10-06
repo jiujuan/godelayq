@@ -1,9 +1,12 @@
 <script setup lang="ts">
-/* 筛选条：只落后端已有的三个参数（status / group / name）。
+/* 筛选条：只落后端已有的四个参数（status / group / type / name）。
    没有关键字框——列表端点不支持，硬加一个"只过滤当前这一页"的输入框
-   会让翻页和总数自相矛盾，比没有更糟（设计文档 §4.6 已按此修订）。 */
+   会让翻页和总数自相矛盾，比没有更糟（设计文档 §4.6 已按此修订）。
+   类型与名称是两个筛子（TASK-N02 之后它们是两件事）：类型下拉的候选来自 GET /job-types，
+   名称框填的是任务的标签，后端按整名精确比。 */
 import { Plus, RotateCcw } from 'lucide-vue-next'
 import UiButton from '../ui/UiButton.vue'
+import UiInput from '../ui/UiInput.vue'
 import UiSelect from '../ui/UiSelect.vue'
 import type { JobStatus, ListJobsQuery } from '../../api/types'
 
@@ -25,7 +28,7 @@ interface Props {
   filters: ListJobsQuery
   /** 分组下拉的候选：注册表 + 只挂在任务标签上的组名 */
   groupNames: string[]
-  /** 名称下拉的候选：GET /job-types */
+  /** 类型下拉的候选：GET /job-types（跑什么的那些名字） */
   jobTypes: string[]
   canCreate: boolean
   createHint: string | null
@@ -45,7 +48,11 @@ function groupValue(): string {
 }
 
 function nameValue(): string {
-  return props.filters.name ?? ALL
+  return props.filters.name ?? ''
+}
+
+function typeValue(): string {
+  return props.filters.type ?? ALL
 }
 
 function patch(next: Partial<ListJobsQuery>): void {
@@ -79,10 +86,18 @@ function patch(next: Partial<ListJobsQuery>): void {
 
     <UiSelect
       class="w-44"
+      label="类型"
+      :model-value="typeValue()"
+      :options="[{ value: ALL, label: '全部类型' }, ...jobTypes.map((name) => ({ value: name, label: name }))]"
+      @update:model-value="(value) => patch({ type: value === ALL ? undefined : value })"
+    />
+
+    <UiInput
+      class="w-52"
       label="名称"
       :model-value="nameValue()"
-      :options="[{ value: ALL, label: '全部名称' }, ...jobTypes.map((name) => ({ value: name, label: name }))]"
-      @update:model-value="(value) => patch({ name: value === ALL ? undefined : value })"
+      placeholder="按完整名称筛"
+      @update:model-value="(value) => patch({ name: value.trim() === '' ? undefined : value.trim() })"
     />
 
     <UiButton variant="ghost" size="sm" @click="emit('update:filters', {})">

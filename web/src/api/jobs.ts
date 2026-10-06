@@ -15,11 +15,12 @@ import type {
 } from './types'
 
 export function listJobs(query: ListJobsQuery = {}): Promise<ListJobsResponse> {
-  // 逐字段列出而不是整体展开：后端只认这五个参数，
+  // 逐字段列出而不是整体展开：后端只认这几个参数，
   // 类型里长出别的东西时要在这里露头，而不是静默变成一个被忽略的查询串
   return request<ListJobsResponse>('/jobs', {
     query: {
       status: query.status,
+      type: query.type,
       name: query.name,
       group: query.group,
       limit: query.limit,
