@@ -182,5 +182,33 @@ grep -n "adhoc" configs/config.example.yaml configs/config.yaml core/config.go c
 
 ## 10. 实现记录（执行时补写）
 
-| # | 与卡片的偏离 | 原因 |
+落地：`core/config.go`（`AdhocConfig` 七个键、三条默认常量、`defaultAdhocRequireExtension`、
+`WantExtensionCheck`、`validateAdhocConfig`、`Validate` 主流程那条"要求 enabled"、
+`Normalized`、BindEnv 列表一行）、`core/config_reload.go`（七个键 `ClassRestart`）、
+新测试 `core/config_adhoc_test.go`、`configs/config.example.yaml` 与 `configs/config.yaml`。
+
+| # | 与卡面的偏离 | 原因 |
 | --- | --- | --- |
+| 1 | §3.3 第 2 条"shell_runtime 必须在 runtime_allow 内"加了一个前提：**只在整节打开时判** | 实现后既有用例 `TestLoadConfig_ExecutorsEnvOverrides`（`core/config_test.go:610`）当场变红：它把 `runtime_allow` 覆盖成 `node,php`，而本节的默认 `shell_runtime` 是 `bash`——一份根本没打算用 adhoc 的部署会因此启动失败。与本节开头的既有口径对齐（`ExecutorsConfig` 一节注释："关闭时这些取值全部不参与行为"）。两条对照用例把结论钉住：关闭时同一份白名单放过、打开时报错 |
+| 2 | 主机写形的判据落成"复用 `checkExecNameList` + 两条额外形状判据（含 `://`、含 `/?#@`）"，没有新增一份主机名正则 | 卡面 §3.3 第 3 条要求 core 侧只做基础形态检查；`*.example.com` 与 `host:port` 的完整写法判据留在 `executor/profile.go:744` 那一份里，注释已写明这条分工 |
+| 3 | 除 §3.3 列的六条判据外，`http_timeout` 的上限比较在 `executors.max_timeout <= 0` 时跳过 | 未打开执行器时 `max_timeout` 可以是 0（"留空用默认"），那时没有上限可比；打开后 `Validate` 主流程已经要求它是正值，比较照常生效 |
+| 4 | `require_extension` 的默认值同时出现在常量 `DefaultAdhocRequireExtension` 与 `WantExtensionCheck()` 上 | 卡面 §3.2 只要求用指针。默认值要在 `DefaultConfig`、`Normalized` 与"N05 那边手上是指针或 nil"三处给出，收成一个常量 + 一个读方法比让调用处各自判空更不容易漂移 |
+| 5 | `defaultAdhocRequireExtension()` 每次返回新指针，而不是共享一个包级 `*bool` | 配置结构按值复制着传（`Normalized()` 返回值拷贝），共享指针会让任何一处就地改写串到其它副本上；用例 `TestAdhocNormalizedIsIdempotent` 末尾那条断言守的就是这一点 |
+| 6 | 环境变量只绑 `executors.adhoc.enabled`，其余六项故意不绑 | 列表型（`path_prefixes`、`url_hosts`）绑上会把"覆盖"变成"替换"，与 `executors.commands` 不绑是同一条理由（`core/config.go` 里那段既有注释）。用例 `TestAdhocEnvOverride` 除了正向证明 `enabled` 能被覆盖，还反向断言了那两项**没有**被覆盖——将来有人加了绑定，这条会红，逼他重新回答"该不该绑" |
+
+DoD 核对：
+
+1. 七个键在 `core/config.go`、`configs/config.example.yaml`、`configs/config.yaml` 三处都出现
+   （`grep -n "adhoc" …` 命中，重载表里七条逐行可查）。
+2. §3.3 的判据逐条有用例：`TestAdhocValidate_Rejects` 10 个子测试（含"关闭时仍判形状"那条），
+   `TestAdhocValidate_Allows` 5 个子测试；归一化幂等见 `TestAdhocNormalizedIsIdempotent`；
+   环境变量覆盖见 `TestAdhocEnvOverride`。
+3. 两个热重载守卫绿：`TestEveryLeafKeyIsClassed`（`core/config_reload_test.go:24`）与
+   `assertEveryExportedFieldCovered` 所在的覆盖用例；另有 `TestAdhocReloadClassesAreRestart`
+   逐条断言七个键都是 `ClassRestart`。
+4. `TestExampleConfigMatchesLocal` **PASS（不是跳过）**——本机 `configs/config.yaml` 存在，
+   两份键集合一致。
+5. 默认关闭时全仓行为零变化：`go test ./core` 整包绿（19.5s），
+   `api`、`executor` 两个包在本卡里一行都没改（`git show --stat` 可查）。
+
+补充：`go build ./...`、`go vet ./...` 无输出；`go test -race -timeout 30m ./core ./api` 见 N02 卡末尾记录。

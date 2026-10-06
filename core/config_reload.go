@@ -89,8 +89,19 @@ var configClasses = map[string]ConfigClass{
 	"executors.queue_capacity": ClassRestart, "executors.default_timeout": ClassRestart,
 	"executors.max_timeout": ClassRestart, "executors.restore_policy": ClassRestart,
 	"executors.loader_allow": ClassRestart, "executors.web_enabled": ClassRestart,
-	"executors.profiles_path":         ClassRestart,
-	"executors.output.inline_preview": ClassRestart, "executors.output.max_bytes": ClassRestart,
+	"executors.profiles_path": ClassRestart,
+	// 自由执行档位整节都是重启档：这一节改的是"注册表里有没有那四条键"和
+	// "任务提交时能给出的范围有多大"，两者都属于执行体的身份边界，与 executors.enabled 同类。
+	// 逐条列出而不是靠默认档，作用是让人知道这七项被认真归过类
+	// （设计文档 job-name-type-and-adhoc-execution.md §5.7 第 4 条）。
+	"executors.adhoc.enabled":           ClassRestart,
+	"executors.adhoc.shell_runtime":     ClassRestart,
+	"executors.adhoc.path_prefixes":     ClassRestart,
+	"executors.adhoc.require_extension": ClassRestart,
+	"executors.adhoc.url_hosts":         ClassRestart,
+	"executors.adhoc.url_allow_private": ClassRestart,
+	"executors.adhoc.http_timeout":      ClassRestart,
+	"executors.output.inline_preview":   ClassRestart, "executors.output.max_bytes": ClassRestart,
 	"executors.output.dir": ClassRestart, "executors.output.ttl": ClassRestart,
 	"server.cors.allow_origins": ClassRestart, "server.cors.allow_credentials": ClassRestart,
 	"server.auth.jwt.access_ttl": ClassRestart, "server.auth.jwt.refresh_ttl": ClassRestart,

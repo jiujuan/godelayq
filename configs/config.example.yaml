@@ -130,6 +130,42 @@ executors:
   # 档位里的本机路径换一台机器会探测失败，那是预期而不是故障。
   # 环境变量：GODELAYQ_EXECUTORS_PROFILES_PATH=/srv/godelayq/exec-profiles.json
   profiles_path: ./data/exec-profiles.json
+  # 自由执行档位：打开后多出四条内置任务类型 exec.php / exec.python / exec.shell / exec.http，
+  # 它们的"跑哪个文件、打到哪里"不在档位定义里，而是提交任务时由 payload 的 script / url 给出。
+  # 这条边界比 executors.commands 宽得多：够 executors.required_role（默认 admin）的身份从此可以
+  # 让这台机器执行它发来的路径、请求它发来的地址。所以整节默认 false，
+  # 且打开它必须同时 executors.enabled: true，否则启动即报（与 web_enabled 同一条规则）。
+  # 本节七项全是重启档：reload.enabled 打开时改它们只会进 ignored_keys，要生效仍需重启进程。
+  # 设计依据见 docs/design/job-name-type-and-adhoc-execution.md（§5.7 与 §8 的运维须知）。
+  # 环境变量只绑这一项：GODELAYQ_EXECUTORS_ADHOC_ENABLED=true
+  adhoc:
+    # 总开关。false 时那四条内置类型一条都不注册，接口、页面与 /job-types 看不出任何变化。
+    enabled: false
+    # exec.shell 用的解释器名，必须是 executors.runtime_allow 里的一项，否则启动即报。
+    # 留空用默认 bash。
+    shell_runtime: bash
+    # 允许的任务级脚本路径前缀：相对 executors.workspace 或绝对路径都写。
+    # 空列表表示不限目录——这是本次主动放宽的第一层，生产部署请显式收紧，例：
+    #   path_prefixes: [./scripts, D:/work/scripts]
+    # 判断用的是目录边界而不是字符串前缀：/srv/scripts-evil 不算在 /srv/scripts 之内。
+    path_prefixes: []
+    # 是否要求脚本扩展名与解释器匹配（php→.php、python→.py、shell→.sh/.bash）。
+    # 删掉这一行等于用默认 true；显式写 false 是"知道风险、主动关掉这道要求"的写法。
+    # 这一项在代码里是指针而不是普通布尔位：false 恰好是零值，普通布尔分不出"没写"与"写了 false"。
+    require_extension: true
+    # exec.http 允许访问的主机，写法与 executors.commands 的 allowed_hosts 同一条
+    # （host、host:port，允许 *.example.com 这种前缀通配）。
+    # 空列表表示不限主机——这是第二层放宽；commands 里的 http 档位仍然必须有非空 allowed_hosts。
+    # 无论这里怎么写，回环/私网/链路本地地址那一层守卫都不放宽（见下一项）。
+    url_hosts: []
+    # 打开后不再拒绝回环、私网、链路本地（含云主机元数据地址 169.254.169.254）、组播地址。
+    # 它关掉的是一道防"打到内部服务"的守卫，只应在开发机上自调自测这种场景显式打开；
+    # 打开时启动会另记一行 warn。默认 false。
+    url_allow_private: false
+    # exec.http 这条档位的单次执行超时，写法同其它时长项（30s、2m）。
+    # 留空/删掉用默认 30s；超过 executors.max_timeout 会被启动拒绝。
+    # 它比脚本档位的默认 5m 短是有意的：自由指定的地址没有部署方兜底，拿不到结论就该断。
+    http_timeout: 30s
   output:
     # 事件与任务详情里携带的输出尾部预览字节数；完整输出在下面的产物目录。0 用默认 2048
     inline_preview: 2048

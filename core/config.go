@@ -212,7 +212,25 @@ const (
 	// DefaultExecProfilesPath 是页面建的档位的约定存放处。与 store.path 分开放：
 	// 档位是低频实体，不该被 jobs.json 的高频合并写盘带着一起重写（同 store.groups_path 的理由）。
 	DefaultExecProfilesPath = "./data/exec-profiles.json"
+
+	// DefaultAdhocShellRuntime 是 exec.shell 这条内置档位用的解释器名。
+	DefaultAdhocShellRuntime = "bash"
+	// DefaultAdhocHTTPTimeout 是 exec.http 的单次执行超时。它比脚本档位的默认值（5m）短得多是有意的：
+	// 自由指定的目标地址没有部署方兜底，一次请求拿不到结论就该断，而不是占着执行名额等下去。
+	DefaultAdhocHTTPTimeout = 30 * time.Second
+	// DefaultAdhocRequireExtension 是"没写 executors.adhoc.require_extension 时的取值"。
+	// 它单独成一个常量，是为了让 DefaultConfig 与 Normalized 两处共用同一个答案。
+	DefaultAdhocRequireExtension = true
 )
+
+// defaultAdhocRequireExtension 给 require_extension 取一个默认指针值。
+//
+// 每次都返回新的指针而不是共享一个：配置结构会被复制着传来传去（Normalized 返回值拷贝），
+// 共享指针意味着任何一处就地改写都会串到别的副本上。
+func defaultAdhocRequireExtension() *bool {
+	value := DefaultAdhocRequireExtension
+	return &value
+}
 
 // ExecutorsConfig 是执行层（脚本 / 二进制 / HTTP 任务）的配置。
 // 设计依据见 docs/design/executor-design.md：可执行内容由配置声明的档位决定，
@@ -283,10 +301,66 @@ type ExecutorsConfig struct {
 	// 本项不能替代 executors.commands：两份来源在启动时合并，同名以配置为准。
 	ProfilesPath string `mapstructure:"profiles_path"`
 
+	// Adhoc 是"执行位置由任务给出"那一组开关：打开后多出四条内置档位
+	// （exec.php、exec.python、exec.shell、exec.http），脚本路径与请求 URL 来自任务的 payload。
+	// 默认整节关闭。设计依据见 docs/design/job-name-type-and-adhoc-execution.md §5.7。
+	Adhoc AdhocConfig `mapstructure:"adhoc"`
+
 	// Commands 档位列表：能执行什么完全由这里决定。
 	// 校验规则在 executor.LoadProfiles（启动时执行，任一条不过即启动失败），
 	// 这里只保证键名与类型——UnmarshalExact 会拒绝档位内部的拼错键名。
 	Commands []ExecutorCommand `mapstructure:"commands"`
+}
+
+// AdhocConfig 是内置自由执行档位（adhoc）那一组开关。
+//
+// 它与 executors.commands 的区别只有一处：commands 里的档位把"跑哪个文件、打到哪里"写在定义里，
+// 而这里四条把这件事交给任务提交时的 payload。正因为交出去了，这一节的默认值是整节关闭
+// （docs/design/job-name-type-and-adhoc-execution.md §D11）。
+//
+// 关闭时四条内置档位一条都不注册：接口、页面与 /job-types 看不出任何变化。
+type AdhocConfig struct {
+	// Enabled 是否注册那四条内置档位，默认 false；打开要求 executors.enabled=true（Validate 拦）。
+	Enabled bool `mapstructure:"enabled"`
+
+	// ShellRuntime exec.shell 用的解释器名，留空用 DefaultAdhocShellRuntime。
+	// 它必须出现在 executors.runtime_allow 里，否则这一条内置档位根本构造不出来（Validate 拦）。
+	ShellRuntime string `mapstructure:"shell_runtime"`
+
+	// PathPrefixes 允许的任务级脚本路径前缀，相对 executors.workspace 或绝对都写；
+	// 空列表表示不限目录（§12 P1 的推荐值）。收窄它是这次放宽之后最顺手的一道闸。
+	PathPrefixes []string `mapstructure:"path_prefixes"`
+
+	// RequireExtension 是否要求脚本扩展名与解释器匹配（php→.php、python→.py、shell→.sh/.bash）。
+	//
+	// 用指针是因为本项的默认取值是 true，而 false 正是零值：普通 bool 分不出"没写"与
+	// "显式写了 false"，那会让"删掉这一行"变成"关掉扩展名要求"。
+	// 同形状的既有先例是 deny_private_ranges（ExecutorCommand 的 DenyPrivate）。
+	// 读它请走 WantExtensionCheck，不要在调用处各自判空。
+	RequireExtension *bool `mapstructure:"require_extension"`
+
+	// URLHosts exec.http 允许的主机，写法与 executors.commands 的 allowed_hosts 同一条
+	// （主机名或 host:port，允许 *.example.com 这种前缀通配）。
+	// 空列表表示不限主机——这是 §D9 第②层的放宽，只对本节生效：
+	// commands 里的 http 档位仍然必须有非空 allowed_hosts。
+	URLHosts []string `mapstructure:"url_hosts"`
+
+	// URLAllowPrivate 打开后不再拒绝回环/私网/链路本地地址。默认 false。
+	// 它关掉的是一道防 SSRF 的守卫（executor.HTTPRunner.refusalReason），
+	// 留空与 false 都表示"保持守卫"；真正的开发机自调自才需要显式打开。
+	URLAllowPrivate bool `mapstructure:"url_allow_private"`
+
+	// HTTPTimeout exec.http 这条档位的单次执行超时，0 用 DefaultAdhocHTTPTimeout；
+	// 超过 executors.max_timeout 会被拒（与档位自己的 timeout 同一条上限）。
+	HTTPTimeout time.Duration `mapstructure:"http_timeout"`
+}
+
+// WantExtensionCheck 回答"是否要求脚本扩展名与解释器匹配"：没写这一项时按默认值 true。
+func (a AdhocConfig) WantExtensionCheck() bool {
+	if a.RequireExtension == nil {
+		return DefaultAdhocRequireExtension
+	}
+	return *a.RequireExtension
 }
 
 // ExecutorCommand 一个可执行档位，注册后的任务类型名是 "exec." + Name。
@@ -467,6 +541,10 @@ func (e ExecutorsConfig) Validate() error {
 		return fmt.Errorf("executors.output.ttl must not be negative, got %v", e.Output.TTL)
 	}
 
+	if err := validateAdhocConfig(e); err != nil {
+		return err
+	}
+
 	if !e.Enabled {
 		if e.LoaderAllow {
 			return fmt.Errorf("executors.loader_allow requires executors.enabled to be true")
@@ -475,6 +553,11 @@ func (e ExecutorsConfig) Validate() error {
 			// 与 loader_allow 同一条：没有执行能力却打开了档位的在线修改，只能是配置写错。
 			// 报错比让人以为"页面上已经能改档位"好——那时三个写端点只会回 503。
 			return fmt.Errorf("executors.web_enabled requires executors.enabled to be true")
+		}
+		if e.Adhoc.Enabled {
+			// 同上一条：自由执行档位是执行能力的一种，关闭了执行器却打开它只能是配置写错。
+			// 这里的判据与 web_enabled 一致，见 docs/design/job-name-type-and-adhoc-execution.md §D11。
+			return fmt.Errorf("executors.adhoc.enabled requires executors.enabled to be true")
 		}
 		return nil
 	}
@@ -495,6 +578,75 @@ func (e ExecutorsConfig) Validate() error {
 	}
 	if e.Output.MaxBytes < 1024 {
 		return fmt.Errorf("executors.output.max_bytes must be at least 1024 when executors.enabled is true, got %d", e.Output.MaxBytes)
+	}
+
+	return nil
+}
+
+// validateAdhocConfig 校验 executors.adhoc 一节的写法。
+//
+// 它在 Enabled 为 false 时也跑：与 runtime_allow、env_allow 同一条口径——
+// 写错的白名单不该等到有人打开开关才暴露。
+// 但"打开 adhoc 却关着执行器"那一条在 Validate 主流程里判（与 web_enabled 并排）。
+//
+// 这一节里"路径能不能落在允许的范围内""主机能不能访问"这类真判据不在这里：
+// 前者与后者都由 executor 侧在构造与提交时执行（core 不许 import executor，
+// 而主机白名单的完整写法判据本来就在 executor/profile.go 的 checkAllowedHosts 那一份里）。
+// 这里只保证"写得对不对形"，避免把一份注定构造不出档位的内容存进配置。
+func validateAdhocConfig(e ExecutorsConfig) error {
+	adhoc := e.Adhoc
+
+	runtime := strings.TrimSpace(adhoc.ShellRuntime)
+	if adhoc.ShellRuntime != "" && runtime == "" {
+		return fmt.Errorf("executors.adhoc.shell_runtime must not be whitespace")
+	}
+	if adhoc.Enabled && runtime != "" {
+		// 只在整节打开时判白名单成员：默认值 bash 与"把 runtime_allow 收成 [node, php]"这两条
+		// 都没打算执行 shell，而启动失败是最响的那种反馈——
+		// 关闭状态下的取值一律不参与行为（见 ExecutorsConfig 一节开头的同一条口径）。
+		allow := e.RuntimeAllow
+		if len(allow) == 0 {
+			// 留空的白名单在归一化之后才是内置默认列表；Validate 跑在归一化之前，
+			// 所以这里按同一份默认判，不能因为列表为空就放过任意解释器名。
+			allow = DefaultConfig().Executors.RuntimeAllow
+		}
+		found := false
+		for _, item := range allow {
+			if strings.EqualFold(strings.TrimSpace(item), runtime) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("executors.adhoc.shell_runtime %q is not in executors.runtime_allow %v",
+				runtime, allow)
+		}
+	}
+
+	if err := checkExecNameList("adhoc.path_prefixes", adhoc.PathPrefixes); err != nil {
+		return err
+	}
+	if err := checkExecNameList("adhoc.url_hosts", adhoc.URLHosts); err != nil {
+		return err
+	}
+	for i, host := range adhoc.URLHosts {
+		// 这里只判形状。完整的主机写法（含 *. 通配的后缀要求、端口区间、IP 字面量）
+		// 在 executor/profile.go 的 checkAllowedHosts 那一份里，两份规则迟早分叉，
+		// 所以这一处刻意只做"一眼就能看出写错了"的那几条。
+		if strings.Contains(host, "://") {
+			return fmt.Errorf("executors.adhoc.url_hosts[%d] %q must be a host, not a URL", i, host)
+		}
+		if strings.ContainsAny(host, `/?#@`) {
+			return fmt.Errorf("executors.adhoc.url_hosts[%d] %q must not contain a path, query or credentials", i, host)
+		}
+	}
+
+	if adhoc.HTTPTimeout < 0 {
+		return fmt.Errorf("executors.adhoc.http_timeout must not be negative, got %v", adhoc.HTTPTimeout)
+	}
+	if adhoc.HTTPTimeout > 0 && e.MaxTimeout > 0 && adhoc.HTTPTimeout > e.MaxTimeout {
+		return fmt.Errorf("executors.adhoc.http_timeout %v must not exceed executors.max_timeout %v",
+			adhoc.HTTPTimeout, e.MaxTimeout)
 	}
 
 	return nil
@@ -695,6 +847,13 @@ func DefaultConfig() Config {
 			LoaderAllow:    false,
 			WebEnabled:     false,
 			ProfilesPath:   DefaultExecProfilesPath,
+			Adhoc: AdhocConfig{
+				// 整节默认关闭：打开它等于让"任务提交时带来的路径/地址"决定执行什么。
+				Enabled:          false,
+				ShellRuntime:     DefaultAdhocShellRuntime,
+				RequireExtension: defaultAdhocRequireExtension(),
+				HTTPTimeout:      DefaultAdhocHTTPTimeout,
+			},
 			Output: ExecutorOutputConfig{
 				InlinePreview: DefaultExecInlinePreview,
 				MaxBytes:      DefaultExecMaxOutputBytes,
@@ -793,6 +952,11 @@ func LoadConfig(path string) (Config, error) {
 		// 指向它），而那份文件的内容与 executors.commands 一样故意不绑环境变量。
 		"executors.web_enabled",
 		"executors.profiles_path",
+		// 自由执行档位只绑这一个开关：开发环境要临时试一次"提交时给路径"，
+		// 靠它打开就够了。其余六项（列表、时长、解释器名、两个布尔）一律不绑——
+		// 列表绑了会把"覆盖"变成"替换"，与 executors.commands 不绑是同一条理由（见上面的注释）。
+		// 漏进这份清单不会报错，只会让该项无法用 GODELAYQ_* 覆盖，所以加键要同时加行。
+		"executors.adhoc.enabled",
 		"executors.output.inline_preview",
 		"executors.output.max_bytes",
 		"executors.output.dir",
@@ -1016,6 +1180,18 @@ func (c Config) Normalized() Config {
 	}
 	if c.Executors.ProfilesPath == "" {
 		c.Executors.ProfilesPath = defaults.Executors.ProfilesPath
+	}
+	// adhoc 这一节的留空与 0 一律回到默认；require_extension 是指针：
+	// 只有"没写"（nil）才补默认值，显式写了 false 必须留住——那是知道风险后主动关掉这道要求。
+	// path_prefixes 与 url_hosts 没有默认值可补：空列表本身就是一个取值（不限范围、不限主机）。
+	if c.Executors.Adhoc.ShellRuntime == "" {
+		c.Executors.Adhoc.ShellRuntime = defaults.Executors.Adhoc.ShellRuntime
+	}
+	if c.Executors.Adhoc.RequireExtension == nil {
+		c.Executors.Adhoc.RequireExtension = defaultAdhocRequireExtension()
+	}
+	if c.Executors.Adhoc.HTTPTimeout == 0 {
+		c.Executors.Adhoc.HTTPTimeout = defaults.Executors.Adhoc.HTTPTimeout
 	}
 	if c.Executors.Output.InlinePreview == 0 {
 		c.Executors.Output.InlinePreview = defaults.Executors.Output.InlinePreview
