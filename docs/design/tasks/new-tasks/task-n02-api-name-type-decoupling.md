@@ -145,6 +145,9 @@ DoD 第 3 条专门为它存在。
 4. `api/api_test.go:56` 与 `:84` 两条既有用例未修改且跑绿（兼容证据）。
 5. 只带 `type` 不带 `name` 时不会静默建出空标签任务（必填判据落在一处，有用例）。
 6. `go test -race -timeout 30m ./api ./core` 绿；`go build ./...`、`go vet ./...` 无输出。
+   （非 race 轮实测：`go test ./api ./core ./executor ./cmd/...` 全绿，api 17.3s、executor 23.1s、
+   cmd/server 6.0s；race 轮与 N03 的配置改动合并后一次性跑，结果记在
+   `task-n03-config-adhoc-keys.md` §10 末尾，两卡共用那一轮。）
 
 ## 7. 验收方式
 
@@ -182,5 +185,51 @@ go build ./... && go vet ./...
 
 ## 10. 实现记录（执行时补写）
 
-| # | 与卡片的偏离 | 原因 |
+落地：`api/dto.go`（`CreateJobRequest.Type`、`UpdateJobRequest.Type`、`JobResponse.Type`）、
+`api/handlers.go`（`validateJobNameField`、`registrationKey`、`createJobFromRequest`、
+`ListJobs` 的 `?type=`、`UpdateJob` 的换类型判定、`toJobResponse`、`execForResponse`）、
+`api/handlers_executors.go`（`executorProfile` 形参改名、`gateExecutorSubmission`、
+`payloadForResponse`、`resultGuard`、三处 `snapshot.HandlerKey()`）、新测试 `api/job_name_type_test.go`、
+`docs/api.md` 的创建/列表/更新三节。
+
+| # | 与卡面的偏离 | 原因 |
 | --- | --- | --- |
+| 1 | 卡面 §3.2 第 1 条说"两个字段都没给有效值 → 400 `job type is required`"，第 3 条说"带 type 时校验名称"；实现顺序是**先算键、再判名称**，所以 `{"name":"   ","type":"   "}` 报的是"类型必填"而不是"名称不合法" | trim 之后为空的 `type` 按"没带"处理（与 D4 的判据同一条），此时走旧写法分支、名称规则不适用。用例 `TestCreateJob_LegacyKeyMustNotBeBlank` 把这条结论钉住 |
+| 2 | `JobResponse.Type` 保持"旧写法时省略"，没有回退填成 `Name` | 回退会让读到的对象与存的不一致，PUT 往返时客户端会把回退值当真值传回来。读侧口径写进 `api/dto.go` 的字段注释与 `docs/api.md`；前端 N07 按"空则回落显示名称"处理 |
+| 3 | 除卡面点名的三处（`:599`、`:662`、`:674`）外，还改了 `api/handlers.go` 更新流程里的档位判定（原 `executorProfile(snapshot.Name)`）与 `handlers_executors.go` 的 `resultGuard` 形参名 | 前者是卡面 §3.3 末行"其余 `.Name` 逐条过一遍"的落点；后者只改形参名与注释，调用点本来就已经传 `HandlerKey()` |
+| 4 | 名称必填（空串）没有新增判据 | `binding:"required"` 已在 `api/dto.go:13`，空串走"请求体非法"那条 400；全空白串（`"   "`）能通过 required，由 `registrationKey` 算出空键后拒掉 |
+| 5 | `docs/api.md` 顺带改了 `GET /jobs` 的查询参数表（`?type=`） | 该表的 `name` 行原本写着"按任务类型过滤"，解耦后这句是错的。留到 N08 会让本卡提交里文档与实现不一致 |
+
+变异反向验证（卡面 §5 末行要求，原始输出留存）：把 `api/handlers_executors.go:606` 的
+`handlerKey := job.HandlerKey()` 改成 `handlerKey := job.Name` 之后——
+
+```
+--- FAIL: TestExecutorGateUsesHandlerKeyNotName (0.22s)
+    --- FAIL: TestExecutorGateUsesHandlerKeyNotName/非法_payload_在提交期就被拒
+    --- PASS: TestExecutorGateUsesHandlerKeyNotName/合法_payload_照常建成并带上类型
+    --- FAIL: TestExecutorGateUsesHandlerKeyNotName/身份档位判定也按类型走
+    --- PASS: TestExecutorGateUsesHandlerKeyNotName/响应层的掩码按类型取档位
+Messages: {"id":"01a11186-e486-76eb-...","name":"我的档位任务","type":"exec.callback",
+"status":"pending",...,"payload":{"params":{"day":"not-a-date"}},"next_run_in":"1s"}
+```
+
+期望与实际的差别正是设计文档 §10 风险 1 描述的那个后果：非法 payload 的任务拿到 201 并入队
+（`status":"pending"`、`next_run_in":"1s"`，即一秒后会被真的执行一次），身份档位判定也一起失效
+（operator 拿 201 而不是 403）。改回 `job.HandlerKey()` 后该用例转绿。
+
+DoD 核对：
+
+1. `grep -n "req\.Name" api/handlers.go` 的 5 处命中分别是：算键的回退（`:69`）、名称规则入参（`:110`）、
+   写任务标签（`:159`）、PUT 的改名判定（`:385`、`:393`）——没有一处用于查注册表或取档位。
+2. `grep -n "job\.Name" api/handlers_executors.go` 只剩注释一行；`executorProfile(` 的六个调用点
+   传的都是 `handlerKey` 或 `snapshot.HandlerKey()`。
+3. 三条核心用例（`TestCreateJob_NameIsLabelAndTypeIsKey`、`TestCreateJob_NameRuleAppliesOnlyToNewStyle`、
+   `TestExecutorGateUsesHandlerKeyNotName`）全绿，门禁那条做过上面的变异验证。
+4. 既有用例 `api/api_test.go:56` `TestCreateJob` 与 `:84` `TestCreateJobUnknownType` 未修改，
+   `go test ./api` 整包绿（17.3s）。
+5. 空键组合有专门子测试（偏离 1）。
+6. `go build ./...`、`go vet ./...` 无输出；`go test ./api ./core ./executor ./cmd/...` 全绿；
+   `go test -race -timeout 30m ./api ./core` 见本卡末尾的运行结果记录。
+
+ Race 运行结果：见 `task-n03-config-adhoc-keys.md` §10 末尾那一轮（本卡的 api 改动与 N03 的
+ core 改动合并跑一次 `go test -race -timeout 30m ./core ./api`）。

@@ -44,6 +44,31 @@ func parseGroupFilter(c *gin.Context) (string, bool) {
 	return value, true
 }
 
+// validateJobNameField 校验任务名称（给人看的标签）。规则只有一份，在 core.ValidateJobName；
+// 这里把它换成 HTTP 结论，错误原文进 details。
+//
+// 只在请求带了 type 时调用：旧写法里 Name 兼作注册键，标签规则对它不适用
+// （payment_check 带下划线，套上就会把既有调用方全部拒掉，见设计文档 §D4）。
+func validateJobNameField(name string) *ErrorResponse {
+	if err := core.ValidateJobName(name); err != nil {
+		return &ErrorResponse{Code: 400, Message: "invalid job name", Details: err.Error()}
+	}
+	return nil
+}
+
+// registrationKey 算出这次创建请求要查注册表的键：type 优先，为空回退 name。
+//
+// 回退那一条与 core.Job.HandlerKey（core/job.go）是同一条规则，
+// 但这里手上还是请求而不是任务，所以独立一份；改一处要同时看另一处。
+// 取 trim 之后的值做查询，是因为注册表里的键都没有前后空白，
+// 而"带了空白的类型名"要说成"这个类型没注册"，不是"请求体读不出来"。
+func registrationKey(req CreateJobRequest) string {
+	if key := strings.TrimSpace(req.Type); key != "" {
+		return key
+	}
+	return strings.TrimSpace(req.Name)
+}
+
 // CreateJob 创建任务
 func (s *Server) CreateJob(c *gin.Context) {
 	var req CreateJobRequest
@@ -78,13 +103,31 @@ func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*co
 		return nil, &ErrorResponse{Code: 400, Message: "invalid time format", Details: err.Error()}
 	}
 
+	// 名称与类型的分工（设计文档 §D4）：带了 type → Name 是标签，套标签规则；
+	// 没带 type → Name 兼作注册键，按旧写法原样处理。
+	legacy := strings.TrimSpace(req.Type) == ""
+	if !legacy {
+		if failure := validateJobNameField(req.Name); failure != nil {
+			return nil, failure
+		}
+	}
+
+	key := registrationKey(req)
+	if key == "" {
+		return nil, &ErrorResponse{
+			Code:    400,
+			Message: "job type is required",
+			Details: "either name or type must name a registered job type",
+		}
+	}
+
 	// 检查Handler是否存在（注册表在调度器，执行时按同一键回查）
-	handler, ok := s.scheduler.LookupHandler(req.Name)
+	handler, ok := s.scheduler.LookupHandler(key)
 	if !ok {
 		return nil, &ErrorResponse{
 			Code:    400,
 			Message: "unknown job type",
-			Details: fmt.Sprintf("job type '%s' not registered", req.Name),
+			Details: fmt.Sprintf("job type '%s' not registered", key),
 		}
 	}
 
@@ -110,9 +153,11 @@ func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*co
 		timeout = d
 	}
 
-	// 创建任务
+	// 创建任务。Type 存请求原文而不是 trim 后的值：查询时才需要 trim，
+	// 而存进快照与响应的应当是调用方写下的那个写法。
 	job := &core.Job{
 		Name:       req.Name,
+		Type:       req.Type,
 		Payload:    []byte(req.Payload),
 		TriggerAt:  triggerAt,
 		Group:      req.Group,
@@ -145,8 +190,9 @@ func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*co
 
 // ListJobs 获取任务列表
 func (s *Server) ListJobs(c *gin.Context) {
-	status := c.Query("status") // 状态名过滤，如 pending/running/success/failed/cancelled/paused
-	name := c.Query("name")     // 名称过滤
+	status := c.Query("status")   // 状态名过滤，如 pending/running/success/failed/cancelled/paused
+	name := c.Query("name")       // 名称（标签）过滤
+	typeFilter := c.Query("type") // 类型（注册键）过滤，与 ?name= 是两件事，见设计文档 §D2
 	groupFilter, filterByGroup := parseGroupFilter(c)
 	limit := parseListJobsLimit(c.Query("limit"))
 	offset := parseListJobsOffset(c.Query("offset"))
@@ -183,6 +229,11 @@ func (s *Server) ListJobs(c *gin.Context) {
 			continue
 		}
 		if name != "" && snap.Name != name {
+			continue
+		}
+		// 类型过滤比 HandlerKey() 而不是比 Type 字段：旧写法建的任务类型在 Name 里，
+		// 按 Type 比会让 "?type=payment_check" 只命中新写法那一批。
+		if typeFilter != "" && snap.HandlerKey() != typeFilter {
 			continue
 		}
 		// 分组匹配忽略大小写：注册表的主键就是这个口径（core/group_store.go），
@@ -334,6 +385,7 @@ func (s *Server) UpdateJob(c *gin.Context) {
 	if req.Name != nil && *req.Name != snapshot.Name {
 		// 本端点不能换任务类型：换了名字就换了执行体，而提交档位的判定是按档位做的。
 		// 相同值按没传处理，方便客户端把读到的对象改几个字段再 PUT 回来（见 api/dto.go）。
+		// 名称与类型解耦之后，名字里还兼着旧写法任务的类型，所以这条判据仍然按 Name 比。
 		c.JSON(400, ErrorResponse{
 			Code:    400,
 			Message: "job name cannot be changed",
@@ -342,7 +394,18 @@ func (s *Server) UpdateJob(c *gin.Context) {
 		})
 		return
 	}
-	if profile, ok := s.executorProfile(snapshot.Name); ok {
+	if req.Type != nil && *req.Type != snapshot.HandlerKey() {
+		// 类型才是执行体的身份：解耦之后只守 Name 等于放开了一条换执行体的路
+		// （设计文档 §D14，与 web-profile-design.md 的 D7"换类型请删除后重建"同一条理由）。
+		c.JSON(400, ErrorResponse{
+			Code:    400,
+			Message: "job type cannot be changed",
+			Details: fmt.Sprintf("this job runs as %q; PUT /jobs/:id does not switch a job to another type (%q), delete and recreate it instead",
+				snapshot.HandlerKey(), *req.Type),
+		})
+		return
+	}
+	if profile, ok := s.executorProfile(snapshot.HandlerKey()); ok {
 		if failure := s.gateExecutorSubmissionRole(c, profile); failure != nil {
 			c.JSON(failure.Code, *failure)
 			return
@@ -629,10 +692,11 @@ func (s *Server) toJobResponse(job *core.Job) JobResponse {
 	resp := JobResponse{
 		ID:         job.ID,
 		Name:       job.Name,
+		Type:       job.Type,
 		Status:     job.Status.String(),
 		Group:      job.Group,
 		TriggerAt:  job.TriggerAt,
-		Payload:    s.payloadForResponse(job.Name, job.Payload),
+		Payload:    s.payloadForResponse(job.HandlerKey(), job.Payload),
 		RetryCount: job.RetryCount,
 		MaxRetries: job.MaxRetries,
 		Attempts:   job.Attempts,
@@ -647,7 +711,7 @@ func (s *Server) toJobResponse(job *core.Job) JobResponse {
 	}
 
 	if job.Exec != nil {
-		resp.Exec = s.execForResponse(job.Name, job.Payload, job.Exec)
+		resp.Exec = s.execForResponse(job.HandlerKey(), job.Payload, job.Exec)
 	}
 
 	// 计算剩余时间
@@ -671,9 +735,9 @@ func (s *Server) toJobResponse(job *core.Job) JobResponse {
 // 这里管的是在那之前落盘的快照——旧数据里的预览可能带着凭据。响应层的掩码不改存储（§3.3 第 3 条）。
 // 超过上限或文本被改动时返回副本——同一个 ExecMeta 可能同时被存储里的快照引用，
 // 改它会改到别处读到的内容。
-func (s *Server) execForResponse(name string, payload []byte, meta *core.ExecMeta) *core.ExecMeta {
+func (s *Server) execForResponse(handlerKey string, payload []byte, meta *core.ExecMeta) *core.ExecMeta {
 	preview := meta.Preview
-	if profile, ok := s.executorProfile(name); ok && profile.HasSecretArgs() {
+	if profile, ok := s.executorProfile(handlerKey); ok && profile.HasSecretArgs() {
 		preview = profile.MaskSecretText(payload, preview)
 	}
 

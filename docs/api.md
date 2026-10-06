@@ -195,7 +195,8 @@ Content-Type: application/json
 
 | 字段           | 类型     | 必填 | 说明                                                  |
 | ------------ | ------ | -- | --------------------------------------------------- |
-| name         | string | ✅  | 任务类型名称：代码里注册的 Handler，或 `executors.commands` 声明的执行器档位（`exec.<档位名>`）                                |
+| name         | string | ✅  | 任务名称。带 `type` 时它是给人看的标签（汉字/字母/数字，1-64 个字符）；不带 `type` 时它兼作任务类型，见下面的[名称与类型两种写法](#名称与类型两种写法)                                |
+| type         | string | ❌  | 任务类型：代码里注册的 Handler，或 `executors.commands` 声明的执行器档位（`exec.<档位名>`）。决定这条任务跑什么                                |
 | delay        | string | 条件 | 相对延迟，如 "10m", "1h30s"（与 trigger\_at/cron\_expr 三选一） |
 | trigger\_at  | string | 条件 | 绝对时间，ISO 8601 格式                                    |
 | cron\_expr   | string | 条件 | Cron 表达式，如 "0 \*/5 \* \* \* \*"                     |
@@ -237,6 +238,21 @@ Content-Type: application/json
 `next_run_in` 只对 `pending` 任务计算：距触发时间还有多久，已过期则写作 `imminent`，
 其它状态下该字段省略。`timeout` 只在任务设置了执行超时时出现（与是否真的超时无关），
 `payload` 为空时省略。
+
+#### 名称与类型两种写法
+
+创建任务有两种写法，判据只有一条：请求体带不带 `type`。
+
+| 写法 | 请求体 | `name` 的规则 | 查注册表用的键 |
+| --- | --- | --- | --- |
+| 新写法 | `{"name":"每晚对账","type":"payment_check"}` | 标签：汉字、字母、数字，1-64 个字符，其它字符（含空格、`_`、`-`、`.`）一律 400 | `type` |
+| 旧写法 | `{"name":"payment_check"}` | 兼作类型，因此**不套**标签规则（`payment_check` 带下划线是合法的） | `name` |
+
+旧写法是既有调用方的兼容路径，行为与名称/类型解耦之前一致；新写的界面与脚本建议一律带 `type`。
+`{"name":"   ","type":"   "}` 这类两边都是空白的请求算不出注册键，返回 400 `job type is required`。
+
+响应里的 `type` 说的是同一件事：旧写法建的任务 `type` 省略（此时名称就是类型）。
+读回来的对象改几个字段再 `PUT` 回去是安全的——`type` 传相同值按没传处理。
 
 ### 2. 创建 Cron 重复任务
 
@@ -281,7 +297,7 @@ Content-Type: application/json
 ### 3. 查询任务列表
 
 ```json
-GET /jobs?status=pending&name=payment_check&limit=20&offset=0
+GET /jobs?status=pending&type=payment_check&name=每晚对账&limit=20&offset=0
 ```
 
 查询参数：
@@ -289,7 +305,8 @@ GET /jobs?status=pending&name=payment_check&limit=20&offset=0
 | 参数     | 类型     | 说明                                            |
 | ------ | ------ | --------------------------------------------- |
 | status | string | 过滤状态：pending/running/success/failed/cancelled/paused（大小写不敏感） |
-| name   | string | 按任务类型过滤                                       |
+| type   | string | 按任务类型（注册键）过滤。旧写法建的任务类型在名称里，因此也会被 `type=` 命中 |
+| name   | string | 按任务名称精确过滤（名称是给人看的标签，见[名称与类型两种写法](#名称与类型两种写法)） |
 | group  | string | 按分组过滤，忽略大小写。**省略=不筛**，`group=`（空值）=只看未分组 |
 | limit  | int    | 分页大小，默认 50，最大 100（超过按 100 截断）  |
 | offset | int    | 分页偏移，默认 0；非数字或负数按 0 处理            |
@@ -361,11 +378,14 @@ Content-Type: application/json
 暂停中的任务同样不能用它改分组（不在堆里 → 409）；给暂停或已结束的任务移组，
 用下面的批量操作端点。
 
-执行器任务在这里多四条约束。判定顺序是"任务不存在 404 → 改了名字 400 → 档位不够 403 → 不是 pending 409"，
+执行器任务在这里多四条约束。判定顺序是"任务不存在 404 → 改了名字或类型 400 → 档位不够 403 → 不是 pending 409"，
 前两条在状态检查之前判，所以档位不够的身份不会从 409 里读出这条任务是否已经跑完：
 
 - `name` 只允许传回任务原本的名字，不同值即 400（`job name cannot be changed`，`details` 里写明当前名字
   与要改成的那个）；这条对所有任务生效，把普通任务改成 `exec.` 前缀同样被拒。
+- `type` 只允许传回这条任务当前的注册键（旧写法建的任务，注册键就是它的名称），不同值即 400
+  （`job type cannot be changed`）。换类型等于换执行体，与档位的"改类型请删除后重建"是同一条口径；
+  传相同值按没传处理，方便客户端把读到的对象改几个字段再 PUT 回来。
 - 改 `payload` 会重跑提交期那一整套判定，因此执行器章节里那四种拒绝都可能在这里出现。
 - 档位声明为 `secret` 的参数在读取接口是 `***`，PUT 不会把它回填成原值；照原样保存会把 `***` 当成新的
   取值写进任务，要改参数就把它改成真实取值再提交。

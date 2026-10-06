@@ -12,6 +12,14 @@ type CreateJobRequest struct {
 	// 任务标识
 	Name string `json:"name" binding:"required" example:"payment_check"`
 
+	// Type 决定这条任务跑什么：调度器注册表里的键（普通处理函数名，或档位的注册键 exec.<name>）。
+	//
+	// 为空时按旧写法处理：Name 兼作这个键，并且 Name 不套标签规则
+	// （payment_check 带下划线、exec.demo-run 带连字符，套上规则会把既有调用方全部拒掉）。
+	// 非空时 Name 只是给人看的标签，取值受 core.ValidateJobName 约束（中文、字母、数字，1..64 个字符）。
+	// 判据只有一条：设计文档 job-name-type-and-adhoc-execution.md §D4。
+	Type string `json:"type,omitempty" example:"exec.php"`
+
 	// 执行时间配置（三选一）
 	Delay     string     `json:"delay,omitempty" example:"10m"`               // 相对延迟，如 "10m", "1h30s"
 	TriggerAt *time.Time `json:"trigger_at,omitempty" format:"date-time"`     // 绝对时间
@@ -42,6 +50,10 @@ type UpdateJobRequest struct {
 	// （换了名字就等于换了一个执行体，提交档位的判定也会跟着失效，TASK-E16 §3.2）。
 	// 传了且与当前名字不同 → 400；传了相同值按没传处理，方便客户端把读到的对象改几个字段再 PUT 回来。
 	Name *string `json:"name,omitempty"`
+	// Type 任务类型（注册键）。与上面的 Name 同样**只用来发现误用，不用来改类型**：
+	// 类型是执行体的身份，换它等于换一条档位（设计文档 §D14 与 web-profile-design.md 的 D7 同一条理由）。
+	// 传了且与该任务当前的注册键不同 → 400；传了相同值按没传处理。
+	Type *string `json:"type,omitempty"`
 	// Timeout 单次执行超时，如 "30s"；传 "0s" 可取消限制
 	Timeout string `json:"timeout,omitempty"`
 	// Group 分组标签。用指针区分"没传"与"传了空串"：
@@ -67,8 +79,11 @@ type BatchItemError struct {
 
 // JobResponse 任务响应
 type JobResponse struct {
-	ID        string          `json:"id" example:"0198a2e3-7d4f-7abc-9def-0123456789ab"`
-	Name      string          `json:"name" example:"payment_check"`
+	ID   string `json:"id" example:"0198a2e3-7d4f-7abc-9def-0123456789ab"`
+	Name string `json:"name" example:"payment_check"`
+	// Type 任务类型（注册键）。为空表示这条任务是旧写法建的——那时名称兼作类型，
+	// 所以读侧要按 JobSnapshot.HandlerKey 的同一条规则回退到 Name（core/job.go）。
+	Type      string          `json:"type,omitempty" example:"exec.php"`
 	Status    string          `json:"status" example:"pending" enums:"pending,running,success,failed,cancelled,paused"`
 	Group     string          `json:"group,omitempty" example:"nightly"`
 	TriggerAt time.Time       `json:"trigger_at" format:"date-time"`

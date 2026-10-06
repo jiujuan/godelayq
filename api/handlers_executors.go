@@ -168,7 +168,7 @@ func (s *Server) GetJobResult(c *gin.Context) {
 		SizeBytes:     size,
 		ReturnedBytes: len(content),
 		Truncated:     truncated,
-		Meta:          s.execForResponse(snapshot.Name, snapshot.Payload, snapshot.Exec),
+		Meta:          s.execForResponse(snapshot.HandlerKey(), snapshot.Payload, snapshot.Exec),
 		Content:       string(content),
 		RedactionNote: note,
 	})
@@ -190,7 +190,7 @@ func (s *Server) markArtifactPurged(snapshot core.JobSnapshot, attempt int) *cor
 	}
 	if snapshot.Exec.Artifact == core.ArtifactPurged {
 		s.markArtifactIndexed(snapshot.ID, attempt)
-		return s.execForResponse(snapshot.Name, snapshot.Payload, snapshot.Exec)
+		return s.execForResponse(snapshot.HandlerKey(), snapshot.Payload, snapshot.Exec)
 	}
 
 	// 复制一份再改：LoadAll 返回的快照与存储内部共用同一个摘要指针，
@@ -206,7 +206,7 @@ func (s *Server) markArtifactPurged(snapshot core.JobSnapshot, attempt int) *cor
 	}
 	// 快照与索引两侧同一时刻变成同一个结论，否则列表说 available、正文说没有
 	s.markArtifactIndexed(snapshot.ID, attempt)
-	return s.execForResponse(snapshot.Name, snapshot.Payload, &summary)
+	return s.execForResponse(snapshot.HandlerKey(), snapshot.Payload, &summary)
 }
 
 // respondArtifactError 把产物存储的读取失败说成一句能用的话：
@@ -547,15 +547,18 @@ func (s *Server) executorRole() core.Role {
 	return core.RoleAdmin
 }
 
-// executorProfile 按任务名取档位；没注入登记表或这个名字不是档位时返回 false。
+// executorProfile 按注册键取档位；没注入登记表或这个键不是档位时返回 false。
 //
 // 判据是登记表的键而不是 exec. 前缀：前缀只是档位的命名规则，表里有没有这个名字
 // 才决定"要不要按执行器任务对待"。表里没有的 exec. 名字走既有的"类型未注册"分支。
-func (s *Server) executorProfile(name string) (*executor.Profile, bool) {
+//
+// 入参必须是 Job.HandlerKey()/JobSnapshot.HandlerKey() 而不是任务名：名称与类型解耦之后
+// （设计文档 §D2），标签里查不到任何档位，用它去取档位会让执行器任务绕过提交期校验。
+func (s *Server) executorProfile(handlerKey string) (*executor.Profile, bool) {
 	if s.executors == nil {
 		return nil, false
 	}
-	return s.executors.Lookup(name)
+	return s.executors.Lookup(handlerKey)
 }
 
 // gateExecutorSubmissionRole 只判"这个身份能不能碰这个档位的任务"（TASK-E16 §3.1）。
@@ -593,20 +596,24 @@ func (s *Server) gateExecutorSubmissionRole(c *gin.Context, profile *executor.Pr
 // 且不改 job.Timeout（普通任务不受本卡影响）。
 // **必须在 scheduler.Schedule 之前调用**：一旦入队，非法 payload 也会真的被执行一次。
 // requestedTimeout 是请求体顶层的 timeout，档位任务对它的上限与 payload 里那个 timeout 同一条规则。
+//
+// 取档位用的是 job.HandlerKey()（Type 优先、回退 Name），不是 job.Name：
+// 名称与类型解耦之后标签查不到档位，用它取档位等于让执行器任务跳过这里的全部判定
+// （设计文档 §10 风险 1，用例见 api/handlers_executors_test.go）。
 func (s *Server) gateExecutorSubmission(c *gin.Context, job *core.Job,
 	requestedTimeout time.Duration) *ErrorResponse {
 
-	profile, ok := s.executorProfile(job.Name)
+	handlerKey := job.HandlerKey()
+	profile, ok := s.executorProfile(handlerKey)
 	if !ok {
 		return nil
 	}
-	name := job.Name
 
 	if failure := s.gateExecutorSubmissionRole(c, profile); failure != nil {
 		return failure
 	}
 
-	if reason, available := s.executors.Available(name); !available {
+	if reason, available := s.executors.Available(handlerKey); !available {
 		// 与"类型未注册"分开写：那条说这个名字不存在，这条说名字对但这台机器现在跑不了
 		// （脚本没部署、程序不在 PATH 里）。运维需要的是后一种的改正方向。
 		stashAuditExecutor(c, auditExecProfileUnavailable, auditReasonProfile, profile)
@@ -659,11 +666,11 @@ func (s *Server) warnAuthDisabledOnce() {
 //
 // 掩码只发生在这里（响应），不改存储也不改执行输入——卡片 §3.3 第 3 条要求把这句话
 // 写在代码里，避免后来者把响应上的 *** 当成"参数已经加密保存"。
-func (s *Server) payloadForResponse(name string, payload []byte) []byte {
+func (s *Server) payloadForResponse(handlerKey string, payload []byte) []byte {
 	if len(payload) == 0 {
 		return payload
 	}
-	profile, ok := s.executorProfile(name)
+	profile, ok := s.executorProfile(handlerKey)
 	if !ok || !profile.HasSecretArgs() {
 		return payload
 	}
@@ -675,8 +682,8 @@ func (s *Server) payloadForResponse(name string, payload []byte) []byte {
 // 卡片 §3.3 第 2 条的收严只针对含 secret 参数的档位：输出正文是脚本或对端产生的，
 // 框架层掩不住它回显的凭据，所以读取门槛跟着升到提交档位，并在响应里留一句说明。
 // 返回的 denied 非 nil 时调用方直接回 403。
-func (s *Server) resultGuard(c *gin.Context, name string) (note string, denied *ErrorResponse) {
-	profile, ok := s.executorProfile(name)
+func (s *Server) resultGuard(c *gin.Context, handlerKey string) (note string, denied *ErrorResponse) {
+	profile, ok := s.executorProfile(handlerKey)
 	if !ok || !profile.HasSecretArgs() {
 		return "", nil
 	}
