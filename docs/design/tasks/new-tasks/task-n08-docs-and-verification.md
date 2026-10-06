@@ -172,5 +172,136 @@ grep -rn "job-name-type-and-adhoc-execution" docs/design
 
 ## 10. 实现记录（执行时补写）
 
+本卡零生产代码改动，只改文档与留证据。输出文件都在 `.dev/n08/`（该目录自带 `.gitignore`，不入库）。
+
+### 10.1 改了哪几份文档
+
+| 文档 | 改动 |
+| --- | --- |
+| `docs/design/job-name-type-and-adhoc-execution.md` | 顶部状态行改"已实施"；新增 §2.1 落地位置（D1…D15 逐条给当前文件:行号）；§8 与 §10 里漂移的六处行号按现状改正（见 D-1005） |
+| `docs/design/executor-design.md` | §2 的 D2 注记后面加一条 ⚠️：`executors.adhoc` 是"必须落在 workspace"与"http 档位必须有非空 `allowed_hosts`"两条的显式例外，并列出**没有一起放宽**的四条守卫，指向本文 §8 |
+| `docs/design/web-profile-design.md` | D7 那一行末尾加 ⚠️：本条管的是档位定义层，内置自由执行档位是"每条任务各自给执行位置"，不是原地换执行体，指向本文 §8 |
+| `docs/api.md` | §1 创建任务的两种写法（N02 已写）之外补：`GET /jobs` 的 `?type=`（已有）、`/job-types` 一句"打开整节时那四条内置键出现在这里"、§10 批量创建里"两种写法可在同一批次混用"的逐条结论（含实测那一批的 `succeeded:1/failed:3` 与四条原因）、自由执行档位一节补提交身份门槛与风险一句话 |
+| `README.md` | 核心特性里加"名称是标签、类型决定跑什么"与"自由执行档位"两条；配置示例的 `executors` 段补 `adhoc.*` 七个键与默认值；"三种提交入口"那条写明目录加载器只支持旧写法 |
+| `docs/deployment.md` | 热重载三档表的"重启档"一格里补 `executors.adhoc.*`（整节七项）；目录加载器一节写明"任务文件只支持旧写法"（S-2 要求的文档落地） |
+| `web/src/content/job-template.md` | 修 N07 留下的编号撞车：新增那节是 §12.4，既有"跑完之后看什么"改成 §12.5（D-1001） |
+
+### 10.2 全仓验证（§3.4，每条一个输出文件）
+
+| 命令 | 结果 | 输出文件 |
+| --- | --- | --- |
+| `go build ./...` | exit 0，无输出 | `.dev/n08/01-go-build.txt` |
+| `go vet ./...` | exit 0，无输出 | `.dev/n08/02-go-vet.txt` |
+| `go test ./core -run TestExampleConfigMatchesLocal -v` / `-run TestEveryLeafKeyIsClassed -v` | 两条都 PASS（本机有 `configs/config.yaml`，所以是跑过而不是跳过） | `.dev/n08/03-targeted-tests.txt` |
+| `go test ./... -count=1 -timeout 30m` | 五个有测试的包全 `ok`（api 22.2s / cmd/server 6.5s / core 20.5s / executor 24.1s / store/sqlite 1.7s） | `.dev/n08/04-go-test-all.txt` |
+| 交叉构建 `GOOS=linux GOARCH=amd64`、`GOOS=darwin GOARCH=arm64`、`GOARCH=386`（各含 `go build ./...` 与只构建 `./cmd/server`） | 六条全部 exit 0 | `.dev/n08/05-cross-build.txt` |
+| `go test -race -timeout 30m ./...` | exit 0；api 那一包命中构建缓存（同参数上一轮刚跑过），core 21.9s / executor 26.7s / cmd/server 8.3s / store/sqlite 5.6s | `.dev/n08/06-go-test-race-all.txt` |
+| 缓存那条强制重跑：`go test -race -count=1 -timeout 30m ./api` | `ok godelayq/api 247.801s` | `.dev/n08/07-race-api-recount.txt` |
+| `npx vue-tsc --noEmit`（exit 0）、`npm run build`、`go build -tags dashboard ./cmd/server` | 全部通过；`web/dist/index.html 01:28:28`、内嵌二进制 `01:28:30` | `.dev/n08/08-web-and-embedded.txt` |
+| DoD 的三条 `grep`（`startsWith('exec`、`已注册的任务类型`、`任务名称（=`）在 `web/src` 下 | 三条零命中 | 同上文件 |
+
+### 10.3 端到端十二条（§3.5，逐条一个文件，目录 `.dev/n08/e2e/`）
+
+冒烟环境：`-tags dashboard` 内嵌形态、端口 8131、`executors.enabled: true` +
+`executors.adhoc.enabled: true`、`required_role: admin`、`runtime_allow` 含 `sh`/`php`、
+workspace 与数据目录在 `.dev/n08/smoke/`。凭据用 admin01 的 JWT 提交执行器任务
+（**静态 machine token 的身份是 operator 档，`required_role: admin` 下提交 `exec.*` 会 403**，
+这是既有设计而不是本系列的缺陷；场景 8 正好用这条差异）。
+
+| # | 场景 | 实测结论 | 文件 |
+| --- | --- | --- | --- |
+| 1 | `{"name":"跑对账","type":"exec.php","payload":{"script":"…/scripts/reconcile.php"}}` | 201 → success；产物 `preview: "ran: reconcile\nargv1: none\n"`、`out_bytes:27`、`artifact:available` | `01-exec-php-success.txt` |
+| 2 | `exec.shell` 同形态 + `exec.http` 打公网 | shell 201 → success（`shell-ran`）；`https://httpbin.org/post` 201 → success（`http_status:200`）；另加一条 `https://example.com/`（该地址不接受 POST）→ failed、`http_status:405`、`permanent:true`，说明非 2xx 判失败且不重试 | `02-exec-shell-and-http.txt` |
+| 3 | `type` 缺失、`name` 是中文标签 | 400 `unknown job type`，`details: job type '每晚对账' not registered` | `03-legacy-name-is-chinese-label.txt` |
+| 4 | `name` 带空格 / 下划线 / 点，`type` 正常 | 三条各 400 `invalid job name`，`details` 点名第一个非法字符与位置（三条位置都是 3） | `04-invalid-job-names.txt` |
+| 5 | 只带 `name:"payment_check"` 的旧写法 | 201，响应里**没有** `type` 键，终态 success | `05-legacy-still-works.txt` |
+| 6a | `{"url":"http://127.0.0.1:8132/probe"}` | 提交 201（名单留空=不限主机），执行期 failed：stderr `address refused by the profile's network policy: 127.0.0.1 (loopback address)`，事件 `job.failed` 同句、`permanent:true`；**本机监听端口收到 0 次请求**（没有外连） | `06a-loopback-refused-at-execution.txt` |
+| 6b | 同一条 URL，配置改 `url_allow_private: true` | 201 → success、`http_status:200`，监听端口收到 1 次（真的建连了） | `06b-url-allow-private-true-passes.txt` |
+| 7 | 路径的六种拒绝/放过 | 目录（取名 `adir.php` 绕开扩展名判据）400、文件不存在 400、扩展名不符 400、空值 400、含 `;` 400（`must not contain "';'"`）、不限目录时 workspace 之外的文件 **201**（对照，说明默认确实不限）、普通档位收到 `script` 键 400 且文案给出该档位实际接受的键（`allowed keys: args, env, timeout`）——七条理由互不相同 | `07-path-rejections.txt` |
+| 7b | `path_prefixes: ["scripts"]` | 目录之外 400（`is outside the directories this server allows: …\ws\scripts`）、目录之内 201 | `07b-path-prefixes.txt` |
+| 8 | operator 身份提交 `exec.php` | 403 `insufficient role`，`details` 点名 `executors.required_role` | `08-operator-403.txt` |
+| 9 | `executors.adhoc.enabled: false` | `GET /executors` 只剩声明档位（`["exec.echo_sh"]`）、`GET /job-types` 里没有那四条键、提交 `exec.php` 400 `unknown job type` | `09-adhoc-disabled.txt` |
+| 10 | `?type=payment_check` 与 `?name=每晚对账` | 类型筛命中 3 条（两条旧写法 + 一条新写法，证明比的是注册键）；名称筛只命中 1 条标签任务 | `10-filter-by-type-and-name.txt` |
+| 11a | `executors.commands` 里放一条 `name: php`（与内置键撞名） | `GET /executors` 的 `exec.php` 那行是 `source:config`、`adhoc:false`、无 `location`；提交 `payload.script` 被 400（`not accepted by profile "php"`）⇒ **内置让位**，与 §D15 一致 | `11a-user-profile-wins-over-built-in.txt` |
+| 11b | 删掉那条同名档位后重启 | 同一行变成 `source:adhoc`、`adhoc:true`、带完整 `location`；提交 201 → success | `11b-built-in-active-after-removing-collision.txt` |
+| 12 | adhoc 任务在跑时强杀进程再启 | 杀之前 `status:running`；重启后 `status:paused`、`attempts:1`，事件 `job.paused` 带 `reason:"restore_after_crash"`、`forced:true` ⇒ 按 `restore_policy: pause` 钉住，没有消失也没有静默重跑 | `12-crash-recovery-pauses-running.txt` |
+| 13 | 混合写法的一个批次 | 207，`succeeded:1 / failed:3`：新写法那条 201（`items[0]` 带 `type`）、旧写法但标签未注册 400 `unknown job type`、名称带空格 400 `invalid job name`、类型未注册 400 `unknown job type` | `13-batch-mixed-writings.txt` |
+
+### 10.4 界面复测（跑在最终构建产物上）
+
+`web/dist/index.html 00:39:26` 的那一份内嵌二进制（`00:39:28`）起服务，端口 8123，
+N07 §5 的七条逐项重做一遍，结论与 N07 §10 的表一致：
+
+| 项 | 复测读数 |
+| --- | --- |
+| ① 中文名称 + `exec.php` + 不存在的路径 | 400，表单顶部 `role=alert` 原文 `invalid executor payload：payload key "script": script file "nope.php" does not exist`，抽屉不关 |
+| ② 改成存在的路径 | 201，列表出现 `收口复测 / exec.php`（表头含"类型"列） |
+| ③ 切 `payment_check` | 位置栏消失，JSON 编辑器（textarea）出现，标签是"payload 合法 JSON…" |
+| ④ 切普通档位 `exec.hello_sh` | 参数表单两栏（`day（必填） · 命令行参数` 文本框、`token · 命令行参数` 是 `type=password`），位置只读展示 `print_path.sh` + "位置来自档位定义，任务只给参数。" |
+| ⑤ 两个筛子 | 类型 → 地址栏 `/jobs?type=exec.php`、请求 `?type=exec.php`；名称 → `/jobs?type=exec.php&name=收口复测`，表里只剩一条 |
+| ⑥ 详情 | `名称 收口复测` / `任务类型 exec.php` / `脚本路径（.php） C:/Users/…/reconcile.php` |
+| ⑦ 编辑模式 | 段落 `收口复测·exec.php（名称与类型不可修改，要换就新建一条）`，名称与类型没有任何可编辑控件 |
+| 权限（operator） | 在 00:25 那一份产物上做的（第二、三组整体不出现，选中普通类型后给出"需要 admin 及以上"的说明）；00:25→00:39 两次构建之间**组件代码未变**，只改了 `job-template.md` 的编号，故未重做 |
+| 未观测 | toast 与折叠动画（应用内标签页隐藏时被节流）；`cancelled` 行不出现在列表（取消即删记录） |
+
+### 10.5 变异反向验证（§5，`go test -overlay`，真实工作树未改）
+
+| # | 变异 | 结果 | 文件 |
+| --- | --- | --- | --- |
+| M1 | `api/handlers_executors.go:695` 的 `handlerKey := job.HandlerKey()` 打回 `job.Name` | **红**：`TestExecutorGateUsesHandlerKeyNotName` 两条子用例 + `TestAdhocGate_SubmissionEvidence` 三条子用例全红（身份不够 / 不可用 / 非法 payload 三条都变成 201） | `mutations/1-gate-by-name.txt` |
+| M2 | `core/job_name.go:25` 正则去掉 `\p{Han}` | **红**：`TestValidateJobName/通过/纯中文`、`/三者混合` 等（"每晚对账"被判非法） | `mutations/2-name-rule-no-han.txt` |
+| M3 | `executor/http.go` 的 `refusalReason` 开头短路成"一律放行" | **红**：`TestHTTPRunner_AdhocRefusesPrivateAddress/127.0.0.1`（期望拒绝却拿到 nil）与 `/169.254.169.254`（真的去拨号，报的是 `dial tcp …connectex…` 而不是策略拒绝） | `mutations/3-address-guard-off.txt` |
+| M4（加测） | `executor/http.go:283` 的"有名单才判"短路成不判 | 卡面点名的那条 `TestHTTPRunner_AdhocHostGuardRunsAtExecution` **仍然绿**（它的拒绝来自执行期重跑的 `takeAdhocLocation`，走不到这一支）；整包跑同一条变异时 `TestHTTP_AllowedHostsMatch`（六个子用例）与 `TestHTTP_IPHostRequiresExplicitAllow` 变红 ⇒ 分支有覆盖，只是不在卡面预期的那条用例上。登记为 D-1007 | `mutations/3b-host-allowlist-off.txt`、`3b-summary.txt` |
+
+### 10.6 设计文档 §10 十二条风险的现状核对
+
+| # | 风险 | 现状 |
+| --- | --- | --- |
+| 1 | 只改 API 不改门禁 | 已落地：同一卡（N02）改了 `gateExecutorSubmission`；M1 变异证明用例有约束力 |
+| 2 | 四个内置键与用户档位撞名 | 已落地：11a/11b 两条实测（内置让位、删掉同名条目后内置生效） |
+| 3 | 名称规则套到旧客户端 | 已落地：场景 3/5 两条（旧写法不套规则、仍能建与执行） |
+| 4 | 只带 `name` 时规则空转 | 登记不修（D4 的代价）：场景 5 就是这条的正面证据 |
+| 5 | 探测对内置条目失去意义 | 已落地：`/executors` 的 `reason` 明说"这条检查说不出某个文件在不在"（11b 那一行原文），场景 1 与 7 各判一次文件 |
+| 6 | SSRF | 部分缓解，按设计：6a 证明默认拒回环且不外连，6b 证明只有显式开关才放开；`url_hosts` 的收紧由 M4 那条分支覆盖（见 D-1007） |
+| 7 | 任意路径执行 | 主动放宽：7b 证明 `path_prefixes` 能收窄；启动日志三条 warn 的原文在 N06 的记录里 |
+| 8 | 普通档位收到新键的文案 | 已落地：场景 7 最后一条（`allowed keys: args, env, timeout`） |
+| 9 | 事件表 `job_name` 是标签 | 登记不修（D13）：场景 12 的事件里 `job_name` 就是中文标签，身份靠 `job_id` |
+| 10 | 编辑表单的名称框被误解 | 已落地：⑦ 复测（只读段落 + 原因） |
+| 11 | 目录加载器仍按名称查键 | 未实施（S-2），文档已写明：`docs/deployment.md` 目录加载器一节与 README 的"三种提交入口" |
+| 12 | 热重载分类漏登记 | 已落地：`TestEveryLeafKeyIsClassed` PASS（03 号文件），部署文档的三档表补了 `executors.adhoc.*` |
+
+### 10.7 缺陷登记
+
+| 编号 | 缺陷 | 处置 |
+| --- | --- | --- |
+| D-1001 | `web/src/content/job-template.md` 出现两个 §12.4（N07 新增那节与既有"跑完之后看什么"撞号） | 已修：后者改 §12.5；`grep "^### 12\."` 复核，页面上 12.1…12.5 各一处 |
+| D-1002 | 编辑模式里旧写法任务把名称打印两遍（`payment_check·payment_check`） | 已修：类型为空时只给名称 + 旧写法说明（N07 §10 偏离 8） |
+| D-1003 | 类型下拉的"普通任务"一组没有组名，与卡面 §3.2 的图示不符 | 已修：三组一律 `optgroup`，占位项留在分组外（N07 §10 偏离 1） |
+| D-1004 | 位置输入框的举例对 `exec.shell` 说 `.php` | 已修：举例给两种后缀（N07 §10 偏离 3） |
+| D-1005 | 设计文档 §8 与 §10 里六处 `文件:行号` 在实施后漂到别的函数上（`profile.go:993`、`:744`、`args.go:529`、`config.go:234`、`args.go:487`、`http.go:744`） | 已修：逐条改到当前行号并复核；§3 的"现状基线盘点"表**故意不改**（那是规划时的坐标，§2.1 才是落地后的） |
+| D-1006 | `docs/deployment.md` 全文没有一处讲 `executors.adhoc` 的部署前提（运维最该看的文档缺章节） | 登记不修：本卡只补了热重载三档表里缺的那一项与加载器的写法说明；整节文档随 S-6 一起做 |
+| D-1007 | `TestHTTPRunner_AdhocHostGuardRunsAtExecution` 对执行期 `checkTarget` 的主机名单分支没有约束力（短路它仍绿） | 登记不修：该分支由 `TestHTTP_AllowedHostsMatch` 与 `TestHTTP_IPHostRequiresExplicitAllow` 覆盖（M4 整包跑红即为证据）；adhoc 那条用例走的是执行期重跑 `takeAdhocLocation` 的路径，改它等于复制第二份判据 |
+
+新增后续项：**S-6** 给 `docs/deployment.md` 补一节"自由执行档位的部署口径"
+（与第 12/13 节同体例：开之前要有什么、`path_prefixes`/`url_hosts` 怎么收、日志看哪几条 warn）。
+
+### 10.8 未验证项（逐条原因）
+
+| 项 | 原因 |
+| --- | --- |
+| Linux / macOS 上的真实执行（脚本档位、进程树终止） | 本机是 Windows；交叉构建只证明能编译。既有系列同样未跑，见执行器系列记录 |
+| `exec.python` 的真实执行 | 本机 `runtime_allow` 里有 `python`，但内置 `exec.python` 要求 `.py` 文件；本轮未造该脚本，只验证了它出现在登记表与类型下拉里（`runtime_ok:true`）。判据与 `exec.php`/`exec.shell` 同源（同一个 `checkAdhocScript`），但**没有**它的独立终态证据 |
+| `url_hosts` 非空时的真实外连拒绝 | 单元层有（`TestHTTPRunner_AdhocHostGuardRunsAtExecution`），端到端本轮未跑（收紧名单要重启，而重启窗口已用于 6b/7b/11 三处） |
+| `cancelled` 状态在列表里的呈现 | 取消即删记录（既有行为），列表里永远看不到那一行 |
+| 观测层按类型查询 | S-3 未实施 |
+
+### 10.9 与卡片的偏离
+
 | # | 与卡片的偏离 | 原因 |
 | --- | --- | --- |
+| 1 | §3.5 第 2 条要求"HTTP 打到本机一个公开端点或本机公网地址"，实测用了 `https://httpbin.org/post` | 内置 `exec.http` 的方法是 POST，`https://example.com/` 回 405（判失败，不重试）。405 那条也留在记录里，因为它正好证明"非 2xx 判失败且不重试" |
+| 2 | §3.5 第 7 条要的四条路径拒绝，实测跑了七条（多加"不限目录时 workspace 之外=放行"、"空值"、"含 shell 元字符"，并把"指向目录"的取名改成 `adir.php`） | 原样写"指向 `ws/scripts` 目录"时先撞上扩展名判据（`has extension ""`），看不到"是不是普通文件"那一判；补的三条是为了让"理由互不相同"这条验收站得住 |
+| 3 | §5 的第三条变异（"把执行期 `hostAllowed` 判据短路"）按字面做时卡面点名的用例仍绿 | 该用例的拒绝来自执行期重跑的 `takeAdhocLocation`，不经过 `checkTarget` 的名单分支。改成同时跑两条：地址范围守卫短路（M3，用例红）+ 名单短路整包跑（M4，另两条用例红），并把差异登记为 D-1007 |
+| 4 | 端到端凭据用 admin01 的 JWT 而不是静态 machine token | 静态 token 的身份是 operator 档，`required_role: admin` 下提交 `exec.*` 一律 403（既有设计）。场景 8 反过来用这条差异取证 |
+| 5 | 交叉构建的三条是 `linux/amd64`、`darwin/arm64`、`windows/386` | 卡面只写"GOOS=linux、GOOS=darwin、GOARCH=386 各一次"；`GOARCH=386` 必须配一个 GOOS，这里选 windows（本机平台 + 32 位，最能暴露平台相关文件的编译问题） |
+| 6 | 冒烟环境的 `runtime_allow` 与解释器全部用本机现成的（`sh`、`php`），档位 `echo_sh` 只为"普通档位收到新键"那条对照而设 | 端到端要跑真进程，不能依赖未安装的解释器；对照条目是卡面 §3.5 第 7 条最后一条证据的最小实现 |
