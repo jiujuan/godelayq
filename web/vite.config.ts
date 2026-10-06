@@ -11,7 +11,7 @@ const backend = 'http://localhost:8080'
 export default defineConfig({
   plugins: [vue(), tailwindcss()],
   server: {
-    port: 5173,
+    port: 5177,
     proxy: {
       '/api': { target: backend, changeOrigin: true },
       '/sse': { target: backend, changeOrigin: true },
