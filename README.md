@@ -294,7 +294,15 @@ godelayq/
 ### 3. 灵活的任务定义
 
 - **多种触发方式**：延迟执行（Duration）、定时执行（Time）、周期执行（Cron，5 或 6 段）
-- **三种提交入口**：REST API、任务文件目录、代码内直接 `Schedule`
+- **名称是标签、类型决定跑什么**：请求体的 `name` 给人看（汉字、英文字母与数字，最长 64 个字符，
+  可以起"每晚对账"这样的中文名），`type` 才是这条任务跑什么——代码里注册的 Handler 名，
+  或执行器档位的注册键 `exec.<档位名>`。控制台的"新建任务"两项分开填，列表与详情同时显示它们，
+  筛选条是"类型下拉 + 名称文本框"（分别落 `?type=` 与 `?name=`）。
+  **省略 `type` 是旧写法**：那时 `name` 兼作类型、也不套标签规则，
+  所以 `payment_check` 这类既有名字与已在跑的脚本仍然照原样可用。
+- **三种提交入口**：REST API、任务文件目录、代码内直接 `Schedule`。
+  任务文件目录那条入口**只支持旧写法**（文件里的 `name` 就是查找键，格式里没有 `type` 这一项），
+  中文标签在那里会被当成查找键而找不到处理函数；详见 [部署文档](./docs/deployment.md) 的目录加载器一节
 - **执行器档位（默认关闭）**：档位注册成 `exec.<档位名>` 任务类型，到点直接跑脚本、跑已编译产物
   或发一个 HTTP 请求，不需要改代码；能执行什么由两份来源决定——配置的 `executors.commands`
   与档位文件 `executors.profiles_path`（`executors.web_enabled` 打开后由 ops 档在
@@ -306,6 +314,16 @@ godelayq/
   无论来自哪份，
   **都不提供自由命令行，也不接受任务里内联源码**。参数声明（必填、正则、`secret`）、可用性探测、
   独立执行池与输出产物存储都在 `executor/` 包里；开关与部署前提见 [部署文档](./docs/deployment.md) 的"开启执行器"。
+- **自由执行档位（`executors.adhoc`，默认关闭）**：打开后登记表里多出四条内置档位
+  `exec.php`、`exec.python`、`exec.shell`、`exec.http`，它们与上面那些档位是同一套东西
+  （同一份参数判据、同一个执行池、同一套超时与产物规则），唯一区别是**跑哪个文件、打到哪条地址
+  写在任务里**（`payload` 顶层的 `script` 或 `url`），控制台选中这四类类型时会多出一个位置输入框，
+  标题与范围说明由接口给。范围由 `executors.adhoc.path_prefixes` 与 `url_hosts` 决定（两者留空都是
+  "不限"），提交身份仍要 `executors.required_role`。**没放宽的是**：地址范围守卫（回环、私网、
+  云元数据地址在建连前拒）、`max_timeout` 上限、argv 直传不过 shell、产物落盘与崩溃恢复。
+  这一节是一次范围很大的授权（够档位的身份可以让这台机器执行它提交的路径），
+  打开时进程启动日志会留下当前生效范围，设计与逐条边界见
+  [任务名称/类型解耦与自由执行位置设计](./docs/design/job-name-type-and-adhoc-execution.md) §8。
 - **上下文传递**：Handler 收到带 cancellation 与 timeout 的 `context.Context`
 - **标识**：任务 ID 为 UUIDv7（毫秒时间戳前缀 + 随机后缀，可按字典序粗略排序）
 
@@ -492,6 +510,18 @@ executors:
   # 档位列表：脚本 / 已编译产物 / HTTP 三种，字段见模板注释与设计文档 §5。
   # 与 server.auth.users 同理，这里不写 []（解开示例即可启用；写 [] 再挂列表项会让 YAML 报错）。
   commands:
+  # 自由执行档位：打开后多出 exec.php / exec.python / exec.shell / exec.http 四条内置档位，
+  # 跑哪个文件、打到哪条地址写在任务的 payload 里。整节默认关闭，打开要求 executors.enabled: true。
+  # 这是"够 required_role 的身份可以让这台机器执行它提交的路径"的一次范围很大的授权，
+  # 逐条边界与默认值见 configs/config.example.yaml 的同节注释与设计文档 §8。
+  adhoc:
+    enabled: false            # 总开关；关闭时那四条类型不存在，接口与页面看不出任何变化
+    shell_runtime: bash       # exec.shell 用的解释器名，必须在 runtime_allow 里
+    path_prefixes: []         # 脚本位置允许落在哪些目录（留空=不限目录，收窄它是放宽之后最顺手的一道闸）
+    require_extension: true   # 是否要求扩展名与那条类型对得上（.php / .py / .sh|.bash）
+    url_hosts: []             # exec.http 允许请求的主机名单（留空=不限主机）
+    url_allow_private: false  # true 才放开"回环/私网/链路本地/组播"那道建连前守卫；不建议
+    http_timeout: 30s         # exec.http 的单次执行超时，仍受 executors.max_timeout 封顶
 observability:
   enabled: false              # 总开关；false 时不建库文件、不订阅事件总线、三个注入全部为空，行为与本节之前一致
   path: ./data/observe.sqlite # 观测库文件；父目录不存在时由启动装配创建，WAL 会另生 -wal/-shm 旁文件

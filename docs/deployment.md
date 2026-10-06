@@ -345,6 +345,12 @@ level=INFO msg="artifact expired directories purged" count=24 ttl=1m0s
 服务端也没有这条链——未接线时这个配置项没有任何行为差别。打开之前请确认监控目录的写权限已收窄到服务账号独占，
 并清楚放弃的是哪一层防护。
 
+**任务文件只支持旧写法（名称兼作查找键）**：`core/load.go` 的任务文件结构体只有 `name` 一个身份字段
+（`:25`，注释写明"同时作为 Handler 查找键"），没有 `type` 这一项，也没有"标签 + 类型"两栏的说法。
+所以 REST 与控制台那套新写法（`{"name":"每晚对账","type":"payment_check"}`）在目录加载器这条入口上
+**没有对应写法**：想跑 `payment_check` 就得把文件的 `name` 写成 `payment_check`，
+中文标签在这里会被当成查找键而找不到处理函数。这一条是本期有意保留的现状（后续项 S-2）。
+
 ### 13. 档位的在线管理（`executors.web_enabled`）
 
 默认关闭。打开之后控制台多一个"档位"页、REST 多四个端点，ops 身份可以在**不重启**的前提下
@@ -560,7 +566,7 @@ level=WARN msg="observability event writer dropped records" dropped=497 path=./d
 
 | 改了立刻生效（下一个防抖窗口） | 改了接受但不应用（进 `ignored_keys`，重启才变） | 改了整次作废（进 `rejected_keys`，一项都不应用） |
 | --- | --- | --- |
-| `logging.level`<br>`scheduler.workers`（运行期扩缩，缩容不打断在跑任务）<br>`scheduler.max_retry_delay`<br>`store.history_limit` / `store.history_ttl`（下一次写入的修剪用新值）<br>`observability.events.retention_*` / `observability.audit.retention_*`（下一个批量周期的淘汰用新值）<br>`executors.commands`（档位内容与条目增删；同名以配置侧为准）<br>`reload.debounce`（下一次事件起用新窗口） | `server.port`、`server.cors.*`、`server.auth.jwt.access_ttl` / `refresh_ttl`<br>`scheduler.queue_capacity`、`scheduler.shutdown_timeout`<br>`store.type` / `store.path` / `store.groups_path` / `store.flush_interval`<br>`logging.format`<br>`observability` 的总开关、`path`、两个 `flush_interval`、`queue_capacity`、`busy_timeout`、`synchronous`、三个子开关<br>`executors` 的总开关、`required_role`、`workspace`、`runtime_allow`、`env_allow`、`concurrency`、`queue_capacity`、`default_timeout`、`max_timeout`、`restore_policy`、`loader_allow`、`web_enabled`、`profiles_path`、`output.*`<br>`reload.enabled`（这一项本身属于重启档） | `server.auth.token`<br>`server.auth.users`<br>`server.auth.jwt.secret`<br>档位条目内的执行许可字段：`kind`、`runtime`、`script`、`program`、`fixed_args`、`cwd`、`env`、`env_allow`、`method`、`url_template`、`allowed_hosts`、`headers`、`header_allow`、`deny_private_ranges`、`max_redirects` |
+| `logging.level`<br>`scheduler.workers`（运行期扩缩，缩容不打断在跑任务）<br>`scheduler.max_retry_delay`<br>`store.history_limit` / `store.history_ttl`（下一次写入的修剪用新值）<br>`observability.events.retention_*` / `observability.audit.retention_*`（下一个批量周期的淘汰用新值）<br>`executors.commands`（档位内容与条目增删；同名以配置侧为准）<br>`reload.debounce`（下一次事件起用新窗口） | `server.port`、`server.cors.*`、`server.auth.jwt.access_ttl` / `refresh_ttl`<br>`scheduler.queue_capacity`、`scheduler.shutdown_timeout`<br>`store.type` / `store.path` / `store.groups_path` / `store.flush_interval`<br>`logging.format`<br>`observability` 的总开关、`path`、两个 `flush_interval`、`queue_capacity`、`busy_timeout`、`synchronous`、三个子开关<br>`executors` 的总开关、`required_role`、`workspace`、`runtime_allow`、`env_allow`、`concurrency`、`queue_capacity`、`default_timeout`、`max_timeout`、`restore_policy`、`loader_allow`、`web_enabled`、`profiles_path`、`output.*`、`adhoc.*`（整节七项，含 `enabled`）<br>`reload.enabled`（这一项本身属于重启档） | `server.auth.token`<br>`server.auth.users`<br>`server.auth.jwt.secret`<br>档位条目内的执行许可字段：`kind`、`runtime`、`script`、`program`、`fixed_args`、`cwd`、`env`、`env_allow`、`method`、`url_template`、`allowed_hosts`、`headers`、`header_allow`、`deny_private_ranges`、`max_redirects` |
 
 三条容易读错的口径：
 

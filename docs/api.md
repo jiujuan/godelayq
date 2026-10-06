@@ -526,6 +526,27 @@ Content-Type: application/json
 校验规则与单条 `POST /jobs` 完全一致（同一套解析逻辑），包括 `delay`/`trigger_at`/`cron_expr`
 优先级、`timeout` 格式非法即拒绝、以及未注册的 `name` 视为错误。
 
+两种写法可以在同一个批次里混用，判据仍然是逐条看那一项请求体带不带 `type`：
+带 `type` 的条目按标签规则判 `name`（中文标签合法、注册键取 `type`），不带的条目沿用旧规则
+（`name` 兼作注册键，因此它必须是注册表里出现过的名字）。逐条独立处理意味着一条的 400
+只影响那一条自己：同批里名称带空格的条目单独拿到 `invalid job name`（`details` 指出第几个字符），
+类型未注册的条目单独拿到 `unknown job type`，其余条目照常 201。
+`items[]` 是完整的任务对象，所以新写法建的条目带 `type`、旧写法的不带——读回来原样 `PUT` 回去仍然安全。
+
+```json
+[
+  { "name": "每晚对账", "type": "payment_check", "delay": "30m" },
+  { "name": "旧写法", "delay": "30m" },
+  { "name": "bad name", "type": "email_send", "delay": "30m" },
+  { "name": "未注册", "type": "no_such_type", "delay": "30m" }
+]
+```
+
+这样一批的实测结果是 `{"succeeded":1,"failed":3}`：第 0 条 201（`items[0]` 里带
+`"type": "payment_check"`），第 1 条 400 `unknown job type`（旧写法下"旧写法"这个标签就是注册键，
+而表里没有它），第 2 条 400 `invalid job name`（`character " " at position 3`），
+第 3 条 400 `unknown job type`。四条的结论互不影响，`succeeded` 只数成功的那几条。
+
 ## 执行器 API
 
 执行器把"任务类型"从代码里注册的 Handler 扩展到配置文件里声明的**档位**（profile）：一条档位写清楚
@@ -744,6 +765,11 @@ argv 也仍然是数组直传，不经过 shell。
 `free-form execution profiles are enabled`，带上当前生效的 `path_prefixes`、`url_hosts`、
 `url_allow_private` 与 `required_role` 四个取值；限定目录留空或放开回环与私网时各再多一条。
 整节关闭时这四条键不存在，`GET /executors` 与 `GET /job-types` 的形状与之前逐字一致。
+
+**提交这四条的身份门槛与其余档位同一条**：`executors.required_role`（默认 `admin`），
+不够时 403 的 `details` 会点名这个配置项（见下面"提交期被拒的四种响应"）。
+风险面因此比配置侧大一档：够这个档位的身份可以让这台机器执行它提交的路径、请求它提交的地址，
+而配置文件里从没写过那两个位置——这也是启动日志要把当前范围说出来的原因。
 
 ### 档位的在线管理
 
@@ -1726,6 +1752,8 @@ GET /job-types
 ```
 
 档位来自配置的 `executors.commands` 与 `executors.profiles_path` 那份文件，两份都在进程启动时注册。
+`executors.adhoc.enabled: true` 时，那四条内置档位（`exec.http`、`exec.php`、`exec.python`、`exec.shell`）
+同样出现在这里；整节关闭时一条都不在，这个数组与名称/类型解耦之前逐字一致。
 `executors.commands` 什么时候要重启取决于 `reload.enabled`：关闭时（默认）改完要重启进程；打开时改条目
 自身的可改字段（超时、参数声明、条目增删）下一个防抖窗口就生效并在这里立刻出现，而改动条目内的执行许可
 字段（`kind`/`runtime`/`script` 等十五项）会让整次重载被拒绝，那种改动连同 `executors.workspace`/

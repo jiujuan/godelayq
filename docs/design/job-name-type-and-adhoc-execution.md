@@ -1,6 +1,7 @@
 # 任务名称自由填写 + 任务类型（档位）+ 自由指定执行位置设计
 
-> 状态：**待实施**。任务拆分见 `docs/design/tasks/new-tasks/README.md`（TASK-N01…N08）。
+> 状态：**已实施**（TASK-N01…N07 落地于 2026-10-06/07，收口验证见 TASK-N08 的 §10 与
+> `docs/design/tasks/new-tasks/README.md` 的状态表）。任务拆分见 `docs/design/tasks/new-tasks/README.md`（TASK-N01…N08）。
 > 需求来源：使用者 2026-10-06 提出，原文要点四条——
 > ①"任务名称"现在等于"已注册的任务类型"，要改成可以任意填写；
 > ②新建任务页要有"任务类型"下拉，列出 PHP、Python、脚本 shell/bash、HTTP、其它当前可执行的类型；
@@ -64,13 +65,57 @@
 | D6 | **adhoc 档位键名：`exec.php`、`exec.python`、`exec.shell`、`exec.http`** | 名字要能直接当界面标签的锚点，也必须是合法档位名（`exec.shell` 的解释器由配置项指定，默认 `bash`）。注意不能用 `exec.adhoc.php` 这种带点的写法——点不在档位名字符集里（`core/executor_profile_store.go:22`） |
 | D7 | **执行位置走 payload 顶层的 `script` / `url` 两个新键，不走 `args`/`params`** | 两条理由。①技术：HTTP 的整条 URL 放进 `params` 必然被拒，占位符值禁止 `:` `/`（`executor/args.go:406-434`，禁字符集 `urlParamForbidden`）。②语义：位置是"跑哪个可执行体"的身份，不是参数值；D7（`web-profile-design.md:38`）正是按这条区分身份与参数。放进 `args` 会让"参数"里混进一个决定执行体的键 |
 | D8 | **路径解析复用 `PathAnywhere`，文件存在性在提交期判一次、执行前由探测再判一次** | `PathAnywhere` 与 `resolveAnywhere`（`executor/profile.go:55`、`:959`）在 TASK-W02 已经实现并只给 Web 侧档位用过，语义正好是"允许本机任意路径，只要求能算出绝对路径"。再判一次是因为提交与执行之间隔着一段时间，文件可能已经不在了；现成的 `fileCheckReason`（`executor/probe.go:115`）就是这一条 |
-| D9 | **URL 仍保留三层守卫，放宽的只有"主机可以在提交时决定"** | ①scheme 只允许 http/https、URL 里不许带凭据（`executor/http.go:267` `checkTarget`）；②主机白名单（`hostAllowed`，`executor/profile.go:885`）由配置项给，空列表按"不限主机"处理，但这条放宽会让 `checkAllowedHosts`（`:744`）现存的"不允许为空"规则对 adhoc 档位绕开，需要显式分支而不是改坏既有档位；③地址范围守卫**不放宽**：拒回环、私网、链路本地（含云主机元数据地址 169.254.169.254）、组播与 100.64.0.0/10（`executor/http.go:744` `refusalReason`），只有配置显式打开 `url_allow_private` 才整条关闭 |
+| D9 | **URL 仍保留三层守卫，放宽的只有"主机可以在提交时决定"** | ①scheme 只允许 http/https、URL 里不许带凭据（`executor/http.go:267` `checkTarget`）；②主机白名单（`hostAllowed`，`executor/profile.go:960`）由配置项给，空列表按"不限主机"处理，但这条放宽会让 `checkAllowedHosts`（`:812`）现存的"不允许为空"规则对 adhoc 档位绕开，需要显式分支而不是改坏既有档位；③地址范围守卫**不放宽**：拒回环、私网、链路本地（含云主机元数据地址 169.254.169.254）、组播与 100.64.0.0/10（`executor/http.go:762` `refusalReason`），只有配置显式打开 `url_allow_private` 才整条关闭 |
 | D10 | **adhoc 的提交身份门槛复用 `executors.required_role`（默认 admin），不新增角色键** | 阶梯已经存在（`configs/config.example.yaml:80-83`）。再加一个键会出现"两个门槛取哪个"的问题。要放宽的是"执行位置从哪来"这一件事，不是"谁能提交" |
 | D11 | **整套 adhoc 由 `executors.adhoc.enabled` 控制，默认 false；打开要求 `executors.enabled=true`** | 与 `executors.web_enabled` 同一条口径，那条"两个开关必须一起"的规则现在落在 `core/config.go:477`（`web-profile-design.md` 的落地位置段写的 `:459` 已经漂移）。关闭时四条内置档位一条都不注册，接口与页面看不出任何变化 |
 | D12 | **`GET /api/v1/job-types` 形状不动，新增信息全部放 `GET /executors`** | job-types 的响应形状已被 `docs/api.md`、swagger 注释与既有用例钉住（`api/handlers.go:528-532`），而前端本来就同时读这两份（`web/src/components/jobs/JobForm.vue:81-92`）。要加的只有"这条档位是不是 adhoc、位置输入框该叫什么、填什么形态"三项，属于档位属性，放档位列表里最自然 |
 | D13 | **事件与观测层不改表**：`Event.JobName` 继续记名称（标签），任务身份由 `JobID` 定位；执行体身份在接口响应与快照里给 | SQLite 事件表只有 `job_name` 一列（`store/sqlite/schema.go:35`），加列要走迁移而收益只有一条"看事件时不用回查任务"。台账侧记的已经是 `HandlerKey`（`api/audit.go:181`），不受影响 |
 | D14 | **`PUT /jobs/:id` 本期不放开改名**，并把 `type` 纳入同一条"传了且不同就 400"的判定 | 改名要连带决定"改名后按名称筛选的历史任务怎么找"、"事件里的旧名字怎么办"，属于另一件事。已登记为 §10 的后续项。换类型的禁令必须扩展：现在只比 `name`（`api/handlers.go:334`），解耦后 `type` 才是执行体身份，只守 `name` 等于放开了一条换执行体的路 |
 | D15 | **内置 adhoc 档位与用户自建档位撞名时，内置让位并记一行启动日志** | 撞名查重已有先例（`executor/register.go:72-77` 键被占用即启动失败；`executor/merge_profiles.go:39` 的降级条目）。这里是内置条目让位而不是拒绝启动，因为用户已经建好的档位不该因为运维打开了 adhoc 开关就失效 |
+
+### 2.1 落地位置（实施后回填，行号是 2026-10-07 的）
+
+- D1 类型下拉的候选仍是 `GET /api/v1/job-types`（`api/handlers.go` 的 `ListJobTypes`），
+  没有引入"类型分类"这层；界面侧的三分组判据在 `web/src/components/jobs/JobForm.vue:557`
+  `typeOptions`——看的是档位表里有没有这条类型、以及它带不带 `location`，不是键名前缀。
+- D2 请求体字段 `api/dto.go:21`（`CreateJobRequest.Type`）→ 写进任务 `api/handlers.go:160`
+  → 读出口 `api/handlers.go:695`（`JobResponse.Type`，空表示旧写法）。
+- D3 规则只有一份：`core/job_name.go:39` `ValidateJobName`；api 侧唯一的调用点是
+  `api/handlers.go:47-53` 的 `validateJobNameField`；前端那份常量在
+  `web/src/components/jobs/JobForm.vue:68`（`JOB_NAME_RULE`，注释指向 `core/job_name.go`），
+  它只负责提前提示，拒绝权在服务端。
+- D4 两种写法的判据只有一处：`api/handlers.go:108` 的
+  `legacy := strings.TrimSpace(req.Type) == ""`；取注册键在 `api/handlers.go:66`。
+- D5 四条内置档位由 `executor/adhoc.go:117` `AdhocProfiles` 造，产出的仍是
+  `core.ExecutorCommand`（`executor/adhoc.go:393` `adhocCommand`），交给既有的
+  `executor.buildProfile` 与 `executor.Register`；执行通路一条都没新增（并发、超时、产物、
+  失败分类、重试、恢复、掩码全部沿用 TASK-E 系列那一条）。
+- D6 四条的键名与解释器在 `executor/adhoc.go:24` 那组常量与 `:62` `adhocSpecs`。
+- D7 位置走 payload 顶层的两个新键：`executor/args.go:60`（`Submission.Script`）与
+  `:68`（`Submission.URL`），收键的是 `executor/adhoc.go:201` `takeAdhocLocation`；
+  错误文案里给出的"允许键清单"由 `executor/args.go` 的 `submissionKeys` 同步算出。
+- D8 提交期判据 `executor/adhoc.go:270` `checkAdhocScript`（复用 `PathAnywhere` 的解析），
+  执行期同一份判据再跑一次；文件在提交后消失按永久失败处理，不重试
+  （用例 `TestRunner_AdhocScriptGoneAtExecutionIsPermanent`）。
+- D9 地址侧提交期判据 `executor/adhoc.go:328` `checkAdhocURL`，执行期在
+  `executor/http.go` 的 `resolveTarget` → `checkTarget`，主机名单与地址范围两条守卫
+  对内置档位与声明式档位走的是同一份代码（`fillTemplate` 那条重复链已删）。
+- D10 身份门槛复用 `api/handlers_executors.go:657` `gateExecutorSubmissionRole`
+  （取 `s.executorRole()`，即 `executors.required_role`），403 的句子点名这个配置项；
+  取档位用的是 `api/handlers_executors.go:646` `executorProfile(handlerKey)`。
+- D11 配置面 `core/config.go:315` `AdhocConfig`、写法校验 `:586` `validateAdhocConfig`、
+  与 `executors.enabled` 的连带判定 `:557`；关闭时 `AdhocProfiles` 回空表。
+- D12 新增信息全在 `GET /executors`：`api/handlers_executors.go:361`（`adhoc`）、
+  `:365`（`location`）、`:373`（`ProfileLocation`）、`:528`（`adhocLocation`，
+  标题与范围说明在这里拼，前端只呈现）。`GET /job-types` 的形状一字未改。
+- D13 观测层零改动：`store/sqlite/schema.go` 未变，事件表仍只有 `job_name` 一列；
+  台账侧记 `HandlerKey` 的行为沿用 `api/audit.go`。
+- D14 `PUT /jobs/:id` 的改名仍然拒（`api/handlers.go` 的 `UpdateJob`），
+  类型也纳入同一条判定：`api/handlers.go:397` 比的是 `*req.Type != snapshot.HandlerKey()`。
+- D15 让位方向：`executor/adhoc.go:117` 的第二个返回值 `[]AdhocSkip` 收集被占用的键，
+  `executor/register.go:36-40` 的 `AdhocSkipped` 是它的数量，启动日志在
+  `executor/register.go:104-111`（`adhoc_skipped=` 计数）与 `:127` `warnAdhocPolicy`
+  （整节打开但一条都没登记时说 "enabled but no built-in profile is registered"）。
 
 ## 3. 现状基线盘点（本文所有改动点的坐标）
 
@@ -375,21 +420,21 @@ type AdhocConfig struct {
 | 原口径 | 位置 | 现在的口径 |
 | --- | --- | --- |
 | 可执行体身份不能在提交任务时决定 | `web-profile-design.md:38` D7、`config-reload-design.md:304` | adhoc 类型的任务在提交时给路径/URL；其余档位身份仍不可变（内置条目的身份字段由配置定死：解释器、方法、超时） |
-| 脚本必须落在 `executors.workspace` 之内 | `executor/profile.go:993` `resolveInside` | adhoc 走 `PathAnywhere`（`:55`），默认允许本机任意路径；可用 `executors.adhoc.path_prefixes` 收紧 |
-| HTTP 档位必须有非空 `allowed_hosts` | `executor/profile.go:744-746` | adhoc 的 `url_hosts` 允许为空=不限主机；`executors.commands` 里的普通档位这条规则不变 |
+| 脚本必须落在 `executors.workspace` 之内 | `executor/profile.go:1068` `resolveInside` | adhoc 走 `PathAnywhere`（`:55`，解析在 `:1034` `resolveAnywhere`），默认允许本机任意路径；可用 `executors.adhoc.path_prefixes` 收紧 |
+| HTTP 档位必须有非空 `allowed_hosts` | `executor/profile.go:812-814` `checkAllowedHosts` | adhoc 的 `url_hosts` 允许为空=不限主机；`executors.commands` 里的普通档位这条规则不变（内置档位只跳过"非空"那一条，写法判据共用 `checkHostEntries`） |
 
 **没动的（本文全部复用现成实现）：**
 
-1. 不经过 shell：argv 数组直传，无 `sh -c` / `cmd /c`（`executor/args.go:529` 注释钉住的 D3；
+1. 不经过 shell：argv 数组直传，无 `sh -c` / `cmd /c`（`executor/args.go:566-567` 注释钉住的 D3；
    Windows/Unix 各自的 `proc_windows.go` / `proc_unix.go` 不使用外壳）。
-2. 解释器白名单：`runtime_allow`（`core/config.go:234`）仍然约束内置条目能注册哪几条。
+2. 解释器白名单：`runtime_allow`（`core/config.go:252`）仍然约束内置条目能注册哪几条。
 3. 环境变量：`env_allow` 与 `GODELAYQ_` 前缀强制排除不变（`configs/config.example.yaml:89-93`）；
    adhoc 档位不声明 `env_allow`，因此 payload 无法注入任何环境变量。
 4. 超时：执行器任务没有"不限制"这一档，`default_timeout`/`max_timeout` 上限照旧
-   （`executor/args.go:487` `EffectiveTimeout`）。
-5. 地址范围守卫：SSRF 那一层不放宽（D9 第③层，`executor/http.go:744`），
+   （`executor/args.go:527` `EffectiveTimeout`）。
+5. 地址范围守卫：SSRF 那一层不放宽（D9 第③层，`executor/http.go:762` `refusalReason`），
    只有显式 `url_allow_private: true` 才整条关闭，且关闭时启动记 warn（与既有
-   `deny_private_ranges=false` 的处理同一条，`:742-743` 注释）。
+   `deny_private_ranges=false` 的处理同一条）。
 6. 重定向一律拒绝（`executor/http.go:110` `refuseRedirect`）。
 7. 产物落盘 workspace 之内、输出裁剪与 secret 掩码机制照旧。
 8. 提交身份门槛：`executors.required_role`，默认 admin（`configs/config.example.yaml:80-83`）。
@@ -426,7 +471,7 @@ type AdhocConfig struct {
 | 2 | `exec.php` 等四个键与用户自建档位撞名 | 按 D15：内置让位 + 启动日志说明；TASK-N04 用例覆盖 |
 | 3 | 名称规则套到旧客户端上会把既有调用全部拒掉 | 按 D4：只在带 `type` 时套规则；TASK-N02 的回归用例覆盖 |
 | 4 | 只带 `name` 时名称规则为空转（可以传 `payment_check` 这类带下划线的标签） | 登记不修。这是 D4 兼容选择的直接代价，收紧到"一律套规则"要另做客户端迁移，属范围变更而不是缺陷 |
-| 5 | adhoc 路径来自任务，`Probe` 的"这台机器跑不跑得动"结论对内置条目失去意义 | 已登记：内置 adhoc 条目的探测只判解释器（`executor/probe.go:80` `probeProgramName`），不判文件；文件存在性在提交期与执行前各判一次（D8） |
+| 5 | adhoc 路径来自任务，`Probe` 的"这台机器跑不跑得动"结论对内置条目失去意义 | 已登记：内置 adhoc 条目的探测只判解释器（`executor/probe.go:93` `probeProgramName`），不判文件；文件存在性在提交期与执行前各判一次（D8） |
 | 6 | SSRF：自由填 URL 可以打内部服务 | 部分缓解：D9 的三层守卫保留、`url_hosts` 可配、`url_allow_private` 默认关。残余风险由 `required_role` 承担，写进 §8 运维须知 |
 | 7 | 任意路径执行 = 本机的任意命令执行面（例如 `C:/Windows/System32/…`） | 主动放宽的选择，不再试图在这里补防：靠 `path_prefixes` + `require_extension` + `runtime_allow`（只经解释器，不经外壳）收窄；§8 的注释与启动 warn 是必须交付的部分 |
 | 8 | payload 顶层新增 `script`/`url` 两个键，普通档位收到它们时报错文案要精确，否则会误以为是"新写法不被支持" | 已登记：TASK-N05 要求错误文本列出该档位实际接受的键（现成 `submissionKeys`，`executor/args.go:197`） |

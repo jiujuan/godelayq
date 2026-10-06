@@ -65,6 +65,15 @@
   判越界只能用 `withinDirectory`，不能用 `relativeTo` 返回的形状（同盘越界会老实给出 `..\..\` 上跳形式）。
   这是评审拍板的主动偏离，安全收口五条 S-1…S-5 只登记未实施，见那份文档 §7.2 与
   `docs/deployment.md` "开启执行器"第 13 条的警告。
+- D2 ⚠️ **第二处显式例外（2026-10-07，TASK-N01…N07）**：`executors.adhoc.enabled: true` 时那四条
+  内置档位（`exec.php` / `exec.python` / `exec.shell` / `exec.http`）的**执行位置写在任务里**而不是
+  写在档位定义里（脚本路径取 `payload.script`、请求地址取 `payload.url`）。因此本条的"必须解析在
+  workspace 之内"对这四条不成立——范围由 `executors.adhoc.path_prefixes` 决定（留空即不限目录，
+  启动日志会为此留一行 warn）；同理，`executor/profile.go:505` 那条"http 档位必须有非空
+  `allowed_hosts`"对 `exec.http` 也不成立，改由 `executors.adhoc.url_hosts` 决定（留空即不限主机）。
+  **没有一起放宽的是**：拨号层的地址范围守卫（回环、私网、链路本地含云元数据、组播）、
+  `max_timeout` 上限、argv 直传不过 shell、产物落盘与崩溃恢复、`executors.required_role` 身份档位。
+  逐条对照见 [job-name-type-and-adhoc-execution.md](./job-name-type-and-adhoc-execution.md) §8。
 - D5 ⚠️ 整树终止：`executor/proc_unix.go` 的 `killTree`（`SysProcAttr{Setpgid:true}` + 进程组 TERM→宽限→KILL）与
   `executor/proc_windows.go` 的 `killTree`/`runTaskkill`。超时的生效值由 `executor/profile.go` 的 `effectiveTimeout`
   合成（档位没写就用 `executors.default_timeout`，一律受 `max_timeout` 封顶）。**与原设计的差别**：
