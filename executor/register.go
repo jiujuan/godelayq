@@ -33,6 +33,11 @@ type Registration struct {
 	// Degraded 是因与 executors.commands 撞名而没被注册的档位数量（TASK-W03、设计文档 §5.2）。
 	// 它们不进注册表，所以不占上面三个计数；这一条只负责让启动日志说出"有几条白写在文件里"
 	Degraded int
+	// AdhocSkipped 是没被登记的内置自由执行档位数量（TASK-N04）：
+	// 解释器不在 executors.runtime_allow 里、或注册键被配置侧档位占用的那几条。
+	// 它们同样不进注册表，所以不占上面三个计数；这一条只负责让启动日志说出
+	// "打开了 adhoc 却只剩两条"，而不是让人以为开关没生效。
+	AdhocSkipped int
 }
 
 // Register 把登记表里的每个档位注册成 exec.<name> 处理函数。
@@ -95,12 +100,15 @@ func Register(registrar Registrar, reg *Registry, cfg core.Config, artifacts *Ar
 	// 被降条目从不进注册表，所以这一句只取计数：它们不需要"跳过"的逻辑，
 	// Keys() 里本来就没有它们（ApplyStore 只把未降级的条目放进表）。
 	result.Degraded = len(reg.Degraded())
+	// 内置档位让位的计数同理：NewRegistry 已经把没登记的那几条连同原因留在了登记表里。
+	result.AdhocSkipped = len(reg.AdhocSkipped())
 
 	logger.Info("executor handlers registered",
 		"total", result.Total,
 		"registered", result.Registered,
 		"unavailable", result.Unavailable,
-		"degraded", result.Degraded)
+		"degraded", result.Degraded,
+		"adhoc_skipped", result.AdhocSkipped)
 
 	warnRelaxedAddressPolicy(reg, keys, logger)
 

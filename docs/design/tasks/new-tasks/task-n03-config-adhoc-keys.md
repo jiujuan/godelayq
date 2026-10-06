@@ -211,4 +211,6 @@ DoD 核对：
 5. 默认关闭时全仓行为零变化：`go test ./core` 整包绿（19.5s），
    `api`、`executor` 两个包在本卡里一行都没改（`git show --stat` 可查）。
 
-补充：`go build ./...`、`go vet ./...` 无输出；`go test -race -timeout 30m ./core ./api` 见 N02 卡末尾记录。
+补充：`go build ./...`、`go vet ./...` 无输出。
+`go test -race -timeout 30m ./core ./api`（N02 的 api 改动 + 本卡的 core 改动合并跑）**两轮都绿**：
+后台任务 `b9dr8avw9` 与 `b9jctuj47`，退出码均为 0。

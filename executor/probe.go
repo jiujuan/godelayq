@@ -66,10 +66,23 @@ func Probe(p *Profile) ProbeResult {
 //
 // 脚本文件只要求"存在且是普通文件"，不要求执行位：它由解释器读取（node app.mjs），
 // 而不是被系统直接执行。给脚本加执行位要求会误伤一批合法配置。
+//
+// 内置自由执行档位（Adhoc）没有脚本文件可查——那个路径来自任务的 payload，
+// 探测这一步看不到它。所以这里只判解释器，并在结论里说明"位置由任务给出"，
+// 否则运维在接口上看见一条"可用"却不知道它能跑什么（TASK-N04 §3.2）。
+// 文件存在性由提交期校验（executor/adhoc.go 的 checkAdhocScript）与执行前那一次判查负责。
 func probeScript(p *Profile) ProbeResult {
 	resolved, err := lookPath(p.Runtime)
 	if err != nil {
 		return ProbeResult{Reason: fmt.Sprintf("runtime %q not found in PATH", p.Runtime)}
+	}
+	if p.Adhoc {
+		return ProbeResult{
+			Available: true,
+			Path:      resolved,
+			Reason: fmt.Sprintf("runtime %q is available; the script path comes from each job's payload, "+
+				"so this check cannot tell whether a given file exists", p.Runtime),
+		}
 	}
 	if reason, ok := fileCheckReason("script", p.ScriptPath, p.ScriptRel); !ok {
 		return ProbeResult{Reason: reason}

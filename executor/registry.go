@@ -22,6 +22,10 @@ const (
 	SourceConfig Source = "config"
 	// SourceStore 来自 executors.profiles_path 指向的档位文件：页面上可增删改。
 	SourceStore Source = "store"
+	// SourceAdhoc 是进程自带的四条自由执行档位（exec.php / exec.python / exec.shell / exec.http）：
+	// 它们不在配置文件里，也不在档位文件里，只由 executors.adhoc.enabled 决定存不存在，
+	// 因此页面上同样只读。见 executor/adhoc.go。
+	SourceAdhoc Source = "adhoc"
 )
 
 // entry 是登记表里的一条：校验过的档位，加上这台机器的可用性结论与来源。
@@ -83,6 +87,10 @@ type Registry struct {
 
 	writeMu sync.Mutex
 	data    atomic.Pointer[snapshot]
+
+	// adhocSkipped 在 NewRegistry 里一次写好，之后只读：内置档位整节配置都是重启档
+	// （core/config_reload.go 的 executors.adhoc.*），运行期不会变，因此不需要跟着 data 一起换。
+	adhocSkipped []AdhocSkip
 }
 
 // NewRegistry 加载并探测 config.yaml 里声明的全部档位。
@@ -135,9 +143,46 @@ func NewRegistry(cfg core.Config, logger *slog.Logger) (*Registry, error) {
 		}
 		entries[profile.HandlerKey()] = &entry{profile: profile, probe: result, source: SourceConfig}
 	}
+
+	// 四条内置自由执行档位合进同一张表：它们与配置侧档位共用探测结论的形状、
+	// 展示面与注册路径，区别只在来源标记与"位置来自任务"。
+	// 撞名时内置那条让位（设计文档 §D15）：用户已经建好的档位不该因为运维打开了
+	// adhoc 开关而失效，而且让位是可见的——skipped 由调用方说出去。
+	adhocProfiles, adhocSkipped, err := AdhocProfiles(normalized)
+	if err != nil {
+		return nil, err
+	}
+	registry.adhocSkipped = adhocSkipped
+	for _, profile := range adhocProfiles {
+		key := profile.HandlerKey()
+		if _, taken := entries[key]; taken {
+			registry.adhocSkipped = append(registry.adhocSkipped, AdhocSkip{
+				HandlerKey: key,
+				Reason:     "the key is already used by a profile declared in executors.commands, the built-in one is not registered",
+			})
+			continue
+		}
+		result := Probe(profile)
+		if !result.Available {
+			logger.Warn("built-in executor profile unavailable",
+				"profile", profile.Name,
+				"handler_key", key,
+				"kind", string(profile.Kind),
+				"reason", result.Reason)
+		}
+		entries[key] = &entry{profile: profile, probe: result, source: SourceAdhoc}
+	}
+
 	registry.data.Store(newSnapshot(entries, nil))
 
 	return registry, nil
+}
+
+// AdhocSkipped 返回没被登记的那几条内置档位与原因（NewRegistry 里判出来的两份：
+// 解释器不在白名单、以及注册键被配置侧档位占用）。
+// 关闭 adhoc 时返回空。注册日志与接口用它说清"为什么页面上少了一条"。
+func (r *Registry) AdhocSkipped() []AdhocSkip {
+	return r.adhocSkipped
 }
 
 // ApplyStore 用给进来的这一批档位重建登记表的 store 部分。
@@ -190,6 +235,14 @@ func (r *Registry) ApplyStore(items []StoreEntry) error {
 		}
 
 		if existing, clash := merged[key]; clash {
+			if existing.source == SourceAdhoc {
+				// 与内置自由执行档位撞名时，内置那条让位（设计文档 §D15）：
+				// 用户在页面上建一条档位是随后发生的显式意图，不该被一份进程自带的定义挡住。
+				// 让位是看得见的——这个键在 GET /executors 里的 source 从 adhoc 变成 store，
+				// 而调度器那一侧的处理函数会在同一次 Apply 里换成新档位的那一个。
+				merged[key] = &entry{profile: item.Profile, probe: item.Probe, source: source}
+				continue
+			}
 			if !item.Degraded {
 				return fmt.Errorf("handler key %q is already used by a %s profile, store profile %q cannot take it",
 					key, existing.source, item.Profile.Name)

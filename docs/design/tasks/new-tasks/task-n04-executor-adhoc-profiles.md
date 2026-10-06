@@ -188,5 +188,45 @@ curl -s -H "X-Auth-Token: <临时 token>" http://127.0.0.1:<端口>/api/v1/job-t
 
 ## 10. 实现记录（执行时补写）
 
-| # | 与卡片的偏离 | 原因 |
+落地：`executor/adhoc.go`（`adhocSpec`/`adhocSpecs`/`AdhocSkip`/`AdhocProfiles`/`adhocCommand`）、
+`executor/profile.go`（`Profile` 四个 adhoc 字段、`buildProfile` 的 adhoc 分支、
+`checkFieldsMatchKind` 与 `fillHTTPProfile` 的放宽、`checkAllowedHosts` 拆出 `checkHostEntries`）、
+`executor/probe.go`（`probeScript` 的 adhoc 分支）、`executor/registry.go`
+（`SourceAdhoc`、`NewRegistry` 合入内置四条、`AdhocSkipped()`、`ApplyStore` 的让位分支）、
+`executor/register.go`（`Registration.AdhocSkipped` 与那一行启动日志）、新测试 `executor/adhoc_test.go`。
+
+| # | 与卡面的偏离 | 原因 |
 | --- | --- | --- |
+| 1 | 构造入口是 `AdhocProfiles(cfg core.Config)`，不是卡面 §3.1 的 `BuildAdhocProfiles(cfg, ec, mode)` | 与 `LoadProfiles(cfg core.Config)`（`executor/profile.go:217`）同形：整节配置一次归一化、workspace 与白名单都在内部取。多收两个参数只会让调用方有机会传进一份没归一化的 `ec` |
+| 2 | 第二返回值是 `[]AdhocSkip`（键 + 原因），不是 `[]string` | 原因要给启动日志与 `GET /executors` 用（N06），一句 `exec.php skipped` 没有可操作方向 |
+| 3 | 让位在**两处**生效，而不只是注册时：`NewRegistry` 里配置侧占键则内置不登记；`ApplyStore` 里页面建的同名档位直接顶掉内置那条 | 卡面 §3.1/§3.3 只写了"内置条目让位"，没写运行期新建的同名档位怎么办。方向必须一致，否则"启动时内置赢、页面上用户赢"。两处的可见性不同：前者进 `AdhocSkipped()` 与启动日志，后者表现在 `List()` 里那一行的 `source` 从 `adhoc` 变成 `store` |
+| 4 | 运行期顶掉内置那条时，`AdhocSkipped` 计数不追加 | 那个视图在 `NewRegistry` 里一次写好、之后无锁只读（`Registry` 的读方法靠"只做一次 Load"保住自洽，`executor/registry.go:67-73`）。为它加锁不值：让位本身在展示面上看得见 |
+| 5 | 内置 http 档位的 `CaptureResponse` 取 false | 卡面未定这一项。默认不采集对端响应正文，与"这一节整体是放宽、这一项不在放宽清单里"一致；要看响应用 `executors.commands` 建一条普通 http 档位 |
+| 6 | 内置档位可用时探测的 `Reason` 也带一句"路径来自任务的 payload" | 既有档位可用时 `Reason` 是空的，所以这一句是新出现的。它只在接口的 `reason` 字段里，界面侧现在只在不可用时显示 `reason`（`web/src/components/jobs/JobForm.vue:444`），不构成回归；N06 的 `location` 字段才是界面侧的正解 |
+| 7 | `buildProfile` 多收一个 `adhoc bool` 参数，而不是新增一个入口函数 | 放宽点只有三处（`script` 必填、`url_template` 必填、`allowed_hosts` 可为空），全部落在既有函数体内；再开一个入口等于把 1100 行的构造函数复制一遍 |
+| 8 | adhoc 分支保留 `binary` 的必填检查（`program is required`） | 内置四条没有 binary。若一并跳过，将来加一条内置 binary 档位时会静默放过一个空 program |
+| 9 | `checkAllowedHosts` 拆成"空列表要求" + `checkHostEntries`（每一项的写法） | 卡面 §3.1 第 4 条要求绕开空列表要求。拆函数比在内置档位那侧复制一份主机正则更守得住"一份规则"；用例 `TestAdhocProfiles_BuiltinHostsEntriesStillChecked` 钉的就是这一点 |
+
+DoD 核对：
+
+1. 四条键可由配置打开并注册成功：`TestNewRegistry_RegistersAdhocAndYieldsOnClash`
+   断言 `registry.Keys()` 含 `exec.php`/`exec.python`/`exec.shell`/`exec.http`。
+2. `Profile.Adhoc` 的分支只在 §3.2 前两处（构造与探测）生效；
+   `grep -n "\.Adhoc" executor/*.go`（非测试）的命中处都有注释说明用途。
+3. 用户档位与 `executors.commands` 行为未变：`executor/profile_test.go`、
+   `executor/build_profile_modes_test.go`、`executor/probe_test.go`、
+   `executor/registry_test.go`、`api/handlers_executor_profiles_test.go` 一条未改，
+   整包 `go test ./executor ./api ./core ./cmd/server` 全绿（executor 26.5s、api 24.3s、
+   core 20.2s、cmd/server 6.6s）；对照用例是 `TestAdhocProfiles_EmptyHostsAreAllowedForBuiltinOnly`
+   （内置空主机通过、用户档位空主机仍然报 `allowed_hosts must not be empty`）。
+4. 撞名让位有日志与计数：`Registration.AdhocSkipped` 进那一行 `executor handlers registered`，
+   用例 `TestRegister_BuiltInProfilesUseExecPoolAndCountSkips` 断言计数为 1。
+5. 关闭时零变化：`TestAdhocProfiles_DisabledByDefault`；上面那一整轮既有用例未改动即为证据。
+6. 没有新增执行通路：`executor/adhoc.go` 里不出现 `exec.Command`，
+   注册仍走 `executor/register.go` 的那一条 `RegisterHandlerClass(key, Handler(profile, …), JobClassExec)`；
+   用例断言四条的 `classOf` 都是 `core.JobClassExec`。
+
+本卡新增用例清单（`executor/adhoc_test.go`，15 个顶层/子用例全部通过）：
+构造与顺序、解释器过滤、`shell_runtime` 生效、空主机只对内置放过、主机写法仍判、
+扩展名要求可关、私网开关传到档位、探测只判解释器、登记表合入与撞名让位、
+热整表替换不冲掉内置、页面同名档位顶掉内置、执行池类别与跳过计数、档位名跨包合法。

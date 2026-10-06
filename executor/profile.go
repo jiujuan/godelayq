@@ -138,6 +138,23 @@ type Profile struct {
 	CaptureResponse bool
 	MaxBodyBytes    int
 	DenyPrivate     bool
+
+	// ---- 以下只有内置自由执行档位（adhoc）用得到，见 executor/adhoc.go ----
+
+	// Adhoc 为 true 表示"跑哪个文件、打到哪里"由任务的 payload 给出：
+	// 档位定义里因此没有 script 也没有 url_template，探测只判解释器（设计文档 §D5）。
+	Adhoc bool
+
+	// AdhocLocationKey 是任务写位置时用的 payload 顶层键：script | url。
+	AdhocLocationKey string
+
+	// AdhocLocationKind 是位置的种类：path | url。接口把它连同 Label/Hint 一起给前端，
+	// 前端不再自己猜"这条档位该给输入框还是参数表单"。
+	AdhocLocationKind string
+
+	// AdhocExtensions 是脚本位置允许的扩展名（小写、含点）；为空表示不要求。
+	// 取值来自 executors.adhoc.require_extension：关掉要求时这里就是空的。
+	AdhocExtensions []string
 }
 
 // HandlerKey 返回注册进调度器的键。
@@ -232,7 +249,7 @@ func LoadProfiles(cfg core.Config) ([]*Profile, error) {
 	profiles := make([]*Profile, 0, len(ec.Commands))
 	declared := make(map[string]int, len(ec.Commands))
 	for i := range ec.Commands {
-		profile, err := buildProfile(&ec.Commands[i], i, workspace, runtimes, ec, PathWithinWorkspace)
+		profile, err := buildProfile(&ec.Commands[i], i, workspace, runtimes, ec, PathWithinWorkspace, false)
 		if err != nil {
 			return nil, err
 		}
@@ -262,7 +279,7 @@ func BuildProfile(cmd core.ExecutorCommand, ec core.ExecutorsConfig, mode PathMo
 		return nil, fmt.Errorf("executors.workspace %q is unusable as a profile root: %w", normalized.Workspace, err)
 	}
 
-	return buildProfile(&cmd, singleProfileIndex, workspace, runtimeSet(normalized.RuntimeAllow), normalized, mode)
+	return buildProfile(&cmd, singleProfileIndex, workspace, runtimeSet(normalized.RuntimeAllow), normalized, mode, false)
 }
 
 // singleProfileIndex 是"这条档位不来自 executors.commands 列表"的记号：
@@ -283,7 +300,12 @@ func runtimeSet(allow []string) map[string]bool {
 //
 // index 是这条档位在 executors.commands 里的位置，只用于错误定位：
 // 不属于那份列表的单条校验（BuildProfile）传 -1，错误文案因此不含列表下标。
-func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtimes map[string]bool, ec core.ExecutorsConfig, mode PathMode) (*Profile, error) {
+//
+// adhoc 为真表示这是内置的自由执行档位：位置字段（script / url_template）留空是合法的，
+// 因为它们的取值来自任务本身（见 executor/adhoc.go）。这个开关只放宽两处
+// ——必填检查与路径解析——其余判据一律照旧，用户自建的档位走不到这一支。
+func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtimes map[string]bool,
+	ec core.ExecutorsConfig, mode PathMode, adhoc bool) (*Profile, error) {
 	if err := checkProfileName(cmd.Name, index); err != nil {
 		return nil, err
 	}
@@ -297,7 +319,7 @@ func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtim
 			"kind %q is invalid, use script, binary or http", cmd.Kind)
 	}
 
-	if err := checkFieldsMatchKind(cmd, kind, index, name); err != nil {
+	if err := checkFieldsMatchKind(cmd, kind, index, name, adhoc); err != nil {
 		return nil, err
 	}
 
@@ -305,6 +327,7 @@ func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtim
 		Name:            name,
 		Kind:            kind,
 		Workspace:       workspace,
+		Adhoc:           adhoc,
 		FixedArgs:       append([]string(nil), cmd.FixedArgs...),
 		ArgsRender:      append([]string(nil), cmd.ArgsRender...),
 		Env:             make(map[string]string, len(cmd.Env)),
@@ -391,6 +414,13 @@ func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtim
 				"runtime %q is not in executors.runtime_allow", cmd.Runtime)
 		}
 		profile.Runtime = cmd.Runtime
+		if adhoc {
+			// 自由执行档位没有脚本路径可解析：那一项来自任务的 payload，
+			// 判它在 executor/adhoc.go 的提交期校验里（设计文档 §5.4）。
+			profile.ScriptPath = ""
+			profile.ScriptRel = ""
+			break
+		}
 		script, err := resolveProfilePath(mode, workspace, cmd.Script, "script", index, name)
 		if err != nil {
 			return nil, err
@@ -414,7 +444,7 @@ func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtim
 		}
 
 	case KindHTTP:
-		if err := fillHTTPProfile(profile, cmd, ec, index, name); err != nil {
+		if err := fillHTTPProfile(profile, cmd, ec, index, name, adhoc); err != nil {
 			return nil, err
 		}
 	}
@@ -423,7 +453,12 @@ func buildProfile(cmd *core.ExecutorCommand, index int, workspace string, runtim
 }
 
 // fillHTTPProfile 校验并填充 http 档位的专属字段。
-func fillHTTPProfile(profile *Profile, cmd *core.ExecutorCommand, ec core.ExecutorsConfig, index int, name string) error {
+//
+// adhoc 为真时放宽两处（都只针对内置自由执行档位，见 executor/adhoc.go）：
+// url_template 不必填（整条地址来自任务），allowed_hosts 允许是空列表（= 不限主机，
+// 设计文档 §D9 第②层）。同一份判据对 executors.commands 里的 http 档位一字不改。
+func fillHTTPProfile(profile *Profile, cmd *core.ExecutorCommand, ec core.ExecutorsConfig,
+	index int, name string, adhoc bool) error {
 	method := strings.TrimSpace(cmd.Method)
 	if method != strings.ToUpper(method) {
 		// 严格到大写：让同一份配置只有一种写法，避免 "post" 与 "POST" 在文档、告警与
@@ -462,7 +497,17 @@ func fillHTTPProfile(profile *Profile, cmd *core.ExecutorCommand, ec core.Execut
 		profile.MaxBodyBytes = ec.Output.MaxBytes
 	}
 
-	if err := checkAllowedHosts(profile.AllowedHosts, index, name); err != nil {
+	// checkAllowedHosts 的第一条判据是"http 档位必须有非空 allowed_hosts"。
+	// 空列表对内置档位是合法取值（executors.adhoc.url_hosts 留空 = 不限主机，
+	// 这是设计文档 §D9 第二层的放宽），所以整条留到这里判；每一项的写法仍然交给同一个函数判，
+	// 不复制一份更松的规则。commands 里的 http 档位走的还是原来那一支。
+	if adhoc {
+		// 内置档位允许这里就是空列表（不限主机），所以整条"必须非空"跳过，
+		// 但每一项的写法仍然交给同一份判据，不复制一份更松的规则。
+		if err := checkHostEntries(profile.AllowedHosts, index, name); err != nil {
+			return err
+		}
+	} else if err := checkAllowedHosts(profile.AllowedHosts, index, name); err != nil {
 		return err
 	}
 	if err := checkNameList("header_allow", profile.HeaderAllow, index, name); err != nil {
@@ -477,8 +522,12 @@ func fillHTTPProfile(profile *Profile, cmd *core.ExecutorCommand, ec core.Execut
 		}
 	}
 
-	if err := checkURLTemplate(profile.URLTemplate, profile.AllowedHosts, profile.Args, index, name); err != nil {
-		return err
+	if !adhoc {
+		// 内置档位的整条地址来自任务，模板这一项因此不存在；
+		// 提交期的地址判据在 executor/adhoc.go 的 checkAdhocURL 那一条链上。
+		if err := checkURLTemplate(profile.URLTemplate, profile.AllowedHosts, profile.Args, index, name); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -498,7 +547,11 @@ func checkProfileName(raw string, index int) error {
 // checkFieldsMatchKind 拒绝"填了不属于该 kind 的字段"。
 // 留空是唯一的"不使用"表达：残留的值要么被后面的执行逻辑读到，
 // 要么让运维误以为某个开关已经生效。必填项在这里一并检查。
-func checkFieldsMatchKind(cmd *core.ExecutorCommand, kind Kind, index int, name string) error {
+//
+// adhoc 为真时只放宽最下面那组"必填"（script / url_template）：位置由任务给出，
+// 档位定义里本来就没有它们。上面那组"不许填错 kind 的字段"一条都不放宽——
+// 内置档位的定义也是照着这份结构拼出来的，填错了同样该报错。
+func checkFieldsMatchKind(cmd *core.ExecutorCommand, kind Kind, index int, name string, adhoc bool) error {
 	reject := func(present bool, field, owner string) error {
 		if !present {
 			return nil
@@ -563,6 +616,16 @@ func checkFieldsMatchKind(cmd *core.ExecutorCommand, kind Kind, index int, name 
 				return err
 			}
 		}
+	}
+
+	if adhoc {
+		// 位置是这两条必填项（script / url_template），而自由执行档位的位置来自任务，
+		// 所以到这里为止：上面的"不许填错 kind 的字段"一条都没跳过。
+		// binary 档位不在内置四条里，那条必填仍然照常判。
+		if kind == KindBinary && cmd.Program == "" {
+			return profileError(index, name, "program is required for the binary kind")
+		}
+		return nil
 	}
 
 	switch kind {
@@ -745,6 +808,13 @@ func checkAllowedHosts(hosts []string, index int, name string) error {
 	if len(hosts) == 0 {
 		return profileError(index, name, "allowed_hosts must not be empty for the http kind")
 	}
+	return checkHostEntries(hosts, index, name)
+}
+
+// checkHostEntries 只判每一项的写法，不判"列表必须非空"。
+// 拆出来是为了让内置自由执行档位能跳过那一条空列表要求（设计文档 §D9 第②层），
+// 而又不必复制第二份主机规则。
+func checkHostEntries(hosts []string, index int, name string) error {
 	for i, raw := range hosts {
 		host := strings.TrimSpace(raw)
 		if host == "" || host != raw {
