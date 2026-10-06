@@ -124,5 +124,26 @@ git status --porcelain    # 预期只有 core/job_name.go 与 core/job_name_test
 
 ## 10. 实现记录（执行时补写）
 
+落地：`core/job_name.go`（`MaxJobNameRunes` / `jobNamePattern` / `ErrJobNameInvalid` /
+`ValidateJobName` / `firstInvalidNameRune` / `isAllowedNameRune`）与 `core/job_name_test.go`。
+
 | # | 与卡片的偏离 | 原因 |
 | --- | --- | --- |
+| 1 | 错误文本的"允许字符集"那一半是英文句子（`a job name may only contain Chinese characters, letters and digits, 1-64 of them`） | 卡面 §3.2 第 4 条要求"点名被拒字符 + 说明允许哪三类"，两条都在；句式跟 `ErrGroupNameInvalid`（`core/group_store.go:63`）与 `ErrProfileNameInvalid`（`core/executor_profile_store.go:242`）的既有英文写法对齐，不在此处引入第三种语言 |
+| 2 | 拒绝样本比卡面清单多了 emoji 与假名（`あ`） | 这两条钉住 `\p{Han}` 的边界：emoji 属 Common、假名属 Unicode 脚本 `Hiragana` 而不是 `Han`，都该拒。不加就会有人以为"东亚文字都放行" |
+| 3 | 长度上限单列常量 `MaxJobNameRunes`，正则里的 `64` 仍是字面量 | 常量给调用方与后续文档用（前端要显示同样的上限）。正则不拼常量：RE2 不支持变量插值，动态拼接只会让"读正则看不出上限" |
+| 4 | §5 的"正则与逐字符一致性"用例只覆盖字符集、不覆盖长度，样本里排除了空串与 65 字写法 | 空串与超长都由前面的专用分支返回，那时"逐字符找不出非法字符"是正确行为而不是分叉。把两者混进同一条用例会让断言变成 `regexOK != manualOK` 的假红 |
+| 5 | `firstInvalidNameRune` 保留"找不到就返回 0"的兜底 | 走不到（正则已先拒），但两份实现分叉时它比 panic 或空字符串更好排查；注释与上面第 4 条的用例一起说明它的存在理由 |
+| 6 | 未做 `TrimSpace` 后放行（卡面 §3.2 第 5 条按原样落地） | 无偏离，登记一条以便复核时确认这条判据被实现过：用例 `拒绝/前导空格`、`拒绝/尾随空格` |
+
+DoD 核对：
+
+- 第 1 条：`grep -rn "jobNamePattern" core` 只命中 `core/job_name.go` 与 `core/job_name_test.go`。
+- 第 2 条：§3.2 六条判据在测试的子测试名里逐条可找（`通过/*`、`拒绝/*`、`长度按字符计`、
+  `错误文本只点名第一处`、`标签与注册键互不相干`）。
+- 第 3 条：`errors.Is` 断言在 `拒绝/*` 全部子测试里跑过。
+- 第 4 条：本次提交只含 `core/job_name.go`、`core/job_name_test.go` 与这张卡，无调用点改动。
+- 第 5 条：`go build ./...`、`go vet ./...` 无输出；`go test ./core -run "TestValidateJobName|TestJobNameCharset" -v`
+  30 条子测试全 PASS；`go test ./core` 整包绿（19.96s）。
+
+未做（留给后续卡）：本卡没有任何调用点，因此 `POST /jobs` 目前仍不套这条规则 —— TASK-N02 接线。
