@@ -161,5 +161,59 @@ go build ./... && go vet ./...
 
 ## 10. 实现记录（执行时补写）
 
-| # | 与卡片的偏离 | 原因 |
+落地：`api/handlers_executors.go`（`ExecutorProfileResponse.Adhoc`（`:361`）与
+`Location`（`:365`）、`ProfileLocation`（`:373`）、`adhocLocation`（`:528`）在
+`toExecutorProfile` 里按 `profile.Adhoc` 接上）、`executor/register.go`
+（`warnAdhocPolicy`（`:127`），调用点在 `Register` 的 `:114`）、`executor/adhoc.go`
+（`AdhocKindPath` / `AdhocKindURL` 改为导出）、新测试 `api/adhoc_metadata_test.go`（6 个顶层用例）与
+`executor/register_adhoc_test.go`（3 个顶层用例）、`docs/api.md`（新增"自由执行档位（executors.adhoc）"一节、
+字段表两行、`/job-types` 一句）。
+
+| # | 与卡面的偏离 | 原因 |
 | --- | --- | --- |
+| 1 | 没有给 `Registry` 补读方法：`Hint` 需要的限定目录、扩展名、主机名单、地址范围开关全部读 `Profile` 上的字段（`AdhocPathPrefixes` / `AdhocExtensions` / `AllowedHosts` / `DenyPrivate`） | 卡面 §4 第 2 步是"若视图缺项就补一个读方法"，而 N04 构造时这几项已经按配置算好并写进档位对象。api 再读一遍配置就同时存在两个答案——接口说的是配置文件里那份，服务端判的是登记表里那份 |
+| 2 | `adhoc` 一律出现（普通条目是 `false`），只有 `location` 用 `omitempty` | 卡面 §3.3 让二选一并在测试里钉住。选"一律出现"与 `web_enabled` 同一条理由（TASK-W07 §3.2）：缺键等于让前端去猜后端认不认识这套东西。用例是 `TestAdhocMetadata_BuiltInRowsCarryLocation` 里对原始正文的两条键存在性断言（结构体分不出"没这个键"与"零值"） |
+| 3 | `executor` 的 `adhocKindPath` / `adhocKindURL` 改成导出 | api 要按位置形态分流，两侧必须用同一套词；不导出就得在 api 抄一份字面量，那正是本卡风险表第 1 行要防的"复制一份规则" |
+| 4 | 启动告警是**三条**而不是两条 | 整节打开时那一条总带四个取值；限定目录留空与放开回环私网各一条（卡面 §3.4 的第 2 条本来就是"各自的第二条"）。另加一条边界分支：整节打开但四条都撞名让位时，说"enabled but no built-in profile is registered"——那时前一条不会说错范围，而是根本没得说 |
+| 5 | `location.hint` 的整句措辞由实现给，用例只断言关键片段 | 卡面 §3.2 写的是要点而非定稿文案；断言整句原文会把一句给人读的说明变成改动阻力 |
+| 6 | 不认识的位置形态时 `adhocLocation` 返回 `nil`（于是 `location` 整个键不出现），不给半句说明 | 内置四条由 `executor/adhoc.go` 拼出来，正常配置到不了这一支；到了就说明档位对象被写坏，此时拼一半的说明比没有更误导 |
+| 7 | §3.5 的五条证据之外，结果读取那条用 `Type: "exec.php"` 播种任务 | `resultGuard` 读的是 `snapshot.HandlerKey()`；播种时只写名称会顺带走旧写法的回退分支，写上新写法才能钉住"N02 的解耦在这一处也生效" |
+
+DoD 核对：
+
+1. 前端只靠 `location` 的有无分流：`TestAdhocMetadata_BuiltInRowsCarryLocation`
+   断言普通条目的原始正文里**没有** `location` 键，四条内置条目各带完整的
+   `{key, kind, label, required, hint}` 对象。
+2. `Hint` 四条规则有用例且跟着配置变：`TestAdhocMetadata_HintFollowsTheEffectiveConfig`
+   六个子用例（限定目录 / 不限目录 / 关掉扩展名要求 / 限定主机含通配 / 不限主机 / 放开私网），
+   限定目录那条断言的是按 `executors.workspace` 展开后的绝对写法，与判据同源。
+3. 启动告警有测试证据：`TestRegister_AdhocEnabledWarnsOnceWithTheFourFacts`
+   （四个取值逐个断言，用 `slog` 文本 handler，不是 grep 控制台）、
+   `TestRegister_AdhocWarnsOnEachTurnedOffGuard`（两个开关各一条 + 整节关闭时半句都没有）、
+   `TestRegister_AdhocEnabledButAllYielded`（让位分支）。`url_allow_private=true` 那一条单独出现，
+   同时仍会撞上既有的 `warnRelaxedAddressPolicy`（两条说的是不同侧面，用例把这一事实钉住）。
+4. §3.5 五条证据齐：`TestAdhocGate_SubmissionEvidence`（403 / 可用性 400 / 四种非法位置各 400 且不入队 /
+   合法 201）、`TestAdhocResult_ReaderLevelIsEnough`（viewer 读到正文、无升档说明、payload 未掩码）、
+   `TestAdhocAudit_RowsUseTheExistingActionWord`（成功与被拒各一行，`action` 仍是 `job.create`，
+   `handler_key` 记 `exec.http`、`profile` 记 `http`；"漏配会落 other"由既有
+   `TestAuditMiddleware_UnmappedRouteFallsBackToOther` 守着，本卡没新增动作词所以没另开用例）。
+5. 关闭时形状零变化：`TestAdhocMetadata_EnabledFalseKeepsShape`；`api/executors_response_test.go`、
+   `api/profile_form_contract_test.go`、`api/audit_test.go` 既有断言一条未改，
+   `go test ./api ./executor` 全绿（api 24.3s / executor 24.6s）。
+6. `go build ./...`、`go vet ./...` 无输出；`go test -race -timeout 30m ./api ./executor` 绿
+   （api 242.2s / executor 28.3s，2026-10-06）。
+
+变异反向验证（卡片 §5 最后一行）：把 `api/handlers_executors.go` 的
+`handlerKey := job.HandlerKey()` 打回 N02 之前的 `handlerKey := job.Name`（`go test -overlay`，
+中间态副本在 `n06probe`，真实工作树未改）⇒ `TestAdhocGate_SubmissionEvidence` 三条子用例全红，
+原始输出的关键三行：
+
+```
+身份不够时 403: expected 403 actual 201  （响应体里 payload 的 url 原样回来了，任务已入队）
+这台机器跑不了时说的是可用性: expected 400 actual 201
+位置非法时 400 且没有入队: expected 400 actual 201   payload 是 {}
+```
+
+也就是"门禁按名称取档位"会让自由执行档位任务的提交期判定整段失效，
+非法 payload 会真的排进堆里被执行一次——这一条同时是 N02 解耦与 N05 判据的共同证据。
+

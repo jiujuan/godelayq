@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
@@ -353,6 +354,33 @@ type ExecutorProfileResponse struct {
 	// PathDisplay 是这个档位指向的本机文件写法：workspace 内给相对写法、之外给绝对路径，
 	// http 档位与"program 写成 PATH 程序名"的 binary 档位没有路径可给，整个键省略。
 	PathDisplay string `json:"path_display,omitempty"`
+
+	// Adhoc 标出"跑哪个文件、打到哪里由任务自己给"的那四条内置档位（executors.adhoc）。
+	// 普通档位是 false 而这个键照样出现：与 web_enabled 同一条理由（TASK-W07 §3.2），
+	// 省略就等于让前端去猜"没这个键"是"普通档位"还是"这份后端还不认识自由执行档位"。
+	Adhoc bool `json:"adhoc"`
+	// Location 只在内置档位出现，是那条位置输入框的说明：payload 键名、取值形态、
+	// 是否必填、以及这份部署允许填什么范围。前端据此决定表单形状，
+	// 不必自己按 exec.php 这类注册键去猜（猜一次就要跟着改名一次）。
+	Location *ProfileLocation `json:"location,omitempty"`
+}
+
+// ProfileLocation 是"执行位置由任务给出"这一项的输入说明（TASK-N06）。
+//
+// 四项取值全部来自档位对象（executor.Profile 的 Adhoc 那一组字段），
+// api 层不重新读一遍配置，也不复制任何一条判据：这里说的是"表单该长什么样、
+// 这个部署放开到哪一步"，而能不能通过仍然由 executor.ValidateSubmission 决定。
+type ProfileLocation struct {
+	// Key 是 payload 顶层的键名：script | url。
+	Key string `json:"key"`
+	// Kind 是位置的形态：path | url，前端据此选输入框与校验提示，不再按注册键猜。
+	Kind string `json:"kind"`
+	// Label 是输入框的标题，含扩展名要求（"脚本路径（.php）"）。
+	Label string `json:"label"`
+	// Required 内置四条恒为 true：没有位置就不知道跑什么，这条档位没有默认值可退。
+	Required bool `json:"required"`
+	// Hint 是这份部署对取值范围的说法，中文整句，前端直接显示。
+	Hint string `json:"hint"`
 }
 
 // ListExecutorsResponse GET /api/v1/executors。
@@ -460,6 +488,10 @@ func toExecutorProfile(view executor.ListedProfile) ExecutorProfileResponse {
 		Editable:    view.Editable,
 		Degraded:    view.Degraded,
 		PathDisplay: profile.PathDisplay(),
+		Adhoc:       profile.Adhoc,
+	}
+	if profile.Adhoc {
+		item.Location = adhocLocation(profile)
 	}
 	if profile.Positional != nil {
 		item.Positional = &ExecutorPositionalResponse{
@@ -482,6 +514,63 @@ func toExecutorProfile(view executor.ListedProfile) ExecutorProfileResponse {
 		item.HeaderAllow = append(item.HeaderAllow, profile.HeaderAllow...)
 	}
 	return item
+}
+
+// adhocLocation 给一条内置档位拼出位置输入框的说明（TASK-N06 §3.1/§3.2）。
+//
+// 四项范围取值全部读档位对象自己的字段：限定目录与扩展名在构造时按
+// executors.adhoc.path_prefixes / require_extension 算好，主机名单与地址范围开关按
+// url_hosts / url_allow_private 算好。api 侧再读一遍配置就会有两个答案
+// ——接口说的是配置里写的那份，而服务端判的是登记表里那份。
+//
+// Hint 说的是"这个部署放开到哪一步"，与 executor.Register 那几条启动告警同一批事实；
+// 句子在这里拼而不是让前端拼：与 reason 同一口径（后端给结论，前端只呈现）。
+func adhocLocation(profile *executor.Profile) *ProfileLocation {
+	location := &ProfileLocation{
+		Key:      profile.AdhocLocationKey,
+		Kind:     profile.AdhocLocationKind,
+		Required: true,
+	}
+
+	switch profile.AdhocLocationKind {
+	case executor.AdhocKindPath:
+		location.Label = "脚本路径"
+		if len(profile.AdhocExtensions) > 0 {
+			location.Label += "（" + strings.Join(profile.AdhocExtensions, "、") + "）"
+		}
+		if len(profile.AdhocPathPrefixes) > 0 {
+			location.Hint = "只能选这些目录里的文件：" + strings.Join(profile.AdhocPathPrefixes, "、") + "。"
+			if len(profile.AdhocExtensions) > 0 {
+				location.Hint += "扩展名限 " + strings.Join(profile.AdhocExtensions, "、") + "。"
+			} else {
+				location.Hint += "这个部署不要求扩展名。"
+			}
+			return location
+		}
+		location.Hint = "可以填本机上任意位置的脚本文件；这个部署没有做目录范围限制。"
+		if len(profile.AdhocExtensions) == 0 {
+			location.Hint += "也不要求扩展名。"
+		}
+		return location
+
+	case executor.AdhocKindURL:
+		location.Label = "请求 URL"
+		if len(profile.AllowedHosts) > 0 {
+			location.Hint = "只能请求这些主机：" + strings.Join(profile.AllowedHosts, "、") + "。"
+		} else {
+			location.Hint = "可以请求任意主机；这个部署没有做主机范围限制。"
+		}
+		if profile.DenyPrivate {
+			location.Hint += "回环、私网与链路本地地址（含云主机元数据地址）仍会被拒绝。"
+		} else {
+			location.Hint += "回环与私网地址的守卫已由 executors.adhoc.url_allow_private 关闭。"
+		}
+		return location
+	}
+
+	// 走到这里说明档位对象带了一个本接口不认识的位置形态：不猜、也不给半句说明。
+	// 内置四条由 executor/adhoc.go 拼出来，正常配置到不了这一支。
+	return nil
 }
 
 // snapshotOf 按 ID 取一份任务快照，取法与 GetJob 相同：存储是一张 map，只能整份读。

@@ -31,8 +31,8 @@ const (
 
 	// 位置的两种形态，接口原样给前端（Profile.AdhocLocationKind）：
 	// 前端据此决定输入框与提示文案，不再自己按注册键猜。
-	adhocKindPath = "path"
-	adhocKindURL  = "url"
+	AdhocKindPath = "path"
+	AdhocKindURL  = "url"
 )
 
 // adhocSpec 是一条内置档位的静态定义。
@@ -72,21 +72,21 @@ func adhocSpecs(ec core.ExecutorsConfig) []adhocSpec {
 	return []adhocSpec{
 		{
 			name: AdhocPHPName, kind: KindScript, runtime: "php",
-			extensions: extensions(".php"), locationKey: adhocLocationKey, locationKind: adhocKindPath,
+			extensions: extensions(".php"), locationKey: adhocLocationKey, locationKind: AdhocKindPath,
 		},
 		{
 			name: AdhocPythonName, kind: KindScript, runtime: "python",
-			extensions: extensions(".py"), locationKey: adhocLocationKey, locationKind: adhocKindPath,
+			extensions: extensions(".py"), locationKey: adhocLocationKey, locationKind: AdhocKindPath,
 		},
 		{
 			// shell 那条的解释器由配置给（默认 bash），所以这里留空占位，
 			// 由 AdhocProfiles 换成 executors.adhoc.shell_runtime 的取值。
 			name: AdhocShellName, kind: KindScript,
-			extensions: extensions(".sh", ".bash"), locationKey: adhocLocationKey, locationKind: adhocKindPath,
+			extensions: extensions(".sh", ".bash"), locationKey: adhocLocationKey, locationKind: AdhocKindPath,
 		},
 		{
 			name: AdhocHTTPName, kind: KindHTTP,
-			locationKey: adhocLocationURL, locationKind: adhocKindURL,
+			locationKey: adhocLocationURL, locationKind: AdhocKindURL,
 			httpMethod: "POST", httpBody: "json",
 		},
 	}
@@ -232,7 +232,7 @@ func takeAdhocLocation(p *Profile, fields map[string]json.RawMessage, sub *Submi
 	}
 
 	switch p.AdhocLocationKind {
-	case adhocKindPath:
+	case AdhocKindPath:
 		absolute, err := checkAdhocScript(p, value)
 		if err != nil {
 			return err
@@ -240,7 +240,7 @@ func takeAdhocLocation(p *Profile, fields map[string]json.RawMessage, sub *Submi
 		sub.Script = absolute
 		return nil
 
-	case adhocKindURL:
+	case AdhocKindURL:
 		target, err := checkAdhocURL(p, value)
 		if err != nil {
 			return err

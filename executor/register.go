@@ -111,8 +111,57 @@ func Register(registrar Registrar, reg *Registry, cfg core.Config, artifacts *Ar
 		"adhoc_skipped", result.AdhocSkipped)
 
 	warnRelaxedAddressPolicy(reg, keys, logger)
+	warnAdhocPolicy(reg, executors, logger)
 
 	return result, nil
+}
+
+// warnAdhocPolicy 给"打开了自由执行档位"的部署记启动告警（TASK-N06 §3.4）。
+//
+// 为什么要把这一条说出来：executors.adhoc.enabled 是一次范围很大的授权——
+// 它把"跑哪个文件、打到哪里"从配置内容变成任务内容，判据只剩提交身份、限定目录与地址守卫。
+// 与 warnRelaxedAddressPolicy 同一个理由：这类取值能通过全部校验，
+// 但部署方 review 配置时未必看得见，只有启动日志里那一行会留下来。
+//
+// 只写范围（目录、主机名单、两个开关、所需身份档位），不写任何文件内容或任务内容。
+func warnAdhocPolicy(reg *Registry, executors core.ExecutorsConfig, logger *slog.Logger) {
+	if !executors.Adhoc.Enabled {
+		return
+	}
+
+	var keys []string
+	for _, key := range reg.Keys() {
+		if profile, ok := reg.Lookup(key); ok && profile.Adhoc {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		// 整节打开却一条都没登记：四条都撞名让位了。这本身就是值得说出来的状态。
+		logger.Warn("executors.adhoc is enabled but no built-in profile is registered",
+			"hint", "every built-in key is taken by a profile in executors.commands or the profile store")
+		return
+	}
+
+	logger.Warn("free-form execution profiles are enabled: a submitter chooses the file to run or the address to request",
+		"profiles", strings.Join(keys, ","),
+		"required_role", reg.RequiredRole(),
+		"path_prefixes", strings.Join(executors.Adhoc.PathPrefixes, ","),
+		"url_hosts", strings.Join(executors.Adhoc.URLHosts, ","),
+		"url_allow_private", executors.Adhoc.URLAllowPrivate,
+		"hint", "any identity at or above executors.required_role can make this machine run a path "+
+			"or send a request that the config files never declared")
+
+	if len(executors.Adhoc.PathPrefixes) == 0 {
+		logger.Warn("executors.adhoc.path_prefixes is empty: script profiles may name any file on this machine",
+			"profiles", strings.Join(keys, ","),
+			"hint", "declare path_prefixes to limit the directories these profiles can reach")
+	}
+	if executors.Adhoc.URLAllowPrivate {
+		logger.Warn("executors.adhoc.url_allow_private is true: the loopback and private address guard is off",
+			"profiles", strings.Join(keys, ","),
+			"hint", "intended for reaching a service on the same development machine; "+
+				"remove it from production configs")
+	}
 }
 
 // warnRelaxedAddressPolicy 给"关掉了地址防线"的 http 档位记一条启动期 warn（TASK-E15 §9）。

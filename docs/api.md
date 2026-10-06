@@ -549,6 +549,8 @@ Content-Type: application/json
 }
 ```
 
+打开 `executors.adhoc.enabled` 时，四条内置自由执行档位（`exec.php`、`exec.python`、`exec.shell`、`exec.http`）也在这里：**它们的名字是类型，而跑哪个文件、打到哪条地址由任务的 payload 给**（顶层的 `script` 或 `url`，见下面[自由执行档位](#自由执行档位executorsadhoc)）。
+
 关闭时这个列表只剩代码里注册的那几个。探测不通过的档位（脚本没部署、程序不在 PATH）
 **仍然注册**，因此也会出现在这里；提交它会被拒，见下面的"提交期被拒的四种响应"。
 
@@ -674,6 +676,8 @@ GET /api/v1/executors
 | `editable` | 能不能在页面上改它：`web_enabled && source == "store" && !degraded`，**由后端一次算好**，前端只读这个布尔决定按钮显不显示。写请求的边界仍是 ops 档判定——隐藏按钮从来不是安全边界 |
 | `degraded` | 为真表示这条档位与 `executors.commands` 里的同名档位撞上了：**看得见但没生效**（见[档位的在线管理](#档位的在线管理)）。此时 `runtime_ok` 恒 `false`、`reason` 给的是那句撞名说明 |
 | `path_display` | 这个档位指向的本机文件写法：`executors.workspace` 之内给相对写法、之外给**绝对路径**（决策 D5）。给的是解析后的结果而不是请求体里的原文：分隔符按本机归一、多余的段会被收掉（Windows 上写 `a//b` 会读回 `a\\b`）。`http` 档位与"`program` 写成 `runtime_allow` 里的程序名"的 binary 档位没有文件可指，**整个键省略**。⚠️  reader 档也读得到这个键，目录结构的遮蔽方案登记为待做项 S-3，不在本节 |
+| `adhoc` | 这一条是不是**自由执行档位**（`executors.adhoc.enabled: true` 时那四条内置档位）。普通档位是 `false`，而这个键一律出现：省略会让前端分不出普通档位与"后端还不认识自由执行档位"（TASK-N06） |
+| `location` | 只有 `adhoc: true` 的条目带，对象 `{key, kind, label, required, hint}`——payload 顶层的键名（`script` / `url`）、位置的形态（`path` / `url`）、输入框标题、是否必填（内置四条恒 `true`）、以及这份部署对取值范围的说法（见[自由执行档位](#自由执行档位executorsadhoc)）。前端以"有没有 `location`"为唯一判据，不必自己认 `exec.php` 这类键名 |
 | `method` / `body_mode` / `url` / `header_allow` | 只出现在 `http` 档位上。`body_mode` 是 `json` / `raw` / `none` 之一（配置里没写 `body` 的档位在这里归一成 `none`）；`url` 给的是模板原文（含 `{占位符}`），不是渲染后的地址；`header_allow` 是 payload 可覆盖的请求头名，**空表时整个键省略**（与 `env_allow` 的口径不同，别当成"没返回"） |
 
 一个注册键在 `profiles` 里最多出现两行（TASK-W07）：`executors.commands` 与档位文件写了同一个名字时，
@@ -689,6 +693,57 @@ GET /api/v1/executors
 因此编辑一条档位时要把手上的**定义**发回去，不能拿 `GET` 的结果直接 `PUT` 回来——
 响应里本来也没有 `runtime` / `script` / `program` / `args_render` / `env` 这些定义字段。
 定义另有读口：[`GET /api/v1/executors/profiles/:name`](#读取档位定义get-apiv1executorsprofilesname)。
+
+### 自由执行档位（`executors.adhoc`）
+
+`executors.adhoc.enabled: true`（默认 `false`，打开还要求 `executors.enabled: true`）时，
+登记表里多出四条不指向任何具体脚本或地址的档位。它们与 `executors.commands` 里的档位是同一个东西
+——同一套参数判据、同一个执行池、同一份超时与产物规则——唯一区别是**执行位置写在任务里**：
+
+```json
+{"name": "昨晚的对账", "type": "exec.php",   "payload": {"script": "D:\\work\\reconcile.php"}}
+{"name": "订单回调",   "type": "exec.http",  "payload": {"url": "https://hook.example.com/orders/7"}}
+```
+
+`payload` 顶层因此多了两个键：`script`（`exec.php` / `exec.python` / `exec.shell` 收）与
+`url`（`exec.http` 收）。两条内置档位各只认自己那一个键再加 `timeout`，
+`args` / `params` / `env` / `headers` / `body` 一律被拒——普通档位不受影响，
+它们带上这两个键同样会被拒（错误文案会列出这条档位实际接受哪些键）。
+
+判据在提交期就跑完（`POST /jobs` 直接 400，任务不入队），执行期还会各重跑一遍：
+
+| 项 | 判据 |
+| --- | --- |
+| `script` | 非空 → 无控制字符 → 无 shell 元字符（分号、竖线、与号、反引号、美元符、尖括号；**反斜杠除外**，Windows 绝对路径必带）→ 能算出绝对路径 → 落在 `executors.adhoc.path_prefixes` 之内（空列表为不限目录）→ 扩展名匹配（`require_extension` 打开时）→ 文件存在且是普通文件 |
+| `url` | 非空 → 无空白与控制字符 → 能解析 → scheme 是 `http` / `https` → 不带 `user:pass` → 主机非空 → 命中 `executors.adhoc.url_hosts`（空列表为不限主机） |
+
+**没放宽的那一条**：地址范围守卫照旧，在建连之前拒回环、私网、链路本地（含 `169.254.169.254`）、
+组播与 `100.64.0.0/10`，只有 `executors.adhoc.url_allow_private: true` 才整条关掉。
+argv 也仍然是数组直传，不经过 shell。
+
+响应里的一行长这样（`GET /api/v1/executors`，为篇幅只留必要字段；`hint` 的取值随配置变）：
+
+```json
+{
+  "key": "exec.php", "name": "php", "kind": "script",
+  "runtime_ok": true,
+  "reason": "runtime \"php\" is available; the script path comes from each job's payload, so this check cannot tell whether a given file exists",
+  "timeout": "5m0s", "max_parallel": 1, "args": [], "env_allow": [],
+  "has_secret_args": false, "preferred_result_direction": "tail",
+  "source": "adhoc", "editable": false, "degraded": false,
+  "adhoc": true,
+  "location": {
+    "key": "script", "kind": "path", "label": "脚本路径（.php）", "required": true,
+    "hint": "可以填本机上任意位置的脚本文件；这个部署没有做目录范围限制。"
+  }
+}
+```
+
+`location.hint` 与启动日志里的那几条 `WARN` 说的是同一批事实，只是一个给界面、一个给运维：
+打开整节时 `executor handlers registered` 之后会有一条
+`free-form execution profiles are enabled`，带上当前生效的 `path_prefixes`、`url_hosts`、
+`url_allow_private` 与 `required_role` 四个取值；限定目录留空或放开回环与私网时各再多一条。
+整节关闭时这四条键不存在，`GET /executors` 与 `GET /job-types` 的形状与之前逐字一致。
 
 ### 档位的在线管理
 
