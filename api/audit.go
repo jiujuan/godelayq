@@ -5,35 +5,9 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"godelayq/core"
 	"godelayq/executor"
 )
-
-// AuditEntry 是一行写操作台账，字段与 store/sqlite 的 write_audit 列一一对应。
-//
-// 这张表从构造上就没有请求体：结构里没有 payload 字段，也没有能装下它的位置。
-// 后来人若想"顺手加一个 body 列"，请先回到设计文档 §10 第 1 条——参数取值曾经出现在
-// 校验错误的文本里，而执行侧的既有规范是"档位名可以外泄，参数值不可以"。
-type AuditEntry struct {
-	Time      time.Time
-	Actor     string
-	ActorKind string
-	Role      string
-	Action    string
-	Method    string
-	Route     string
-	Status    int
-	Latency   time.Duration
-	Verdict   string
-
-	// 执行器补充列：只有走过提交期判定的请求才有值，普通任务提交一律为空。
-	ExecVerdict    string
-	ExecReasonCode string
-	HandlerKey     string
-	Profile        string
-	JobID          string
-	RemoteIP       string
-	UserAgent      string
-}
 
 // actor_kind 的三个取值。machine 与 anonymous 是从身份名与鉴权开关推出来的，
 // 不是配置里能填的东西。
@@ -198,27 +172,16 @@ func stashAuditJobID(c *gin.Context, jobID string) {
 // AuditRecorder 是台账的写入能力。nil 表示未装配，此时中间件退回只记结构化日志。
 //
 // 与产物索引同一取向：这一行的写入失败不影响请求，台账缺行只意味着查不到，
-// 而响应与访问日志仍然完整。
+// 而响应与访问日志仍然完整。行类型是 core.AuditEntry——共享词汇在 core，
+// 本包只声明能力，不拥有数据形状。
 type AuditRecorder interface {
-	Append(entry AuditEntry) error
+	Append(entry core.AuditEntry) error
 }
 
 // AuditReader 是台账的查询能力，供 GET /admin/audit 用。
 // 返回的第二个值是匹配总数（不带 limit 的那一个），端点把它原样透出成分页依据。
 type AuditReader interface {
-	Query(f AuditFilter) ([]AuditEntry, int, error)
-}
-
-// AuditFilter 是台账查询的条件。零值字段表示不按该项过滤。
-// Since/Until 是闭区间还是开区间由实现决定，见 store/sqlite 一侧的 Query 注释。
-type AuditFilter struct {
-	Actor   string
-	Action  string
-	Verdict string
-	Since   *time.Time
-	Until   *time.Time
-	Limit   int
-	Offset  int
+	Query(f core.AuditFilter) ([]core.AuditEntry, int, error)
 }
 
 // WithAuditLog 注入台账的写与读两面。传 nil 与不注入等价。
@@ -260,7 +223,7 @@ func (s *Server) auditMiddleware() gin.HandlerFunc {
 }
 
 // buildAuditEntry 在请求处理结束后组装一行台账。
-func (s *Server) buildAuditEntry(c *gin.Context, started time.Time) AuditEntry {
+func (s *Server) buildAuditEntry(c *gin.Context, started time.Time) core.AuditEntry {
 	route := c.FullPath()
 	action, ok := auditActions[c.Request.Method+" "+route]
 	if !ok {
@@ -276,7 +239,7 @@ func (s *Server) buildAuditEntry(c *gin.Context, started time.Time) AuditEntry {
 	}
 
 	actor, kind, role := s.auditIdentity(c)
-	entry := AuditEntry{
+	entry := core.AuditEntry{
 		Time:      started,
 		Actor:     actor,
 		ActorKind: kind,
@@ -365,7 +328,7 @@ func auditVerdict(status int) string {
 // 未装配时记的这行与表同形（含 action/verdict/执行结论），而不是复用访问日志那行：
 // requestLogger 已经为每个请求记了 method/path/status/who，它没有的是这张表的意义所在——
 // 封闭集的动作与结论。所以这一行是台账的日志形态，不是它的重复。
-func (s *Server) recordAudit(entry AuditEntry) {
+func (s *Server) recordAudit(entry core.AuditEntry) {
 	if s.auditLog == nil {
 		s.logger.Info("write operation audited", auditLogAttrs(entry)...)
 		return
@@ -378,7 +341,7 @@ func (s *Server) recordAudit(entry AuditEntry) {
 
 // auditLogAttrs 把一行台账摊成 slog 属性。键名与表列同名，
 // 这样"日志里的那行"与"库里的那行"能逐字对照。
-func auditLogAttrs(entry AuditEntry) []any {
+func auditLogAttrs(entry core.AuditEntry) []any {
 	attrs := []any{
 		"who", entry.Actor, "kind", entry.ActorKind, "role", entry.Role,
 		"action", entry.Action, "method", entry.Method, "route", entry.Route,

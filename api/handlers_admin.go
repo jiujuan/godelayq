@@ -185,8 +185,8 @@ func (s *Server) GetAudit(c *gin.Context) {
 //
 // action 与 verdict 按封闭集校验，因此 ?action=../x 这类拼错或试探在进库之前就被挡下；
 // 过滤条件本身全部是语句参数，不存在拼接进 SQL 的路径。
-func (s *Server) parseAuditFilter(c *gin.Context) (AuditFilter, bool) {
-	var filter AuditFilter
+func (s *Server) parseAuditFilter(c *gin.Context) (core.AuditFilter, bool) {
+	var filter core.AuditFilter
 
 	limit := auditDefaultLimit
 	if raw := c.Query("limit"); raw != "" {
@@ -280,7 +280,7 @@ func (s *Server) parseAuditTime(c *gin.Context, name, raw string) (time.Time, bo
 	return parsed, true
 }
 
-func auditItemOf(entry AuditEntry) AuditItem {
+func auditItemOf(entry core.AuditEntry) AuditItem {
 	return AuditItem{
 		Time:           entry.Time,
 		Actor:          entry.Actor,

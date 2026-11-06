@@ -108,8 +108,8 @@ type signalNotifier func(chan<- os.Signal, ...os.Signal)
 type auditLogAPI interface {
 	Close() error
 	Dropped() int64
-	Append(api.AuditEntry) error
-	Query(api.AuditFilter) ([]api.AuditEntry, int, error)
+	Append(core.AuditEntry) error
+	Query(core.AuditFilter) ([]core.AuditEntry, int, error)
 	// SetRetention 是 observability.audit.retention_* 两个键的热更落点（TASK-R02、R06），
 	// 与事件写入器同形：下一个批量周期的淘汰用新值。
 	SetRetention(count int, age time.Duration)

@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"godelayq/api"
 	"godelayq/core"
 	"godelayq/executor"
 	"godelayq/store/observe"
@@ -765,9 +764,9 @@ func (s *auditLogStub) Close() error {
 func (s *auditLogStub) Dropped() int64 { return s.dropped }
 
 // Append 与 Query 只为满足 auditLogAPI 的读写面：装配断言的是实例交接。
-func (s *auditLogStub) Append(api.AuditEntry) error { return nil }
+func (s *auditLogStub) Append(core.AuditEntry) error { return nil }
 
-func (s *auditLogStub) Query(api.AuditFilter) ([]api.AuditEntry, int, error) { return nil, 0, nil }
+func (s *auditLogStub) Query(core.AuditFilter) ([]core.AuditEntry, int, error) { return nil, 0, nil }
 
 // observabilityCase 是观测层装配用例共用的输入：配置改法、各闭包的返回值、
 // "在 newServer 那一刻能拿到总线"的钩子（那时事件写入器已经挂上，发出去的事件会走完整链路），

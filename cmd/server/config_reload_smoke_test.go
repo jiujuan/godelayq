@@ -28,7 +28,6 @@ import (
 	"testing"
 	"time"
 
-	"godelayq/api"
 	"godelayq/core"
 	"godelayq/store/observe"
 )
@@ -658,7 +657,7 @@ func seedEvents(t *testing.T, stack *smokeStack, n int) {
 func appendAuditRow(t *testing.T, stack *smokeStack) {
 	t.Helper()
 
-	if err := stack.audit.Append(api.AuditEntry{
+	if err := stack.audit.Append(core.AuditEntry{
 		Time: time.Now(), Actor: "smoke", ActorKind: "user", Role: "admin",
 		Action: "job.create", Method: "POST", Route: "/api/v1/jobs",
 		Status: 200, Latency: time.Millisecond, Verdict: "ok",

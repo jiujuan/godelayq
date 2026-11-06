@@ -23,18 +23,18 @@ import (
 // auditCapture 是台账读写两面的替身：中间件用例只看自己被怎么调用，
 // 真库的写入与查询在 store/sqlite 有用例。
 type auditCapture struct {
-	entries []AuditEntry
+	entries []core.AuditEntry
 	err     error
 
 	// 查询面的返回值与收到的过滤条件
-	queryItems  []AuditEntry
+	queryItems  []core.AuditEntry
 	queryTotal  int
 	queryErr    error
-	queryFilter AuditFilter
+	queryFilter core.AuditFilter
 	queryCalls  int
 }
 
-func (a *auditCapture) Append(entry AuditEntry) error {
+func (a *auditCapture) Append(entry core.AuditEntry) error {
 	if a.err != nil {
 		return a.err
 	}
@@ -42,7 +42,7 @@ func (a *auditCapture) Append(entry AuditEntry) error {
 	return nil
 }
 
-func (a *auditCapture) Query(f AuditFilter) ([]AuditEntry, int, error) {
+func (a *auditCapture) Query(f core.AuditFilter) ([]core.AuditEntry, int, error) {
 	a.queryCalls++
 	a.queryFilter = f
 	if a.queryErr != nil {
@@ -53,7 +53,7 @@ func (a *auditCapture) Query(f AuditFilter) ([]AuditEntry, int, error) {
 
 // only 取出唯一一行；不是恰好一行就让用例停在这里，
 // 因为"多记一行"与"少记一行"在本卡同样是缺陷（一行对应一个 HTTP 请求）。
-func (a *auditCapture) only(t *testing.T) AuditEntry {
+func (a *auditCapture) only(t *testing.T) core.AuditEntry {
 	t.Helper()
 
 	require.Len(t, a.entries, 1, "台账应当只有一行：%+v", a.entries)
@@ -98,7 +98,7 @@ func opsHeader(t *testing.T, srv *Server, capture *auditCapture) http.Header {
 //
 // 用反射而不是逐字段列一遍：新增列时这里会自动跟上，
 // 而手工列表迟早漏掉一个，漏掉的那个正好是能泄露参数值的那一个。
-func fieldStrings(entry AuditEntry) []string {
+func fieldStrings(entry core.AuditEntry) []string {
 	var out []string
 	value := reflect.ValueOf(entry)
 	for i := 0; i < value.NumField(); i++ {
@@ -111,7 +111,7 @@ func fieldStrings(entry AuditEntry) []string {
 }
 
 // assertRowHasNo 断言这一行的任何字符串列都不含 needle。
-func assertRowHasNo(t *testing.T, entry AuditEntry, needle string) {
+func assertRowHasNo(t *testing.T, entry core.AuditEntry, needle string) {
 	t.Helper()
 
 	for _, value := range fieldStrings(entry) {
@@ -178,7 +178,7 @@ func TestBuildAuditEntry_LatencyFromStart(t *testing.T) {
 	srv := auditServer(t, capture)
 
 	engine := gin.New()
-	var built AuditEntry
+	var built core.AuditEntry
 	started := time.Now().Add(-25 * time.Millisecond)
 	engine.GET("/probe", func(c *gin.Context) {
 		built = srv.buildAuditEntry(c, started)
@@ -625,7 +625,7 @@ func TestGetAudit_NoReader503(t *testing.T) {
 
 // TestGetAudit_RecordsAndPaging 走一次正常查询：响应形状、顺序说明与 total 口径。
 func TestGetAudit_RecordsAndPaging(t *testing.T) {
-	first := AuditEntry{
+	first := core.AuditEntry{
 		Time: time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC), Actor: testAdminName,
 		ActorKind: auditActorUser, Role: "admin", Action: "job.create", Method: http.MethodPost,
 		Route: "/api/v1/jobs", Status: http.StatusCreated, Latency: 1200 * time.Microsecond,
@@ -637,7 +637,7 @@ func TestGetAudit_RecordsAndPaging(t *testing.T) {
 	second.ExecVerdict = auditExecRoleDenied
 	second.ExecReasonCode = "admin"
 
-	capture := &auditCapture{queryItems: []AuditEntry{first, second}, queryTotal: 41}
+	capture := &auditCapture{queryItems: []core.AuditEntry{first, second}, queryTotal: 41}
 	srv := auditServer(t, capture)
 
 	recorder := doGet(t, srv, "/api/v1/admin/audit?limit=2&offset=4", opsHeader(t, srv, capture))

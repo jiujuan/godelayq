@@ -10,7 +10,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"godelayq/api"
 	"godelayq/core"
 )
 
@@ -63,9 +62,10 @@ type auditRecord struct {
 
 // AuditLog 把每个写操作登记成一行台账，并回答 /admin/audit 的查询。
 //
-// 它与 api 的关系是反过来的常见读法：接口（AuditRecorder / AuditReader）与行结构
-// 定义在消费方 api/audit.go，这一侧 import 它并实现。方向与产物索引那张表一致
-// （store/sqlite 已经 import executor），api 仍然不知道驱动在哪。
+// 它与 api 的关系是"消费方声明能力"：接口（api.AuditRecorder / api.AuditReader）
+// 定义在 api/audit.go，本包不 import api、只提供隐式实现——是否满足由装配方
+// （cmd/server 的 newAuditLog 闭包把返回值交给 auditLogAPI）在编译期把关。
+// 行结构是 core.AuditEntry：共享词汇放 core，本包与 api 各自依赖它，互不相认。
 type AuditLog struct {
 	db     *Handle
 	batch  *batcher[auditRecord]
@@ -123,7 +123,7 @@ func NewAuditLog(db *Handle, opts AuditLogOptions, logger *slog.Logger) (*AuditL
 // 队满时这条被丢弃并计入 Dropped，返回值仍是 nil：让一次丢弃变成请求路径上的 warn，
 // 等于在高负载时把台账的问题转嫁给响应。真正需要立刻看见的只有一种——写入器已经关闭，
 // 那说明关停顺序写错（台账还在收请求，连接已经关了），所以它返回错误。
-func (a *AuditLog) Append(entry api.AuditEntry) error {
+func (a *AuditLog) Append(entry core.AuditEntry) error {
 	a.closeMu.Lock()
 	defer a.closeMu.Unlock()
 	if a.closed {
@@ -158,7 +158,7 @@ func (a *AuditLog) SetRetention(count int, age time.Duration) {
 
 // mapEntry 把 api 侧的行折成库里的一行。空字符串的可空列写成 NULL，
 // 读回来时也是空字符串，往返不丢信息。
-func (a *AuditLog) mapEntry(entry api.AuditEntry) auditRecord {
+func (a *AuditLog) mapEntry(entry core.AuditEntry) auditRecord {
 	timestamp := entry.Time
 	if timestamp.IsZero() {
 		timestamp = a.now()
@@ -268,7 +268,7 @@ const auditReadLimitFallback = 500
 // 台账的读频率是"运维查一次"，两条语句的形态更好读，也更不容易在改分页时被改错。
 //
 // Since/Until 都是闭区间（>= 与 <=），两端都含：运维圈一天的范围时不该纠结边界那条算不算。
-func (a *AuditLog) Query(f api.AuditFilter) ([]api.AuditEntry, int, error) {
+func (a *AuditLog) Query(f core.AuditFilter) ([]core.AuditEntry, int, error) {
 	where, args := auditWhere(f)
 
 	var total int
@@ -294,7 +294,7 @@ func (a *AuditLog) Query(f api.AuditFilter) ([]api.AuditEntry, int, error) {
 	defer rows.Close()
 
 	// 空列表而不是 nil：端点把它序列化出去是 []
-	items := make([]api.AuditEntry, 0, min(limit, 256))
+	items := make([]core.AuditEntry, 0, min(limit, 256))
 	for rows.Next() {
 		entry, err := scanAudit(rows)
 		if err != nil {
@@ -310,7 +310,7 @@ func (a *AuditLog) Query(f api.AuditFilter) ([]api.AuditEntry, int, error) {
 
 // auditWhere 把过滤条件拼成参数化谓词。返回的空串表示不带 WHERE。
 // 每个值都走语句参数，没有任何拼接进来的字符串。
-func auditWhere(f api.AuditFilter) (string, []any) {
+func auditWhere(f core.AuditFilter) (string, []any) {
 	var clauses []string
 	var args []any
 
@@ -342,7 +342,7 @@ func auditWhere(f api.AuditFilter) (string, []any) {
 
 // scanAudit 还原一行。ts_us 只到微秒，读回来的时间丢原来的纳秒与原始时区（这里是本地时区），
 // 与事件表的读回完全同一口径（S04 卡 §9）。
-func scanAudit(row rowScanner) (api.AuditEntry, error) {
+func scanAudit(row rowScanner) (core.AuditEntry, error) {
 	var (
 		timestampUS int64
 		actor       string
@@ -365,10 +365,10 @@ func scanAudit(row rowScanner) (api.AuditEntry, error) {
 	if err := row.Scan(&timestampUS, &actor, &actorKind, &role, &action, &method, &route,
 		&status, &latencyUS, &verdict, &execVerdict, &execReason, &handlerKey, &profile,
 		&jobID, &remoteIP, &userAgent); err != nil {
-		return api.AuditEntry{}, err
+		return core.AuditEntry{}, err
 	}
 
-	return api.AuditEntry{
+	return core.AuditEntry{
 		Time:           time.UnixMicro(timestampUS),
 		Actor:          actor,
 		ActorKind:      actorKind,
@@ -422,8 +422,3 @@ func (a *AuditLog) Close() error {
 	return a.closeErr
 }
 
-// 编译期把 api 侧声明的两个能力钉在这个类型上：装配方不需要读实现就知道两面都在。
-var (
-	_ api.AuditRecorder = (*AuditLog)(nil)
-	_ api.AuditReader   = (*AuditLog)(nil)
-)

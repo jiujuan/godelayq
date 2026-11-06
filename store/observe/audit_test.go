@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"godelayq/api"
+	"godelayq/core"
 )
 
 // auditFixedTime 是本文件统一使用的"当前时间"：行上的时间是请求到达的那一刻，
@@ -46,8 +46,8 @@ func newTestAuditLog(t *testing.T, tune func(*AuditLogOptions)) (*AuditLog, *Han
 
 // auditEntry 造一行台账，缺省字段是"一次普通的成功建任务"。
 // 序号进 Action 之外的字段会让过滤用例的期望值写成一堆字符串比对，所以这里用 Method 拼序号。
-func auditEntry(seq int) api.AuditEntry {
-	return api.AuditEntry{
+func auditEntry(seq int) core.AuditEntry {
+	return core.AuditEntry{
 		Time:      auditFixedTime.Add(time.Duration(seq) * time.Second),
 		Actor:     fmt.Sprintf("operator%02d", seq%3),
 		ActorKind: "user",
@@ -73,7 +73,7 @@ func mustFlush(t *testing.T, log *AuditLog) {
 }
 
 // mustQuery 读一次台账。
-func mustQuery(t *testing.T, log *AuditLog, f api.AuditFilter) ([]api.AuditEntry, int) {
+func mustQuery(t *testing.T, log *AuditLog, f core.AuditFilter) ([]core.AuditEntry, int) {
 	t.Helper()
 
 	items, total, err := log.Query(f)
@@ -84,7 +84,7 @@ func mustQuery(t *testing.T, log *AuditLog, f api.AuditFilter) ([]api.AuditEntry
 }
 
 // appendAll 写入若干行台账。
-func appendAll(t *testing.T, log *AuditLog, entries ...api.AuditEntry) {
+func appendAll(t *testing.T, log *AuditLog, entries ...core.AuditEntry) {
 	t.Helper()
 
 	for _, entry := range entries {
@@ -118,7 +118,7 @@ func TestAuditLog_RoundTrip(t *testing.T) {
 	appendAll(t, log, executor, plain)
 	mustFlush(t, log)
 
-	items, total := mustQuery(t, log, api.AuditFilter{})
+	items, total := mustQuery(t, log, core.AuditFilter{})
 	if total != 2 {
 		t.Fatalf("expected 2 rows, got total=%d items=%d", total, len(items))
 	}
@@ -170,7 +170,7 @@ func TestAuditLog_RoundTrip(t *testing.T) {
 func TestAuditLog_FilterAndPagination(t *testing.T) {
 	log, _ := newTestAuditLog(t, nil)
 
-	entries := make([]api.AuditEntry, 0, 9)
+	entries := make([]core.AuditEntry, 0, 9)
 	for i := 0; i < 9; i++ {
 		entry := auditEntry(i)
 		switch i {
@@ -193,19 +193,19 @@ func TestAuditLog_FilterAndPagination(t *testing.T) {
 
 	cases := []struct {
 		name   string
-		filter api.AuditFilter
+		filter core.AuditFilter
 		want   int
 	}{
-		{"no filter", api.AuditFilter{}, 9},
-		{"by actor", api.AuditFilter{Actor: "operator01"}, 3},
-		{"by machine actor", api.AuditFilter{Actor: "ops01"}, 1},
-		{"by action", api.AuditFilter{Action: "group.delete"}, 2},
-		{"by verdict", api.AuditFilter{Verdict: "denied"}, 2},
-		{"actor and action", api.AuditFilter{Actor: "operator01", Action: "job.create"}, 1},
-		{"unknown actor", api.AuditFilter{Actor: "nobody"}, 0},
+		{"no filter", core.AuditFilter{}, 9},
+		{"by actor", core.AuditFilter{Actor: "operator01"}, 3},
+		{"by machine actor", core.AuditFilter{Actor: "ops01"}, 1},
+		{"by action", core.AuditFilter{Action: "group.delete"}, 2},
+		{"by verdict", core.AuditFilter{Verdict: "denied"}, 2},
+		{"actor and action", core.AuditFilter{Actor: "operator01", Action: "job.create"}, 1},
+		{"unknown actor", core.AuditFilter{Actor: "nobody"}, 0},
 		{
 			"time window",
-			api.AuditFilter{
+			core.AuditFilter{
 				Since: pointerTo(auditFixedTime.Add(2 * time.Second)),
 				Until: pointerTo(auditFixedTime.Add(5 * time.Second)),
 			},
@@ -225,7 +225,7 @@ func TestAuditLog_FilterAndPagination(t *testing.T) {
 	// 翻页：每页 2 条走完全表，行不重不漏
 	seen := map[int64]bool{}
 	for offset := 0; offset < 9; offset += 2 {
-		items, total := mustQuery(t, log, api.AuditFilter{Limit: 2, Offset: offset})
+		items, total := mustQuery(t, log, core.AuditFilter{Limit: 2, Offset: offset})
 		if total != 9 {
 			t.Fatalf("total must ignore paging, got %d", total)
 		}
@@ -249,7 +249,7 @@ func TestAuditLog_FilterAndPagination(t *testing.T) {
 	}
 
 	// 越界 offset 是空列表而不是报错
-	items, total := mustQuery(t, log, api.AuditFilter{Limit: 5, Offset: 50})
+	items, total := mustQuery(t, log, core.AuditFilter{Limit: 5, Offset: 50})
 	if len(items) != 0 || total != 9 {
 		t.Fatalf("offset past the end: %d items / total %d", len(items), total)
 	}
@@ -262,7 +262,7 @@ func pointerTo(value time.Time) *time.Time { return &value }
 func TestAuditLog_ListIsNeverNil(t *testing.T) {
 	log, _ := newTestAuditLog(t, nil)
 
-	items, total := mustQuery(t, log, api.AuditFilter{})
+	items, total := mustQuery(t, log, core.AuditFilter{})
 	if items == nil {
 		t.Fatal("Query returned a nil slice for an empty table")
 	}
@@ -275,14 +275,14 @@ func TestAuditLog_ListIsNeverNil(t *testing.T) {
 func TestAuditLog_FallbackLimit(t *testing.T) {
 	log, db := newTestAuditLog(t, nil)
 
-	entries := make([]api.AuditEntry, 0, auditReadLimitFallback+5)
+	entries := make([]core.AuditEntry, 0, auditReadLimitFallback+5)
 	for i := 0; i < auditReadLimitFallback+5; i++ {
 		entries = append(entries, auditEntry(i))
 	}
 	appendAll(t, log, entries...)
 	mustFlush(t, log)
 
-	items, total := mustQuery(t, log, api.AuditFilter{})
+	items, total := mustQuery(t, log, core.AuditFilter{})
 	if len(items) != auditReadLimitFallback {
 		t.Fatalf("expected the fallback cap of %d rows, got %d", auditReadLimitFallback, len(items))
 	}
@@ -291,7 +291,7 @@ func TestAuditLog_FallbackLimit(t *testing.T) {
 	}
 
 	// 负数 limit 与负 offset 同样不会把语句写成非法形状
-	items, _ = mustQuery(t, log, api.AuditFilter{Limit: -3, Offset: -7})
+	items, _ = mustQuery(t, log, core.AuditFilter{Limit: -3, Offset: -7})
 	if len(items) != auditReadLimitFallback {
 		t.Fatalf("negative limit should fall back, got %d rows", len(items))
 	}
@@ -329,7 +329,7 @@ func TestAuditLog_DroppedWhenFull(t *testing.T) {
 
 	// 丢弃不改变已入队的那些：落盘后库里是 4 行
 	mustFlush(t, log)
-	_, total := mustQuery(t, log, api.AuditFilter{})
+	_, total := mustQuery(t, log, core.AuditFilter{})
 	if total != 4 {
 		t.Fatalf("expected the 4 queued rows, got %d", total)
 	}
@@ -368,7 +368,7 @@ func TestAuditLog_Retention(t *testing.T) {
 		appendAll(t, log, auditEntry(1), auditEntry(2), auditEntry(3), auditEntry(4))
 		mustFlush(t, log)
 
-		items, total := mustQuery(t, log, api.AuditFilter{})
+		items, total := mustQuery(t, log, core.AuditFilter{})
 		if total != 3 || len(items) != 3 {
 			t.Fatalf("retention by count left %d rows (total %d)", len(items), total)
 		}
@@ -392,7 +392,7 @@ func TestAuditLog_Retention(t *testing.T) {
 		appendAll(t, log, auditEntry(1), auditEntry(2), auditEntry(3), auditEntry(4), auditEntry(5))
 		mustFlush(t, log)
 
-		_, total := mustQuery(t, log, api.AuditFilter{})
+		_, total := mustQuery(t, log, core.AuditFilter{})
 		// 截止点是 fixedTime-3s，所以五条都还在——这一条判的是"淘汰没有走过界"
 		if total != 5 {
 			t.Fatalf("nothing should be pruned yet, got %d rows", total)
@@ -405,7 +405,7 @@ func TestAuditLog_Retention(t *testing.T) {
 		appendAll(t, log, fresh)
 		mustFlush(t, log)
 
-		items, total := mustQuery(t, log, api.AuditFilter{})
+		items, total := mustQuery(t, log, core.AuditFilter{})
 		if total != 1 || len(items) != 1 {
 			t.Fatalf("expected only the newest row, got %d (total %d)", len(items), total)
 		}
@@ -422,7 +422,7 @@ func TestAuditLog_Retention(t *testing.T) {
 		appendAll(t, log, auditEntry(1), auditEntry(2))
 		mustFlush(t, log)
 
-		_, total := mustQuery(t, log, api.AuditFilter{})
+		_, total := mustQuery(t, log, core.AuditFilter{})
 		if total != 2 {
 			t.Fatalf("retention_age=0 must not prune, got %d rows", total)
 		}
@@ -474,7 +474,7 @@ func TestAuditLog_QueryErrorIsReturned(t *testing.T) {
 	}
 	// t.Cleanup 里那次 db.Close 会变成重复关闭，无害
 
-	_, _, err := log.Query(api.AuditFilter{})
+	_, _, err := log.Query(core.AuditFilter{})
 	if err == nil {
 		t.Fatal("expected the query on a closed database to fail")
 	}
