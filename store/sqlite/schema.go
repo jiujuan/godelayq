@@ -4,29 +4,17 @@ package sqlite
 // 表名、列名、索引名一经落地就是契约：S03/S05/S06 只读写，不再执行任何 DDL。
 // 改动只能以新增迁移版本号的方式表达，改这里的 version 1 语句会让已存在的库文件对不上号。
 
-// migrationTable 记录已应用的迁移版本。表名带 observe_ 前缀：将来若把任务快照
-// 也换成 SQLite（设计文档 §4.3），两张迁移表不能撞名（设计文档 §13 风险 6）。
-const migrationTable = `
-CREATE TABLE IF NOT EXISTS observe_schema_migrations (
-  version    INTEGER NOT NULL,
-  applied_at INTEGER NOT NULL              -- 写入时的 Unix 秒
-);
-`
-
-// migration 是一段按版本号顺序执行的内置语句。
-type migration struct {
-	version int
-	// up 里的每一条都是独立可执行的语句；整批在同一个事务里跑，
-	// 中途失败时版本号不会写进去，下次启动重来。
-	up []string
-}
+// migrationTableName 是观测库记录已应用迁移版本的表名。表名带 observe_ 前缀：
+// 将来若把任务快照也换成 SQLite（设计文档 §4.3），两张迁移表不能撞名
+// （设计文档 §13 风险 6）。建表语句由 DB.Migrate 按这个名字生成。
+const migrationTableName = "observe_schema_migrations"
 
 // migrations 是内置的迁移列表，必须按 version 升序排列。
 // 本卡只有 version 1：建三张表与八个索引。
-var migrations = []migration{
+var migrations = []Migration{
 	{
-		version: 1,
-		up: []string{
+		Version: 1,
+		Up: []string{
 			`CREATE TABLE IF NOT EXISTS job_events (
   seq      INTEGER PRIMARY KEY AUTOINCREMENT,
   ts_us    INTEGER NOT NULL,               -- core.Event.Timestamp，Unix 微秒
