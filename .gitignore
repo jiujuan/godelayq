@@ -2,3 +2,9 @@
 
 # 实际运行配置含本机凭据，入库的是同结构的 config.example.yaml
 configs/config.yaml
+
+# 本地 SQLite 库不入库：观测库与管理库（含 WAL/SHM 旁文件）。
+# 管理库存账号密码哈希；观测库存账号名与拒绝原因——两者都只属于这台机器。
+data/*.sqlite
+data/*.sqlite-wal
+data/*.sqlite-shm
