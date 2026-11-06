@@ -90,8 +90,8 @@ type reloadTargets struct {
 	setWorkers        func(n int) error                        // R03: core.Scheduler.ResizeWorkers
 	setRetry          func(maxDelay time.Duration) error       // R02: scheduler.SetRetryPolicy
 	setRetention      func(limit int, ttl time.Duration) error // R02: store.SetHistoryRetention
-	setEventRetention func(count int, age time.Duration) error // R02: sqlite.EventLog.SetRetention（未启用时 nil）
-	setAuditRetention func(count int, age time.Duration) error // R02: sqlite.AuditLog.SetRetention（未启用时 nil）
+	setEventRetention func(count int, age time.Duration) error // R02: observe.EventLog.SetRetention（未启用时 nil）
+	setAuditRetention func(count int, age time.Duration) error // R02: observe.AuditLog.SetRetention（未启用时 nil）
 	setCommands       func(candidate core.Config) error        // R04: Applier.ApplyConfig（未装配 applier 时 nil）
 	setDebounce       func(d time.Duration) error              // R05: ConfigWatcher.SetDebounce（watcher 未建时 nil）
 }

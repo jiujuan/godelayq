@@ -1,4 +1,4 @@
-package sqlite
+package observe
 
 import (
 	"encoding/json"
@@ -18,7 +18,7 @@ var fixedTime = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 
 // newTestEventLog 建一份真库 + 真总线 + 事件写入器。
 // 默认的 FlushInterval 是一小时，也就是说落盘只由用例显式 Flush 或 Close 触发。
-func newTestEventLog(t *testing.T, tune func(*EventLogOptions)) (*EventLog, *DB, *core.EventBus) {
+func newTestEventLog(t *testing.T, tune func(*EventLogOptions)) (*EventLog, *Handle, *core.EventBus) {
 	t.Helper()
 
 	db, err := Open(openConfig(filepath.Join(t.TempDir(), "observe.sqlite")), testLogger())
@@ -63,10 +63,10 @@ func waitQueued(t *testing.T, log *EventLog, n int) {
 }
 
 // queryEvents 按 seq 升序读回库内的事件行，用于对照写入顺序。
-func queryEvents(t *testing.T, db *DB) []eventRecord {
+func queryEvents(t *testing.T, db *Handle) []eventRecord {
 	t.Helper()
 
-	rows, err := db.sqlDB.Query(`SELECT ts_us, type, job_id, job_name, status, data, metadata FROM job_events ORDER BY seq`)
+	rows, err := db.SQL().Query(`SELECT ts_us, type, job_id, job_name, status, data, metadata FROM job_events ORDER BY seq`)
 	if err != nil {
 		t.Fatalf("query events failed: %v", err)
 	}
@@ -274,7 +274,7 @@ func TestEventLog_OrderIsStableWithinSameMicrosecond(t *testing.T) {
 	}
 	// seq 由 AUTOINCREMENT 给出并且严格递增，是读侧 ORDER BY 的依据
 	var seqs []int64
-	rows, err := db.sqlDB.Query(`SELECT seq FROM job_events ORDER BY seq`)
+	rows, err := db.SQL().Query(`SELECT seq FROM job_events ORDER BY seq`)
 	if err != nil {
 		t.Fatalf("query seq failed: %v", err)
 	}

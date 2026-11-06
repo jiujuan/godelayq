@@ -16,7 +16,7 @@ import (
 	"godelayq/api"
 	"godelayq/core"
 	"godelayq/executor"
-	"godelayq/store/sqlite"
+	"godelayq/store/observe"
 	"godelayq/web"
 )
 
@@ -70,12 +70,12 @@ type serverAPI interface {
 //
 // 接口定义在消费方是本仓库的既有惯例（schedulerAPI、serverAPI 同样如此），这里还多一条理由：
 // 关闭顺序（观测层早于 store.Close）只有在句柄可替换时才断言得出来，
-// 真实 *sqlite.DB 的关闭时机在测试里没有别的观察办法。
+// 真实 *observe.Handle 的关闭时机在测试里没有别的观察办法。
 // 本卡只用到这三个方法，S03 起要把事件写入器接进装配时再扩，不提前摆空参数。
 type observabilityDB interface {
 	Path() string
 	JournalMode() string
-	Stats() (sqlite.Stats, error)
+	Stats() (observe.Stats, error)
 	Close() error
 }
 
@@ -265,23 +265,23 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 			}, logger)
 		},
 		newObservabilityDB: func(cfg core.Config, logger *slog.Logger) (observabilityDB, error) {
-			db, err := sqlite.Open(cfg.Observability, logger)
+			db, err := observe.Open(cfg.Observability, logger)
 			if err != nil {
 				// 这里必须返回 nil 而不是那个类型化的空句柄：
-				// 装了 *sqlite.DB(nil) 的接口值不等于 nil，调用方的判空会失效。
+				// 装了 *observe.Handle(nil) 的接口值不等于 nil，调用方的判空会失效。
 				return nil, err
 			}
 			return db, nil
 		},
 		newEventLog: func(bus *core.EventBus, db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (eventLogAPI, error) {
-			handle, ok := db.(*sqlite.DB)
+			handle, ok := db.(*observe.Handle)
 			if !ok {
-				// 真实装配里这一步一定成立：句柄就是上面 sqlite.Open 建出来的那一个。
+				// 真实装配里这一步一定成立：句柄就是上面 observe.Open 建出来的那一个。
 				// 不成立说明有人把假句柄接到了要真连接的写入器上，直接报错，
 				// 而不是让写入器静默缺席、事件表永远为空。
 				return nil, fmt.Errorf("event writer needs the real observability handle, got %T", db)
 			}
-			return sqlite.NewEventLog(bus, handle, sqlite.EventLogOptions{
+			return observe.NewEventLog(bus, handle, observe.EventLogOptions{
 				FlushInterval:  cfg.FlushInterval,
 				QueueCapacity:  cfg.QueueCapacity,
 				RetentionCount: cfg.Events.RetentionCount,
@@ -289,24 +289,24 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 			}, logger)
 		},
 		newArtifactIndex: func(db observabilityDB, cfg core.ObservabilityConfig, rootDir string, logger *slog.Logger) (executor.ArtifactIndexer, error) {
-			handle, ok := db.(*sqlite.DB)
+			handle, ok := db.(*observe.Handle)
 			if !ok {
 				// 与 newEventLog 同一处置：索引要真连接，接了假句柄就报错，
 				// 而不是让这张表安静地空着。
 				return nil, fmt.Errorf("artifact index needs the real observability handle, got %T", db)
 			}
-			return sqlite.NewArtifactIndex(handle, sqlite.ArtifactIndexOptions{
+			return observe.NewArtifactIndex(handle, observe.ArtifactIndexOptions{
 				RootDir: rootDir,
 			}, logger)
 		},
 		newAuditLog: func(db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (auditLogAPI, error) {
-			handle, ok := db.(*sqlite.DB)
+			handle, ok := db.(*observe.Handle)
 			if !ok {
 				// 与 newEventLog、newArtifactIndex 同一处置：台账要真连接，
 				// 接了假句柄就报错，而不是让这张表安静地空着。
 				return nil, fmt.Errorf("audit log needs the real observability handle, got %T", db)
 			}
-			return sqlite.NewAuditLog(handle, sqlite.AuditLogOptions{
+			return observe.NewAuditLog(handle, observe.AuditLogOptions{
 				FlushInterval:  cfg.FlushInterval,
 				QueueCapacity:  cfg.QueueCapacity,
 				RetentionCount: cfg.Audit.RetentionCount,

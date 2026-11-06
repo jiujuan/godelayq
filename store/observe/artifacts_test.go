@@ -1,4 +1,4 @@
-package sqlite
+package observe
 
 import (
 	"errors"
@@ -19,7 +19,7 @@ var indexTime = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 // indexFixture 是一份真库 + 一个假想的产物根目录。
 // 根目录在这里只是一个字符串：索引用它折相对路径，不碰文件系统。
 type indexFixture struct {
-	db   *DB
+	db   *Handle
 	root string
 }
 
@@ -103,7 +103,7 @@ func countIndexRows(t *testing.T, idx *ArtifactIndex, jobID string) int {
 	t.Helper()
 
 	var count int
-	if err := idx.db.sqlDB.QueryRow(
+	if err := idx.db.SQL().QueryRow(
 		`SELECT COUNT(*) FROM artifact_index WHERE job_id = ?`, jobID).Scan(&count); err != nil {
 		t.Fatalf("count rows for %s failed: %v", jobID, err)
 	}
@@ -478,7 +478,7 @@ func TestNewArtifactIndex_RejectsNilDeps(t *testing.T) {
 		t.Fatal("an empty artifact root must be rejected: nothing can be relativised against it")
 	}
 
-	// logger 为 nil 时回落到 slog.Default()，与 sqlite.Open、NewEventLog 同一口径
+	// logger 为 nil 时回落到 slog.Default()，与 observe.Open、NewEventLog 同一口径
 	idx, err := NewArtifactIndex(f.db, ArtifactIndexOptions{RootDir: f.root}, nil)
 	if err != nil {
 		t.Fatalf("NewArtifactIndex with a nil logger failed: %v", err)

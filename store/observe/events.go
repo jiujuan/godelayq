@@ -1,4 +1,4 @@
-package sqlite
+package observe
 
 import (
 	"database/sql"
@@ -53,7 +53,7 @@ type eventRecord struct {
 // 它与 api.EventHistory 并列而不是替代（设计文档 D5）：内存那份继续服务未启用库时的
 // 读路径，这份负责跨重启留存。写入一律走 batcher，转发协程里不等任何 SQL。
 type EventLog struct {
-	db     *DB
+	db     *Handle
 	bus    *core.EventBus
 	subID  string
 	batch  *batcher[eventRecord]
@@ -80,7 +80,7 @@ type EventLog struct {
 //
 // 返回的 EventLog 必须在进程退出前 Close：撤订阅 → 等转发协程退出 → 最后一次落盘。
 // 顺序颠倒（先关库再关它）就会在已关闭的连接上写入，cmd/server 的 defer 排列守的就是这条。
-func NewEventLog(bus *core.EventBus, db *DB, opts EventLogOptions, logger *slog.Logger) (*EventLog, error) {
+func NewEventLog(bus *core.EventBus, db *Handle, opts EventLogOptions, logger *slog.Logger) (*EventLog, error) {
 	if bus == nil {
 		return nil, errors.New("sqlite: NewEventLog requires an event bus")
 	}
@@ -206,7 +206,7 @@ func nullableText(raw []byte) sql.NullString {
 // 这是 batcher 的落盘回调，不做重试以外的事情：失败就返回错误，由 batcher 决定再试一次还是放弃。
 func (e *EventLog) writeBatch(rows []eventRecord) error {
 	e.writeRounds.Add(1)
-	tx, err := e.db.sqlDB.Begin()
+	tx, err := e.db.SQL().Begin()
 	if err != nil {
 		return fmt.Errorf("sqlite: begin event batch: %w", err)
 	}
@@ -296,7 +296,7 @@ func (e *EventLog) readEvents(query string, limit int, args ...any) ([]core.Even
 	if limit <= 0 {
 		limit = eventsReadLimitFallback
 	}
-	rows, err := e.db.sqlDB.Query(query, append(args, limit)...)
+	rows, err := e.db.SQL().Query(query, append(args, limit)...)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: query events: %w", err)
 	}
@@ -381,7 +381,7 @@ func (e *EventLog) Dropped() int64 {
 // Count 返回库内事件行数，主要是给读端点与验收命令对照用。
 func (e *EventLog) Count() (int64, error) {
 	var count int64
-	if err := e.db.sqlDB.QueryRow(`SELECT COUNT(*) FROM job_events`).Scan(&count); err != nil {
+	if err := e.db.SQL().QueryRow(`SELECT COUNT(*) FROM job_events`).Scan(&count); err != nil {
 		return 0, fmt.Errorf("sqlite: count events: %w", err)
 	}
 	return count, nil

@@ -1,4 +1,4 @@
-package sqlite
+package observe
 
 import (
 	"database/sql"
@@ -67,7 +67,7 @@ type auditRecord struct {
 // 定义在消费方 api/audit.go，这一侧 import 它并实现。方向与产物索引那张表一致
 // （store/sqlite 已经 import executor），api 仍然不知道驱动在哪。
 type AuditLog struct {
-	db     *DB
+	db     *Handle
 	batch  *batcher[auditRecord]
 	logger *slog.Logger
 
@@ -86,7 +86,7 @@ type AuditLog struct {
 
 // NewAuditLog 开始接收台账行。返回的 AuditLog 必须在观测库关闭之前 Close：
 // 剩下的批次要先落盘，连接才能关。
-func NewAuditLog(db *DB, opts AuditLogOptions, logger *slog.Logger) (*AuditLog, error) {
+func NewAuditLog(db *Handle, opts AuditLogOptions, logger *slog.Logger) (*AuditLog, error) {
 	if db == nil {
 		return nil, errors.New("sqlite: NewAuditLog requires an observability database")
 	}
@@ -196,7 +196,7 @@ func optionalText(value string) sql.NullString {
 
 // writeBatch 在一个事务里写完这批台账，并按保留策略淘汰旧行。
 func (a *AuditLog) writeBatch(rows []auditRecord) error {
-	tx, err := a.db.sqlDB.Begin()
+	tx, err := a.db.SQL().Begin()
 	if err != nil {
 		return fmt.Errorf("sqlite: begin audit batch: %w", err)
 	}
@@ -272,7 +272,7 @@ func (a *AuditLog) Query(f api.AuditFilter) ([]api.AuditEntry, int, error) {
 	where, args := auditWhere(f)
 
 	var total int
-	if err := a.db.sqlDB.QueryRow(`SELECT COUNT(*) FROM write_audit`+where, args...).Scan(&total); err != nil {
+	if err := a.db.SQL().QueryRow(`SELECT COUNT(*) FROM write_audit`+where, args...).Scan(&total); err != nil {
 		return nil, 0, fmt.Errorf("sqlite: count audit rows: %w", err)
 	}
 
@@ -285,7 +285,7 @@ func (a *AuditLog) Query(f api.AuditFilter) ([]api.AuditEntry, int, error) {
 		offset = 0
 	}
 
-	rows, err := a.db.sqlDB.Query(
+	rows, err := a.db.SQL().Query(
 		`SELECT `+auditColumns+` FROM write_audit`+where+` ORDER BY seq DESC LIMIT ? OFFSET ?`,
 		append(args, limit, offset)...)
 	if err != nil {
@@ -402,7 +402,7 @@ func (a *AuditLog) Dropped() int64 {
 // Count 返回库内台账行数，给验收命令与查询端点的 total 对照用。
 func (a *AuditLog) Count() (int64, error) {
 	var count int64
-	if err := a.db.sqlDB.QueryRow(`SELECT COUNT(*) FROM write_audit`).Scan(&count); err != nil {
+	if err := a.db.SQL().QueryRow(`SELECT COUNT(*) FROM write_audit`).Scan(&count); err != nil {
 		return 0, fmt.Errorf("sqlite: count audit rows: %w", err)
 	}
 	return count, nil

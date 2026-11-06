@@ -1,7 +1,9 @@
 package sqlite
 
 import (
+	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -115,4 +117,26 @@ func TestClose_IsIdempotentAndSQLStopsWorking(t *testing.T) {
 	err = db.SQL().Ping()
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "database is closed")
+}
+
+// TestOpenFile_FilePermissions 固定库文件 0640、父目录 0750（设计文档 §10.4）。
+// Windows 上 NTFS 权限不由 mode bits 表达，os.Chmod 只影响只读位，
+// 这条断言留给 Unix 与 CI（照 executor/artifact_test.go 的既有处理）。
+func TestOpenFile_FilePermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Windows 上 NTFS 权限不由 mode bits 表达，这条断言在 Unix 与 CI 生效")
+	}
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "sub", "base.sqlite")
+	db, err := OpenFile(Options{Path: path}, nil)
+	require.NoError(t, err)
+	defer db.Close()
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, filePerm, info.Mode().Perm(), "database file mode")
+	parent, err := os.Stat(filepath.Dir(path))
+	require.NoError(t, err)
+	assert.Equal(t, dirPerm, parent.Mode().Perm(), "parent dir mode")
 }

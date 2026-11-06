@@ -30,7 +30,7 @@ import (
 
 	"godelayq/api"
 	"godelayq/core"
-	"godelayq/store/sqlite"
+	"godelayq/store/observe"
 )
 
 // logSink 是带锁的日志收集器。用例主协程读它的时候，store 的 flushLoop 与两个观测写入器的
@@ -70,8 +70,8 @@ type smokeStack struct {
 	levelVar  *slog.LevelVar
 	scheduler *core.Scheduler
 	store     *core.JSONFileStore
-	audit     *sqlite.AuditLog
-	events    *sqlite.EventLog
+	audit     *observe.AuditLog
+	events    *observe.EventLog
 	bus       *core.EventBus
 
 	// chain 是被验的那个对象本身：生产构造函数造出来的真链，落点全是上面这些真下游。
@@ -154,16 +154,16 @@ func newSmokeStack(t *testing.T, spec fileSpec) *smokeStack {
 	// 关闭顺序：t.Cleanup 后注册的先跑，所以按 store → db → events → audit 注册，
 	// 实际关闭就是 audit → events → db → store，即两个写入器先撤订阅、再关库、最后关存储。
 	// 每条都紧跟自己的构造函数注册：中途 Fatalf 时已经建起来的资源不会漏关。
-	db, err := sqlite.Open(cfg.Observability, logger)
+	db, err := observe.Open(cfg.Observability, logger)
 	if err != nil {
-		t.Fatalf("sqlite.Open: %v", err)
+		t.Fatalf("observe.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
 
 	bus := core.NewEventBus(200)
 	stack.bus = bus
 
-	events, err := sqlite.NewEventLog(bus, db, sqlite.EventLogOptions{
+	events, err := observe.NewEventLog(bus, db, observe.EventLogOptions{
 		FlushInterval:  cfg.Observability.FlushInterval,
 		QueueCapacity:  cfg.Observability.QueueCapacity,
 		RetentionCount: cfg.Observability.Events.RetentionCount,
@@ -175,7 +175,7 @@ func newSmokeStack(t *testing.T, spec fileSpec) *smokeStack {
 	stack.events = events
 	t.Cleanup(func() { _ = events.Close() })
 
-	audit, err := sqlite.NewAuditLog(db, sqlite.AuditLogOptions{
+	audit, err := observe.NewAuditLog(db, observe.AuditLogOptions{
 		FlushInterval:  cfg.Observability.FlushInterval,
 		QueueCapacity:  cfg.Observability.QueueCapacity,
 		RetentionCount: cfg.Observability.Audit.RetentionCount,

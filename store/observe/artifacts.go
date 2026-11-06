@@ -1,4 +1,4 @@
-package sqlite
+package observe
 
 import (
 	"database/sql"
@@ -32,7 +32,7 @@ type ArtifactIndexOptions struct {
 // 定位是加速器而不是账本（设计文档 D8）：这里每个方法的错误都由调用方记日志，
 // 没有一个会改动执行结果，也没有一个会阻止产物文件被读到。
 type ArtifactIndex struct {
-	db      *DB
+	db      *Handle
 	rootDir string
 	now     func() time.Time
 	logger  *slog.Logger
@@ -40,7 +40,7 @@ type ArtifactIndex struct {
 
 // NewArtifactIndex 构造产物索引。db 为 nil 或根目录为空时返回错误而不是 panic：
 // 后者折不出相对路径，静默建出来的索引每一行都要靠猜。
-func NewArtifactIndex(db *DB, opts ArtifactIndexOptions, logger *slog.Logger) (*ArtifactIndex, error) {
+func NewArtifactIndex(db *Handle, opts ArtifactIndexOptions, logger *slog.Logger) (*ArtifactIndex, error) {
 	if db == nil {
 		return nil, errors.New("sqlite: NewArtifactIndex requires an observability database")
 	}
@@ -97,7 +97,7 @@ func (i *ArtifactIndex) Record(rec executor.IndexRecord) error {
 	if rec.Info.Truncated {
 		truncated = 1
 	}
-	_, err = i.db.sqlDB.Exec(insertArtifact,
+	_, err = i.db.SQL().Exec(insertArtifact,
 		rec.JobID, rec.Attempt, rec.Kind, rec.Profile, outRel, errRel,
 		rec.Info.OutBytes, rec.Info.ErrBytes, truncated,
 		core.ArtifactAvailable, i.now().Unix())
@@ -137,11 +137,11 @@ func (i *ArtifactIndex) markPurged(jobID string, attempt *int) (int64, error) {
 	)
 	if attempt == nil {
 		args = []any{core.ArtifactPurged, jobID, core.ArtifactAvailable}
-		res, err = i.db.sqlDB.Exec(
+		res, err = i.db.SQL().Exec(
 			`UPDATE artifact_index SET state = ? WHERE job_id = ? AND state = ?`, args...)
 	} else {
 		args = []any{core.ArtifactPurged, jobID, *attempt, core.ArtifactAvailable}
-		res, err = i.db.sqlDB.Exec(
+		res, err = i.db.SQL().Exec(
 			`UPDATE artifact_index SET state = ? WHERE job_id = ? AND attempt = ? AND state = ?`, args...)
 	}
 	if err != nil {
@@ -178,7 +178,7 @@ func (i *ArtifactIndex) DeleteByJob(jobID string) error {
 	if err := executor.CheckArtifactJobID(jobID); err != nil {
 		return fmt.Errorf("sqlite: artifact index: %w", err)
 	}
-	if _, err := i.db.sqlDB.Exec(`DELETE FROM artifact_index WHERE job_id = ?`, jobID); err != nil {
+	if _, err := i.db.SQL().Exec(`DELETE FROM artifact_index WHERE job_id = ?`, jobID); err != nil {
 		return fmt.Errorf("sqlite: delete artifacts for %s: %w", jobID, err)
 	}
 	return nil
@@ -194,7 +194,7 @@ func (i *ArtifactIndex) List(jobID string) ([]executor.IndexRecord, error) {
 	if err := executor.CheckArtifactJobID(jobID); err != nil {
 		return nil, fmt.Errorf("sqlite: artifact index: %w", err)
 	}
-	rows, err := i.db.sqlDB.Query(artifactSelect+` WHERE job_id = ? ORDER BY attempt ASC`, jobID)
+	rows, err := i.db.SQL().Query(artifactSelect+` WHERE job_id = ? ORDER BY attempt ASC`, jobID)
 	if err != nil {
 		return nil, fmt.Errorf("sqlite: list artifacts for %s: %w", jobID, err)
 	}
@@ -221,7 +221,7 @@ func (i *ArtifactIndex) Exists(jobID string, attempt int) (bool, error) {
 		return false, fmt.Errorf("sqlite: artifact index: %w", err)
 	}
 	var one int
-	err := i.db.sqlDB.QueryRow(
+	err := i.db.SQL().QueryRow(
 		`SELECT 1 FROM artifact_index WHERE job_id = ? AND attempt = ? LIMIT 1`, jobID, attempt).Scan(&one)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
@@ -288,7 +288,7 @@ func (i *ArtifactIndex) ReconcileMissing(dirExists func(jobID string) bool) (int
 		return 0, errNeedDirCheck
 	}
 
-	rows, err := i.db.sqlDB.Query(
+	rows, err := i.db.SQL().Query(
 		`SELECT DISTINCT job_id FROM artifact_index WHERE state = ?`, core.ArtifactAvailable)
 	if err != nil {
 		return 0, fmt.Errorf("sqlite: list indexed jobs: %w", err)

@@ -1,10 +1,9 @@
-package sqlite
+package observe
 
 import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -30,11 +29,11 @@ func openConfig(path string) core.ObservabilityConfig {
 }
 
 // countQuery 读一个标量查询结果，用于直接查 sqlite_master 核对表与索引。
-func countQuery(t *testing.T, db *DB, query string, args ...any) int {
+func countQuery(t *testing.T, db *Handle, query string, args ...any) int {
 	t.Helper()
 
 	var n int
-	if err := db.sqlDB.QueryRow(query, args...).Scan(&n); err != nil {
+	if err := db.SQL().QueryRow(query, args...).Scan(&n); err != nil {
 		t.Fatalf("query %q failed: %v", query, err)
 	}
 	return n
@@ -134,7 +133,7 @@ func TestOpen_WALModeEnabled(t *testing.T) {
 
 	// 生效值来自查询本身，而不是 DSN 字符串：网络文件系统上 WAL 可能静默退回 delete
 	var mode string
-	if err := db.sqlDB.QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
+	if err := db.SQL().QueryRow(`PRAGMA journal_mode`).Scan(&mode); err != nil {
 		t.Fatalf("read journal_mode failed: %v", err)
 	}
 	if mode != "wal" {
@@ -222,38 +221,6 @@ func TestClose_Idempotent(t *testing.T) {
 	}
 }
 
-// TestOpen_FilePermissions 固定库文件 0640、父目录 0750（设计文档 §10.4）。
-// Windows 上 NTFS 权限不由 mode bits 表达，os.Chmod 只影响只读位，
-// 这条断言留给 Unix 与 CI（照 executor/artifact_test.go 的既有处理）。
-func TestOpen_FilePermissions(t *testing.T) {
-	if runtime.GOOS == "windows" {
-		t.Skip("Windows 上 NTFS 权限不由 mode bits 表达，这条断言在 Unix 与 CI 生效")
-	}
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "sub", "observe.sqlite")
-	db, err := Open(openConfig(path), testLogger())
-	if err != nil {
-		t.Fatalf("Open failed: %v", err)
-	}
-	defer db.Close()
-
-	info, err := os.Stat(path)
-	if err != nil {
-		t.Fatalf("stat file failed: %v", err)
-	}
-	if perm := info.Mode().Perm(); perm != filePerm {
-		t.Errorf("expected database file mode %04o, got %04o", filePerm, perm)
-	}
-	parent, err := os.Stat(filepath.Dir(path))
-	if err != nil {
-		t.Fatalf("stat dir failed: %v", err)
-	}
-	if perm := parent.Mode().Perm(); perm != dirPerm {
-		t.Errorf("expected parent dir mode %04o, got %04o", dirPerm, perm)
-	}
-}
-
 // TestSchemaColumnsMatchDesign 把三张表的列名、类型与 NOT NULL 钉在用例里。
 //
 // 这是 DoD"表名、列名、索引名与设计文档 §6 逐字一致，S03/S05/S06 不需要再执行任何 DDL"的
@@ -289,7 +256,7 @@ func TestSchemaColumnsMatchDesign(t *testing.T) {
 	}
 
 	for table, want := range expected {
-		rows, err := db.sqlDB.Query(`SELECT name || '|' || type || '|' || "notnull" || '|' || pk || '|' || COALESCE(dflt_value, '') FROM pragma_table_info(?) ORDER BY cid`, table)
+		rows, err := db.SQL().Query(`SELECT name || '|' || type || '|' || "notnull" || '|' || pk || '|' || COALESCE(dflt_value, '') FROM pragma_table_info(?) ORDER BY cid`, table)
 		if err != nil {
 			t.Fatalf("pragma_table_info(%s) failed: %v", table, err)
 		}
@@ -328,7 +295,7 @@ func TestCloseCheckpointsWAL(t *testing.T) {
 
 	// 这里的 INSERT 只是测试手段：本卡不提供任何表的读写方法（§8），
 	// 但没有一次写事务就观察不到 WAL 旁文件。
-	if _, err := db.sqlDB.Exec(`INSERT INTO job_events (ts_us, type, job_id, status) VALUES (1727000000000000, 'job.created', 'job-1', 1)`); err != nil {
+	if _, err := db.SQL().Exec(`INSERT INTO job_events (ts_us, type, job_id, status) VALUES (1727000000000000, 'job.created', 'job-1', 1)`); err != nil {
 		t.Fatalf("test insert failed: %v", err)
 	}
 	if _, err := os.Stat(path + "-wal"); err != nil {
@@ -364,7 +331,7 @@ func TestStatsReportsQueryError(t *testing.T) {
 	}
 	defer db.Close()
 
-	if _, err := db.sqlDB.Exec(`DROP TABLE write_audit`); err != nil {
+	if _, err := db.SQL().Exec(`DROP TABLE write_audit`); err != nil {
 		t.Fatalf("drop table failed: %v", err)
 	}
 	if _, err := db.Stats(); err == nil {

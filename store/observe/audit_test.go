@@ -1,4 +1,4 @@
-package sqlite
+package observe
 
 import (
 	"errors"
@@ -17,7 +17,7 @@ var auditFixedTime = time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
 
 // newTestAuditLog 建一份真库 + 真台账写入器。
 // 默认落盘周期是一小时，也就是说写盘只由用例显式 Flush 或 Close 触发（与事件用例同形）。
-func newTestAuditLog(t *testing.T, tune func(*AuditLogOptions)) (*AuditLog, *DB) {
+func newTestAuditLog(t *testing.T, tune func(*AuditLogOptions)) (*AuditLog, *Handle) {
 	t.Helper()
 
 	db, err := Open(openConfig(filepath.Join(t.TempDir(), "observe.sqlite")), testLogger())
@@ -297,7 +297,7 @@ func TestAuditLog_FallbackLimit(t *testing.T) {
 	}
 
 	var count int64
-	if err := db.sqlDB.QueryRow(`SELECT COUNT(*) FROM write_audit`).Scan(&count); err != nil {
+	if err := db.SQL().QueryRow(`SELECT COUNT(*) FROM write_audit`).Scan(&count); err != nil {
 		t.Fatalf("count failed: %v", err)
 	}
 	if count != int64(auditReadLimitFallback+5) {
@@ -435,7 +435,7 @@ func TestNewAuditLog_RejectsNilDB(t *testing.T) {
 		t.Fatal("a nil database must be rejected")
 	}
 
-	// logger 为 nil 时回落到 slog.Default()，与 sqlite.Open、NewEventLog、NewArtifactIndex 同一口径
+	// logger 为 nil 时回落到 slog.Default()，与 observe.Open、NewEventLog、NewArtifactIndex 同一口径
 	db, err := Open(openConfig(filepath.Join(t.TempDir(), "observe.sqlite")), testLogger())
 	if err != nil {
 		t.Fatalf("Open failed: %v", err)
