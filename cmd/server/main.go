@@ -400,6 +400,12 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 					opts = append(opts, api.WithAuditLog(obs.audit, obs.audit))
 				}
 			}
+			// 管理库模式把账号存储交给服务：认证器随之切到库模式（改账号即时生效），
+			// 账号管理端点（/admin/users）也随之启用——两者共用这一个存储句柄。
+			// 关闭时账号走配置快照（遗留模式），管理端点不存在。
+			if cfg.MgrStore.Enabled {
+				opts = append(opts, api.WithUserStore(mgr.NewUserStore(mgrDB.handle)))
+			}
 			// 档位的在线管理两面同生同灭：web_enabled=false 时 profiles 整体是 nil，
 			// 三个写端点因此走到 503 那条明确分支，而不是"能建但建完不生效"。
 			if profiles != nil {

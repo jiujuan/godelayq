@@ -123,13 +123,20 @@ var publicAuthEndpoints = map[string]bool{
 	http.MethodPost + " /api/v1/auth/refresh": true,
 }
 
+// authRequired 综合两路凭据判定本机是否启用鉴权：静态凭据看配置（token 或
+// users 节），控制台账号看认证器——账号来自管理库时（dbBacked），配置里的
+// users 节只是导入源，判定必须落到"库里有账号"上。两者任一成立即启用。
+func (s *Server) authRequired() bool {
+	return s.sec.authEnabled() || s.auth.dbBacked()
+}
+
 // authMiddleware 把请求解析成 Principal 并放进上下文；未配置任何凭据时全部放行
 // （等价于历史行为：本地自托管、单机自用，不区分身份）。
 func (s *Server) authMiddleware() gin.HandlerFunc {
 	want := []byte(s.sec.Auth.Token)
 
 	return func(c *gin.Context) {
-		if !s.sec.authEnabled() {
+		if !s.authRequired() {
 			// 未启用鉴权 = 单机自托管，所有请求视作同一个本机用户。
 			// 给一个 ops 档的匿名身份是为了让角色判断与审计日志有值可读，
 			// 不是因为"没配凭据就该谁都能调运维端点"——那种部署下根本没有需要隔离的对象。
@@ -259,7 +266,7 @@ func (s *Server) RequireRole(min core.Role) gin.HandlerFunc {
 // required 只用于日志（把"要什么"和"你是谁"一起写出来），判定本身读 check。
 func (s *Server) require(check func(Principal) bool, required core.Role) gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if !s.sec.authEnabled() {
+		if !s.authRequired() {
 			c.Next()
 			return
 		}
@@ -293,7 +300,7 @@ func (s *Server) require(check func(Principal) bool, required core.Role) gin.Han
 // 中间件在解析 body 之前就得决定放不放行，这类判断只能落在处理器里。
 // 路由上写死的档位一律走 RequireRole，不要两处各判一套。
 func (s *Server) allowRole(c *gin.Context, min core.Role) bool {
-	if !s.sec.authEnabled() {
+	if !s.authRequired() {
 		return true
 	}
 	principal, ok := PrincipalFrom(c)

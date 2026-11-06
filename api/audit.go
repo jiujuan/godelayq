@@ -94,6 +94,11 @@ var auditActions = map[string]string{
 	http.MethodPost + " /api/v1/admin/scheduler/suspend":    "admin.scheduler_suspend",
 	http.MethodPost + " /api/v1/admin/scheduler/unsuspend":  "admin.scheduler_unsuspend",
 	http.MethodDelete + " /api/v1/admin/events":             "admin.events_clear",
+	// 账号管理（mgrstore 启用后）：改的是"谁能进控制台、进来了是什么档位"，
+	// 与执行器档位管理同一量级的留痕需求。
+	http.MethodPost + " /api/v1/admin/users":         "user.create",
+	http.MethodPut + " /api/v1/admin/users/:name":    "user.update",
+	http.MethodDelete + " /api/v1/admin/users/:name": "user.delete",
 }
 
 // AuditVerdicts 是 verdict 列的全部合法取值，供查询端点校验 ?verdict= 用。
@@ -287,7 +292,7 @@ func (s *Server) auditIdentity(c *gin.Context) (actor, kind, role string) {
 	role = principal.Role.String()
 
 	switch {
-	case !s.sec.authEnabled():
+	case !s.authRequired():
 		return "", auditActorAnonymous, role
 	case principal.Name == machinePrincipalName:
 		return principal.Name, auditActorMachine, role

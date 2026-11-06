@@ -31,6 +31,9 @@ type Server struct {
 
 	// auth 是控制台账号的认证器；nil 表示只配了机器凭据或完全没配鉴权
 	auth *Authenticator
+	// userStore 是账号存储；nil = 账号来自配置快照（遗留模式）。
+	// 非 nil 时认证器经它读账号（带缓存），账号管理 API 经它写账号。
+	userStore core.UserStore
 	// tokens 承载登录态的服务端部分：refresh 表 / jti 拒绝表 / 一次性 ticket
 	tokens *authStore
 	// loginLimit 给登录端点做双维度（IP+账号）失败计数：
@@ -103,6 +106,13 @@ type Option func(*Server)
 // 但任务上的 group 标签照常读写——两者是两份数据，不要混用。
 func WithGroupStore(store core.GroupStore) Option {
 	return func(s *Server) { s.groups = store }
+}
+
+// WithUserStore 注入账号存储：认证器随之进入库模式（账号经它读取、带缓存，
+// 改账号即时生效），账号管理端点（/admin/users）也随之启用——两者共用这一个
+// 存储句柄。未注入时账号走配置快照（遗留模式），管理端点返回 503。
+func WithUserStore(store core.UserStore) Option {
+	return func(s *Server) { s.userStore = store }
 }
 
 // WithExecutorProfileStore 注入档位文件的读写口，与 WithExecutorProfileApplier 成对使用：
@@ -180,9 +190,15 @@ func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Sec
 		baseCancel: baseCancel,
 	}
 
+	// 先应用可选依赖：WithUserStore 交给的账号存储决定认证器走哪种模式
+	// （管理库 or 配置快照），所以它必须先于认证器构造到位。
+	for _, opt := range opts {
+		opt(s)
+	}
+
 	// 账号配置有问题（哈希格式、cost、缺密钥）必须挡住启动：
 	// 否则鉴权看似开启，实际所有登录都失败，运维只在现场发现。
-	auth, err := NewAuthenticator(sec.Auth)
+	auth, err := NewAuthenticator(sec.Auth, s.userStore, logger)
 	if err != nil {
 		s.authErr = err
 		logger.Error("authentication is configured but cannot be initialized", "error", err)
@@ -192,9 +208,6 @@ func NewServer(scheduler *core.Scheduler, store core.Store, port string, sec Sec
 		logger.Info("console accounts loaded", "count", len(auth.accountNames()))
 	}
 
-	for _, opt := range opts {
-		opt(s)
-	}
 	// 事件历史跟着服务器起：订阅在构造时建立，服务器活着期间的第一个事件就不会漏。
 	// 上限是常量（api/history.go），运维要看的只是"缓冲占用多少"，不配 knob。
 	s.history = NewEventHistory(scheduler.GetEventBus())
@@ -340,6 +353,17 @@ func (s *Server) setupRoutes() {
 			// 台账的读端点。档位沿用本组的 ops（行内含账号名与拒绝原因，
 			// 比运行诊断更敏感），没装配观测库时由 requireAudit 明确回 503。
 			admin.GET("/audit", s.requireAudit(), s.GetAudit)
+		}
+
+		// 账号管理：admin 及以上（ops 天然包含）。单独建组而不是挂在上面那个
+		// 运维组里：本组门槛是 admin，运维组是 ops——档位语义不同，不能共用。
+		// 没装配账号存储（遗留配置模式）时由 requireUserStore 统一回 503。
+		users := api.Group("/admin/users", s.RequireRole(core.RoleAdmin))
+		{
+			users.GET("", s.ListUsers)
+			users.POST("", s.CreateUser)
+			users.PUT("/:name", s.UpdateUser)
+			users.DELETE("/:name", s.DeleteUser)
 		}
 
 		// 统计与监控。/health 继续保持"启用鉴权则需凭据"的历史契约
