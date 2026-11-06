@@ -16,6 +16,7 @@ import (
 	"godelayq/api"
 	"godelayq/core"
 	"godelayq/executor"
+	"godelayq/store/mgr"
 	"godelayq/store/observe"
 	"godelayq/web"
 )
@@ -115,6 +116,22 @@ type auditLogAPI interface {
 	SetRetention(count int, age time.Duration)
 }
 
+// mgrAPI 是 run 对管理库句柄的要求：报路径（启动日志）、干净关闭。
+// 与 observabilityDB 同样定义在消费方；接口先收窄到这两个方法，
+// mgrstore 带来更多读数需求时再扩，不提前摆空参数。
+type mgrAPI interface {
+	Path() string
+	Close() error
+}
+
+// mgrDBHolder 晚绑定管理库句柄：defaultRuntimeDeps 建好壳，run() 打开管理库后写入；
+// newServer（分组、账号）与 newExecutorProfileStore（档位）两个闭包在各自被调用时读它。
+// 与 reloadStatus 同一手法——闭包在 defaultRuntimeDeps 里建，句柄要等 run() 按配置打开。
+// 只在 mgrstore.enabled=true 时非 nil；两个闭包各自先看配置开关再看句柄。
+type mgrDBHolder struct {
+	handle *mgr.Handle
+}
+
 // observabilityAPI 是装配好的观测层写入器集合，作为 newServer 的最后一个参数交给服务。
 // 整体为 nil 表示这次部署没装观测层；单个字段为 nil 表示那一个子开关关着。
 //
@@ -195,7 +212,13 @@ type runtimeDeps struct {
 	// 列入依赖完整性检查的条件与事件写入器相同：少了它这张表永远是空的，
 	// 而 /admin/audit 看起来"没有符合条件的记录"，与真的没有分不清。
 	newAuditLog func(db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (auditLogAPI, error)
-	newServer   func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry,
+	// newMgrDB 打开 SQLite 管理库（建目录、建表、应用迁移），只在 mgrstore.enabled=true
+	// 时调用。句柄经 mgrDBHolder 晚绑定给 newServer（分组、账号）与
+	// newExecutorProfileStore（档位）两个闭包——与 reloadStatus 同一手法：
+	// 闭包先建、句柄后到。列入依赖完整性检查：少装配它，启用管理库的部署
+	// 会在 nil 句柄上建出三张"永远写不进"的存储。
+	newMgrDB  func(core.Config, *slog.Logger) (mgrAPI, error)
+	newServer func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry,
 		artifacts *executor.ArtifactStore, obs *observabilityAPI, profiles *profileStoreAPI) (serverAPI, error)
 	// 配置热重载（TASK-R06）的三处装配点。全部是函数值或可替换句柄，与上面那些闭包同一种风格：
 	// 集成测试因此能塞一个假 watcher 进去驱动整条链，而不必真的等一次文件系统事件。
@@ -227,6 +250,9 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 	// 而 watcher 得到 server.Start() 之后才建（那条链不该在服务还没监听时就开始改现网）。
 	// 两边靠这个晚绑定的句柄对齐，见 runtimeDeps.reloadStatus 的注释。
 	reloadStatus := &reloadStatusReader{path: configPath}
+	// 管理库句柄的晚绑定壳：run() 打开管理库后写入（见 runtimeDeps.newMgrDB 的注释），
+	// newServer 与 newExecutorProfileStore 两个闭包读它。禁用管理库的部署永远不写它。
+	mgrDB := &mgrDBHolder{}
 
 	return runtimeDeps{
 		config:       cfg,
@@ -246,6 +272,11 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 		},
 		newExecutorRegistry: executor.NewRegistry,
 		newExecutorProfileStore: func(cfg core.Config) (core.ExecutorProfileStore, error) {
+			if cfg.MgrStore.Enabled {
+				// run() 的装配顺序保证管理库先于本闭包打开，句柄必已就位。
+				// 档位以库为准：executors.profiles_path 只剩一次性导入源的语义。
+				return mgr.NewExecutorProfileStore(mgrDB.handle), nil
+			}
 			normalized := cfg.Normalized()
 			profiles, err := core.NewJSONFileExecutorProfileStore(normalized.Executors.ProfilesPath)
 			if err != nil {
@@ -272,6 +303,16 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 				return nil, err
 			}
 			return db, nil
+		},
+		newMgrDB: func(cfg core.Config, logger *slog.Logger) (mgrAPI, error) {
+			handle, err := mgr.Open(cfg.MgrStore, logger)
+			if err != nil {
+				// 与 newObservabilityDB 同一处置：nil 而不是类型化的空指针。
+				return nil, err
+			}
+			// 晚绑定壳在这里填上：newServer 与 newExecutorProfileStore 读它。
+			mgrDB.handle = handle
+			return handle, nil
 		},
 		newEventLog: func(bus *core.EventBus, db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (eventLogAPI, error) {
 			handle, ok := db.(*observe.Handle)
@@ -324,11 +365,19 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 				AllowOrigins:     cfg.Server.CORS.AllowOrigins,
 				AllowCredentials: cfg.Server.CORS.AllowCredentials,
 			}
-			// 分组注册表读不出来就别起服务：与其让 /groups 每个请求都 500，
+			// 分组注册表：mgrstore.enabled 时以库为准，否则走 JSON 文件。
+			// JSON 那条分支读不出来就别起服务：与其让 /groups 每个请求都 500，
 			// 不如在启动日志里就把文件权限/格式问题摆到眼前。
-			groups, err := core.NewJSONFileGroupStore(cfg.Store.GroupsPath)
-			if err != nil {
-				return nil, err
+			var groups core.GroupStore
+			if cfg.MgrStore.Enabled {
+				// run() 的装配顺序保证管理库先于服务构造打开，句柄必已就位。
+				groups = mgr.NewGroupStore(mgrDB.handle)
+			} else {
+				var groupErr error
+				groups, groupErr = core.NewJSONFileGroupStore(cfg.Store.GroupsPath)
+				if groupErr != nil {
+					return nil, groupErr
+				}
 			}
 			opts := []api.Option{
 				api.WithGroupStore(groups),
@@ -460,8 +509,14 @@ func usableConfigFile(candidate string) (string, bool) {
 
 func run(deps runtimeDeps) error {
 	if deps.newStore == nil || deps.newScheduler == nil || deps.newExecutorRegistry == nil ||
-		deps.newArtifactStore == nil || deps.newObservabilityDB == nil || deps.newServer == nil ||
+		deps.newArtifactStore == nil || deps.newObservabilityDB == nil ||
+		deps.newServer == nil ||
 		deps.notifySignals == nil {
+		return fmt.Errorf("runtime dependencies are incomplete")
+	}
+	// 管理库闭包的必需条件：开关打开却少了闭包，后果是 nil 句柄上建出三张
+	// "永远写不进"的存储——分组、档位、账号看起来都在，实际一条都存不下来。
+	if deps.config.MgrStore.Enabled && deps.newMgrDB == nil {
 		return fmt.Errorf("runtime dependencies are incomplete")
 	}
 	// 事件写入器的闭包按"这次要不要用它"来判断必需性：观测层总开关或事件子开关任一关闭时
@@ -529,6 +584,37 @@ func run(deps runtimeDeps) error {
 	}
 	// 事件里输出预览的字节上限：取值已在 Normalized 里补齐，非法值的兜底由调度器负责。
 	scheduler.SetEventPreviewLimit(cfg.Executors.Output.InlinePreview)
+
+	// 管理库在档位存储与服务构造之前打开：newExecutorProfileStore 与 newServer 两个闭包
+	// 都要读它的句柄（mgrDBHolder 晚绑定）。打开或导入失败都拒绝启动——
+	// mgrstore.enabled=true 表示部署方已决定以库为准，"半导半没导"的状态比起不来更难解释。
+	// 关闭顺序由 defer 的声明位次决定（后声明先执行）：观测层写入器 → 观测库 →
+	// 管理库 → 任务存储；管理库的三张表都是同步落库，无需先行收尾。
+	if cfg.MgrStore.Enabled {
+		mgrdb, err := deps.newMgrDB(cfg, deps.logger)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := mgrdb.Close(); err != nil {
+				deps.logger.Error("failed to close mgr database", "error", err)
+			}
+		}()
+		handle, ok := mgrdb.(*mgr.Handle)
+		if !ok {
+			// 与 newEventLog 的断言同一处置：导入要真连接，接了假句柄就报错。
+			return fmt.Errorf("mgr db needs the real handle, got %T", mgrdb)
+		}
+		deps.logger.Info("mgr database opened",
+			"path", handle.Path(), "journal_mode", handle.JournalMode(), "synchronous", handle.Synchronous())
+		if err := mgr.ImportOnce(handle, mgr.ImportSource{
+			AuthUsers:    cfg.Server.Auth.Users,
+			GroupsPath:   cfg.Store.GroupsPath,
+			ProfilesPath: cfg.Executors.ProfilesPath,
+		}, deps.logger); err != nil {
+			return err
+		}
+	}
 
 	// 档位文件在登记表之前读、在注册之前合。两个时点都有理由：
 	//   - 读不出来就没有"这一批档位"可合，那种状态不该带着起服务（见 newExecutorProfileStore）；
