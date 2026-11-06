@@ -83,7 +83,10 @@ var configClasses = map[string]ConfigClass{
 	"observability.busy_timeout": ClassRestart, "observability.synchronous": ClassRestart,
 	"observability.events.enabled": ClassRestart, "observability.artifacts.enabled": ClassRestart,
 	"observability.audit.enabled": ClassRestart,
-	"executors.enabled":           ClassRestart, "executors.required_role": ClassRestart,
+	// 管理库整节归重启档：库在启动时打开、句柄随进程存活，运行期换库无从谈起。
+	"mgrstore.enabled": ClassRestart, "mgrstore.path": ClassRestart,
+	"mgrstore.busy_timeout": ClassRestart, "mgrstore.synchronous": ClassRestart,
+	"executors.enabled": ClassRestart, "executors.required_role": ClassRestart,
 	"executors.workspace": ClassRestart, "executors.runtime_allow": ClassRestart,
 	"executors.env_allow": ClassRestart, "executors.concurrency": ClassRestart,
 	"executors.queue_capacity": ClassRestart, "executors.default_timeout": ClassRestart,

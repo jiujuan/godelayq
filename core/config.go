@@ -32,6 +32,9 @@ type Config struct {
 	// Observability SQLite 观测层（运行事件、产物索引、写操作审计）；默认关闭，
 	// 关闭时不创建任何文件，详见 ObservabilityConfig。
 	Observability ObservabilityConfig `mapstructure:"observability"`
+	// MgrStore SQLite 管理库（控制台账号、分组元数据、执行器档位）；默认关闭，
+	// 关闭时这三类数据走配置与 JSON 文件，详见 MgrStoreConfig。
+	MgrStore MgrStoreConfig `mapstructure:"mgrstore"`
 	// Reload 配置热重载的开关与节奏；默认关闭，关闭时一个监听器都不建，详见 ReloadConfig。
 	Reload ReloadConfig `mapstructure:"reload"`
 }
@@ -795,6 +798,52 @@ func (o ObservabilityConfig) Validate() error {
 	return nil
 }
 
+// 管理库的默认值。库文件落在 data/ 目录树，与 observe.sqlite、jobs.json 同一取向；
+// busy/synchronous 沿用观测层的那组口径（本地库 + WAL + normal）。
+const (
+	// DefaultMgrDBPath 管理库文件位置。
+	DefaultMgrDBPath = "./data/goqsys_mgr.sqlite"
+	// DefaultMgrBusyTimeout SQLite busy 等待上限。
+	DefaultMgrBusyTimeout = DefaultObserveBusyTimeout
+	// DefaultMgrSynchronous SQLite synchronous PRAGMA 取值。
+	DefaultMgrSynchronous = DefaultObserveSynchronous
+)
+
+// MgrStoreConfig 管理库：控制台账号、分组元数据、执行器档位的 SQLite 存储。
+// 默认关闭——关闭时这三类数据继续走既有文件（server.auth.users、store.groups_path、
+// executors.profiles_path），进程行为与本节不存在时完全一致，不创建任何文件。
+// 打开后这三类数据以库为准，配置与 JSON 文件只在首次启动时作为一次性导入源。
+type MgrStoreConfig struct {
+	// Enabled 管理库总开关。false 时不建库文件，进程按文件形态运行。
+	Enabled bool `mapstructure:"enabled"`
+	// Path 库文件路径；空表示 DefaultMgrDBPath，父目录不存在时由装配方创建。
+	Path string `mapstructure:"path"`
+	// BusyTimeout SQLite busy 等待上限；0 表示 DefaultMgrBusyTimeout。
+	BusyTimeout time.Duration `mapstructure:"busy_timeout"`
+	// Synchronous SQLite synchronous PRAGMA：normal|full，空表示 DefaultMgrSynchronous。
+	Synchronous string `mapstructure:"synchronous"`
+}
+
+// Validate 校验管理库自身的取值。与 ObservabilityConfig.Validate 同一口径：
+// Enabled 为 false 时本节全部取值不生效。
+func (m MgrStoreConfig) Validate() error {
+	if !m.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(m.Path) == "" {
+		return fmt.Errorf("mgrstore.path must not be empty when mgrstore.enabled is true")
+	}
+	switch strings.TrimSpace(m.Synchronous) {
+	case "", "normal", "full":
+	default:
+		return fmt.Errorf("mgrstore.synchronous %q is invalid, use normal or full", m.Synchronous)
+	}
+	if m.BusyTimeout < 0 {
+		return fmt.Errorf("mgrstore.busy_timeout must not be negative, got %v", m.BusyTimeout)
+	}
+	return nil
+}
+
 // DefaultConfig 返回与代码内置默认值一致的配置
 func DefaultConfig() Config {
 	return Config{
@@ -884,6 +933,14 @@ func DefaultConfig() Config {
 				RetentionCount: DefaultObserveAuditRetentionCount,
 				RetentionAge:   DefaultObserveAuditRetentionAge,
 			},
+		},
+		MgrStore: MgrStoreConfig{
+			// 默认关闭：打开它等于把账号、分组、档位从配置与 JSON 文件迁进 SQLite，
+			// 必须由部署方显式决定（导入行为见 store/mgr 的一次性导入说明）。
+			Enabled:     false,
+			Path:        DefaultMgrDBPath,
+			BusyTimeout: DefaultMgrBusyTimeout,
+			Synchronous: DefaultMgrSynchronous,
 		},
 		Reload: ReloadConfig{
 			// 默认关闭：打开它等于让进程盯着配置文件自动换取值，
@@ -1073,6 +1130,10 @@ func (c Config) Validate() error {
 		return err
 	}
 
+	if err := c.MgrStore.Validate(); err != nil {
+		return err
+	}
+
 	// 配置热重载：与 executors.* 那组方向不同——关闭状态下 reload.debounce 也没有
 	// "合法的过小写法"，因为它会被 Normalized 补成默认值，写 10ms 只会是写错而不是"不生效"。
 	// 0 是唯一合法的"用默认值"写法：LoadConfig 里 Validate 在 Normalized 之前，
@@ -1220,6 +1281,16 @@ func (c Config) Normalized() Config {
 	}
 	if c.Observability.Synchronous == "" {
 		c.Observability.Synchronous = defaults.Observability.Synchronous
+	}
+
+	if c.MgrStore.Path == "" {
+		c.MgrStore.Path = defaults.MgrStore.Path
+	}
+	if c.MgrStore.BusyTimeout <= 0 {
+		c.MgrStore.BusyTimeout = defaults.MgrStore.BusyTimeout
+	}
+	if c.MgrStore.Synchronous == "" {
+		c.MgrStore.Synchronous = defaults.MgrStore.Synchronous
 	}
 	if c.Observability.Events.RetentionCount <= 0 {
 		c.Observability.Events.RetentionCount = defaults.Observability.Events.RetentionCount

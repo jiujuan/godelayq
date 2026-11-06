@@ -256,6 +256,12 @@ func checkProfileRecord(record ExecutorProfileRecord) error {
 	return nil
 }
 
+// ValidateProfileRecord 是档位记录校验的公开入口（checkProfileRecord 的导出别名）：
+// SQLite 存储实现与 JSON 实现在 Save 前调用同一份规则，规则的唯一出处在这里。
+func ValidateProfileRecord(record ExecutorProfileRecord) error {
+	return checkProfileRecord(record)
+}
+
 // 编译期钉住接口实现：ExecutorProfileStore 的方法集一旦改动，这里立刻报错，
 // 而不是等到 HTTP 层接线时才发现漏了方法。
 var _ ExecutorProfileStore = (*JSONFileExecutorProfileStore)(nil)

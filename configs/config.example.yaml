@@ -254,6 +254,24 @@ observability:
     # 保留时长；0 表示不按时间淘汰。默认 90 天：安全台账的价值在事后追溯。
     retention_age: 2160h
 
+# SQLite 管理库：控制台账号、分组元数据、执行器档位三张本地表。
+# 默认关闭——关闭时这三类数据走既有位置（server.auth.users、store.groups_path、
+# executors.profiles_path），进程行为与本节不存在时一致，不创建任何文件。
+# 打开后这三类数据以库为准：首次启动做一次性导入（config 里的 users、两个 JSON 文件，
+# 库非空即跳过），之后 server.auth.users 节废弃、两个 JSON 文件不再被读取。
+# 改账号此后走账号管理 API（/api/v1/admin/users），改完即时生效，不必重启。
+mgrstore:
+# 总开关。false 时不创建任何文件。
+  enabled: false
+# 管理库文件路径，父目录不存在时由启动装配创建。文件权限 0640、目录 0750，
+# 与观测库同一取向——这里存的是账号密码哈希，不放给同机其它用户读；
+# WAL 模式会额外产生 -wal/-shm 旁文件，连同主文件一起加进 .gitignore。
+  path: ./data/goqsys_mgr.sqlite
+# SQLite 锁等待上限；0 用默认 2s。单连接写入已消除大部分 busy 竞争。
+  busy_timeout: 2s
+# synchronous PRAGMA：normal（默认）| full。口径与观测库相同。
+  synchronous: normal
+
 # 配置热重载：改文件即生效，不必重启进程。默认关闭，关闭时一个监听器都不建，
 # 进程行为与本节不存在时一致。
 # 设计依据见 docs/design/config-reload-design.md，实施进度见 docs/design/tasks/config-reload/README.md。
