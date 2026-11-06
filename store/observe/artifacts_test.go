@@ -58,14 +58,14 @@ func (f *indexFixture) index(t *testing.T) *ArtifactIndex {
 }
 
 // recordOf 造一次执行的登记项，路径按产物根目录下的标准布局写。
-func (f *indexFixture) recordOf(jobID string, attempt int, outBytes, errBytes int64, truncated bool) executor.IndexRecord {
+func (f *indexFixture) recordOf(jobID string, attempt int, outBytes, errBytes int64, truncated bool) core.ArtifactIndexRecord {
 	dir := filepath.Join(f.root, jobID)
-	return executor.IndexRecord{
+	return core.ArtifactIndexRecord{
 		JobID:   jobID,
 		Attempt: attempt,
 		Kind:    string(executor.KindScript),
 		Profile: "hello",
-		Info: executor.ArtifactInfo{
+		Info: core.ArtifactInfo{
 			JobID:     jobID,
 			Attempt:   attempt,
 			OutPath:   filepath.Join(dir, "a"+strconv.Itoa(attempt)+".out"),
@@ -78,7 +78,7 @@ func (f *indexFixture) recordOf(jobID string, attempt int, outBytes, errBytes in
 }
 
 // mustRecord 登记一次，失败就让用例停在这里。
-func mustRecord(t *testing.T, idx *ArtifactIndex, rec executor.IndexRecord) {
+func mustRecord(t *testing.T, idx *ArtifactIndex, rec core.ArtifactIndexRecord) {
 	t.Helper()
 
 	if err := idx.Record(rec); err != nil {
@@ -87,7 +87,7 @@ func mustRecord(t *testing.T, idx *ArtifactIndex, rec executor.IndexRecord) {
 }
 
 // mustList 读回一个任务的行。
-func mustList(t *testing.T, idx *ArtifactIndex, jobID string) []executor.IndexRecord {
+func mustList(t *testing.T, idx *ArtifactIndex, jobID string) []core.ArtifactIndexRecord {
 	t.Helper()
 
 	got, err := idx.List(jobID)
@@ -250,7 +250,7 @@ func TestArtifactIndex_BadJobIDRejected(t *testing.T) {
 	f := newIndexFixture(t)
 	idx := f.index(t)
 
-	// 校验规则与产物存储同一个来源（executor.CheckArtifactJobID），这里不另写一套
+	// 校验规则与产物存储同一个来源（core.CheckArtifactJobID），这里不另写一套
 	bad := []string{"../escape", "a/b", `a\b`, "带中文", "", "job.id", "job:id"}
 	for _, jobID := range bad {
 		if err := idx.Record(f.recordOf(jobID, 1, 1, 1, false)); err == nil {
@@ -423,7 +423,7 @@ func TestArtifactIndex_RealWriterBytesMatchDisk(t *testing.T) {
 	}
 
 	idx := newIndexFixtureAt(t, root).index(t)
-	mustRecord(t, idx, executor.IndexRecord{
+	mustRecord(t, idx, core.ArtifactIndexRecord{
 		JobID:   "job-real",
 		Attempt: 1,
 		Kind:    string(executor.KindScript),

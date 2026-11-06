@@ -18,14 +18,14 @@ import (
 // fakeArtifactIndex 是 executor.ArtifactIndexer 的替身：列表端点与 purged 标注只关心
 // 自己被怎么调用，真读库在 store/sqlite 那一侧有用例。
 type fakeArtifactIndex struct {
-	rows      []executor.IndexRecord
+	rows      []core.ArtifactIndexRecord
 	listErr   error
 	markErr   error
 	recordErr error
 
 	listCalls   []string
 	markPurged  []artifactMark
-	recorded    []executor.IndexRecord
+	recorded    []core.ArtifactIndexRecord
 	deletedJobs []string
 }
 
@@ -35,7 +35,7 @@ type artifactMark struct {
 	Attempt int
 }
 
-func (f *fakeArtifactIndex) Record(rec executor.IndexRecord) error {
+func (f *fakeArtifactIndex) Record(rec core.ArtifactIndexRecord) error {
 	if f.recordErr != nil {
 		return f.recordErr
 	}
@@ -61,7 +61,7 @@ func (f *fakeArtifactIndex) DeleteByJob(jobID string) error {
 	return nil
 }
 
-func (f *fakeArtifactIndex) List(jobID string) ([]executor.IndexRecord, error) {
+func (f *fakeArtifactIndex) List(jobID string) ([]core.ArtifactIndexRecord, error) {
 	f.listCalls = append(f.listCalls, jobID)
 	if f.listErr != nil {
 		return nil, f.listErr
@@ -73,15 +73,15 @@ func (f *fakeArtifactIndex) Exists(string, int) (bool, error) { return false, ni
 
 // indexArtifact 造一行索引记录，字段填满以便对照响应。
 func indexArtifact(jobID string, attempt int, profile string, out, errBytes int64,
-	truncated bool, state string) executor.IndexRecord {
-	return executor.IndexRecord{
+	truncated bool, state string) core.ArtifactIndexRecord {
+	return core.ArtifactIndexRecord{
 		JobID:     jobID,
 		Attempt:   attempt,
 		Kind:      string(executor.KindScript),
 		Profile:   profile,
 		State:     state,
 		CreatedAt: time.Date(2026, 10, 1, 12, 0, attempt, 0, time.UTC),
-		Info: executor.ArtifactInfo{
+		Info: core.ArtifactInfo{
 			JobID:     jobID,
 			Attempt:   attempt,
 			OutBytes:  out,
@@ -147,7 +147,7 @@ func TestListJobArtifacts_Empty200(t *testing.T) {
 }
 
 func TestListJobArtifacts_RecordsAndOrder(t *testing.T) {
-	index := &fakeArtifactIndex{rows: []executor.IndexRecord{
+	index := &fakeArtifactIndex{rows: []core.ArtifactIndexRecord{
 		indexArtifact("job-1", 1, "hello", 42, 512, false, core.ArtifactAvailable),
 		indexArtifact("job-1", 2, "hello", 0, 128, true, core.ArtifactPurged),
 	}}

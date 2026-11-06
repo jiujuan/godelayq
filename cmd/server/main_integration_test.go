@@ -1308,11 +1308,11 @@ func TestRun_NoServerReaderWhenEventsDisabled(t *testing.T) {
 // 索引真正的读写行为在 store/sqlite 与 executor 两侧各有用例。
 type artifactIndexStub struct{}
 
-func (s *artifactIndexStub) Record(executor.IndexRecord) error { return nil }
+func (s *artifactIndexStub) Record(core.ArtifactIndexRecord) error { return nil }
 func (s *artifactIndexStub) MarkPurged(string, int) error      { return nil }
 func (s *artifactIndexStub) MarkAllPurged(string) error        { return nil }
 func (s *artifactIndexStub) DeleteByJob(string) error          { return nil }
-func (s *artifactIndexStub) List(string) ([]executor.IndexRecord, error) {
+func (s *artifactIndexStub) List(string) ([]core.ArtifactIndexRecord, error) {
 	return nil, nil
 }
 func (s *artifactIndexStub) Exists(string, int) (bool, error) { return false, nil }

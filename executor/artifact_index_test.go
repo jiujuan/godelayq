@@ -38,7 +38,7 @@ type deletedCall struct {
 type fakeIndex struct {
 	root string
 
-	records   []IndexRecord
+	records   []core.ArtifactIndexRecord
 	purged    []purgeMark
 	allPurged []string
 	deleted   []deletedCall
@@ -47,7 +47,7 @@ type fakeIndex struct {
 	recordErr   error
 	markErr     error
 	deleteErr   error
-	listRows    []IndexRecord
+	listRows    []core.ArtifactIndexRecord
 	listErr     error
 	existsValue bool
 
@@ -59,7 +59,7 @@ type fakeIndex struct {
 	reconcileAnswers []string
 }
 
-func (f *fakeIndex) Record(rec IndexRecord) error {
+func (f *fakeIndex) Record(rec core.ArtifactIndexRecord) error {
 	if f.recordErr != nil {
 		return f.recordErr
 	}
@@ -92,7 +92,7 @@ func (f *fakeIndex) DeleteByJob(jobID string) error {
 	return nil
 }
 
-func (f *fakeIndex) List(jobID string) ([]IndexRecord, error) {
+func (f *fakeIndex) List(jobID string) ([]core.ArtifactIndexRecord, error) {
 	f.lists = append(f.lists, jobID)
 	if f.listErr != nil {
 		return nil, f.listErr
@@ -315,7 +315,7 @@ func TestSetIndex_NilIsSafe(t *testing.T) {
 func TestIndexAccessors_NilStoreIsSafe(t *testing.T) {
 	var store *ArtifactStore
 	assert.Nil(t, store.Index())
-	store.recordIndex(KindScript, "hello", ArtifactInfo{JobID: "job-a"})
+	store.recordIndex(KindScript, "hello", core.ArtifactInfo{JobID: "job-a"})
 	store.deleteIndexRows("job-a")
 	store.reconcileIndex()
 }
@@ -387,11 +387,11 @@ func TestStart_WithoutReconcilerIsFine(t *testing.T) {
 // plainIndex 只实现 ArtifactIndexer 的必需方法，用来证明对账接口确实是可选的。
 type plainIndex struct{}
 
-func (p *plainIndex) Record(IndexRecord) error           { return nil }
+func (p *plainIndex) Record(core.ArtifactIndexRecord) error           { return nil }
 func (p *plainIndex) MarkPurged(string, int) error       { return nil }
 func (p *plainIndex) MarkAllPurged(string) error         { return nil }
 func (p *plainIndex) DeleteByJob(string) error           { return nil }
-func (p *plainIndex) List(string) ([]IndexRecord, error) { return nil, nil }
+func (p *plainIndex) List(string) ([]core.ArtifactIndexRecord, error) { return nil, nil }
 func (p *plainIndex) Exists(string, int) (bool, error)   { return false, nil }
 
 // raceIndex 是加了锁的索引替身：本卡 §9 的那条风险是两个 goroutine 同时触达索引
@@ -404,7 +404,7 @@ type raceIndex struct {
 	deletes []deletedCall
 }
 
-func (r *raceIndex) Record(IndexRecord) error {
+func (r *raceIndex) Record(core.ArtifactIndexRecord) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.records++
@@ -423,7 +423,7 @@ func (r *raceIndex) DeleteByJob(jobID string) error {
 	return nil
 }
 
-func (r *raceIndex) List(string) ([]IndexRecord, error) { return nil, nil }
+func (r *raceIndex) List(string) ([]core.ArtifactIndexRecord, error) { return nil, nil }
 
 func (r *raceIndex) Exists(string, int) (bool, error) { return false, nil }
 

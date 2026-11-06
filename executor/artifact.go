@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+
+	"godelayq/core"
 	"os"
 	"path/filepath"
 	"strings"
@@ -125,35 +127,9 @@ func (a *ArtifactStore) MaxBytes() int { return a.maxBytes }
 // TTL 返回保留时长，0 表示不按时间清理。
 func (a *ArtifactStore) TTL() time.Duration { return a.ttl }
 
-// CheckArtifactJobID 拒绝任何可能被当成路径写法的任务 ID。产物索引（store/sqlite）
-// 在写库与按 ID 查询时用同一个判断，不另写一套规则。
-//
-// 现实里的 ID 是 UUIDv7 文本形式，只含小写十六进制与连字符；但目录名来自调用方
-// （自行接入的程序、测试、以及未来任何写入路径），所以这里不依赖"上游一定安全"：
-// 分隔符、点号（含 `..`）、绝对路径前缀与任何非 ASCII 都挡掉。
-func CheckArtifactJobID(jobID string) error { return checkArtifactJobID(jobID) }
-
-func checkArtifactJobID(jobID string) error {
-	if jobID == "" {
-		return errors.New("artifact: job id is empty")
-	}
-	if len(jobID) > 128 {
-		return fmt.Errorf("artifact: job id too long (%d characters)", len(jobID))
-	}
-	for _, r := range jobID {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
-			// 允许字母、数字与连字符，其余（`.` `/` `\` `:` 等）一律拒绝
-		default:
-			return fmt.Errorf("artifact: job id %q contains an unusable character %q", jobID, r)
-		}
-	}
-	return nil
-}
-
 // jobDir 校验 ID 并给出该任务的产物目录。
 func (a *ArtifactStore) jobDir(jobID string) (string, error) {
-	if err := checkArtifactJobID(jobID); err != nil {
+	if err := core.CheckArtifactJobID(jobID); err != nil {
 		return "", err
 	}
 	return filepath.Join(a.dir, jobID), nil
@@ -234,7 +210,7 @@ func (w *ArtifactWriter) OutPath() string { return w.stdout.path }
 func (w *ArtifactWriter) ErrPath() string { return w.stderr.path }
 
 // Close 关闭两个文件并返回落盘结论。重复调用安全，返回同样的结论。
-func (w *ArtifactWriter) Close() (ArtifactInfo, error) {
+func (w *ArtifactWriter) Close() (core.ArtifactInfo, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
@@ -251,8 +227,8 @@ func (w *ArtifactWriter) Close() (ArtifactInfo, error) {
 	return info, err
 }
 
-func (w *ArtifactWriter) info() ArtifactInfo {
-	return ArtifactInfo{
+func (w *ArtifactWriter) info() core.ArtifactInfo {
+	return core.ArtifactInfo{
 		JobID:     w.jobID,
 		Attempt:   w.attempt,
 		OutPath:   w.OutPath(),
@@ -261,17 +237,6 @@ func (w *ArtifactWriter) info() ArtifactInfo {
 		ErrBytes:  w.stderr.written(),
 		Truncated: w.stdout.truncated() || w.stderr.truncated(),
 	}
-}
-
-// ArtifactInfo 是一次执行产物的落盘结论，由 Close 返回给执行侧填进 core.ExecMeta。
-type ArtifactInfo struct {
-	JobID     string `json:"job_id"`
-	Attempt   int    `json:"attempt"`
-	OutPath   string `json:"out_path"`
-	ErrPath   string `json:"err_path"`
-	OutBytes  int64  `json:"out_bytes"`
-	ErrBytes  int64  `json:"err_bytes"`
-	Truncated bool   `json:"truncated,omitempty"`
 }
 
 // metaFileName 是某次尝试的元数据文件名。
@@ -618,7 +583,7 @@ func (a *ArtifactStore) jobDirs() ([]string, error) {
 		}
 		// 目录名是写入时校验过的，但手工放进来的名字不受约束；
 		// 校验不过的名字不参与清理，避免误删别人放在这里的目录。
-		if err := checkArtifactJobID(entry.Name()); err != nil {
+		if err := core.CheckArtifactJobID(entry.Name()); err != nil {
 			a.logger.Warn("artifact entry is not a job id, leaving it alone", "name", entry.Name())
 			continue
 		}

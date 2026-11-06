@@ -2,37 +2,11 @@ package executor
 
 import (
 	"os"
-	"time"
+
+	"godelayq/core"
 )
 
-// IndexRecord 是一次执行的输出登记项，一行对应一个 (job_id, attempt)。
-//
-// Kind 与 Profile 由执行器给出：ArtifactStore 只管文件，不认识档位，
-// 而列表端点要回答的"这是哪条档位跑出来的"只有执行侧知道。
-// 字节数与截断标记来自 ArtifactInfo，也就是 writer.Close() 那份结论——
-// 索引与任务摘要必须同源，不能各算一套。
-type IndexRecord struct {
-	JobID   string
-	Attempt int
-	Kind    string // script|binary|http
-	Profile string // 档位名，不含 exec. 前缀
-	Info    ArtifactInfo
-
-	// State 与 CreatedAt 只有读的时候才需要由实现填写：写入时状态恒为
-	// core.ArtifactAvailable（文件刚刚写完），时间取实现自己的时间源。
-	// 调用方传进来的这两个字段在 Record 里被忽略。
-	State     string
-	CreatedAt time.Time
-
-	// OutRel 与 ErrRel 同理，只在读取结果里有意义：库里存的是相对产物根目录的写法，
-	// 绝对路径不入库（与 Profile.ProgramDisplay() 不把服务器目录结构透给前端同一取向）。
-	// Info.OutPath/ErrPath 保持为空——那两个是要交给 os 打开的路径，
-	// 拿相对写法去开文件会指向错误的目录。
-	OutRel string
-	ErrRel string
-}
-
-// ArtifactIndexer 是产物索引的读写能力，由 store/sqlite 的产物索引实现。
+// ArtifactIndexer 是产物索引的读写能力，由 store/observe 的产物索引实现。
 //
 // 它是可选依赖：nil 表示不维护索引，产物的写入、读取、清理路径与本能力存在之前完全一致。
 // 定位是加速器而不是账本（设计文档 D8）：文件才是权威，索引里缺一行只意味着
@@ -44,7 +18,7 @@ type IndexRecord struct {
 type ArtifactIndexer interface {
 	// Record 登记一次执行。同一 (job_id, attempt) 再次 Record 是覆盖：清理后再读、
 	// 或者同一个任务被重复跑到同一个 attempt 都会二次触达这一行。
-	Record(rec IndexRecord) error
+	Record(rec core.ArtifactIndexRecord) error
 	// MarkPurged 把某一次尝试标成已清理。只标这一条：同一任务的其他尝试的产物可能还在，
 	// 全标是假话。
 	MarkPurged(jobID string, attempt int) error
@@ -53,7 +27,7 @@ type ArtifactIndexer interface {
 	// DeleteByJob 删除一个任务的全部行，在产物目录删除成功之后调用。
 	DeleteByJob(jobID string) error
 	// List 按 attempt 升序返回一个任务的全部行。
-	List(jobID string) ([]IndexRecord, error)
+	List(jobID string) ([]core.ArtifactIndexRecord, error)
 	// Exists 判断索引里有没有这一次尝试。
 	Exists(jobID string, attempt int) (bool, error)
 }
@@ -87,11 +61,11 @@ func (a *ArtifactStore) Index() ArtifactIndexer {
 // 登记失败只记一条 warn：文件已经落盘，摘要也已经写进任务快照，
 // 索引缺一行的后果只是列表端点看不见它（D8）。让任务因为索引写不进去而失败，
 // 等于把加速器升级成了执行路径上的依赖。
-func (a *ArtifactStore) recordIndex(kind Kind, profileName string, info ArtifactInfo) {
+func (a *ArtifactStore) recordIndex(kind Kind, profileName string, info core.ArtifactInfo) {
 	if a == nil || a.index == nil {
 		return
 	}
-	if err := a.index.Record(IndexRecord{
+	if err := a.index.Record(core.ArtifactIndexRecord{
 		JobID:   info.JobID,
 		Attempt: info.Attempt,
 		Kind:    string(kind),

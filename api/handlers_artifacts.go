@@ -5,6 +5,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"godelayq/core"
 	"godelayq/executor"
 )
 
@@ -66,7 +67,7 @@ func (s *Server) requireIndex() gin.HandlerFunc {
 // "没有记录"是正常状态。本端点不查任务是否存在（那要读任务存储，与这张表无关）。
 func (s *Server) ListJobArtifacts(c *gin.Context) {
 	jobID := c.Param("id")
-	if err := executor.CheckArtifactJobID(jobID); err != nil {
+	if err := core.CheckArtifactJobID(jobID); err != nil {
 		// 这个 ID 连产物目录名都当不了，任务存储里也不会有它：与其让库那一侧的
 		// 同一套校验把请求打成 500（写着"服务器坏了"），不如当场说清是哪一段不对。
 		s.respondBadParam(c, "id", jobID, err.Error())

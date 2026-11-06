@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"godelayq/core"
-	"godelayq/executor"
 )
 
 // errNeedDirCheck 是对账少了判断函数的情形：没有它就无法判断哪一行的文件已经不在，
@@ -26,8 +25,10 @@ type ArtifactIndexOptions struct {
 	Now func() time.Time
 }
 
-// ArtifactIndex 是 artifact_index 表的实现，同时满足 executor.ArtifactIndexer
-// 与 executor.IndexReconciler。
+// ArtifactIndex 是 artifact_index 表的实现，隐式满足消费方 executor 侧声明的
+// ArtifactIndexer 与 IndexReconciler——本包不 import executor，是否满足由装配方
+// （cmd/server 的 newArtifactIndex 闭包把返回值交给 executor.ArtifactIndexer）
+// 在编译期把关。行结构是 core.ArtifactIndexRecord：共享词汇放 core。
 //
 // 定位是加速器而不是账本（设计文档 D8）：这里每个方法的错误都由调用方记日志，
 // 没有一个会改动执行结果，也没有一个会阻止产物文件被读到。
@@ -76,8 +77,8 @@ const insertArtifact = `INSERT INTO artifact_index
 
 // Record 登记一次执行。写入状态恒为 available：调用点在文件刚关完之后，
 // IndexRecord 里的 State 与 CreatedAt 在写侧被忽略（见该结构的字段注释）。
-func (i *ArtifactIndex) Record(rec executor.IndexRecord) error {
-	if err := executor.CheckArtifactJobID(rec.JobID); err != nil {
+func (i *ArtifactIndex) Record(rec core.ArtifactIndexRecord) error {
+	if err := core.CheckArtifactJobID(rec.JobID); err != nil {
 		return fmt.Errorf("sqlite: artifact index: %w", err)
 	}
 	if rec.Attempt < 0 {
@@ -156,7 +157,7 @@ func (i *ArtifactIndex) markPurged(jobID string, attempt *int) (int64, error) {
 
 // MarkPurged 只标这一次尝试：同一任务其他尝试的产物可能还在，全标是假话。
 func (i *ArtifactIndex) MarkPurged(jobID string, attempt int) error {
-	if err := executor.CheckArtifactJobID(jobID); err != nil {
+	if err := core.CheckArtifactJobID(jobID); err != nil {
 		return fmt.Errorf("sqlite: artifact index: %w", err)
 	}
 	_, err := i.markPurged(jobID, &attempt)
@@ -165,7 +166,7 @@ func (i *ArtifactIndex) MarkPurged(jobID string, attempt int) error {
 
 // MarkAllPurged 标掉一个任务的全部行，供启动期对账使用。
 func (i *ArtifactIndex) MarkAllPurged(jobID string) error {
-	if err := executor.CheckArtifactJobID(jobID); err != nil {
+	if err := core.CheckArtifactJobID(jobID); err != nil {
 		return fmt.Errorf("sqlite: artifact index: %w", err)
 	}
 	_, err := i.markPurged(jobID, nil)
@@ -175,7 +176,7 @@ func (i *ArtifactIndex) MarkAllPurged(jobID string) error {
 // DeleteByJob 删掉一个任务的全部行。调用方必须在产物目录删除成功之后，
 // 顺序反过来会留下"索引说没有、文件还在"的状态。
 func (i *ArtifactIndex) DeleteByJob(jobID string) error {
-	if err := executor.CheckArtifactJobID(jobID); err != nil {
+	if err := core.CheckArtifactJobID(jobID); err != nil {
 		return fmt.Errorf("sqlite: artifact index: %w", err)
 	}
 	if _, err := i.db.SQL().Exec(`DELETE FROM artifact_index WHERE job_id = ?`, jobID); err != nil {
@@ -190,8 +191,8 @@ const artifactSelect = `SELECT job_id, attempt, kind, profile, out_rel, err_rel,
 	FROM artifact_index`
 
 // List 按 attempt 升序返回一个任务的全部行：重试链的自然阅读顺序。
-func (i *ArtifactIndex) List(jobID string) ([]executor.IndexRecord, error) {
-	if err := executor.CheckArtifactJobID(jobID); err != nil {
+func (i *ArtifactIndex) List(jobID string) ([]core.ArtifactIndexRecord, error) {
+	if err := core.CheckArtifactJobID(jobID); err != nil {
 		return nil, fmt.Errorf("sqlite: artifact index: %w", err)
 	}
 	rows, err := i.db.SQL().Query(artifactSelect+` WHERE job_id = ? ORDER BY attempt ASC`, jobID)
@@ -201,7 +202,7 @@ func (i *ArtifactIndex) List(jobID string) ([]executor.IndexRecord, error) {
 	defer rows.Close()
 
 	// 空列表而不是 nil：端点把它序列化出去是 []，调用方不必再判一次
-	out := make([]executor.IndexRecord, 0, 4)
+	out := make([]core.ArtifactIndexRecord, 0, 4)
 	for rows.Next() {
 		rec, err := scanArtifact(rows)
 		if err != nil {
@@ -217,7 +218,7 @@ func (i *ArtifactIndex) List(jobID string) ([]executor.IndexRecord, error) {
 
 // Exists 判断索引里有没有这一次尝试。
 func (i *ArtifactIndex) Exists(jobID string, attempt int) (bool, error) {
-	if err := executor.CheckArtifactJobID(jobID); err != nil {
+	if err := core.CheckArtifactJobID(jobID); err != nil {
 		return false, fmt.Errorf("sqlite: artifact index: %w", err)
 	}
 	var one int
@@ -239,7 +240,7 @@ type rowArtifacts interface {
 
 // scanArtifact 还原一行。时间与路径都是"读侧字段"：写侧的 State/CreatedAt/Info.OutPath
 // 由实现自己填，读回来放在这里，调用方不会拿它们去开文件。
-func scanArtifact(row rowArtifacts) (executor.IndexRecord, error) {
+func scanArtifact(row rowArtifacts) (core.ArtifactIndexRecord, error) {
 	var (
 		jobID      string
 		attempt    int
@@ -256,10 +257,10 @@ func scanArtifact(row rowArtifacts) (executor.IndexRecord, error) {
 	err := row.Scan(&jobID, &attempt, &kind, &profile, &outRel, &errRel,
 		&outBytes, &errBytes, &truncated, &state, &createdSec)
 	if err != nil {
-		return executor.IndexRecord{}, err
+		return core.ArtifactIndexRecord{}, err
 	}
 
-	rec := executor.IndexRecord{
+	rec := core.ArtifactIndexRecord{
 		JobID:     jobID,
 		Attempt:   attempt,
 		Kind:      kind,
@@ -268,7 +269,7 @@ func scanArtifact(row rowArtifacts) (executor.IndexRecord, error) {
 		CreatedAt: time.Unix(createdSec, 0),
 		OutRel:    outRel.String,
 		ErrRel:    errRel.String,
-		Info: executor.ArtifactInfo{
+		Info: core.ArtifactInfo{
 			JobID:     jobID,
 			Attempt:   attempt,
 			OutBytes:  outBytes,
@@ -319,10 +320,3 @@ func (i *ArtifactIndex) ReconcileMissing(dirExists func(jobID string) bool) (int
 	}
 	return marked, nil
 }
-
-// 编译期把两个能力钉在类型上：接口定义在 executor 侧（消费方声明能力），
-// 装配方在这里确认实现没有漏方法。
-var (
-	_ executor.ArtifactIndexer = (*ArtifactIndex)(nil)
-	_ executor.IndexReconciler = (*ArtifactIndex)(nil)
-)
