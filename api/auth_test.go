@@ -393,7 +393,7 @@ func TestNewAuthenticatorRejectsBrokenAccountConfig(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := NewAuthenticator(tc.auth)
+			_, err := NewAuthenticator(tc.auth, nil, nil)
 			require.Error(t, err)
 			assert.Contains(t, err.Error(), tc.want)
 		})
@@ -402,7 +402,7 @@ func TestNewAuthenticatorRejectsBrokenAccountConfig(t *testing.T) {
 
 func TestNewAuthenticatorDisabledWithoutUsers(t *testing.T) {
 	// 只配了机器凭据的部署不该被要求准备 JWT 密钥
-	auth, err := NewAuthenticator(core.AuthConfig{Token: testToken})
+	auth, err := NewAuthenticator(core.AuthConfig{Token: testToken}, nil, nil)
 	require.NoError(t, err)
 	assert.Nil(t, auth)
 	assert.False(t, auth.Enabled())
