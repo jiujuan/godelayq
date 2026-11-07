@@ -159,11 +159,13 @@ type SchedulerConfig struct {
 
 // StoreConfig 持久化配置
 type StoreConfig struct {
-	// Type 存储后端，目前仅支持 "json"
+	// Type 存储后端："json"（默认，合并落盘）|"sqlite"（直写，TASK-M03）。
+	// 切换是重启档：两种后端的数据文件互不相认，运行期换型没有意义。
 	Type string `mapstructure:"type"`
-	// Path JSON 存储文件路径
+	// Path JSON 存储文件路径。Type=sqlite 时本键降级为一次性导入源（见 store/jobs）。
 	Path string `mapstructure:"path"`
-	// FlushInterval 合并落盘周期，0 表示 DefaultFlushInterval
+	// FlushInterval 合并落盘周期，0 表示 DefaultFlushInterval。
+	// 仅 json 后端生效：sqlite 直写没有"后台合并"这个环节。
 	FlushInterval time.Duration `mapstructure:"flush_interval"`
 	// HistoryLimit 终态（成功/失败/取消）快照保留条数，
 	// 0 表示 DefaultHistoryLimit，-1 表示不留痕（写入即删除）
@@ -173,6 +175,8 @@ type StoreConfig struct {
 	// GroupsPath 分组元数据文件路径，与任务快照分文件存放：
 	// 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
 	GroupsPath string `mapstructure:"groups_path"`
+	// SQLite SQLite 后端取值，仅 Type=sqlite 时生效。
+	SQLite StoreSQLiteConfig `mapstructure:"sqlite"`
 }
 
 // LoggingConfig 日志输出配置，作用于调度器、存储、WebSocket 与 HTTP 访问日志
@@ -809,6 +813,19 @@ const (
 	DefaultMgrSynchronous = DefaultObserveSynchronous
 )
 
+// 任务快照库的默认值。与管理库分文件是刻意的：任务写入是热路径（每次状态
+// 迁移一写），账号/分组/档位是冷数据，隔离 WAL 与锁竞争；观测库同理。
+// busy/synchronous 与管理库同组口径，三常量不抽公共结构——默认值唯一来源在
+// core 各自的字段上，抽结构会让两处语义共享一个进化方向，那不是事实。
+const (
+	// DefaultJobsDBPath 任务快照库文件位置。
+	DefaultJobsDBPath = "./data/goqsys_jobs.sqlite"
+	// DefaultJobsBusyTimeout 任务快照库 SQLite busy 等待上限。
+	DefaultJobsBusyTimeout = DefaultObserveBusyTimeout
+	// DefaultJobsSynchronous 任务快照库 synchronous PRAGMA 取值。
+	DefaultJobsSynchronous = DefaultObserveSynchronous
+)
+
 // MgrStoreConfig 管理库：控制台账号、分组元数据、执行器档位的 SQLite 存储。
 // 默认关闭——关闭时这三类数据继续走既有文件（server.auth.users、store.groups_path、
 // executors.profiles_path），进程行为与本节不存在时完全一致，不创建任何文件。
@@ -844,6 +861,32 @@ func (m MgrStoreConfig) Validate() error {
 	return nil
 }
 
+// StoreSQLiteConfig 任务快照 SQLite 后端的取值。仅 store.type=sqlite 时生效；
+// 三字段与 MgrStoreConfig 同构而不抽公共结构（默认值唯一来源原则，见任务库常量注释）。
+type StoreSQLiteConfig struct {
+	// Path 库文件路径；空表示 DefaultJobsDBPath，父目录不存在时由装配方创建。
+	Path string `mapstructure:"path"`
+	// BusyTimeout SQLite busy 等待上限；0 表示 DefaultJobsBusyTimeout。
+	BusyTimeout time.Duration `mapstructure:"busy_timeout"`
+	// Synchronous SQLite synchronous PRAGMA：normal|full，空表示 DefaultJobsSynchronous。
+	Synchronous string `mapstructure:"synchronous"`
+}
+
+// Validate 校验任务库自身的取值。没有 Enabled 开关——生效与否由 store.type 决定，
+// 但取值合法性独立检查：写着 type=sqlite 却带非法 synchronous 要在启动时报错，
+// 不能等切了 type 才炸。
+func (s StoreSQLiteConfig) Validate() error {
+	switch strings.TrimSpace(s.Synchronous) {
+	case "", "normal", "full":
+	default:
+		return fmt.Errorf("store.sqlite.synchronous %q is invalid, use normal or full", s.Synchronous)
+	}
+	if s.BusyTimeout < 0 {
+		return fmt.Errorf("store.sqlite.busy_timeout must not be negative, got %v", s.BusyTimeout)
+	}
+	return nil
+}
+
 // DefaultConfig 返回与代码内置默认值一致的配置
 func DefaultConfig() Config {
 	return Config{
@@ -875,6 +918,7 @@ func DefaultConfig() Config {
 			HistoryLimit:  DefaultHistoryLimit,
 			HistoryTTL:    0,
 			GroupsPath:    DefaultGroupsPath,
+			SQLite:        StoreSQLiteConfig{Path: DefaultJobsDBPath},
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
@@ -1086,10 +1130,14 @@ func (c Config) Validate() error {
 
 	switch c.Store.Type {
 	case "json":
+	case "sqlite":
+		if err := c.Store.SQLite.Validate(); err != nil {
+			return err
+		}
 	case "":
 		return fmt.Errorf("store.type must not be empty")
 	default:
-		return fmt.Errorf("unsupported store.type %q, only \"json\" is implemented", c.Store.Type)
+		return fmt.Errorf("unsupported store.type %q, use \"json\" or \"sqlite\"", c.Store.Type)
 	}
 
 	if c.Store.Path == "" {
@@ -1288,6 +1336,12 @@ func (c Config) Normalized() Config {
 	}
 	if c.MgrStore.BusyTimeout <= 0 {
 		c.MgrStore.BusyTimeout = defaults.MgrStore.BusyTimeout
+	}
+	if c.Store.SQLite.Path == "" {
+		c.Store.SQLite.Path = defaults.Store.SQLite.Path
+	}
+	if c.Store.SQLite.BusyTimeout <= 0 {
+		c.Store.SQLite.BusyTimeout = defaults.Store.SQLite.BusyTimeout
 	}
 	if c.MgrStore.Synchronous == "" {
 		c.MgrStore.Synchronous = defaults.MgrStore.Synchronous

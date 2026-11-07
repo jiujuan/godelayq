@@ -64,6 +64,11 @@ store:
   # 分组元数据文件（Web 控制台的 /api/v1/groups 读写它）。与任务快照分文件：
   # 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
   groups_path: ./data/groups.json
+  # 任务快照 SQLite 后端（仅 type: sqlite 时生效；TASK-M03）。type=json 时不读取。
+  sqlite:
+    path: ./data/goqsys_jobs.sqlite  # 空取默认值；与管理库、观测库分文件
+    busy_timeout: 5s                 # 0=默认值，与管理库同口径
+    synchronous: normal              # normal|full；空=默认 normal
 
 logging:
   level: info           # debug|info|warn|error；排障时可临时改 debug

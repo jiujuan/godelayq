@@ -16,6 +16,7 @@ import (
 	"github.com/jiujuan/godelayq/internal/api"
 	"github.com/jiujuan/godelayq/internal/core"
 	"github.com/jiujuan/godelayq/internal/executor"
+	"github.com/jiujuan/godelayq/internal/store/jobs"
 	"github.com/jiujuan/godelayq/internal/store/mgr"
 	"github.com/jiujuan/godelayq/internal/store/observe"
 	"github.com/jiujuan/godelayq/internal/web"
@@ -260,12 +261,30 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 		levelVar:     levelVar,
 		reloadStatus: reloadStatus,
 		newStore: func() (core.Store, error) {
-			return core.NewJSONFileStoreWithOptions(cfg.Store.Path, core.StoreOptions{
-				Interval:     cfg.Store.FlushInterval,
-				HistoryLimit: cfg.Store.HistoryLimit,
-				HistoryTTL:   cfg.Store.HistoryTTL,
-				Logger:       logger,
-			})
+			switch cfg.Store.Type {
+			case "json":
+				return core.NewJSONFileStoreWithOptions(cfg.Store.Path, core.StoreOptions{
+					Interval:     cfg.Store.FlushInterval,
+					HistoryLimit: cfg.Store.HistoryLimit,
+					HistoryTTL:   cfg.Store.HistoryTTL,
+					Logger:       logger,
+				})
+			case "sqlite":
+				// 直写后端：建不起库或导入失败都拦住启动——快照无处安放与
+				// 配置非法是同一量级的故障，不带病上线。
+				store, err := jobs.Open(cfg.Store.SQLite, cfg.Store.HistoryLimit, cfg.Store.HistoryTTL, logger)
+				if err != nil {
+					return nil, fmt.Errorf("open jobs sqlite store: %w", err)
+				}
+				if err := store.ImportOnce(cfg.Store.Path); err != nil {
+					_ = store.Close()
+					return nil, err
+				}
+				return store, nil
+			default:
+				// Validate 已拦过未知取值，这里是装配层的最后防线。
+				return nil, fmt.Errorf("unsupported store.type %q", cfg.Store.Type)
+			}
 		},
 		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
 			return core.NewScheduler(store, retryPolicy, eventBus, core.WithLogger(logger))

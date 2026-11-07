@@ -78,6 +78,9 @@ var configClasses = map[string]ConfigClass{
 	// 所以下面这些也逐条列出（值相同，作用是让读的人知道它们被认真归过类）。
 	"store.type": ClassRestart, "store.path": ClassRestart,
 	"store.flush_interval": ClassRestart, "store.groups_path": ClassRestart,
+	// 任务快照 SQLite 后端（TASK-M03）：与 mgrstore.* 同为重启档。
+	"store.sqlite.path": ClassRestart, "store.sqlite.busy_timeout": ClassRestart,
+	"store.sqlite.synchronous": ClassRestart,
 	"observability.enabled": ClassRestart, "observability.path": ClassRestart,
 	"observability.flush_interval": ClassRestart, "observability.queue_capacity": ClassRestart,
 	"observability.busy_timeout": ClassRestart, "observability.synchronous": ClassRestart,

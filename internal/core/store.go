@@ -184,30 +184,38 @@ func (s *JSONFileStore) LoadAll() ([]JobSnapshot, error) {
 }
 
 // trimTerminalLocked 按保留策略清理终态快照，Pending/Running 永不淘汰。
-// 条数上限 < 0 表示不留痕；0 已在构造与 SetHistoryRetention 里替换为 DefaultHistoryLimit。
-// 两个原子值在开头各读一次并留在局部变量里：读不到半个值是 atomic 给的，
-// 这里防的是另一件事——SetHistoryRetention 不持 s.mu，两次独立 Store 之间有窗口，
-// 分两次 Load 就可能让同一次淘汰的"按几条切"与"按多久切"来自两代策略。
-// 这个窗口本身没有关（见卡 §10.5 的 D-R0201），关掉它要把两项装进一个整体一起换。
+// 两个原子值在调用处各读一次一起传入：SetHistoryRetention 不持 s.mu，
+// 两次独立 Store 之间有窗口，分两次 Load 就可能让同一次淘汰的"按几条切"与
+// "按多久切"来自两代策略。这个窗口本身没有关（见卡 §10.5 的 D-R0201），
+// 关掉它要把两项装进一个整体一起换。
 func (s *JSONFileStore) trimTerminalLocked() {
+	for _, id := range TrimTerminal(s.data, s.historyLimit.Load(), time.Duration(s.historyTTL.Load())) {
+		delete(s.data, id)
+	}
+}
+
+// TrimTerminal 按终态留痕策略算出 all 里应删除的快照 ID。纯函数，不改入参——
+// JSON 存储与 SQLite 存储（store/jobs）共用这一份语义，淘汰规则只许有一处：
+// limit<0 删光终态；ttl>0 删早于 now-ttl 的终态；limit>=0 时按 UpdatedAt 降序
+// 保留 limit 条、同刻按 ID 升序稳定排序。0 的 limit 已在两处构造里折成
+// DefaultHistoryLimit，这里不再解释 0。
+func TrimTerminal(all map[string]JobSnapshot, limit int64, ttl time.Duration) []string {
 	now := time.Now()
-	limit := int(s.historyLimit.Load())
-	ttl := time.Duration(s.historyTTL.Load())
+	deleted := make([]string, 0)
+	terminal := make([]JobSnapshot, 0)
 
-	terminal := make([]JobSnapshot, 0, len(s.data))
-
-	for id, snap := range s.data {
+	for id, snap := range all {
 		if !JobStatus(snap.Status).IsTerminal() {
 			continue
 		}
 		if limit < 0 || (ttl > 0 && now.Sub(snap.UpdatedAt) > ttl) {
-			delete(s.data, id)
+			deleted = append(deleted, id)
 			continue
 		}
 		terminal = append(terminal, snap)
 	}
 
-	if limit >= 0 && len(terminal) > limit {
+	if limit >= 0 && len(terminal) > int(limit) {
 		sort.Slice(terminal, func(i, j int) bool {
 			if !terminal[i].UpdatedAt.Equal(terminal[j].UpdatedAt) {
 				return terminal[i].UpdatedAt.After(terminal[j].UpdatedAt)
@@ -216,9 +224,10 @@ func (s *JSONFileStore) trimTerminalLocked() {
 			return terminal[i].ID < terminal[j].ID
 		})
 		for _, snap := range terminal[limit:] {
-			delete(s.data, snap.ID)
+			deleted = append(deleted, snap.ID)
 		}
 	}
+	return deleted
 }
 
 // Flush 强制落盘；脏标记未置位时不写文件
