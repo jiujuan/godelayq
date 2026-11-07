@@ -13,12 +13,12 @@ import (
 	"syscall"
 	"time"
 
-	"godelayq/api"
-	"godelayq/core"
-	"godelayq/executor"
-	"godelayq/store/mgr"
-	"godelayq/store/observe"
-	"godelayq/web"
+	"github.com/jiujuan/godelayq/internal/api"
+	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/jiujuan/godelayq/internal/executor"
+	"github.com/jiujuan/godelayq/internal/store/mgr"
+	"github.com/jiujuan/godelayq/internal/store/observe"
+	"github.com/jiujuan/godelayq/internal/web"
 )
 
 type schedulerAPI interface {

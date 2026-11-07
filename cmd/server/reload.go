@@ -30,8 +30,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"godelayq/core"
-	"godelayq/executor"
+	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/jiujuan/godelayq/internal/executor"
 )
 
 // 热更键路径。它们与 core/config_reload.go 的 configClasses 里标成 ClassHot 的那些条目一一对应，

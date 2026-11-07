@@ -16,9 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"godelayq/core"
-	"godelayq/executor"
-	"godelayq/store/observe"
+	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/jiujuan/godelayq/internal/executor"
+	"github.com/jiujuan/godelayq/internal/store/observe"
 )
 
 func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
@@ -1309,9 +1309,9 @@ func TestRun_NoServerReaderWhenEventsDisabled(t *testing.T) {
 type artifactIndexStub struct{}
 
 func (s *artifactIndexStub) Record(core.ArtifactIndexRecord) error { return nil }
-func (s *artifactIndexStub) MarkPurged(string, int) error      { return nil }
-func (s *artifactIndexStub) MarkAllPurged(string) error        { return nil }
-func (s *artifactIndexStub) DeleteByJob(string) error          { return nil }
+func (s *artifactIndexStub) MarkPurged(string, int) error          { return nil }
+func (s *artifactIndexStub) MarkAllPurged(string) error            { return nil }
+func (s *artifactIndexStub) DeleteByJob(string) error              { return nil }
 func (s *artifactIndexStub) List(string) ([]core.ArtifactIndexRecord, error) {
 	return nil, nil
 }

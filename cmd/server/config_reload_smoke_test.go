@@ -28,8 +28,8 @@ import (
 	"testing"
 	"time"
 
-	"godelayq/core"
-	"godelayq/store/observe"
+	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/jiujuan/godelayq/internal/store/observe"
 )
 
 // logSink 是带锁的日志收集器。用例主协程读它的时候，store 的 flushLoop 与两个观测写入器的

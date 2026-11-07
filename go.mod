@@ -1,4 +1,4 @@
-module godelayq
+module github.com/jiujuan/godelayq
 
 go 1.24.13
 
