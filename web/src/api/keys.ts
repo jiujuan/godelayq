@@ -11,6 +11,8 @@ export const queryKeys = {
   jobEvents: (id: string) => ['job-events', id] as const,
   eventsRecent: ['events'] as const,
   groups: ['groups'] as const,
+  /** 控制台账号列表：任何账号写操作后整体失效 */
+  users: ['users'] as const,
   jobTypes: ['job-types'] as const,
   runtime: ['admin', 'runtime'] as const,
   /** 档位列表：只有启动期配置会改它，页面自己不带轮询 */
