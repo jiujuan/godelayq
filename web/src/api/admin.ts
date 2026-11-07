@@ -1,7 +1,14 @@
 /* 运维端点（§5.4）：ops 档专属，低档位调用会得到 403。
    前端的入口隐藏只是体验，真正拦下请求的是服务端 RBAC。 */
 import { request } from './client'
-import type { AuditListResponse, AuditQuery, RuntimeInfo } from './types'
+import type {
+  AuditListResponse,
+  AuditQuery,
+  CreateUserRequest,
+  RuntimeInfo,
+  UpdateUserRequest,
+  UserView,
+} from './types'
 
 export function fetchRuntime(): Promise<RuntimeInfo> {
   return request<RuntimeInfo>('/admin/runtime')
@@ -41,4 +48,28 @@ export function unsuspendScheduler(): Promise<{ suspended: boolean }> {
  * 装配了库时时间线读库，清空只影响这份缓冲，任务历史与库里的事件都不动 */
 export function clearEventHistory(): Promise<{ cleared: number }> {
   return request<{ cleared: number }>('/admin/events', { method: 'DELETE' })
+}
+
+/**
+ * 控制台账号管理（handlers_users.go 的 /admin/users，admin 档）。
+ * 未启用账号存储时后端回 503——那是部署选择（mgrstore.enabled=false），
+ * 页面按"没开管理库"呈现，与台账的 503 同一待遇。
+ * 密码只在创建与改密的请求体里出现一次，任何响应都不含哈希。
+ */
+export function listUsers(): Promise<UserView[]> {
+  return request<UserView[]>('/admin/users')
+}
+
+export function createUser(body: CreateUserRequest): Promise<UserView> {
+  return request<UserView>('/admin/users', { method: 'POST', body })
+}
+
+/** password/role 都省略是写错的请求（后端 400），调用方至少给一项 */
+export function updateUser(name: string, body: UpdateUserRequest): Promise<UserView> {
+  return request<UserView>(`/admin/users/${encodeURIComponent(name)}`, { method: 'PUT', body })
+}
+
+/** 最后一个 admin 的删除/降权会被后端拒绝——保护规则在服务端，前端只负责把后果说清 */
+export function deleteUser(name: string): Promise<void> {
+  return request<void>(`/admin/users/${encodeURIComponent(name)}`, { method: 'DELETE' })
 }

@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/jiujuan/godelayq/internal/executor"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"godelayq/core"
-	"godelayq/executor"
 )
 
 // quietLogger 吞掉测试不关心的日志，避免注册计数混进 go test 的输出。

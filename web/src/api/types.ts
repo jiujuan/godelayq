@@ -433,6 +433,27 @@ export interface UserInfo {
   role: RoleName
 }
 
+/** 账号视图（handlers_users.go 的 UserView）：哈希绝不出后端，前端也没有对应字段 */
+export interface UserView {
+  name: string
+  role: RoleName
+  created_at: string
+  updated_at: string
+}
+
+/** POST /admin/users：三项都是必填，缺一后端 400 */
+export interface CreateUserRequest {
+  name: string
+  password: string
+  role: RoleName
+}
+
+/** PUT /admin/users/:name：指针语义——省略的字段表示"不动"，两项全省后端回 400 */
+export interface UpdateUserRequest {
+  password?: string
+  role?: RoleName
+}
+
 export interface TokenSession {
   access_token: string
   refresh_token: string

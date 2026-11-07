@@ -13,11 +13,13 @@ import (
 	"syscall"
 	"time"
 
-	"godelayq/api"
-	"godelayq/core"
-	"godelayq/executor"
-	"godelayq/store/sqlite"
-	"godelayq/web"
+	"github.com/jiujuan/godelayq/internal/api"
+	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/jiujuan/godelayq/internal/executor"
+	"github.com/jiujuan/godelayq/internal/store/jobs"
+	"github.com/jiujuan/godelayq/internal/store/mgr"
+	"github.com/jiujuan/godelayq/internal/store/observe"
+	"github.com/jiujuan/godelayq/internal/web"
 )
 
 type schedulerAPI interface {
@@ -70,12 +72,12 @@ type serverAPI interface {
 //
 // 接口定义在消费方是本仓库的既有惯例（schedulerAPI、serverAPI 同样如此），这里还多一条理由：
 // 关闭顺序（观测层早于 store.Close）只有在句柄可替换时才断言得出来，
-// 真实 *sqlite.DB 的关闭时机在测试里没有别的观察办法。
+// 真实 *observe.Handle 的关闭时机在测试里没有别的观察办法。
 // 本卡只用到这三个方法，S03 起要把事件写入器接进装配时再扩，不提前摆空参数。
 type observabilityDB interface {
 	Path() string
 	JournalMode() string
-	Stats() (sqlite.Stats, error)
+	Stats() (observe.Stats, error)
 	Close() error
 }
 
@@ -108,11 +110,27 @@ type signalNotifier func(chan<- os.Signal, ...os.Signal)
 type auditLogAPI interface {
 	Close() error
 	Dropped() int64
-	Append(api.AuditEntry) error
-	Query(api.AuditFilter) ([]api.AuditEntry, int, error)
+	Append(core.AuditEntry) error
+	Query(core.AuditFilter) ([]core.AuditEntry, int, error)
 	// SetRetention 是 observability.audit.retention_* 两个键的热更落点（TASK-R02、R06），
 	// 与事件写入器同形：下一个批量周期的淘汰用新值。
 	SetRetention(count int, age time.Duration)
+}
+
+// mgrAPI 是 run 对管理库句柄的要求：报路径（启动日志）、干净关闭。
+// 与 observabilityDB 同样定义在消费方；接口先收窄到这两个方法，
+// mgrstore 带来更多读数需求时再扩，不提前摆空参数。
+type mgrAPI interface {
+	Path() string
+	Close() error
+}
+
+// mgrDBHolder 晚绑定管理库句柄：defaultRuntimeDeps 建好壳，run() 打开管理库后写入；
+// newServer（分组、账号）与 newExecutorProfileStore（档位）两个闭包在各自被调用时读它。
+// 与 reloadStatus 同一手法——闭包在 defaultRuntimeDeps 里建，句柄要等 run() 按配置打开。
+// 只在 mgrstore.enabled=true 时非 nil；两个闭包各自先看配置开关再看句柄。
+type mgrDBHolder struct {
+	handle *mgr.Handle
 }
 
 // observabilityAPI 是装配好的观测层写入器集合，作为 newServer 的最后一个参数交给服务。
@@ -195,7 +213,13 @@ type runtimeDeps struct {
 	// 列入依赖完整性检查的条件与事件写入器相同：少了它这张表永远是空的，
 	// 而 /admin/audit 看起来"没有符合条件的记录"，与真的没有分不清。
 	newAuditLog func(db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (auditLogAPI, error)
-	newServer   func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry,
+	// newMgrDB 打开 SQLite 管理库（建目录、建表、应用迁移），只在 mgrstore.enabled=true
+	// 时调用。句柄经 mgrDBHolder 晚绑定给 newServer（分组、账号）与
+	// newExecutorProfileStore（档位）两个闭包——与 reloadStatus 同一手法：
+	// 闭包先建、句柄后到。列入依赖完整性检查：少装配它，启用管理库的部署
+	// 会在 nil 句柄上建出三张"永远写不进"的存储。
+	newMgrDB  func(core.Config, *slog.Logger) (mgrAPI, error)
+	newServer func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry,
 		artifacts *executor.ArtifactStore, obs *observabilityAPI, profiles *profileStoreAPI) (serverAPI, error)
 	// 配置热重载（TASK-R06）的三处装配点。全部是函数值或可替换句柄，与上面那些闭包同一种风格：
 	// 集成测试因此能塞一个假 watcher 进去驱动整条链，而不必真的等一次文件系统事件。
@@ -227,6 +251,9 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 	// 而 watcher 得到 server.Start() 之后才建（那条链不该在服务还没监听时就开始改现网）。
 	// 两边靠这个晚绑定的句柄对齐，见 runtimeDeps.reloadStatus 的注释。
 	reloadStatus := &reloadStatusReader{path: configPath}
+	// 管理库句柄的晚绑定壳：run() 打开管理库后写入（见 runtimeDeps.newMgrDB 的注释），
+	// newServer 与 newExecutorProfileStore 两个闭包读它。禁用管理库的部署永远不写它。
+	mgrDB := &mgrDBHolder{}
 
 	return runtimeDeps{
 		config:       cfg,
@@ -234,18 +261,41 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 		levelVar:     levelVar,
 		reloadStatus: reloadStatus,
 		newStore: func() (core.Store, error) {
-			return core.NewJSONFileStoreWithOptions(cfg.Store.Path, core.StoreOptions{
-				Interval:     cfg.Store.FlushInterval,
-				HistoryLimit: cfg.Store.HistoryLimit,
-				HistoryTTL:   cfg.Store.HistoryTTL,
-				Logger:       logger,
-			})
+			switch cfg.Store.Type {
+			case "json":
+				return core.NewJSONFileStoreWithOptions(cfg.Store.Path, core.StoreOptions{
+					Interval:     cfg.Store.FlushInterval,
+					HistoryLimit: cfg.Store.HistoryLimit,
+					HistoryTTL:   cfg.Store.HistoryTTL,
+					Logger:       logger,
+				})
+			case "sqlite":
+				// 直写后端：建不起库或导入失败都拦住启动——快照无处安放与
+				// 配置非法是同一量级的故障，不带病上线。
+				store, err := jobs.Open(cfg.Store.SQLite, cfg.Store.HistoryLimit, cfg.Store.HistoryTTL, logger)
+				if err != nil {
+					return nil, fmt.Errorf("open jobs sqlite store: %w", err)
+				}
+				if err := store.ImportOnce(cfg.Store.Path); err != nil {
+					_ = store.Close()
+					return nil, err
+				}
+				return store, nil
+			default:
+				// Validate 已拦过未知取值，这里是装配层的最后防线。
+				return nil, fmt.Errorf("unsupported store.type %q", cfg.Store.Type)
+			}
 		},
 		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
 			return core.NewScheduler(store, retryPolicy, eventBus, core.WithLogger(logger))
 		},
 		newExecutorRegistry: executor.NewRegistry,
 		newExecutorProfileStore: func(cfg core.Config) (core.ExecutorProfileStore, error) {
+			if cfg.MgrStore.Enabled {
+				// run() 的装配顺序保证管理库先于本闭包打开，句柄必已就位。
+				// 档位以库为准：executors.profiles_path 只剩一次性导入源的语义。
+				return mgr.NewExecutorProfileStore(mgrDB.handle), nil
+			}
 			normalized := cfg.Normalized()
 			profiles, err := core.NewJSONFileExecutorProfileStore(normalized.Executors.ProfilesPath)
 			if err != nil {
@@ -265,23 +315,33 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 			}, logger)
 		},
 		newObservabilityDB: func(cfg core.Config, logger *slog.Logger) (observabilityDB, error) {
-			db, err := sqlite.Open(cfg.Observability, logger)
+			db, err := observe.Open(cfg.Observability, logger)
 			if err != nil {
 				// 这里必须返回 nil 而不是那个类型化的空句柄：
-				// 装了 *sqlite.DB(nil) 的接口值不等于 nil，调用方的判空会失效。
+				// 装了 *observe.Handle(nil) 的接口值不等于 nil，调用方的判空会失效。
 				return nil, err
 			}
 			return db, nil
 		},
+		newMgrDB: func(cfg core.Config, logger *slog.Logger) (mgrAPI, error) {
+			handle, err := mgr.Open(cfg.MgrStore, logger)
+			if err != nil {
+				// 与 newObservabilityDB 同一处置：nil 而不是类型化的空指针。
+				return nil, err
+			}
+			// 晚绑定壳在这里填上：newServer 与 newExecutorProfileStore 读它。
+			mgrDB.handle = handle
+			return handle, nil
+		},
 		newEventLog: func(bus *core.EventBus, db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (eventLogAPI, error) {
-			handle, ok := db.(*sqlite.DB)
+			handle, ok := db.(*observe.Handle)
 			if !ok {
-				// 真实装配里这一步一定成立：句柄就是上面 sqlite.Open 建出来的那一个。
+				// 真实装配里这一步一定成立：句柄就是上面 observe.Open 建出来的那一个。
 				// 不成立说明有人把假句柄接到了要真连接的写入器上，直接报错，
 				// 而不是让写入器静默缺席、事件表永远为空。
 				return nil, fmt.Errorf("event writer needs the real observability handle, got %T", db)
 			}
-			return sqlite.NewEventLog(bus, handle, sqlite.EventLogOptions{
+			return observe.NewEventLog(bus, handle, observe.EventLogOptions{
 				FlushInterval:  cfg.FlushInterval,
 				QueueCapacity:  cfg.QueueCapacity,
 				RetentionCount: cfg.Events.RetentionCount,
@@ -289,24 +349,24 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 			}, logger)
 		},
 		newArtifactIndex: func(db observabilityDB, cfg core.ObservabilityConfig, rootDir string, logger *slog.Logger) (executor.ArtifactIndexer, error) {
-			handle, ok := db.(*sqlite.DB)
+			handle, ok := db.(*observe.Handle)
 			if !ok {
 				// 与 newEventLog 同一处置：索引要真连接，接了假句柄就报错，
 				// 而不是让这张表安静地空着。
 				return nil, fmt.Errorf("artifact index needs the real observability handle, got %T", db)
 			}
-			return sqlite.NewArtifactIndex(handle, sqlite.ArtifactIndexOptions{
+			return observe.NewArtifactIndex(handle, observe.ArtifactIndexOptions{
 				RootDir: rootDir,
 			}, logger)
 		},
 		newAuditLog: func(db observabilityDB, cfg core.ObservabilityConfig, logger *slog.Logger) (auditLogAPI, error) {
-			handle, ok := db.(*sqlite.DB)
+			handle, ok := db.(*observe.Handle)
 			if !ok {
 				// 与 newEventLog、newArtifactIndex 同一处置：台账要真连接，
 				// 接了假句柄就报错，而不是让这张表安静地空着。
 				return nil, fmt.Errorf("audit log needs the real observability handle, got %T", db)
 			}
-			return sqlite.NewAuditLog(handle, sqlite.AuditLogOptions{
+			return observe.NewAuditLog(handle, observe.AuditLogOptions{
 				FlushInterval:  cfg.FlushInterval,
 				QueueCapacity:  cfg.QueueCapacity,
 				RetentionCount: cfg.Audit.RetentionCount,
@@ -324,11 +384,19 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 				AllowOrigins:     cfg.Server.CORS.AllowOrigins,
 				AllowCredentials: cfg.Server.CORS.AllowCredentials,
 			}
-			// 分组注册表读不出来就别起服务：与其让 /groups 每个请求都 500，
+			// 分组注册表：mgrstore.enabled 时以库为准，否则走 JSON 文件。
+			// JSON 那条分支读不出来就别起服务：与其让 /groups 每个请求都 500，
 			// 不如在启动日志里就把文件权限/格式问题摆到眼前。
-			groups, err := core.NewJSONFileGroupStore(cfg.Store.GroupsPath)
-			if err != nil {
-				return nil, err
+			var groups core.GroupStore
+			if cfg.MgrStore.Enabled {
+				// run() 的装配顺序保证管理库先于服务构造打开，句柄必已就位。
+				groups = mgr.NewGroupStore(mgrDB.handle)
+			} else {
+				var groupErr error
+				groups, groupErr = core.NewJSONFileGroupStore(cfg.Store.GroupsPath)
+				if groupErr != nil {
+					return nil, groupErr
+				}
 			}
 			opts := []api.Option{
 				api.WithGroupStore(groups),
@@ -350,6 +418,12 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 					// 读写两面是同一个句柄：台账的写入方就是查询方
 					opts = append(opts, api.WithAuditLog(obs.audit, obs.audit))
 				}
+			}
+			// 管理库模式把账号存储交给服务：认证器随之切到库模式（改账号即时生效），
+			// 账号管理端点（/admin/users）也随之启用——两者共用这一个存储句柄。
+			// 关闭时账号走配置快照（遗留模式），管理端点不存在。
+			if cfg.MgrStore.Enabled {
+				opts = append(opts, api.WithUserStore(mgr.NewUserStore(mgrDB.handle)))
 			}
 			// 档位的在线管理两面同生同灭：web_enabled=false 时 profiles 整体是 nil，
 			// 三个写端点因此走到 503 那条明确分支，而不是"能建但建完不生效"。
@@ -460,8 +534,14 @@ func usableConfigFile(candidate string) (string, bool) {
 
 func run(deps runtimeDeps) error {
 	if deps.newStore == nil || deps.newScheduler == nil || deps.newExecutorRegistry == nil ||
-		deps.newArtifactStore == nil || deps.newObservabilityDB == nil || deps.newServer == nil ||
+		deps.newArtifactStore == nil || deps.newObservabilityDB == nil ||
+		deps.newServer == nil ||
 		deps.notifySignals == nil {
+		return fmt.Errorf("runtime dependencies are incomplete")
+	}
+	// 管理库闭包的必需条件：开关打开却少了闭包，后果是 nil 句柄上建出三张
+	// "永远写不进"的存储——分组、档位、账号看起来都在，实际一条都存不下来。
+	if deps.config.MgrStore.Enabled && deps.newMgrDB == nil {
 		return fmt.Errorf("runtime dependencies are incomplete")
 	}
 	// 事件写入器的闭包按"这次要不要用它"来判断必需性：观测层总开关或事件子开关任一关闭时
@@ -529,6 +609,37 @@ func run(deps runtimeDeps) error {
 	}
 	// 事件里输出预览的字节上限：取值已在 Normalized 里补齐，非法值的兜底由调度器负责。
 	scheduler.SetEventPreviewLimit(cfg.Executors.Output.InlinePreview)
+
+	// 管理库在档位存储与服务构造之前打开：newExecutorProfileStore 与 newServer 两个闭包
+	// 都要读它的句柄（mgrDBHolder 晚绑定）。打开或导入失败都拒绝启动——
+	// mgrstore.enabled=true 表示部署方已决定以库为准，"半导半没导"的状态比起不来更难解释。
+	// 关闭顺序由 defer 的声明位次决定（后声明先执行）：观测层写入器 → 观测库 →
+	// 管理库 → 任务存储；管理库的三张表都是同步落库，无需先行收尾。
+	if cfg.MgrStore.Enabled {
+		mgrdb, err := deps.newMgrDB(cfg, deps.logger)
+		if err != nil {
+			return err
+		}
+		defer func() {
+			if err := mgrdb.Close(); err != nil {
+				deps.logger.Error("failed to close mgr database", "error", err)
+			}
+		}()
+		handle, ok := mgrdb.(*mgr.Handle)
+		if !ok {
+			// 与 newEventLog 的断言同一处置：导入要真连接，接了假句柄就报错。
+			return fmt.Errorf("mgr db needs the real handle, got %T", mgrdb)
+		}
+		deps.logger.Info("mgr database opened",
+			"path", handle.Path(), "journal_mode", handle.JournalMode(), "synchronous", handle.Synchronous())
+		if err := mgr.ImportOnce(handle, mgr.ImportSource{
+			AuthUsers:    cfg.Server.Auth.Users,
+			GroupsPath:   cfg.Store.GroupsPath,
+			ProfilesPath: cfg.Executors.ProfilesPath,
+		}, deps.logger); err != nil {
+			return err
+		}
+	}
 
 	// 档位文件在登记表之前读、在注册之前合。两个时点都有理由：
 	//   - 读不出来就没有"这一批档位"可合，那种状态不该带着起服务（见 newExecutorProfileStore）；

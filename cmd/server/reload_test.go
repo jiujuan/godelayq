@@ -20,7 +20,7 @@ import (
 	"time"
 	"unicode/utf16"
 
-	"godelayq/core"
+	"github.com/jiujuan/godelayq/internal/core"
 )
 
 // ---- 配置文件文本夹具 ----

@@ -6,7 +6,7 @@ import (
 	"log"
 	"time"
 
-	"godelayq/core"
+	"github.com/jiujuan/godelayq/internal/core"
 )
 
 func main() {

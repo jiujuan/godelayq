@@ -31,12 +31,16 @@ scheduler:
   shutdown_timeout: 5s        # 优雅关闭等待时长；开启执行器时建议 >=10s（见"开启执行器"第 4 条）
 
 store:
-  type: json                  # 目前仅支持 json
+  type: json                  # json | sqlite；切换需重启
   path: /var/lib/godelayq/jobs.json
-  flush_interval: 200ms       # 合并落盘周期；崩溃时最多丢失一个周期的状态
+  flush_interval: 200ms       # 合并落盘周期；仅 json 后端生效（sqlite 直写无此环节）
   history_limit: 1000         # 终态快照留痕条数；0 用默认值，-1 不留痕
   history_ttl: 0s             # 终态快照保留时长，如 24h；0 不按时间淘汰
   groups_path: /var/lib/godelayq/groups.json  # 分组注册表（改动即同步落盘）
+  sqlite:                     # 仅 type: sqlite 时生效（TASK-M03）
+    path: /var/lib/godelayq/goqsys_jobs.sqlite
+    busy_timeout: 5s
+    synchronous: normal
 
 logging:
   level: info                 # debug|info|warn|error
@@ -49,6 +53,13 @@ logging:
 任务状态与分组是**两个文件**：前者按 `flush_interval` 合并写盘（崩溃最多丢一个周期），
 后者每次改动同步原子重写。备份或迁移时两个都要带走——只带 `jobs.json` 的话，
 任务的 `group` 标签还在，但分组的描述与颜色没了。
+
+任务快照也可以落 SQLite（`store.type: sqlite`，库文件默认 `./data/goqsys_jobs.sqlite`）：
+每次状态变更直写一个事务，没有合并窗口；首次启动时若库为空且 `store.path` 指向的
+`jobs.json` 存在，会把旧文件**一次性导入**并打标记，之后 JSON 永不再读（文件不删除，
+确认无误后可自行归档）。终态留痕（`history_limit`/`history_ttl`）两种后端语义一致。
+想切回 json 直接改回 `store.type` 重启即可，但注意 `jobs.json` 里是切走之前的旧快照，
+回滚前先用 API 把库中的任务状态核对清楚。
 
 两点设计取舍，配置校验会直接拒绝未知键，因此不要照抄旧文档里的其它字段：
 
@@ -107,7 +118,7 @@ go build -tags dashboard -o godelayq-server ./cmd/server
 ```
 
 - **顺序不能反**。`-tags dashboard` 下 `//go:embed all:dist` 在编译期就要求
-  `web/dist` 存在，缺了它构建直接失败（`pattern all:dist: no matching files found`），
+  `internal/web/dist` 存在，缺了它构建直接失败（`pattern all:dist: no matching files found`），
   不会给出一个"看起来成功、打开没有页面"的二进制。发布流水线里两步之间要有依赖关系，
   不能并行。
 - **不带 tag 的构建不含前端**：`go build ./...` 与全部测试因此不需要 Node，
@@ -119,7 +130,7 @@ go build -tags dashboard -o godelayq-server ./cmd/server
 - **缓存**：`index.html` 是 `no-cache`，`/assets/*` 是 `max-age=31536000, immutable`
   （文件名带内容哈希）。反代或 CDN 上如果给 `index.html` 加了缓存，升级后旧页面会去取
   已经不存在的哈希资源，表现是白屏而不是报错。
-- `web/dist` 不进版本库，发布时构建。
+- `internal/web/dist` 不进版本库，发布时构建。
 
 ### 接入层安全（账号、token 与跨域）
 
@@ -132,10 +143,13 @@ go build -tags dashboard -o godelayq-server ./cmd/server
      **签名密钥不要落盘**：先用 `go run ./cmd/gensecret` 生成（密钥走 stdout，赋值语句走 stderr，
      `export X=$(go run ./cmd/gensecret)` 拿到的是纯密钥），再用 `GODELAYQ_SERVER_AUTH_JWT_SECRET`
      注入，systemd 下放进 `EnvironmentFile=/etc/godelayq/auth.env`（权限 0600）。
-     轮换密钥会让全部已发令牌立即失效，所有人都要重新登录。账号本身不支持环境变量覆盖，
-     增删账号需重启进程。这一点连配置热重载也不代劳：`reload.enabled: true` 时改动
-     `server.auth.users`（或 `server.auth.token`、`server.auth.jwt.secret`）会让**整次重载被拒绝**，
-     一项都不会应用，旧凭据照旧可用——见"配置热重载"一节。
+     轮换密钥会让全部已发令牌立即失效，所有人都要重新登录。账号本身不支持环境变量覆盖；
+     配置文件声明的账号增删需重启进程（这一点连配置热重载也不代劳：`reload.enabled: true`
+     时改动 `server.auth.users`——或 `server.auth.token`、`server.auth.jwt.secret`——会让
+     **整次重载被拒绝**，一项都不会应用，旧凭据照旧可用——见"配置热重载"一节）。
+     启用管理库（`mgrstore.enabled: true`）后账号落 `goqsys_mgr.sqlite`，增删改走
+     控制台"账号"页或 `POST/PUT/DELETE /api/v1/admin/users`（admin 档），**改动即时生效，
+     无需重启**；配置节里的账号只在首次启动时一次性导入，之后以库为准。
    - **静态 token** `server.auth.token`：给脚本与 CI 用的全局口令，身份是 `machine`
      （能读写任务，没有 admin/ops 能力）。同样优先用 `GODELAYQ_SERVER_AUTH_TOKEN` 注入。
 2. 按人分配角色（`viewer`/`operator`/`admin`/`ops`）。最小可用的一组通常是：一个 `ops` 给值班、

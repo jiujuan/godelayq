@@ -1,0 +1,221 @@
+package executor
+
+import (
+	"fmt"
+	"log/slog"
+	"strings"
+
+	"github.com/jiujuan/godelayq/internal/core"
+)
+
+// Registrar 是注册档位所需的调度器能力：写入处理函数、查询某个键是否已被占用。
+// *core.Scheduler 与 *api.Server 的组合都满足它，装配方传哪一个由它自己决定。
+//
+// RegisterHandlerClass 是执行器唯一需要的注册入口：档位任务属于 JobClassExec，
+// 与普通任务分池执行（TASK-E13）。只有 RegisterHandler 的组合（例如把注册表换成
+// 测试替身）仍然可用，只是所有档位会落进共享池。
+type Registrar interface {
+	RegisterHandler(jobType string, handler core.Handler)
+	RegisterHandlerClass(jobType string, handler core.Handler, class core.JobClass)
+	LookupHandler(jobType string) (core.Handler, bool)
+}
+
+// Registration 是一次注册的计数，直接进启动日志：
+// 运维看一行就知道"声明了几个、注册了几个、其中几个当前跑不了"。
+type Registration struct {
+	// Total 是登记表里生效档位的数量（不含被降级的条目，那些从来没进注册表）
+	Total int
+	// Registered 是成功写进调度器的数量；键冲突时因为没有任何写入，这个值仍是 0
+	Registered int
+	// Unavailable 是已注册但探测失败的档位数量。提交期会被 api 拒掉（TASK-E16 §3.2 第 1 条），
+	// 因此正常情况下不会有这类任务进到执行侧；真进来了也只是起进程失败，没有第二道拒绝
+	Unavailable int
+	// Degraded 是因与 executors.commands 撞名而没被注册的档位数量（TASK-W03、设计文档 §5.2）。
+	// 它们不进注册表，所以不占上面三个计数；这一条只负责让启动日志说出"有几条白写在文件里"
+	Degraded int
+	// AdhocSkipped 是没被登记的内置自由执行档位数量（TASK-N04）：
+	// 解释器不在 executors.runtime_allow 里、或注册键被配置侧档位占用的那几条。
+	// 它们同样不进注册表，所以不占上面三个计数；这一条只负责让启动日志说出
+	// "打开了 adhoc 却只剩两条"，而不是让人以为开关没生效。
+	AdhocSkipped int
+}
+
+// Register 把登记表里的每个档位注册成 exec.<name> 处理函数。
+//
+// cfg 是整份配置（内部归一化后取 executors 一节给执行器用），artifacts 是输出落盘的存储：
+// 打开执行器时装配方一定要传一个可用的进来，传 nil 只会让每次执行在起进程之前失败——
+// 那种失败在日志里看起来像"脚本坏了"，其实是装配漏了参数。
+//
+// 键冲突一律返回错误而不是覆盖：档位与代码里注册的处理函数同名，说明这台机器的
+// 配置和代码对不上，静默覆盖会让其中一方悄悄失效，运维在现场查不到痕迹。
+// 检查在写入之前全部做完，因此冲突时不会留下部分注册结果——注册表要么完整要么没动过。
+//
+// 探测失败的档位仍然注册：接口要能显示"已声明但不可用"（E03 的同一口径），
+// 而静默消失会让 /job-types 里凭空少一个名字。
+//
+// 登记表为空时不写任何东西也不记注册日志；此时若开关是打开的，另记一条 warn。
+func Register(registrar Registrar, reg *Registry, cfg core.Config, artifacts *ArtifactStore, logger *slog.Logger) (Registration, error) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+
+	keys := reg.Keys()
+	result := Registration{Total: len(keys)}
+	executors := cfg.Normalized().Executors
+
+	// 空表直接返回：开关关闭时这是正常状态，不该在每次启动留一行注册日志。
+	if result.Total == 0 {
+		if reg.Enabled() {
+			// 开了开关却一个档位都没有，多半是 commands 写错了层级。
+			logger.Warn("executors are enabled but no profile is declared",
+				"hint", "declare entries as a list under executors.commands")
+		}
+		return result, nil
+	}
+
+	for _, key := range keys {
+		if _, ok := registrar.LookupHandler(key); ok {
+			profile, _ := reg.Lookup(key)
+			return result, fmt.Errorf("handler key %q is already registered, executor profile %q cannot use it",
+				key, profile.Name)
+		}
+	}
+
+	for _, key := range keys {
+		profile, ok := reg.Lookup(key)
+		if !ok {
+			continue
+		}
+		// 按 kind 分流：进程档位由 Runner 起进程，http 档位由 HTTPRunner 发请求（TASK-E15）。
+		// 两条都是真实的执行主体，共用校验、许可、产物与失败分类那一套；
+		// 分流只在这一处，Runner 自己不再解释 http 档位（它会按"档位类型不符"报永久失败）。
+		registrar.RegisterHandlerClass(key, Handler(profile, artifacts, executors, logger),
+			core.JobClassExec)
+		result.Registered++
+		if probe, ok := reg.ProbeOf(key); ok && !probe.Available {
+			result.Unavailable++
+		}
+	}
+
+	// 被降条目从不进注册表，所以这一句只取计数：它们不需要"跳过"的逻辑，
+	// Keys() 里本来就没有它们（ApplyStore 只把未降级的条目放进表）。
+	result.Degraded = len(reg.Degraded())
+	// 内置档位让位的计数同理：NewRegistry 已经把没登记的那几条连同原因留在了登记表里。
+	result.AdhocSkipped = len(reg.AdhocSkipped())
+
+	logger.Info("executor handlers registered",
+		"total", result.Total,
+		"registered", result.Registered,
+		"unavailable", result.Unavailable,
+		"degraded", result.Degraded,
+		"adhoc_skipped", result.AdhocSkipped)
+
+	warnRelaxedAddressPolicy(reg, keys, logger)
+	warnAdhocPolicy(reg, executors, logger)
+
+	return result, nil
+}
+
+// warnAdhocPolicy 给"打开了自由执行档位"的部署记启动告警（TASK-N06 §3.4）。
+//
+// 为什么要把这一条说出来：executors.adhoc.enabled 是一次范围很大的授权——
+// 它把"跑哪个文件、打到哪里"从配置内容变成任务内容，判据只剩提交身份、限定目录与地址守卫。
+// 与 warnRelaxedAddressPolicy 同一个理由：这类取值能通过全部校验，
+// 但部署方 review 配置时未必看得见，只有启动日志里那一行会留下来。
+//
+// 只写范围（目录、主机名单、两个开关、所需身份档位），不写任何文件内容或任务内容。
+func warnAdhocPolicy(reg *Registry, executors core.ExecutorsConfig, logger *slog.Logger) {
+	if !executors.Adhoc.Enabled {
+		return
+	}
+
+	var keys []string
+	for _, key := range reg.Keys() {
+		if profile, ok := reg.Lookup(key); ok && profile.Adhoc {
+			keys = append(keys, key)
+		}
+	}
+	if len(keys) == 0 {
+		// 整节打开却一条都没登记：四条都撞名让位了。这本身就是值得说出来的状态。
+		logger.Warn("executors.adhoc is enabled but no built-in profile is registered",
+			"hint", "every built-in key is taken by a profile in executors.commands or the profile store")
+		return
+	}
+
+	logger.Warn("free-form execution profiles are enabled: a submitter chooses the file to run or the address to request",
+		"profiles", strings.Join(keys, ","),
+		"required_role", reg.RequiredRole(),
+		"path_prefixes", strings.Join(executors.Adhoc.PathPrefixes, ","),
+		"url_hosts", strings.Join(executors.Adhoc.URLHosts, ","),
+		"url_allow_private", executors.Adhoc.URLAllowPrivate,
+		"hint", "any identity at or above executors.required_role can make this machine run a path "+
+			"or send a request that the config files never declared")
+
+	if len(executors.Adhoc.PathPrefixes) == 0 {
+		logger.Warn("executors.adhoc.path_prefixes is empty: script profiles may name any file on this machine",
+			"profiles", strings.Join(keys, ","),
+			"hint", "declare path_prefixes to limit the directories these profiles can reach")
+	}
+	if executors.Adhoc.URLAllowPrivate {
+		logger.Warn("executors.adhoc.url_allow_private is true: the loopback and private address guard is off",
+			"profiles", strings.Join(keys, ","),
+			"hint", "intended for reaching a service on the same development machine; "+
+				"remove it from production configs")
+	}
+}
+
+// warnRelaxedAddressPolicy 给"关掉了地址防线"的 http 档位记一条启动期 warn（TASK-E15 §9）。
+//
+// 为什么这一条要在启动时说出来而不是等执行时报错：`deny_private_ranges: false` 是一次
+// 明确的配置选择，E02 只能挡住它最危险的那半种写法（通配主机名），
+// 写成具体内网主机名的档位会顺利通过校验并且从此每次都能连到那台机器。
+// 让它在启动日志里留一行，部署方 review 配置时才有机会发现这条档位上了生产机。
+func warnRelaxedAddressPolicy(reg *Registry, keys []string, logger *slog.Logger) {
+	var relaxed []string
+	for _, key := range keys {
+		profile, ok := reg.Lookup(key)
+		if !ok || profile.Kind != KindHTTP || profile.DenyPrivate {
+			continue
+		}
+		relaxed = append(relaxed, key)
+	}
+	if len(relaxed) == 0 {
+		return
+	}
+
+	logger.Warn("executor http profiles accept private and loopback addresses",
+		"profiles", strings.Join(relaxed, ","),
+		"reason", "deny_private_ranges is false",
+		"hint", "intended for reaching a service on the same development machine; remove it from production configs")
+}
+
+// Handler 交出一个可注册进调度器的档位处理函数：按 kind 分流到进程执行器或 HTTP 执行主体。
+//
+// 它是注册链路（Register）与运行期同步（Applier）共用的那一个构造口，
+// 两条路径因此不可能建出两种处理函数。
+func Handler(p *Profile, artifacts *ArtifactStore, cfg core.ExecutorsConfig, logger *slog.Logger) core.Handler {
+	return handlerFor(p, artifacts, cfg, logger).Handler()
+}
+
+// profileHandler 是两种执行主体共同的最小形状：交出一个能给调度器的处理函数。
+// 用接口而不是 switch 里两份注册代码：分流只应该发生在一处（见 handlerFor）。
+type profileHandler interface {
+	Handler() core.Handler
+}
+
+// handlerFor 按档位的 kind 选执行主体：http 走 HTTPRunner，其余走进程执行器 Runner。
+//
+// 两条路共用 payload 校验、档位并发许可、产物存储与失败分类那一张表，
+// 差别只在"起一个进程"还是"发一个请求"。
+func handlerFor(p *Profile, artifacts *ArtifactStore, cfg core.ExecutorsConfig, logger *slog.Logger) profileHandler {
+	if p.Kind == KindHTTP {
+		runner, err := NewHTTPRunner(p, artifacts, cfg, logger)
+		if err == nil {
+			return runner
+		}
+		// NewHTTPRunner 只在 kind 不符时报错，而这一支刚判过它是 http：属于走不到的分支。
+		// 真走到了就退回进程执行器，由它在执行时说明"档位类型与本执行器不符"——
+		// 注册阶段 panic 会让整个进程起不来，而这条档位本身没写错。
+	}
+	return NewRunner(p, artifacts, cfg, logger)
+}

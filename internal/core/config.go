@@ -1,0 +1,1369 @@
+package core
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/spf13/viper"
+)
+
+// DefaultConfigPath 是约定的配置文件位置。它已被 .gitignore 排除（装着本机凭据），
+// 入库的模板是同目录的 config.example.yaml；文件不存在不是错误，进程按代码默认值启动。
+const DefaultConfigPath = "configs/config.yaml"
+
+// 控制台令牌的默认有效期。访问令牌取短，靠 refresh 续期，缩短被盗用窗口。
+const (
+	DefaultAccessTTL  = 15 * time.Minute
+	DefaultRefreshTTL = 12 * time.Hour
+)
+
+// Config 是进程的可配置项。只收录当前真正生效的字段：
+// 未实现的选项（存储后端类型、加载器、WebSocket 上限等）故意不出现，
+// LoadConfig 使用精确解码，写入未知键会直接报错而不是被忽略。
+type Config struct {
+	Server    ServerConfig    `mapstructure:"server"`
+	Scheduler SchedulerConfig `mapstructure:"scheduler"`
+	Store     StoreConfig     `mapstructure:"store"`
+	Logging   LoggingConfig   `mapstructure:"logging"`
+	// Executors 执行层（脚本/二进制/HTTP 任务）；默认关闭，详见 ExecutorsConfig。
+	Executors ExecutorsConfig `mapstructure:"executors"`
+	// Observability SQLite 观测层（运行事件、产物索引、写操作审计）；默认关闭，
+	// 关闭时不创建任何文件，详见 ObservabilityConfig。
+	Observability ObservabilityConfig `mapstructure:"observability"`
+	// MgrStore SQLite 管理库（控制台账号、分组元数据、执行器档位）；默认关闭，
+	// 关闭时这三类数据走配置与 JSON 文件，详见 MgrStoreConfig。
+	MgrStore MgrStoreConfig `mapstructure:"mgrstore"`
+	// Reload 配置热重载的开关与节奏；默认关闭，关闭时一个监听器都不建，详见 ReloadConfig。
+	Reload ReloadConfig `mapstructure:"reload"`
+}
+
+// ServerConfig HTTP 接入层配置
+type ServerConfig struct {
+	// Port 监听端口，如 "8080"
+	Port string `mapstructure:"port"`
+	// Auth 控制台账号与机器凭据
+	Auth AuthConfig `mapstructure:"auth"`
+	// CORS 跨域来源白名单
+	CORS CORSConfig `mapstructure:"cors"`
+}
+
+// AuthConfig 鉴权配置。Token 为空且 Users 为空表示不启用鉴权。
+type AuthConfig struct {
+	// Token 静态机器凭据，通过 GODELAYQ_SERVER_AUTH_TOKEN 注入更安全。
+	// 它不再是控制台凭据：以它进来的调用方身份是 core.RoleMachine，
+	// 能读写任务但不能强制暂停、删组或使用运维端点。
+	Token string `mapstructure:"token"`
+	// JWT 控制台令牌的签发参数；Users 非空时必填 Secret。
+	JWT JWTConfig `mapstructure:"jwt"`
+	// Users 控制台账号。账号只在此声明，改动需重启进程。
+	Users []UserConfig `mapstructure:"users"`
+}
+
+// JWTConfig 访问令牌参数。密钥只走环境变量注入更安全。
+type JWTConfig struct {
+	// Secret HS256 签名密钥；轮换会使全部已发令牌立即失效
+	Secret string `mapstructure:"secret"`
+	// AccessTTL 访问令牌有效期，0 表示 DefaultAccessTTL
+	AccessTTL time.Duration `mapstructure:"access_ttl"`
+	// RefreshTTL 刷新令牌有效期，0 表示 DefaultRefreshTTL
+	RefreshTTL time.Duration `mapstructure:"refresh_ttl"`
+}
+
+// UserConfig 一个控制台账号。密码只存 bcrypt 哈希，明文禁止入配置。
+type UserConfig struct {
+	// Name 登录名，配置内唯一
+	Name string `mapstructure:"name"`
+	// PasswordBcrypt bcrypt 哈希（可用 cmd/hashpassword 生成）
+	PasswordBcrypt string `mapstructure:"password_bcrypt"`
+	// Role viewer|operator|admin|ops
+	Role string `mapstructure:"role"`
+}
+
+// Enabled 表示是否配置了任何凭据（静态 token 或账号）。
+func (a AuthConfig) Enabled() bool {
+	return a.Token != "" || len(a.Users) > 0
+}
+
+// Validate 检查账号列表自身的一致性。
+// 哈希格式是否真是 bcrypt 留给 api 层在启动时用 bcrypt.Cost 校验：
+// core 不该为了校验一个字符串而依赖 crypto 库。
+func (a AuthConfig) Validate() error {
+	if len(a.Users) == 0 {
+		return nil
+	}
+	// 有账号却没有签名密钥，等于登录页能开但永远签不出令牌
+	if a.JWT.Secret == "" {
+		return fmt.Errorf("server.auth.jwt.secret must not be empty when server.auth.users is configured")
+	}
+	if len(a.JWT.Secret) < minJWTSecretLen {
+		return fmt.Errorf("server.auth.jwt.secret must be at least %d bytes, got %d", minJWTSecretLen, len(a.JWT.Secret))
+	}
+	if a.JWT.AccessTTL < 0 {
+		return fmt.Errorf("server.auth.jwt.access_ttl must not be negative, got %v", a.JWT.AccessTTL)
+	}
+	if a.JWT.RefreshTTL < 0 {
+		return fmt.Errorf("server.auth.jwt.refresh_ttl must not be negative, got %v", a.JWT.RefreshTTL)
+	}
+
+	seen := make(map[string]bool, len(a.Users))
+	for i, user := range a.Users {
+		name := strings.TrimSpace(user.Name)
+		if name == "" {
+			return fmt.Errorf("server.auth.users[%d].name must not be empty", i)
+		}
+		key := strings.ToLower(name)
+		if seen[key] {
+			return fmt.Errorf("server.auth.users contains duplicate name %q (case-insensitive)", name)
+		}
+		seen[key] = true
+
+		if user.PasswordBcrypt == "" {
+			return fmt.Errorf("server.auth.users[%d].password_bcrypt must not be empty for user %q", i, name)
+		}
+		if _, ok := ParseRole(user.Role); !ok {
+			return fmt.Errorf("server.auth.users[%d].role %q for user %q is invalid, use viewer|operator|admin|ops", i, user.Role, name)
+		}
+	}
+	return nil
+}
+
+// minJWTSecretLen 是 HS256 密钥的最小长度；短密钥容易被离线爆破。
+const minJWTSecretLen = 32
+
+// ResolveRole 解析账号角色；非法取值由 Validate 拦截，调用方仍需处理 false。
+func (u UserConfig) ResolveRole() (Role, bool) {
+	return ParseRole(u.Role)
+}
+
+// CORSConfig 跨域配置。AllowOrigins 为空等价于 ["*"]（历史行为）。
+type CORSConfig struct {
+	// AllowOrigins 允许的来源列表，元素为完整 origin（如 https://app.example.com）或 "*"
+	AllowOrigins []string `mapstructure:"allow_origins"`
+	// AllowCredentials 是否允许携带凭据；开启时不允许使用 "*" 来源
+	AllowCredentials bool `mapstructure:"allow_credentials"`
+}
+
+// SchedulerConfig 调度与执行侧配置
+type SchedulerConfig struct {
+	// Workers 并发执行协程数，0 表示 DefaultConcurrency
+	Workers int `mapstructure:"workers"`
+	// QueueCapacity 执行队列容量，0 表示与 Workers 相等；队列满时调度循环阻塞入队
+	QueueCapacity int `mapstructure:"queue_capacity"`
+	// MaxRetryDelay 指数退避的单次重试延迟上限，0 表示不限制
+	MaxRetryDelay time.Duration `mapstructure:"max_retry_delay"`
+	// ShutdownTimeout 优雅关闭等待时长，必须为正
+	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
+}
+
+// StoreConfig 持久化配置
+type StoreConfig struct {
+	// Type 存储后端："json"（默认，合并落盘）|"sqlite"（直写，TASK-M03）。
+	// 切换是重启档：两种后端的数据文件互不相认，运行期换型没有意义。
+	Type string `mapstructure:"type"`
+	// Path JSON 存储文件路径。Type=sqlite 时本键降级为一次性导入源（见 store/jobs）。
+	Path string `mapstructure:"path"`
+	// FlushInterval 合并落盘周期，0 表示 DefaultFlushInterval。
+	// 仅 json 后端生效：sqlite 直写没有"后台合并"这个环节。
+	FlushInterval time.Duration `mapstructure:"flush_interval"`
+	// HistoryLimit 终态（成功/失败/取消）快照保留条数，
+	// 0 表示 DefaultHistoryLimit，-1 表示不留痕（写入即删除）
+	HistoryLimit int `mapstructure:"history_limit"`
+	// HistoryTTL 终态快照保留时长，0 表示不按时间淘汰
+	HistoryTTL time.Duration `mapstructure:"history_ttl"`
+	// GroupsPath 分组元数据文件路径，与任务快照分文件存放：
+	// 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
+	GroupsPath string `mapstructure:"groups_path"`
+	// SQLite SQLite 后端取值，仅 Type=sqlite 时生效。
+	SQLite StoreSQLiteConfig `mapstructure:"sqlite"`
+}
+
+// LoggingConfig 日志输出配置，作用于调度器、存储、WebSocket 与 HTTP 访问日志
+type LoggingConfig struct {
+	// Level 最低输出级别：debug|info|warn|error
+	Level string `mapstructure:"level"`
+	// Format 输出格式：text|json
+	Format string `mapstructure:"format"`
+}
+
+// DefaultReloadDebounce 是配置监听的事件合并窗口（设计文档 §5.1、待拍板 P3）。
+const DefaultReloadDebounce = 500 * time.Millisecond
+
+// minReloadDebounce 是可用取值下界：比它小等于每次存盘读好几遍配置文件。
+const minReloadDebounce = 50 * time.Millisecond
+
+// ReloadConfig 配置热重载的开关与节奏。整体默认关闭。
+type ReloadConfig struct {
+	// Enabled 总开关。false 时不建监听器，进程行为与本节不存在时一致。
+	// 这一项自身属于重启档：运行期关掉监听只能重启。
+	Enabled bool `mapstructure:"enabled"`
+	// Debounce 事件合并窗口；0 表示 DefaultReloadDebounce。
+	// 低于 minReloadDebounce 由 Validate 拒绝。这一项可以热更。
+	Debounce time.Duration `mapstructure:"debounce"`
+}
+
+// 执行器配置的默认值。执行能力默认关闭（ExecutorsConfig.Enabled），
+// 关闭时这些取值全部不参与行为，只在打开之后生效。
+const (
+	DefaultExecConcurrency    = 4
+	DefaultExecInlinePreview  = 2048
+	DefaultExecMaxOutputBytes = 262144
+	DefaultExecOutputDir      = "./data/exec"
+	DefaultExecOutputTTL      = 7 * 24 * time.Hour
+	DefaultExecWorkspace      = "./exec-workspace"
+	DefaultExecRequiredRole   = "admin"
+	DefaultExecRestorePolicy  = "pause"
+	DefaultExecDefaultTimeout = 5 * time.Minute
+	DefaultExecMaxTimeout     = 30 * time.Minute
+	// DefaultExecProfilesPath 是页面建的档位的约定存放处。与 store.path 分开放：
+	// 档位是低频实体，不该被 jobs.json 的高频合并写盘带着一起重写（同 store.groups_path 的理由）。
+	DefaultExecProfilesPath = "./data/exec-profiles.json"
+
+	// DefaultAdhocShellRuntime 是 exec.shell 这条内置档位用的解释器名。
+	DefaultAdhocShellRuntime = "bash"
+	// DefaultAdhocHTTPTimeout 是 exec.http 的单次执行超时。它比脚本档位的默认值（5m）短得多是有意的：
+	// 自由指定的目标地址没有部署方兜底，一次请求拿不到结论就该断，而不是占着执行名额等下去。
+	DefaultAdhocHTTPTimeout = 30 * time.Second
+	// DefaultAdhocRequireExtension 是"没写 executors.adhoc.require_extension 时的取值"。
+	// 它单独成一个常量，是为了让 DefaultConfig 与 Normalized 两处共用同一个答案。
+	DefaultAdhocRequireExtension = true
+)
+
+// defaultAdhocRequireExtension 给 require_extension 取一个默认指针值。
+//
+// 每次都返回新的指针而不是共享一个：配置结构会被复制着传来传去（Normalized 返回值拷贝），
+// 共享指针意味着任何一处就地改写都会串到别的副本上。
+func defaultAdhocRequireExtension() *bool {
+	value := DefaultAdhocRequireExtension
+	return &value
+}
+
+// ExecutorsConfig 是执行层（脚本 / 二进制 / HTTP 任务）的配置。
+// 设计依据见 docs/design/executor-design.md：可执行内容由配置声明的档位决定，
+// 不提供自由命令行，因此 Enabled 默认 false——打开它等于把"能提交任务"扩展成"能执行命令"。
+type ExecutorsConfig struct {
+	// Enabled 执行器总开关。false 时一个 exec.* 处理函数都不注册，本节其它取值全部不生效。
+	Enabled bool `mapstructure:"enabled"`
+
+	// RequiredRole 提交执行器任务所需的最低档位：operator|admin|ops，空表示 DefaultExecRequiredRole。
+	// machine（静态 token 的身份）的档位等同 operator，所以默认值 admin 把脚本凭据挡在执行能力之外；
+	// viewer 被 Validate 拒绝：只读身份不该有执行能力。
+	RequiredRole string `mapstructure:"required_role"`
+
+	// Workspace 档位里 script/program/cwd 的根目录：这些相对路径解析后必须仍落在它之内。
+	// 留空表示 DefaultExecWorkspace，不是"不限制目录"。
+	Workspace string `mapstructure:"workspace"`
+
+	// RuntimeAllow 允许档位使用的解释器或程序名白名单；空表示内置默认列表。
+	RuntimeAllow []string `mapstructure:"runtime_allow"`
+
+	// EnvAllow 传给子进程的环境变量键名白名单；空表示内置默认列表。
+	// GODELAYQ_ 前缀的键即使在列表里也会被强制排除（见 Validate）：服务凭据不进子进程。
+	EnvAllow []string `mapstructure:"env_allow"`
+
+	// Concurrency 执行器专用执行池的协程数；0 表示 DefaultExecConcurrency。
+	// 与普通任务分池的原因见设计文档 §6.5：共池时分钟级的脚本会长时间占住执行名额。
+	Concurrency int `mapstructure:"concurrency"`
+
+	// QueueCapacity 执行器队列容量；0 表示与 Concurrency 相等。
+	// 队列满时任务留在堆与存储里等空位，不会无限堆积在内存。
+	QueueCapacity int `mapstructure:"queue_capacity"`
+
+	// DefaultTimeout 档位未声明 timeout 时的单次执行超时。
+	// 打开 Enabled 后必须是正值：执行器任务不存在"不限制"，否则挂死的进程会一直占住名额。
+	DefaultTimeout time.Duration `mapstructure:"default_timeout"`
+
+	// MaxTimeout 单次执行超时的上限。档位或任务请求里超过它的值会被拒绝，而不是静默夹取——
+	// 让调用方在提交时就看到上限，比执行到一半被中止更好排查。0 表示 DefaultExecMaxTimeout。
+	MaxTimeout time.Duration `mapstructure:"max_timeout"`
+
+	// RestorePolicy 重启时如何处理"崩溃瞬间仍在执行"的执行器任务：
+	// pause（默认）置为 paused 等人工确认——副作用结果未知时不替人决定；
+	// replay 则照常重新入队。其它取值由 Validate 拒绝。
+	RestorePolicy string `mapstructure:"restore_policy"`
+
+	// LoaderAllow 是否允许目录任务加载器接受 exec. 前缀的任务文件，默认 false。
+	//
+	// 结论（TASK-E17）：服务端二进制不启用加载器，所以这个取值在服务端没有行为差别。
+	// 它有一条明确的读取方——executor.Registry.LoaderAllowed()——供自行接入 core.DirectoryLoader
+	// 的程序把结果接到 LoaderOptions.AllowExecJobs 上；加载器自己只看那个字段，不回头读配置
+	// （core 读不到执行器登记表）。见 docs/design/executor-design.md §6.9。
+	LoaderAllow bool `mapstructure:"loader_allow"`
+
+	// Output 执行输出的截断与保留策略
+	Output ExecutorOutputConfig `mapstructure:"output"`
+
+	// WebEnabled 是否允许通过 Web 控制台与 REST 写端点增删改档位，默认 false。
+	// 打开它等于把"能改配置文件并重启的人才有可能执行命令"这条边界改成
+	// "能拿到 ops 档 JWT 的人也可以"，所以与 Enabled 一样必须由部署方显式表态。
+	// 关闭时不构造档位存储、不读 profiles_path 指向的文件，三个写端点一律 503。
+	// 设计依据见 docs/design/web-profile-design.md §2（D2），开发环境可用环境变量临时打开：
+	// GODELAYQ_EXECUTORS_WEB_ENABLED=true
+	WebEnabled bool `mapstructure:"web_enabled"`
+
+	// ProfilesPath 页面建的档位存放处；留空用 DefaultExecProfilesPath。
+	// 只有 WebEnabled 为 true 时才会被读。文件不存在是正常状态（还没人在页面上建过档位），
+	// 内容损坏则启动失败——把坏文件当成空文件会静默抹掉已经建好的档位。
+	// 本项不能替代 executors.commands：两份来源在启动时合并，同名以配置为准。
+	ProfilesPath string `mapstructure:"profiles_path"`
+
+	// Adhoc 是"执行位置由任务给出"那一组开关：打开后多出四条内置档位
+	// （exec.php、exec.python、exec.shell、exec.http），脚本路径与请求 URL 来自任务的 payload。
+	// 默认整节关闭。设计依据见 docs/design/job-name-type-and-adhoc-execution.md §5.7。
+	Adhoc AdhocConfig `mapstructure:"adhoc"`
+
+	// Commands 档位列表：能执行什么完全由这里决定。
+	// 校验规则在 executor.LoadProfiles（启动时执行，任一条不过即启动失败），
+	// 这里只保证键名与类型——UnmarshalExact 会拒绝档位内部的拼错键名。
+	Commands []ExecutorCommand `mapstructure:"commands"`
+}
+
+// AdhocConfig 是内置自由执行档位（adhoc）那一组开关。
+//
+// 它与 executors.commands 的区别只有一处：commands 里的档位把"跑哪个文件、打到哪里"写在定义里，
+// 而这里四条把这件事交给任务提交时的 payload。正因为交出去了，这一节的默认值是整节关闭
+// （docs/design/job-name-type-and-adhoc-execution.md §D11）。
+//
+// 关闭时四条内置档位一条都不注册：接口、页面与 /job-types 看不出任何变化。
+type AdhocConfig struct {
+	// Enabled 是否注册那四条内置档位，默认 false；打开要求 executors.enabled=true（Validate 拦）。
+	Enabled bool `mapstructure:"enabled"`
+
+	// ShellRuntime exec.shell 用的解释器名，留空用 DefaultAdhocShellRuntime。
+	// 它必须出现在 executors.runtime_allow 里，否则这一条内置档位根本构造不出来（Validate 拦）。
+	ShellRuntime string `mapstructure:"shell_runtime"`
+
+	// PathPrefixes 允许的任务级脚本路径前缀，相对 executors.workspace 或绝对都写；
+	// 空列表表示不限目录（§12 P1 的推荐值）。收窄它是这次放宽之后最顺手的一道闸。
+	PathPrefixes []string `mapstructure:"path_prefixes"`
+
+	// RequireExtension 是否要求脚本扩展名与解释器匹配（php→.php、python→.py、shell→.sh/.bash）。
+	//
+	// 用指针是因为本项的默认取值是 true，而 false 正是零值：普通 bool 分不出"没写"与
+	// "显式写了 false"，那会让"删掉这一行"变成"关掉扩展名要求"。
+	// 同形状的既有先例是 deny_private_ranges（ExecutorCommand 的 DenyPrivate）。
+	// 读它请走 WantExtensionCheck，不要在调用处各自判空。
+	RequireExtension *bool `mapstructure:"require_extension"`
+
+	// URLHosts exec.http 允许的主机，写法与 executors.commands 的 allowed_hosts 同一条
+	// （主机名或 host:port，允许 *.example.com 这种前缀通配）。
+	// 空列表表示不限主机——这是 §D9 第②层的放宽，只对本节生效：
+	// commands 里的 http 档位仍然必须有非空 allowed_hosts。
+	URLHosts []string `mapstructure:"url_hosts"`
+
+	// URLAllowPrivate 打开后不再拒绝回环/私网/链路本地地址。默认 false。
+	// 它关掉的是一道防 SSRF 的守卫（executor.HTTPRunner.refusalReason），
+	// 留空与 false 都表示"保持守卫"；真正的开发机自调自才需要显式打开。
+	URLAllowPrivate bool `mapstructure:"url_allow_private"`
+
+	// HTTPTimeout exec.http 这条档位的单次执行超时，0 用 DefaultAdhocHTTPTimeout；
+	// 超过 executors.max_timeout 会被拒（与档位自己的 timeout 同一条上限）。
+	HTTPTimeout time.Duration `mapstructure:"http_timeout"`
+}
+
+// WantExtensionCheck 回答"是否要求脚本扩展名与解释器匹配"：没写这一项时按默认值 true。
+func (a AdhocConfig) WantExtensionCheck() bool {
+	if a.RequireExtension == nil {
+		return DefaultAdhocRequireExtension
+	}
+	return *a.RequireExtension
+}
+
+// ExecutorCommand 一个可执行档位，注册后的任务类型名是 "exec." + Name。
+// 按 Kind 使用不同字段子集，未用的字段应当留空：executor.LoadProfiles 会拒绝填错的组合。
+type ExecutorCommand struct {
+	// Name 档位名，只允许字母、数字、下划线与连字符，长度 ≤64
+	Name string `mapstructure:"name"`
+	// Kind 执行方式：script（解释器 + workspace 内脚本）| binary（workspace 内产物或 PATH 程序）| http
+	Kind string `mapstructure:"kind"`
+
+	// Runtime 解释器名（bash/sh/cmd/pwsh/node/php/python/java 之一，受 executors.runtime_allow 约束），仅 script 档位使用
+	Runtime string `mapstructure:"runtime"`
+	// Script workspace 内的脚本相对路径，仅 script 档位使用
+	Script string `mapstructure:"script"`
+	// Program 二进制档位的可执行文件：workspace 内相对路径，或 runtime_allow 里的程序名
+	Program string `mapstructure:"program"`
+	// FixedArgs 二进制档位写死的参数前缀（payload 无法改写），例如 ["-jar", "app/app.jar"]
+	FixedArgs []string `mapstructure:"fixed_args"`
+
+	// Args 允许 payload 提供的具名参数；未声明的键一律拒绝
+	Args []ExecutorArg `mapstructure:"args"`
+	// ArgsRender 参数渲染模板，每项形如 "--day={day}"，占位符只能引用 Args 里声明过的名字
+	ArgsRender []string `mapstructure:"args_render"`
+	// Positional 位置参数规则；不声明就不接受位置参数
+	Positional *ExecutorPositional `mapstructure:"positional"`
+
+	// Cwd 工作目录，相对 workspace；留空表示 workspace 本身
+	Cwd string `mapstructure:"cwd"`
+	// Env 注入子进程的固定变量，payload 不能覆盖
+	Env map[string]string `mapstructure:"env"`
+	// EnvAllow 允许 payload 额外注入的变量键名白名单
+	EnvAllow []string `mapstructure:"env_allow"`
+
+	// Timeout 单次执行超时，留空用 executors.default_timeout；超过 executors.max_timeout 报错
+	Timeout time.Duration `mapstructure:"timeout"`
+	// MaxParallel 同一档位同时执行的任务数上限，0 表示 1
+	MaxParallel int `mapstructure:"max_parallel"`
+	// RetryOnExit 这些退出码允许重试；其它非 0 退出码按"重试也不会变好"处理
+	RetryOnExit []int `mapstructure:"retry_on_exit"`
+
+	// ---- 以下仅 http 档位使用 ----
+
+	// Method HTTP 方法，大写：GET|POST|PUT|PATCH|DELETE
+	Method string `mapstructure:"method"`
+	// URLTemplate 目标 URL，可含 {name} 占位符（占位符名必须在 Args 里声明）
+	URLTemplate string `mapstructure:"url_template"`
+	// AllowedHosts 允许访问的主机白名单，元素是主机名、host:port 或 "*.域名"
+	AllowedHosts []string `mapstructure:"allowed_hosts"`
+	// Headers 固定请求头
+	Headers map[string][]string `mapstructure:"headers"`
+	// HeaderAllow 允许 payload 覆盖的请求头键名
+	HeaderAllow []string `mapstructure:"header_allow"`
+	// Body 请求体来源：json（payload.body 必须是对象/数组）| raw（任意 JSON 值）| none（忽略 body）
+	Body string `mapstructure:"body"`
+	// ExpectStatus 视为成功的状态码；留空表示只接受 2xx
+	ExpectStatus []int `mapstructure:"expect_status"`
+	// CaptureResponse 是否把响应体写进产物文件
+	CaptureResponse bool `mapstructure:"capture_response"`
+	// MaxBodyBytes 响应体读取上限，0 表示用 executors.output.max_bytes
+	MaxBodyBytes int `mapstructure:"max_body_bytes"`
+	// MaxRedirects 只允许 0：跟随重定向会让 allowed_hosts 失去意义
+	MaxRedirects int `mapstructure:"max_redirects"`
+	// DenyPrivate 是否禁止解析到回环/内网/链路本地地址；留空表示禁止
+	DenyPrivate *bool `mapstructure:"deny_private_ranges"`
+}
+
+// ExecutorArg 档位声明的一个具名参数。
+type ExecutorArg struct {
+	// Name 参数名，小写字母、数字与下划线
+	Name string `mapstructure:"name"`
+	// Required payload 必须提供该参数
+	Required bool `mapstructure:"required"`
+	// Default 未提供时使用的值；与 Required 同时给出属于配置矛盾
+	Default string `mapstructure:"default"`
+	// Pattern 值的正则约束；留空由 executor 侧套用默认安全字符集
+	Pattern string `mapstructure:"pattern"`
+	// Secret 值属于敏感信息：HTTP 响应里掩码，且不出现在错误信息中
+	Secret bool `mapstructure:"secret"`
+	// AllowDash 允许值以 "-" 开头。默认不允许：值以 "-" 开头可能被程序解释成选项
+	AllowDash bool `mapstructure:"allow_dash"`
+}
+
+// ExecutorPositional 位置参数的数量与取值约束。
+type ExecutorPositional struct {
+	// Max 位置参数个数上限，1..16
+	Max int `mapstructure:"max"`
+	// Pattern 每个位置值的正则约束；留空由 executor 侧套用默认安全字符集
+	Pattern string `mapstructure:"pattern"`
+}
+
+// ExecutorOutputConfig 执行输出（stdout/stderr）的落盘与预览参数。
+type ExecutorOutputConfig struct {
+	// InlinePreview 事件与任务快照里携带的输出尾部预览字节数；0 表示 DefaultExecInlinePreview。
+	// 完整输出落在 Dir 下的产物文件，不进 jobs.json——那里每次落盘都是整文件重写。
+	InlinePreview int `mapstructure:"inline_preview"`
+
+	// MaxBytes 单条流（stdout 或 stderr）的落盘上限；0 表示 DefaultExecMaxOutputBytes。
+	// 达到上限即停止写入并标记截断，不静默丢弃也不报错中断执行。
+	MaxBytes int `mapstructure:"max_bytes"`
+
+	// Dir 产物目录；空表示 DefaultExecOutputDir。与 store.path 分开放，便于单独设权限与清理。
+	Dir string `mapstructure:"dir"`
+
+	// TTL 产物保留时长，如 168h；0 表示不按时间清理（只做启动时的孤儿清理）。
+	// 默认 DefaultExecOutputTTL；建议与 store.history_ttl 一起配置，见设计文档 §6.4。
+	TTL time.Duration `mapstructure:"ttl"`
+}
+
+// Validate 校验执行器配置自身的取值。
+//
+// 只有 Enabled 为 true 时才收紧"必须显式配置"这类约束：关闭状态下 0 值与留空是正常写法，
+// 不该逼每个部署都抄一遍完整配置。反向的例外是 loader_allow：它开了却没开执行器，
+// 只能是配置写错，静默接受会让人以为文件投递通道已经打通。
+func (e ExecutorsConfig) Validate() error {
+	if role := strings.TrimSpace(e.RequiredRole); role != "" {
+		parsed, ok := ParseRole(role)
+		if !ok {
+			return fmt.Errorf("executors.required_role %q is invalid, use operator|admin|ops", role)
+		}
+		if !parsed.AtLeast(RoleOperator) {
+			// machine 不是可填档位，ParseRole 已经把它拒了；这里拦的是只读档
+			return fmt.Errorf("executors.required_role must be operator, admin or ops, got %q", role)
+		}
+	}
+
+	switch strings.TrimSpace(e.RestorePolicy) {
+	case "", "pause", "replay":
+	default:
+		return fmt.Errorf("executors.restore_policy %q is invalid, use pause or replay", e.RestorePolicy)
+	}
+
+	if e.Workspace != "" && strings.TrimSpace(e.Workspace) == "" {
+		return fmt.Errorf("executors.workspace must not be whitespace")
+	}
+	if e.Output.Dir != "" && strings.TrimSpace(e.Output.Dir) == "" {
+		return fmt.Errorf("executors.output.dir must not be whitespace")
+	}
+	if e.ProfilesPath != "" && strings.TrimSpace(e.ProfilesPath) == "" {
+		return fmt.Errorf("executors.profiles_path must not be whitespace")
+	}
+
+	if err := checkExecNameList("runtime_allow", e.RuntimeAllow); err != nil {
+		return err
+	}
+	if err := checkExecNameList("env_allow", e.EnvAllow); err != nil {
+		return err
+	}
+	// 这里的键名不检查大小写：执行侧按折大小写的方式比较（Windows 的环境变量名不区分大小写），
+	// 并且无条件透传 SystemRoot/COMSPEC/PATHEXT/PATH 这几个子进程启动必需的键。
+	// 把它们再写一遍进 env_allow 是正常配置，不是安全漏洞；本节关于环境变量的红线只有下面那条。
+	for _, key := range e.EnvAllow {
+		if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(key)), "GODELAYQ_") {
+			// 服务端的凭据与 JWT 密钥都以 GODELAYQ_ 前缀出现在进程环境里，
+			// 把它们列进子进程白名单是配置错误，不是运维选择
+			return fmt.Errorf("executors.env_allow must not contain %q: GODELAYQ_ prefixed keys hold server credentials", key)
+		}
+	}
+
+	if e.Concurrency < 0 {
+		return fmt.Errorf("executors.concurrency must not be negative, got %d", e.Concurrency)
+	}
+	if e.QueueCapacity < 0 {
+		return fmt.Errorf("executors.queue_capacity must not be negative, got %d", e.QueueCapacity)
+	}
+	if e.DefaultTimeout < 0 {
+		return fmt.Errorf("executors.default_timeout must not be negative, got %v", e.DefaultTimeout)
+	}
+	if e.MaxTimeout < 0 {
+		return fmt.Errorf("executors.max_timeout must not be negative, got %v", e.MaxTimeout)
+	}
+	if e.Output.InlinePreview < 0 {
+		return fmt.Errorf("executors.output.inline_preview must not be negative, got %d", e.Output.InlinePreview)
+	}
+	if e.Output.MaxBytes < 0 {
+		return fmt.Errorf("executors.output.max_bytes must not be negative, got %d", e.Output.MaxBytes)
+	}
+	if e.Output.TTL < 0 {
+		return fmt.Errorf("executors.output.ttl must not be negative, got %v", e.Output.TTL)
+	}
+
+	if err := validateAdhocConfig(e); err != nil {
+		return err
+	}
+
+	if !e.Enabled {
+		if e.LoaderAllow {
+			return fmt.Errorf("executors.loader_allow requires executors.enabled to be true")
+		}
+		if e.WebEnabled {
+			// 与 loader_allow 同一条：没有执行能力却打开了档位的在线修改，只能是配置写错。
+			// 报错比让人以为"页面上已经能改档位"好——那时三个写端点只会回 503。
+			return fmt.Errorf("executors.web_enabled requires executors.enabled to be true")
+		}
+		if e.Adhoc.Enabled {
+			// 同上一条：自由执行档位是执行能力的一种，关闭了执行器却打开它只能是配置写错。
+			// 这里的判据与 web_enabled 一致，见 docs/design/job-name-type-and-adhoc-execution.md §D11。
+			return fmt.Errorf("executors.adhoc.enabled requires executors.enabled to be true")
+		}
+		return nil
+	}
+
+	// 开启执行器后，0 值不再按"用默认值"放过：写显式 0 的人想要的是"不配置"，
+	// 而这两者在执行器上后果差别很大，宁可报错让他删掉这一项或填个真实值。
+	if e.Concurrency < 1 {
+		return fmt.Errorf("executors.concurrency must be at least 1 when executors.enabled is true, got %d (omit the key to use %d)", e.Concurrency, DefaultExecConcurrency)
+	}
+	if e.DefaultTimeout <= 0 {
+		return fmt.Errorf("executors.default_timeout must be positive when executors.enabled is true, got %v (omit the key to use %v)", e.DefaultTimeout, DefaultExecDefaultTimeout)
+	}
+	if e.MaxTimeout <= 0 {
+		return fmt.Errorf("executors.max_timeout must be positive when executors.enabled is true, got %v (omit the key to use %v)", e.MaxTimeout, DefaultExecMaxTimeout)
+	}
+	if e.DefaultTimeout > e.MaxTimeout {
+		return fmt.Errorf("executors.default_timeout %v must not exceed executors.max_timeout %v", e.DefaultTimeout, e.MaxTimeout)
+	}
+	if e.Output.MaxBytes < 1024 {
+		return fmt.Errorf("executors.output.max_bytes must be at least 1024 when executors.enabled is true, got %d", e.Output.MaxBytes)
+	}
+
+	return nil
+}
+
+// validateAdhocConfig 校验 executors.adhoc 一节的写法。
+//
+// 它在 Enabled 为 false 时也跑：与 runtime_allow、env_allow 同一条口径——
+// 写错的白名单不该等到有人打开开关才暴露。
+// 但"打开 adhoc 却关着执行器"那一条在 Validate 主流程里判（与 web_enabled 并排）。
+//
+// 这一节里"路径能不能落在允许的范围内""主机能不能访问"这类真判据不在这里：
+// 前者与后者都由 executor 侧在构造与提交时执行（core 不许 import executor，
+// 而主机白名单的完整写法判据本来就在 executor/profile.go 的 checkAllowedHosts 那一份里）。
+// 这里只保证"写得对不对形"，避免把一份注定构造不出档位的内容存进配置。
+func validateAdhocConfig(e ExecutorsConfig) error {
+	adhoc := e.Adhoc
+
+	runtime := strings.TrimSpace(adhoc.ShellRuntime)
+	if adhoc.ShellRuntime != "" && runtime == "" {
+		return fmt.Errorf("executors.adhoc.shell_runtime must not be whitespace")
+	}
+	if adhoc.Enabled && runtime != "" {
+		// 只在整节打开时判白名单成员：默认值 bash 与"把 runtime_allow 收成 [node, php]"这两条
+		// 都没打算执行 shell，而启动失败是最响的那种反馈——
+		// 关闭状态下的取值一律不参与行为（见 ExecutorsConfig 一节开头的同一条口径）。
+		allow := e.RuntimeAllow
+		if len(allow) == 0 {
+			// 留空的白名单在归一化之后才是内置默认列表；Validate 跑在归一化之前，
+			// 所以这里按同一份默认判，不能因为列表为空就放过任意解释器名。
+			allow = DefaultConfig().Executors.RuntimeAllow
+		}
+		found := false
+		for _, item := range allow {
+			if strings.EqualFold(strings.TrimSpace(item), runtime) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("executors.adhoc.shell_runtime %q is not in executors.runtime_allow %v",
+				runtime, allow)
+		}
+	}
+
+	if err := checkExecNameList("adhoc.path_prefixes", adhoc.PathPrefixes); err != nil {
+		return err
+	}
+	if err := checkExecNameList("adhoc.url_hosts", adhoc.URLHosts); err != nil {
+		return err
+	}
+	for i, host := range adhoc.URLHosts {
+		// 这里只判形状。完整的主机写法（含 *. 通配的后缀要求、端口区间、IP 字面量）
+		// 在 executor/profile.go 的 checkAllowedHosts 那一份里，两份规则迟早分叉，
+		// 所以这一处刻意只做"一眼就能看出写错了"的那几条。
+		if strings.Contains(host, "://") {
+			return fmt.Errorf("executors.adhoc.url_hosts[%d] %q must be a host, not a URL", i, host)
+		}
+		if strings.ContainsAny(host, `/?#@`) {
+			return fmt.Errorf("executors.adhoc.url_hosts[%d] %q must not contain a path, query or credentials", i, host)
+		}
+	}
+
+	if adhoc.HTTPTimeout < 0 {
+		return fmt.Errorf("executors.adhoc.http_timeout must not be negative, got %v", adhoc.HTTPTimeout)
+	}
+	if adhoc.HTTPTimeout > 0 && e.MaxTimeout > 0 && adhoc.HTTPTimeout > e.MaxTimeout {
+		return fmt.Errorf("executors.adhoc.http_timeout %v must not exceed executors.max_timeout %v",
+			adhoc.HTTPTimeout, e.MaxTimeout)
+	}
+
+	return nil
+}
+
+// checkExecNameList 校验白名单列表的每一项：不能是空白项、不能带首尾空格或控制字符。
+// 这三条都会让白名单出现"看起来配了但永远匹配不上"的项，属于必须启动即报的写法。
+func checkExecNameList(field string, list []string) error {
+	for _, item := range list {
+		if strings.TrimSpace(item) == "" {
+			return fmt.Errorf("executors.%s must not contain an empty entry", field)
+		}
+		if item != strings.TrimSpace(item) {
+			return fmt.Errorf("executors.%s entries must not have surrounding spaces, got %q", field, item)
+		}
+		if strings.ContainsFunc(item, func(r rune) bool { return r < 0x20 || r == 0x7f }) {
+			return fmt.Errorf("executors.%s entries must not contain control characters, got %q", field, item)
+		}
+	}
+	return nil
+}
+
+// SQLite 观测层配置的默认值。整节默认关闭（ObservabilityConfig.Enabled），
+// 关闭时下面所有取值都不生效，进程也不创建任何文件。
+// 本节每一项都有明确的读取方（见各字段注释里的卡片编号），卡片顺序见
+// docs/design/tasks/sqlite/README.md；执行到 S02 之前还没有读取方是阶段安排，
+// 不是未生效项，不要按 api/history.go 的惯例删掉。
+const (
+	// DefaultObservePath 观测库文件位置。与 store.path、executors.output.dir 同一目录树但不同文件。
+	DefaultObservePath = "./data/observe.sqlite"
+	// DefaultObserveFlushInterval 批量写入周期，与任务快照的 DefaultFlushInterval 同一口径，
+	// 同时是事件读取端点的可见性延迟上界（设计文档 D5）。
+	DefaultObserveFlushInterval = DefaultFlushInterval
+	// DefaultObserveQueueCapacity 写入队列容量：队满即丢弃新记录并累计计数，不阻塞调用方。
+	DefaultObserveQueueCapacity = 4096
+	// DefaultObserveBusyTimeout SQLite busy 等待上限。
+	DefaultObserveBusyTimeout = 2 * time.Second
+	// DefaultObserveSynchronous SQLite synchronous PRAGMA 取值。
+	DefaultObserveSynchronous = "normal"
+
+	// DefaultObserveEventRetentionCount job_events 保留条数，超出按 seq 淘汰最旧。
+	DefaultObserveEventRetentionCount = 200000
+	// DefaultObserveEventRetentionAge job_events 保留时长，0 表示不按时间淘汰。
+	DefaultObserveEventRetentionAge = 720 * time.Hour
+
+	// DefaultObserveAuditRetentionCount write_audit 保留条数。
+	DefaultObserveAuditRetentionCount = 500000
+	// DefaultObserveAuditRetentionAge write_audit 保留时长（90 天）：安全台账的价值在事后追溯。
+	DefaultObserveAuditRetentionAge = 2160 * time.Hour
+)
+
+// minObserveFlushInterval 批量写入周期的下限。低于它的取值等价于"每写一条记录开一个事务"，
+// 观测层不该以这种形态运行，因此由 Validate 直接拒绝而不是悄悄抬到下限。
+const minObserveFlushInterval = 10 * time.Millisecond
+
+// ObservabilityConfig 是 SQLite 观测层：运行事件、产物索引、写操作审计。
+// 默认关闭，关闭时下面所有取值都不生效，进程不创建任何文件。
+// 设计依据见 docs/design/sqlite-observability-design.md；它独立于 store 一节，
+// 因为这里不改任务快照的存放位置，放近会让人以为它与 store.type 有关。
+type ObservabilityConfig struct {
+	// Enabled 观测层总开关。false 时不建库文件、不订阅事件总线、不注入任何写入器。
+	// 由 S02 消费（cmd/server 的装配分支）。
+	Enabled bool `mapstructure:"enabled"`
+	// Path 库文件路径；空表示 DefaultObservePath，父目录不存在时由 S02 创建。
+	Path string `mapstructure:"path"`
+	// FlushInterval 批量写入周期，也是事件端点看到最新一条的延迟上界；0 表示 DefaultObserveFlushInterval。
+	FlushInterval time.Duration `mapstructure:"flush_interval"`
+	// QueueCapacity 三个写入器各自的有界队列容量；满则丢弃并计数，绝不回压 EventBus。
+	// 与 executors.queue_capacity 的"0 表示用默认值"不同：这里显式写 0 等于"一条都不留"，
+	// 由 Validate 拒绝。Normalized 的补默认只服务代码里直接构造的配置。
+	QueueCapacity int `mapstructure:"queue_capacity"`
+	// BusyTimeout SQLite busy 等待上限；0 表示 DefaultObserveBusyTimeout。
+	BusyTimeout time.Duration `mapstructure:"busy_timeout"`
+	// Synchronous SQLite synchronous PRAGMA：normal|full，空表示 DefaultObserveSynchronous。
+	// normal 在 WAL 下断电最多丢最后若干次已提交事务，与 JSONFileStore 的"最多丢一个合并周期"同量级。
+	Synchronous string `mapstructure:"synchronous"`
+
+	// Events 运行事件（job_events）的开关与保留策略。
+	Events ObservabilityEventsConfig `mapstructure:"events"`
+	// Artifacts 产物索引（artifact_index）的开关。
+	Artifacts ObservabilityArtifactsConfig `mapstructure:"artifacts"`
+	// Audit 写操作审计（write_audit）的开关与保留策略。
+	Audit ObservabilityAuditConfig `mapstructure:"audit"`
+}
+
+// ObservabilityEventsConfig 运行事件表。enabled 与保留条数/时长由 S03 消费。
+type ObservabilityEventsConfig struct {
+	// Enabled 总开关打开时是否写入事件。关掉它只建表不写入，读端点仍按未装配处理。
+	Enabled bool `mapstructure:"enabled"`
+	// RetentionCount 保留条数，超出按 seq 淘汰最旧；<=0 表示 DefaultObserveEventRetentionCount。
+	RetentionCount int `mapstructure:"retention_count"`
+	// RetentionAge 保留时长，如 720h；0 表示不按时间淘汰，负值归一化为默认时长。
+	RetentionAge time.Duration `mapstructure:"retention_age"`
+}
+
+// ObservabilityArtifactsConfig 产物索引表，由 S05 消费。
+type ObservabilityArtifactsConfig struct {
+	// Enabled 是否在产物写入与清理时同步维护 artifact_index。
+	Enabled bool `mapstructure:"enabled"`
+}
+
+// ObservabilityAuditConfig 写操作审计表，由 S06 消费。
+type ObservabilityAuditConfig struct {
+	// Enabled 是否记录 POST/PUT/DELETE 的审计行。
+	Enabled bool `mapstructure:"enabled"`
+	// RetentionCount 保留条数；<=0 表示 DefaultObserveAuditRetentionCount。
+	RetentionCount int `mapstructure:"retention_count"`
+	// RetentionAge 保留时长；0 表示不按时间淘汰，负值归一化为默认时长。
+	RetentionAge time.Duration `mapstructure:"retention_age"`
+}
+
+// Validate 校验观测层自身的取值。
+//
+// 与 ExecutorsConfig.Validate 同一口径：Enabled 为 false 时本节全部取值不生效，
+// 一个都没启用观测层的部署不该因为这里写了非法值而起不来，也不该被要求抄一遍完整配置。
+func (o ObservabilityConfig) Validate() error {
+	if !o.Enabled {
+		return nil
+	}
+
+	if strings.TrimSpace(o.Path) == "" {
+		return fmt.Errorf("observability.path must not be empty when observability.enabled is true")
+	}
+	switch strings.TrimSpace(o.Synchronous) {
+	case "", "normal", "full":
+	default:
+		return fmt.Errorf("observability.synchronous %q is invalid, use normal or full", o.Synchronous)
+	}
+	if o.FlushInterval < 0 {
+		return fmt.Errorf("observability.flush_interval must not be negative, got %v", o.FlushInterval)
+	}
+	if o.FlushInterval > 0 && o.FlushInterval < minObserveFlushInterval {
+		return fmt.Errorf("observability.flush_interval %v is too small, a batch window below %v means one transaction per record (omit the key to use %v)",
+			o.FlushInterval, minObserveFlushInterval, DefaultObserveFlushInterval)
+	}
+	if o.BusyTimeout < 0 {
+		return fmt.Errorf("observability.busy_timeout must not be negative, got %v", o.BusyTimeout)
+	}
+	if o.QueueCapacity <= 0 {
+		return fmt.Errorf("observability.queue_capacity must be positive when observability.enabled is true, got %d (omit the key to use %d)",
+			o.QueueCapacity, DefaultObserveQueueCapacity)
+	}
+	// 三个子节的 enabled 在总开关关闭时没有意义，这里不报错：保持"关闭即惰性"的读法。
+	// 保留条数与时长也没有非法值可拦——0 与负数都被 Normalized 解释成默认值。
+
+	return nil
+}
+
+// 管理库的默认值。库文件落在 data/ 目录树，与 observe.sqlite、jobs.json 同一取向；
+// busy/synchronous 沿用观测层的那组口径（本地库 + WAL + normal）。
+const (
+	// DefaultMgrDBPath 管理库文件位置。
+	DefaultMgrDBPath = "./data/goqsys_mgr.sqlite"
+	// DefaultMgrBusyTimeout SQLite busy 等待上限。
+	DefaultMgrBusyTimeout = DefaultObserveBusyTimeout
+	// DefaultMgrSynchronous SQLite synchronous PRAGMA 取值。
+	DefaultMgrSynchronous = DefaultObserveSynchronous
+)
+
+// 任务快照库的默认值。与管理库分文件是刻意的：任务写入是热路径（每次状态
+// 迁移一写），账号/分组/档位是冷数据，隔离 WAL 与锁竞争；观测库同理。
+// busy/synchronous 与管理库同组口径，三常量不抽公共结构——默认值唯一来源在
+// core 各自的字段上，抽结构会让两处语义共享一个进化方向，那不是事实。
+const (
+	// DefaultJobsDBPath 任务快照库文件位置。
+	DefaultJobsDBPath = "./data/goqsys_jobs.sqlite"
+	// DefaultJobsBusyTimeout 任务快照库 SQLite busy 等待上限。
+	DefaultJobsBusyTimeout = DefaultObserveBusyTimeout
+	// DefaultJobsSynchronous 任务快照库 synchronous PRAGMA 取值。
+	DefaultJobsSynchronous = DefaultObserveSynchronous
+)
+
+// MgrStoreConfig 管理库：控制台账号、分组元数据、执行器档位的 SQLite 存储。
+// 默认关闭——关闭时这三类数据继续走既有文件（server.auth.users、store.groups_path、
+// executors.profiles_path），进程行为与本节不存在时完全一致，不创建任何文件。
+// 打开后这三类数据以库为准，配置与 JSON 文件只在首次启动时作为一次性导入源。
+type MgrStoreConfig struct {
+	// Enabled 管理库总开关。false 时不建库文件，进程按文件形态运行。
+	Enabled bool `mapstructure:"enabled"`
+	// Path 库文件路径；空表示 DefaultMgrDBPath，父目录不存在时由装配方创建。
+	Path string `mapstructure:"path"`
+	// BusyTimeout SQLite busy 等待上限；0 表示 DefaultMgrBusyTimeout。
+	BusyTimeout time.Duration `mapstructure:"busy_timeout"`
+	// Synchronous SQLite synchronous PRAGMA：normal|full，空表示 DefaultMgrSynchronous。
+	Synchronous string `mapstructure:"synchronous"`
+}
+
+// Validate 校验管理库自身的取值。与 ObservabilityConfig.Validate 同一口径：
+// Enabled 为 false 时本节全部取值不生效。
+func (m MgrStoreConfig) Validate() error {
+	if !m.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(m.Path) == "" {
+		return fmt.Errorf("mgrstore.path must not be empty when mgrstore.enabled is true")
+	}
+	switch strings.TrimSpace(m.Synchronous) {
+	case "", "normal", "full":
+	default:
+		return fmt.Errorf("mgrstore.synchronous %q is invalid, use normal or full", m.Synchronous)
+	}
+	if m.BusyTimeout < 0 {
+		return fmt.Errorf("mgrstore.busy_timeout must not be negative, got %v", m.BusyTimeout)
+	}
+	return nil
+}
+
+// StoreSQLiteConfig 任务快照 SQLite 后端的取值。仅 store.type=sqlite 时生效；
+// 三字段与 MgrStoreConfig 同构而不抽公共结构（默认值唯一来源原则，见任务库常量注释）。
+type StoreSQLiteConfig struct {
+	// Path 库文件路径；空表示 DefaultJobsDBPath，父目录不存在时由装配方创建。
+	Path string `mapstructure:"path"`
+	// BusyTimeout SQLite busy 等待上限；0 表示 DefaultJobsBusyTimeout。
+	BusyTimeout time.Duration `mapstructure:"busy_timeout"`
+	// Synchronous SQLite synchronous PRAGMA：normal|full，空表示 DefaultJobsSynchronous。
+	Synchronous string `mapstructure:"synchronous"`
+}
+
+// Validate 校验任务库自身的取值。没有 Enabled 开关——生效与否由 store.type 决定，
+// 但取值合法性独立检查：写着 type=sqlite 却带非法 synchronous 要在启动时报错，
+// 不能等切了 type 才炸。
+func (s StoreSQLiteConfig) Validate() error {
+	switch strings.TrimSpace(s.Synchronous) {
+	case "", "normal", "full":
+	default:
+		return fmt.Errorf("store.sqlite.synchronous %q is invalid, use normal or full", s.Synchronous)
+	}
+	if s.BusyTimeout < 0 {
+		return fmt.Errorf("store.sqlite.busy_timeout must not be negative, got %v", s.BusyTimeout)
+	}
+	return nil
+}
+
+// DefaultConfig 返回与代码内置默认值一致的配置
+func DefaultConfig() Config {
+	return Config{
+		Server: ServerConfig{
+			Port: "8080",
+			Auth: AuthConfig{
+				Token: "", // 空即不启用静态凭据
+				JWT: JWTConfig{
+					Secret:     "", // 无账号时不需要密钥
+					AccessTTL:  DefaultAccessTTL,
+					RefreshTTL: DefaultRefreshTTL,
+				},
+			},
+			CORS: CORSConfig{
+				AllowOrigins:     []string{"*"},
+				AllowCredentials: false,
+			},
+		},
+		Scheduler: SchedulerConfig{
+			Workers:         DefaultConcurrency,
+			QueueCapacity:   0, // 与 Workers 相等
+			MaxRetryDelay:   30 * time.Minute,
+			ShutdownTimeout: 5 * time.Second,
+		},
+		Store: StoreConfig{
+			Type:          "json",
+			Path:          "./data/jobs.json",
+			FlushInterval: DefaultFlushInterval,
+			HistoryLimit:  DefaultHistoryLimit,
+			HistoryTTL:    0,
+			GroupsPath:    DefaultGroupsPath,
+			SQLite:        StoreSQLiteConfig{Path: DefaultJobsDBPath},
+		},
+		Logging: LoggingConfig{
+			Level:  "info",
+			Format: "text",
+		},
+		Executors: ExecutorsConfig{
+			// 默认关闭：打开执行器等于把任务提交权限扩展成命令执行权限，
+			// 必须由部署方显式决定（Enabled 为 true 时同时应配置 server.auth）。
+			Enabled:        false,
+			RequiredRole:   DefaultExecRequiredRole,
+			Workspace:      DefaultExecWorkspace,
+			RuntimeAllow:   []string{"bash", "sh", "cmd", "pwsh", "node", "php", "python", "java"},
+			EnvAllow:       []string{"PATH", "LANG", "LC_ALL", "TZ", "HOME"},
+			Concurrency:    DefaultExecConcurrency,
+			QueueCapacity:  0, // 与 Concurrency 相等
+			DefaultTimeout: DefaultExecDefaultTimeout,
+			MaxTimeout:     DefaultExecMaxTimeout,
+			RestorePolicy:  DefaultExecRestorePolicy,
+			LoaderAllow:    false,
+			WebEnabled:     false,
+			ProfilesPath:   DefaultExecProfilesPath,
+			Adhoc: AdhocConfig{
+				// 整节默认关闭：打开它等于让"任务提交时带来的路径/地址"决定执行什么。
+				Enabled:          false,
+				ShellRuntime:     DefaultAdhocShellRuntime,
+				RequireExtension: defaultAdhocRequireExtension(),
+				HTTPTimeout:      DefaultAdhocHTTPTimeout,
+			},
+			Output: ExecutorOutputConfig{
+				InlinePreview: DefaultExecInlinePreview,
+				MaxBytes:      DefaultExecMaxOutputBytes,
+				Dir:           DefaultExecOutputDir,
+				TTL:           DefaultExecOutputTTL,
+			},
+			Commands: nil,
+		},
+		Observability: ObservabilityConfig{
+			// 默认关闭：观测层是可选的排障与追溯能力，打开它才会创建库文件，
+			// 关闭时下面所有取值都不生效（子节的 enabled 保持"打开总开关即用"的默认）。
+			Enabled:       false,
+			Path:          DefaultObservePath,
+			FlushInterval: DefaultObserveFlushInterval,
+			QueueCapacity: DefaultObserveQueueCapacity,
+			BusyTimeout:   DefaultObserveBusyTimeout,
+			Synchronous:   DefaultObserveSynchronous,
+			Events: ObservabilityEventsConfig{
+				Enabled:        true,
+				RetentionCount: DefaultObserveEventRetentionCount,
+				RetentionAge:   DefaultObserveEventRetentionAge,
+			},
+			Artifacts: ObservabilityArtifactsConfig{
+				Enabled: true,
+			},
+			Audit: ObservabilityAuditConfig{
+				Enabled:        true,
+				RetentionCount: DefaultObserveAuditRetentionCount,
+				RetentionAge:   DefaultObserveAuditRetentionAge,
+			},
+		},
+		MgrStore: MgrStoreConfig{
+			// 默认关闭：打开它等于把账号、分组、档位从配置与 JSON 文件迁进 SQLite，
+			// 必须由部署方显式决定（导入行为见 store/mgr 的一次性导入说明）。
+			Enabled:     false,
+			Path:        DefaultMgrDBPath,
+			BusyTimeout: DefaultMgrBusyTimeout,
+			Synchronous: DefaultMgrSynchronous,
+		},
+		Reload: ReloadConfig{
+			// 默认关闭：打开它等于让进程盯着配置文件自动换取值，
+			// 关闭时一个监听器都不建，本节其余取值全部不生效。
+			Enabled:  false,
+			Debounce: DefaultReloadDebounce,
+		},
+	}
+}
+
+// LoadConfig 读取配置：以默认值为底，叠加配置文件与环境变量。
+// path 为空时按约定查找 configs/config.{yaml,yml}；该文件不存在不算错误。
+// 显式指定的文件缺失或格式非法则返回错误。
+func LoadConfig(path string) (Config, error) {
+	cfg := DefaultConfig()
+
+	v := viper.New()
+	v.SetConfigType("yaml")
+
+	if path != "" {
+		v.SetConfigFile(path)
+	} else {
+		v.SetConfigName("config")
+		v.AddConfigPath("configs")
+	}
+
+	// 环境变量覆盖：GODELAYQ_SERVER_PORT / GODELAYQ_SCHEDULER_WORKERS ...
+	// 列表型（allow_origins）由 viper 默认的逗号分隔 hook 解析。
+	// server.auth.users 故意不绑定环境变量：它是"名字+哈希+角色"的嵌套列表，
+	// 逗号分隔 hook 无法表达，且把账号塞进环境变量很容易被 `ps eww` 之类的旁路读到。
+	for _, key := range []string{
+		"server.port",
+		"server.auth.token",
+		"server.auth.jwt.secret",
+		"server.auth.jwt.access_ttl",
+		"server.auth.jwt.refresh_ttl",
+		"server.cors.allow_origins",
+		"server.cors.allow_credentials",
+		"scheduler.workers",
+		"scheduler.queue_capacity",
+		"scheduler.max_retry_delay",
+		"scheduler.shutdown_timeout",
+		"store.type",
+		"store.path",
+		"store.flush_interval",
+		"store.history_limit",
+		"store.history_ttl",
+		"store.groups_path",
+		"logging.level",
+		"logging.format",
+		// 执行器：只绑定标量与简单列表。executors.commands 是"名字+参数+路径"的嵌套列表，
+		// 与 server.auth.users 同一条限制：逗号分隔 hook 无法表达，且把可执行内容塞进
+		// 环境变量很容易被 `ps eww` 之类的旁路读到。
+		"executors.enabled",
+		"executors.required_role",
+		"executors.workspace",
+		"executors.runtime_allow",
+		"executors.env_allow",
+		"executors.concurrency",
+		"executors.queue_capacity",
+		"executors.default_timeout",
+		"executors.max_timeout",
+		"executors.restore_policy",
+		"executors.loader_allow",
+		// 在线管理档位：两个都是标量，所以能绑。真正的档位列表在文件里（executors.profiles_path
+		// 指向它），而那份文件的内容与 executors.commands 一样故意不绑环境变量。
+		"executors.web_enabled",
+		"executors.profiles_path",
+		// 自由执行档位只绑这一个开关：开发环境要临时试一次"提交时给路径"，
+		// 靠它打开就够了。其余六项（列表、时长、解释器名、两个布尔）一律不绑——
+		// 列表绑了会把"覆盖"变成"替换"，与 executors.commands 不绑是同一条理由（见上面的注释）。
+		// 漏进这份清单不会报错，只会让该项无法用 GODELAYQ_* 覆盖，所以加键要同时加行。
+		"executors.adhoc.enabled",
+		"executors.output.inline_preview",
+		"executors.output.max_bytes",
+		"executors.output.dir",
+		"executors.output.ttl",
+		// SQLite 观测层：全部是标量，逐项绑定。这里漏一项不会让任何东西失败——配置照常读、
+		// 值照常生效，只有环境变量悄悄无效。反向的"YAML 里写 observability.* 能被接受"
+		// 来自 UnmarshalExact 按结构体字段判断，与下面这份列表无关。
+		// 路径不是凭据，所以 observability.path 也绑定（对照故意不绑的 server.auth.users、
+		// executors.commands：那是嵌套列表，且内容本身不该出现在环境变量里）。
+		"observability.enabled",
+		"observability.path",
+		"observability.flush_interval",
+		"observability.queue_capacity",
+		"observability.busy_timeout",
+		"observability.synchronous",
+		"observability.events.enabled",
+		"observability.events.retention_count",
+		"observability.events.retention_age",
+		"observability.artifacts.enabled",
+		"observability.audit.enabled",
+		"observability.audit.retention_count",
+		"observability.audit.retention_age",
+		// 配置热重载：两项都是标量，逐项绑定。这里漏一项不会让任何东西失败——
+		// YAML 里的 reload.* 照常能被读出来（那是 UnmarshalExact 按结构体字段判断的），
+		// 只有环境变量悄悄无效，所以由 TestLoadConfig_ReloadEnvOverrides 守着。
+		"reload.enabled",
+		"reload.debounce",
+	} {
+		if err := v.BindEnv(key, "GODELAYQ_"+strings.ToUpper(strings.ReplaceAll(key, ".", "_"))); err != nil {
+			return cfg, fmt.Errorf("bind env for %q failed: %w", key, err)
+		}
+	}
+
+	if err := v.ReadInConfig(); err != nil {
+		// 没有配置文件是正常情况，用默认值继续；显式指定的文件缺失则报错
+		var notFound viper.ConfigFileNotFoundError
+		if !(path == "" && errors.As(err, &notFound)) {
+			return cfg, fmt.Errorf("read config failed: %w", err)
+		}
+	} else if err := v.UnmarshalExact(&cfg); err != nil {
+		// 精确解码：拼错的键应当报错，而不是静默失效
+		return cfg, fmt.Errorf("parse config failed: %w", err)
+	}
+
+	if err := cfg.Validate(); err != nil {
+		return cfg, err
+	}
+
+	return cfg, nil
+}
+
+// Validate 校验取值范围，并把 0 值补齐为代码默认值
+func (c Config) Validate() error {
+	if c.Server.Port == "" {
+		return fmt.Errorf("server.port must not be empty")
+	}
+
+	if c.Scheduler.Workers < 0 {
+		return fmt.Errorf("scheduler.workers must not be negative, got %d", c.Scheduler.Workers)
+	}
+	if c.Scheduler.QueueCapacity < 0 {
+		return fmt.Errorf("scheduler.queue_capacity must not be negative, got %d", c.Scheduler.QueueCapacity)
+	}
+	if c.Scheduler.MaxRetryDelay < 0 {
+		return fmt.Errorf("scheduler.max_retry_delay must not be negative, got %v", c.Scheduler.MaxRetryDelay)
+	}
+	if c.Scheduler.ShutdownTimeout <= 0 {
+		return fmt.Errorf("scheduler.shutdown_timeout must be positive, got %v", c.Scheduler.ShutdownTimeout)
+	}
+
+	switch c.Store.Type {
+	case "json":
+	case "sqlite":
+		if err := c.Store.SQLite.Validate(); err != nil {
+			return err
+		}
+	case "":
+		return fmt.Errorf("store.type must not be empty")
+	default:
+		return fmt.Errorf("unsupported store.type %q, use \"json\" or \"sqlite\"", c.Store.Type)
+	}
+
+	if c.Store.Path == "" {
+		return fmt.Errorf("store.path must not be empty")
+	}
+	if c.Store.FlushInterval < 0 {
+		return fmt.Errorf("store.flush_interval must not be negative, got %v", c.Store.FlushInterval)
+	}
+	// -1 是"不留痕"的哨兵值，比 -1 更小没有含义；0 表示使用默认条数
+	if c.Store.HistoryLimit < -1 {
+		return fmt.Errorf("store.history_limit must be -1 (keep nothing), 0 (default) or positive, got %d", c.Store.HistoryLimit)
+	}
+	if c.Store.HistoryTTL < 0 {
+		return fmt.Errorf("store.history_ttl must not be negative, got %v", c.Store.HistoryTTL)
+	}
+	if c.Store.GroupsPath == "" {
+		return fmt.Errorf("store.groups_path must not be empty")
+	}
+
+	if _, err := parseLogLevel(c.Logging.Level); err != nil {
+		return err
+	}
+	switch strings.ToLower(strings.TrimSpace(c.Logging.Format)) {
+	case "", "text", "json":
+	default:
+		return fmt.Errorf("invalid logging.format %q, use text or json", c.Logging.Format)
+	}
+
+	if err := c.Server.Auth.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.Executors.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.Observability.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.MgrStore.Validate(); err != nil {
+		return err
+	}
+
+	// 配置热重载：与 executors.* 那组方向不同——关闭状态下 reload.debounce 也没有
+	// "合法的过小写法"，因为它会被 Normalized 补成默认值，写 10ms 只会是写错而不是"不生效"。
+	// 0 是唯一合法的"用默认值"写法：LoadConfig 里 Validate 在 Normalized 之前，
+	// 所以 0 先被放过、再由 Normalized 补齐。
+	if c.Reload.Debounce < 0 {
+		return fmt.Errorf("reload.debounce must not be negative, got %v", c.Reload.Debounce)
+	}
+	if c.Reload.Debounce > 0 && c.Reload.Debounce < minReloadDebounce {
+		return fmt.Errorf("reload.debounce %v is too small, a merge window below %v means re-reading the config file several times per save (omit the key to use %v)",
+			c.Reload.Debounce, minReloadDebounce, DefaultReloadDebounce)
+	}
+
+	for _, origin := range c.Server.CORS.AllowOrigins {
+		if strings.TrimSpace(origin) == "" {
+			return fmt.Errorf("server.cors.allow_origins must not contain an empty entry")
+		}
+	}
+	if c.Server.CORS.AllowCredentials && containsOrigin(c.Server.CORS.AllowOrigins, "*") {
+		// 浏览器会拒绝 "*"+凭据 的组合，配置层面直接否掉而不是运行时静默降级
+		return fmt.Errorf("server.cors.allow_credentials cannot be combined with the \"*\" origin")
+	}
+
+	return nil
+}
+
+// containsOrigin 判断列表里是否有指定来源（忽略首尾空白）
+func containsOrigin(origins []string, want string) bool {
+	for _, o := range origins {
+		if strings.TrimSpace(o) == want {
+			return true
+		}
+	}
+	return false
+}
+
+// Normalized 把 0 值替换成代码默认值，便于直接传给各构造函数
+func (c Config) Normalized() Config {
+	defaults := DefaultConfig()
+
+	if c.Server.Port == "" {
+		c.Server.Port = defaults.Server.Port
+	}
+	if len(c.Server.CORS.AllowOrigins) == 0 {
+		c.Server.CORS.AllowOrigins = defaults.Server.CORS.AllowOrigins
+	}
+	if c.Scheduler.Workers == 0 {
+		c.Scheduler.Workers = defaults.Scheduler.Workers
+	}
+	if c.Scheduler.ShutdownTimeout <= 0 {
+		c.Scheduler.ShutdownTimeout = defaults.Scheduler.ShutdownTimeout
+	}
+	if c.Store.Type == "" {
+		c.Store.Type = defaults.Store.Type
+	}
+	if c.Store.Path == "" {
+		c.Store.Path = defaults.Store.Path
+	}
+	if c.Store.FlushInterval == 0 {
+		c.Store.FlushInterval = defaults.Store.FlushInterval
+	}
+	if c.Store.HistoryLimit == 0 {
+		c.Store.HistoryLimit = defaults.Store.HistoryLimit
+	}
+	if c.Store.GroupsPath == "" {
+		c.Store.GroupsPath = defaults.Store.GroupsPath
+	}
+	if c.Server.Auth.JWT.AccessTTL == 0 {
+		c.Server.Auth.JWT.AccessTTL = defaults.Server.Auth.JWT.AccessTTL
+	}
+	if c.Server.Auth.JWT.RefreshTTL == 0 {
+		c.Server.Auth.JWT.RefreshTTL = defaults.Server.Auth.JWT.RefreshTTL
+	}
+	if c.Logging.Level == "" {
+		c.Logging.Level = defaults.Logging.Level
+	}
+	if c.Logging.Format == "" {
+		c.Logging.Format = defaults.Logging.Format
+	}
+
+	// 执行器：0 值与留空一律回到默认（Enabled 为 false 时这些取值本身不生效，
+	// 但归一化后传给 executor 包就不必再各自判空补默认）。
+	if c.Executors.RequiredRole == "" {
+		c.Executors.RequiredRole = defaults.Executors.RequiredRole
+	}
+	if c.Executors.Workspace == "" {
+		c.Executors.Workspace = defaults.Executors.Workspace
+	}
+	if len(c.Executors.RuntimeAllow) == 0 {
+		c.Executors.RuntimeAllow = defaults.Executors.RuntimeAllow
+	}
+	if len(c.Executors.EnvAllow) == 0 {
+		c.Executors.EnvAllow = defaults.Executors.EnvAllow
+	}
+	if c.Executors.Concurrency == 0 {
+		c.Executors.Concurrency = defaults.Executors.Concurrency
+	}
+	if c.Executors.DefaultTimeout == 0 {
+		c.Executors.DefaultTimeout = defaults.Executors.DefaultTimeout
+	}
+	if c.Executors.MaxTimeout == 0 {
+		c.Executors.MaxTimeout = defaults.Executors.MaxTimeout
+	}
+	if c.Executors.RestorePolicy == "" {
+		c.Executors.RestorePolicy = defaults.Executors.RestorePolicy
+	}
+	if c.Executors.ProfilesPath == "" {
+		c.Executors.ProfilesPath = defaults.Executors.ProfilesPath
+	}
+	// adhoc 这一节的留空与 0 一律回到默认；require_extension 是指针：
+	// 只有"没写"（nil）才补默认值，显式写了 false 必须留住——那是知道风险后主动关掉这道要求。
+	// path_prefixes 与 url_hosts 没有默认值可补：空列表本身就是一个取值（不限范围、不限主机）。
+	if c.Executors.Adhoc.ShellRuntime == "" {
+		c.Executors.Adhoc.ShellRuntime = defaults.Executors.Adhoc.ShellRuntime
+	}
+	if c.Executors.Adhoc.RequireExtension == nil {
+		c.Executors.Adhoc.RequireExtension = defaultAdhocRequireExtension()
+	}
+	if c.Executors.Adhoc.HTTPTimeout == 0 {
+		c.Executors.Adhoc.HTTPTimeout = defaults.Executors.Adhoc.HTTPTimeout
+	}
+	if c.Executors.Output.InlinePreview == 0 {
+		c.Executors.Output.InlinePreview = defaults.Executors.Output.InlinePreview
+	}
+	if c.Executors.Output.MaxBytes == 0 {
+		c.Executors.Output.MaxBytes = defaults.Executors.Output.MaxBytes
+	}
+	if c.Executors.Output.Dir == "" {
+		c.Executors.Output.Dir = defaults.Executors.Output.Dir
+	}
+
+	// SQLite 观测层：Enabled 为 false 时这些取值本身不生效，但归一化后传给 store/sqlite
+	// 就不必再各自判空补默认（Validate 已拦下 enabled 时的显式 0 值，这里的补齐只服务
+	// 代码里直接构造的配置）。retention_age 的 0 是"不按时间淘汰"的有意取值，保持原样。
+	if c.Observability.Path == "" {
+		c.Observability.Path = defaults.Observability.Path
+	}
+	if c.Observability.FlushInterval <= 0 {
+		c.Observability.FlushInterval = defaults.Observability.FlushInterval
+	}
+	if c.Observability.QueueCapacity <= 0 {
+		c.Observability.QueueCapacity = defaults.Observability.QueueCapacity
+	}
+	if c.Observability.BusyTimeout <= 0 {
+		c.Observability.BusyTimeout = defaults.Observability.BusyTimeout
+	}
+	if c.Observability.Synchronous == "" {
+		c.Observability.Synchronous = defaults.Observability.Synchronous
+	}
+
+	if c.MgrStore.Path == "" {
+		c.MgrStore.Path = defaults.MgrStore.Path
+	}
+	if c.MgrStore.BusyTimeout <= 0 {
+		c.MgrStore.BusyTimeout = defaults.MgrStore.BusyTimeout
+	}
+	if c.Store.SQLite.Path == "" {
+		c.Store.SQLite.Path = defaults.Store.SQLite.Path
+	}
+	if c.Store.SQLite.BusyTimeout <= 0 {
+		c.Store.SQLite.BusyTimeout = defaults.Store.SQLite.BusyTimeout
+	}
+	if c.MgrStore.Synchronous == "" {
+		c.MgrStore.Synchronous = defaults.MgrStore.Synchronous
+	}
+	if c.Observability.Events.RetentionCount <= 0 {
+		c.Observability.Events.RetentionCount = defaults.Observability.Events.RetentionCount
+	}
+	if c.Observability.Events.RetentionAge < 0 {
+		c.Observability.Events.RetentionAge = defaults.Observability.Events.RetentionAge
+	}
+	if c.Observability.Audit.RetentionCount <= 0 {
+		c.Observability.Audit.RetentionCount = defaults.Observability.Audit.RetentionCount
+	}
+	if c.Observability.Audit.RetentionAge < 0 {
+		c.Observability.Audit.RetentionAge = defaults.Observability.Audit.RetentionAge
+	}
+
+	// 配置热重载：enabled 的 false 是有意的取值（"关闭"就是它的正常工作状态），归一化不动；
+	// debounce 的 0 表示"用默认值"，与 store.flush_interval 同一读法。
+	if c.Reload.Debounce == 0 {
+		c.Reload.Debounce = defaults.Reload.Debounce
+	}
+
+	return c
+}

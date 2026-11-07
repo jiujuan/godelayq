@@ -16,10 +16,9 @@ import (
 	"testing"
 	"time"
 
-	"godelayq/api"
-	"godelayq/core"
-	"godelayq/executor"
-	"godelayq/store/sqlite"
+	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/jiujuan/godelayq/internal/executor"
+	"github.com/jiujuan/godelayq/internal/store/observe"
 )
 
 func TestRun_RegistersHandlersStartsAndStops(t *testing.T) {
@@ -643,12 +642,12 @@ func unopenedObservabilityDB(t *testing.T) func(core.Config, *slog.Logger) (obse
 	}
 }
 
-// observabilityStub 是观测库句柄的替身。真实 *sqlite.DB 的关闭时机在测试里没有旁路可看，
+// observabilityStub 是观测库句柄的替身。真实 *observe.Handle 的关闭时机在测试里没有旁路可看，
 // 而"观测层先关、存储后关"正是本卡要钉住的顺序（设计文档 §7.3），所以 run 拿的是接口。
 type observabilityStub struct {
 	path       string
 	journal    string
-	stats      sqlite.Stats
+	stats      observe.Stats
 	statsErr   error
 	closeErr   error
 	statsCalls int
@@ -666,7 +665,7 @@ func (s *observabilityStub) JournalMode() string {
 	return "wal"
 }
 
-func (s *observabilityStub) Stats() (sqlite.Stats, error) {
+func (s *observabilityStub) Stats() (observe.Stats, error) {
 	s.statsCalls++
 	return s.stats, s.statsErr
 }
@@ -699,7 +698,7 @@ type eventLogStub struct {
 }
 
 // SetRetention 是 observability.events.retention_* 的热更落点替身（eventLogAPI 的扩项）。
-// 真实的淘汰行为在 store/sqlite 的热点用例里，这里只记"接没接上、给了什么值"。
+// 真实的淘汰行为在 store/observe 的热点用例里，这里只记"接没接上、给了什么值"。
 func (s *eventLogStub) SetRetention(count int, age time.Duration) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -724,7 +723,7 @@ func (s *eventLogStub) Close() error {
 func (s *eventLogStub) Dropped() int64 { return s.dropped }
 
 // Events 与 Recent 只为满足 eventLogAPI 的读取面：装配用例断言的是实例交接，
-// 不是查询结果。真读库的内容由 api 的替身用例与 store/sqlite 的用例覆盖。
+// 不是查询结果。真读库的内容由 api 的替身用例与 store/observe 的用例覆盖。
 func (s *eventLogStub) Events(string, int) ([]core.Event, error) { return nil, nil }
 
 func (s *eventLogStub) Recent(int) ([]core.Event, error) { return nil, nil }
@@ -765,9 +764,9 @@ func (s *auditLogStub) Close() error {
 func (s *auditLogStub) Dropped() int64 { return s.dropped }
 
 // Append 与 Query 只为满足 auditLogAPI 的读写面：装配断言的是实例交接。
-func (s *auditLogStub) Append(api.AuditEntry) error { return nil }
+func (s *auditLogStub) Append(core.AuditEntry) error { return nil }
 
-func (s *auditLogStub) Query(api.AuditFilter) ([]api.AuditEntry, int, error) { return nil, 0, nil }
+func (s *auditLogStub) Query(core.AuditFilter) ([]core.AuditEntry, int, error) { return nil, 0, nil }
 
 // observabilityCase 是观测层装配用例共用的输入：配置改法、各闭包的返回值、
 // "在 newServer 那一刻能拿到总线"的钩子（那时事件写入器已经挂上，发出去的事件会走完整链路），
@@ -799,7 +798,7 @@ func runWithObservability(t *testing.T, tc observabilityCase) (*observabilityStu
 	}
 
 	stub := &observabilityStub{path: cfg.Observability.Path, order: &order,
-		stats: sqlite.Stats{SchemaVersion: 1}}
+		stats: observe.Stats{SchemaVersion: 1}}
 	logStub := &eventLogStub{order: &order}
 	auditStub := &auditLogStub{order: &order}
 	// 闭包由用例决定返回替身还是报错；传 nil 就用上面两份替身
@@ -1055,7 +1054,7 @@ func TestRun_ObservabilityClosedBeforeStore(t *testing.T) {
 	}
 }
 
-// TestRun_ObservabilityEnabledOpensAndClosesForReal 用真实的 sqlite.Open 走一遍装配：
+// TestRun_ObservabilityEnabledOpensAndClosesForReal 用真实的 observe.Open 走一遍装配：
 // 闭包的映射（cfg.Observability → store/sqlite）与 defer 的关闭都是被执行过的那条路径，
 // 替身断言不了这条。库文件建出来、启动日志有那一行、run 返回后连接确实已关。
 func TestRun_ObservabilityEnabledOpensAndClosesForReal(t *testing.T) {
@@ -1068,7 +1067,7 @@ func TestRun_ObservabilityEnabledOpensAndClosesForReal(t *testing.T) {
 			cfg.Observability.Path = path
 		},
 		newDB: func(cfg core.Config, logger *slog.Logger) (observabilityDB, error) {
-			db, err := sqlite.Open(cfg.Observability, logger)
+			db, err := observe.Open(cfg.Observability, logger)
 			if err != nil {
 				return nil, err
 			}
@@ -1106,7 +1105,7 @@ func TestRun_ObservabilityEnabledOpensAndClosesForReal(t *testing.T) {
 
 	// 端到端：从总线发出去的两条事件，经过订阅、队列、批量事务落到库里；
 	// 重新打开这份文件还能读到那两行，就是"重启后历史仍在"这条需求的本体。
-	again, err := sqlite.Open(sqliteOptionsForTest(path), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	again, err := observe.Open(sqliteOptionsForTest(path), slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatalf("reopening the database failed: %v", err)
 	}
@@ -1124,7 +1123,7 @@ func TestRun_ObservabilityEnabledOpensAndClosesForReal(t *testing.T) {
 }
 
 // sqliteOptionsForTest 把路径包成一份打开观测库用的配置，其余取值一律用 core 的默认。
-// store/sqlite 的用例里有同名的 openConfig，这里是要跨包用，所以放在装配侧的这一份测试里。
+// store/observe 的用例里有同名的 openConfig，这里是要跨包用，所以放在装配侧的这一份测试里。
 func sqliteOptionsForTest(path string) core.ObservabilityConfig {
 	cfg := core.DefaultConfig()
 	cfg.Observability.Enabled = true
@@ -1179,7 +1178,7 @@ func TestRun_EventLogOpenFailureStopsStartup(t *testing.T) {
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
 		newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
-			return &observabilityStub{path: cfg.Observability.Path, stats: sqlite.Stats{SchemaVersion: 1}}, nil
+			return &observabilityStub{path: cfg.Observability.Path, stats: observe.Stats{SchemaVersion: 1}}, nil
 		},
 		newAuditLog: func(observabilityDB, core.ObservabilityConfig, *slog.Logger) (auditLogAPI, error) {
 			return &auditLogStub{}, nil
@@ -1221,7 +1220,7 @@ func TestRun_EventLogClosureIsMandatoryWhenEnabled(t *testing.T) {
 			newExecutorRegistry: staticExecutorRegistry(nil, nil),
 			newArtifactStore:    staticArtifactStore(nil, nil),
 			newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
-				return &observabilityStub{stats: sqlite.Stats{SchemaVersion: 1}}, nil
+				return &observabilityStub{stats: observe.Stats{SchemaVersion: 1}}, nil
 			},
 			// 台账闭包照给：这一条用例判的是"少了事件写入器"，不该被审计那条检查先挡住
 			newAuditLog: func(observabilityDB, core.ObservabilityConfig, *slog.Logger) (auditLogAPI, error) {
@@ -1309,11 +1308,11 @@ func TestRun_NoServerReaderWhenEventsDisabled(t *testing.T) {
 // 索引真正的读写行为在 store/sqlite 与 executor 两侧各有用例。
 type artifactIndexStub struct{}
 
-func (s *artifactIndexStub) Record(executor.IndexRecord) error { return nil }
-func (s *artifactIndexStub) MarkPurged(string, int) error      { return nil }
-func (s *artifactIndexStub) MarkAllPurged(string) error        { return nil }
-func (s *artifactIndexStub) DeleteByJob(string) error          { return nil }
-func (s *artifactIndexStub) List(string) ([]executor.IndexRecord, error) {
+func (s *artifactIndexStub) Record(core.ArtifactIndexRecord) error { return nil }
+func (s *artifactIndexStub) MarkPurged(string, int) error          { return nil }
+func (s *artifactIndexStub) MarkAllPurged(string) error            { return nil }
+func (s *artifactIndexStub) DeleteByJob(string) error              { return nil }
+func (s *artifactIndexStub) List(string) ([]core.ArtifactIndexRecord, error) {
 	return nil, nil
 }
 func (s *artifactIndexStub) Exists(string, int) (bool, error) { return false, nil }
@@ -1382,7 +1381,7 @@ func runWithArtifactIndexFlags(t *testing.T, tune func(*core.Config),
 	}
 	if cfg.Observability.Enabled {
 		deps.newObservabilityDB = func(core.Config, *slog.Logger) (observabilityDB, error) {
-			return &observabilityStub{stats: sqlite.Stats{SchemaVersion: 1}}, nil
+			return &observabilityStub{stats: observe.Stats{SchemaVersion: 1}}, nil
 		}
 	}
 
@@ -1654,7 +1653,7 @@ func TestRun_AuditLogClosureIsMandatoryWhenEnabled(t *testing.T) {
 			newExecutorRegistry: staticExecutorRegistry(nil, nil),
 			newArtifactStore:    staticArtifactStore(nil, nil),
 			newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
-				return &observabilityStub{stats: sqlite.Stats{SchemaVersion: 1}}, nil
+				return &observabilityStub{stats: observe.Stats{SchemaVersion: 1}}, nil
 			},
 			newServer: func(schedulerAPI, core.Store, string, *executor.Registry, *executor.ArtifactStore, *observabilityAPI, *profileStoreAPI) (serverAPI, error) {
 				return newFakeServer(), nil
@@ -1700,7 +1699,7 @@ func TestRun_AuditLogOpenFailureStopsStartup(t *testing.T) {
 		newExecutorRegistry: staticExecutorRegistry(nil, nil),
 		newArtifactStore:    staticArtifactStore(nil, nil),
 		newObservabilityDB: func(core.Config, *slog.Logger) (observabilityDB, error) {
-			return &observabilityStub{stats: sqlite.Stats{SchemaVersion: 1}}, nil
+			return &observabilityStub{stats: observe.Stats{SchemaVersion: 1}}, nil
 		},
 		newAuditLog: func(observabilityDB, core.ObservabilityConfig, *slog.Logger) (auditLogAPI, error) {
 			return nil, wantErr

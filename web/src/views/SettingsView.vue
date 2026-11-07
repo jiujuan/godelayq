@@ -92,8 +92,16 @@ const profiles = computed(() => executorsQuery.data.value?.profiles ?? [])
     </section>
 
     <p class="mt-4 max-w-2xl text-xs leading-relaxed text-[var(--color-text-muted)]">
-      账号与角色由服务端配置声明（<code>server.auth.users</code>），改动需重启进程；前端隐藏按钮只是体验，
-      越权请求仍会被服务端以 403 拒绝。跨域与来源白名单见 <code>docs/api.md</code> 的鉴权与跨域章节。
+      账号与角色的增删改在
+      <RouterLink
+        v-if="auth.roleAtLeast('admin')"
+        :to="{ name: 'admin-users' }"
+        class="text-[var(--color-primary)] hover:underline"
+      >账号管理页</RouterLink>
+      <template v-else>账号管理页（admin 档可见）</template>在线完成，改动即时生效、无需重启；
+      未启用管理库（<code>mgrstore.enabled=false</code>）的部署仍按配置文件
+      <code>server.auth.users</code> 声明，改动需重启进程。越权请求会被服务端以 403 拒绝，
+      跨域与来源白名单见 <code>docs/api.md</code> 的鉴权与跨域章节。
     </p>
 
     <!-- 执行器档位：这一节只读，增删改在线档位去档位管理页（TASK-W08） -->

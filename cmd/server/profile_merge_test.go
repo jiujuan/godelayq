@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/jiujuan/godelayq/internal/executor"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"godelayq/core"
-	"godelayq/executor"
 )
 
 // 启动合并（TASK-W05）：executors.web_enabled 打开后，档位文件里的那份来源要和

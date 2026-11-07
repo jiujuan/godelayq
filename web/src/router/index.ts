@@ -15,6 +15,7 @@ import {
   LayoutDashboard,
   ScrollText,
   Settings,
+  Users,
   Wrench,
   type LucideIcon,
 } from 'lucide-vue-next'
@@ -91,6 +92,13 @@ const routes: RouteRecordRaw[] = [
     component: () => import('../views/AdminView.vue'),
     // 运维页改的是整个进程的行为，只有 ops 档能进（后端 /admin/* 同档位）
     meta: { title: '运维', icon: Wrench, minimumRole: 'ops' },
+  },
+  {
+    path: '/admin/users',
+    name: 'admin-users',
+    component: () => import('../views/AdminUsersView.vue'),
+    // 账号端点是 admin 档（handlers_users.go），管理账号的人不必然是运维
+    meta: { title: '账号', icon: Users, minimumRole: 'admin' },
   },
   {
     path: '/audit',
