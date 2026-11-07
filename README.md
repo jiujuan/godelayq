@@ -224,9 +224,10 @@ godelayq/
 │   │   └── *_test.go         # 与上述文件一一对应的单元测试（含真实进程与跨平台夹具）
 │   │
 │   ├── store/                # 存储实现（接口定义在消费方，这里只做实现）
-│   │   ├── sqlite/           # SQLite 公共地基（打开/PRAGMA/批量器）与观测库；全仓唯一 import 驱动的位置
+│   │   ├── sqlite/           # SQLite 公共地基（打开/PRAGMA/批量器/迁移框架）；全仓唯一 import 驱动的位置
 │   │   ├── observe/          # 观测库：job_events / artifact_index / write_audit 三面（依赖红线由守卫测试钉死）
-│   │   └── mgr/              # 管理库：账号、分组、档位的管理面存储（mgrstore.enabled 时启用）
+│   │   ├── mgr/              # 管理库：账号、分组、档位的管理面存储（mgrstore.enabled 时启用）
+│   │   └── jobs/             # 任务快照 SQLite 后端（store.type=sqlite 时启用，含一次性导入）
 │   │
 │   └── web/                  # 前端产物 embed 包（vite 构建产物直落这里的 dist/）
 │       ├── embed_dashboard.go  # //go:build dashboard：//go:embed all:dist 暴露 web.Dist
@@ -248,7 +249,7 @@ godelayq/
 │       ├── router/           # 路由表派生菜单，守卫按 meta.minimumRole 拦截
 │       ├── composables/      # usePermission 能力表、useCountdown、useJobEvents、useEventFeed
 │       ├── components/       # layout（侧栏/顶栏/页头）、ui、jobs（表格/表单/筛选/时间线）、groups、dashboard
-│       ├── views/            # 登录、概览、任务、任务详情、分组、实时、运维、设置（八页均已实现）
+│       ├── views/            # 登录、概览、任务、任务详情、分组、实时、档位、模板、运维、审计、账号、设置（均已实现）
 │       ├── display.ts        # 短 ID（取 UUIDv7 尾段）与时间格式化
 │       └── styles/           # tokens.css：蓝白灰主题变量
 │
@@ -479,7 +480,7 @@ scheduler:
   max_retry_delay: 30m        # 指数退避的单次重试延迟上限
   shutdown_timeout: 5s        # 优雅关闭等待时长
 store:
-  type: json                  # 目前仅支持 json
+  type: json                  # json | sqlite；切换需重启
   path: ./data/jobs.json
   flush_interval: 200ms       # 合并落盘周期
   history_limit: 1000         # 终态快照留痕条数；-1 表示不留痕

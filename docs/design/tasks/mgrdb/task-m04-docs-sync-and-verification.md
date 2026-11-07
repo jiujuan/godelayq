@@ -53,4 +53,12 @@ go test ./... && grep -rn "目前仅支持 json" README.md docs/ configs/ | wc -
 
 ## 10. 实现记录
 
-(执行时补写)
+- deployment.md 三处：store 配置骨架补 sqlite 节与"flush_interval 仅 json 生效"注；
+  任务存储段新增 SQLite 后端说明（直写、一次性导入、回滚注意 jobs.json 是旧快照）；
+  账号段从"增删需重启"改为"管理库启用后在线管理（控制台账号页 / /admin/users），即时生效"，
+  配置文件路径保留为未启用管理库时的口径。
+- README 目录树补 internal/store/jobs 行、views 清单补"账号"并按实际页面数重列（原文"八页"
+  与实际不符，顺带修正）；config.example.yaml 的 `type` 注释更新。
+- "目前仅支持 json"全仓清零（mgrdb 设计文档与卡片里的引用是引述旧文案，保留）；
+  本机 configs/config.yaml 注释同步（不入库，键集合测试要求两份一致）。
+- 终验记录见提交：go build/vet/test 全量绿、vue-tsc/build 绿、dashboard 冒烟过。

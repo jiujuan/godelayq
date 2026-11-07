@@ -72,4 +72,16 @@ go test ./internal/core/... ./internal/store/jobs/... ./cmd/server/...
 
 ## 10. 实现记录
 
-(执行时补写)
+- `core.TrimTerminal` 抽取按设计落地：JSON 的 `trimTerminalLocked` 改为薄包装（先 Load 两个
+  原子值一起传入——D-R0201 的窗口注释原样保留），SQLite 侧用只填 ID/Status/UpdatedAt 的
+  部分快照构造入参（该函数只读这三个字段，注释已写明）。
+- **行为语义的教训**："limit<0 不留痕"是字面义的**写入即删除**——终态写入触发的 trim 连刚写入
+  的那条一起删。测试首版断言"t2 留下"错了，修正为断言全空；JSON 实现历来如此（StoreOptions
+  注释"负数表示不保留终态记录（写入即删除）"），共享函数没有引入新语义。
+- 实现偏差（相对设计文档 §10）：`historyRetentionValues` 在 jobs 包有一份复制（core 的同名
+  函数私有，跨包可见性的代价），两边由对照测试钉住；`ImportOnce` 在 Store 上加了一个方法
+  包装（`s.ImportOnce(path)`），装配侧不必碰内部句柄。
+- 默认值解析走 `Config.Normalized()`（SQLite.Path/BusyTimeout 空→DefaultJobs*，与 MgrStore
+  同机位），jobs.Open 不再兜底空值——sqlite.OpenFile 本就拒绝空路径。
+- 验证：往返/留痕四子态/导入三条件/Close 幂等/与 JSON 可见集合对照/包守卫全过；
+  `TestExampleConfigMatchesLocal` 过（两份 YAML 已同步 store.sqlite 节）；全量 8 包全绿。

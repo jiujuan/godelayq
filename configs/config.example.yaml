@@ -54,7 +54,7 @@ scheduler:
   shutdown_timeout: 5s  # 优雅关闭等待时长
 
 store:
-  type: json            # 存储后端，目前仅支持 json
+  type: json            # 存储后端：json（默认，合并落盘）|sqlite（直写，TASK-M03）；切换需重启
   path: ./data/jobs.json
   flush_interval: 200ms # 合并落盘周期；崩溃时最多丢失一个周期的状态变更
   # 终态（成功/失败/取消）快照留痕策略：ListJobs?status=success|failed 与

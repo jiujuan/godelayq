@@ -66,4 +66,14 @@ go test ./internal/api/...
 
 ## 10. 实现记录
 
-(执行时补写)
+- 契约核对后落地：UserView{name,role,created_at,updated_at}、createUserRequest 三必填、
+  updateUserRequest 指针语义（省略=不改，双省 400）——前端把"留空不改密码"折成只提交 role。
+- 交互决策：新建/编辑共用一张表单卡（editing='' 为新建），编辑态锁定账号名（身份键不可改）；
+  自己的删除按钮直接置灰（title="不能删除删除自己"），最后 admin 的后果写进 UiConfirm 正文；
+  503 态给"未启用管理库"引导而非错误横幅（与台账页同款 notEnabled 判定）。
+- 路由 `/admin/users` minimumRole='admin'（后端 RequireRole(RoleAdmin) 对齐，不是 ops），
+  Users 图标，菜单与守卫自动生效；SettingsView 的"改动需重启进程"改写为在线管理 + 入口链接，
+  admin 不可见时降级为纯文本说明。
+- 验证：`npx vue-tsc --noEmit` 与 `npm run build` 通过（产物落 internal/web/dist）。
+- 实现偏差：UiEmptyState 文案引号用「」避开了 HTML 属性转义；UiBadge 首版漏 import，
+  vue-tsc 当场抓住后补——两处均无行为影响。
