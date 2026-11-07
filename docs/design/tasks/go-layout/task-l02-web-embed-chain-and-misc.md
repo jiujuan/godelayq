@@ -63,4 +63,7 @@ git status --short   # job_queue rename、dashboard 删除可见
 
 ## 10. 实现记录
 
-(执行时补写)
+- 旧 `web/dist/`(迁移前的构建产物)在移除 web/.gitignore 的 `dist` 条目后暴露为 untracked,确认内容为旧 vite 产物后删除;新产物经 `npm run build`(4.4s)直落 `internal/web/dist/`。
+- 冒烟结果(端口 8091,避开可能在跑的 8080 开发实例):`go build -tags dashboard` 成功;`GET /` 200(index.html,no-cache)、真实 `/assets/index-*.js|css` 200(immutable)、未认证 `GET /api/stats` 401、SPA 深链 `GET /login` 不带 `Accept: text/html` 时被鉴权拦下、带头时 200 回 index——与 `internal/api/console.go` 的设计逐条一致。冒烟实例已 taskkill 停止。
+- 工具坑:Git Bash 的 MSYS 路径转换会把**以 `/` 开头的 grep 模式参数**转成 Windows 路径导致匹配错乱(表现为匹配结果被截断、后续 curl 拿到坏路径 000);模式写成不以 `/` 开头即可绕开。
+- job_queue 三个示例文件 rename 100%;dashboard/index.html 删除(全仓零代码引用,执行前已复核)。

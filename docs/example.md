@@ -1,5 +1,8 @@
 ## 示例 1：电商订单超时取消
 
+> 下例把调度器嵌进自己的二进制,import 的都是 `internal/` 包——这只在**本仓库内**可编译,
+> 属于仓内开发参考。外部系统接入请部署 godelayq 服务后走 REST API(见 `api.md`)。
+
 ```go
 package main
 
@@ -14,8 +17,8 @@ import (
 	"syscall"
 	"time"
 
-	"godelayq/api"
-	"godelayq/core"
+	"github.com/jiujuan/godelayq/internal/api"
+	"github.com/jiujuan/godelayq/internal/core"
 )
 
 func main() {
@@ -251,6 +254,6 @@ setInterval(() => {
 }, 30000);
 ```
 
-仓库里的 `dashboard/index.html` 是这种单文件页面的**历史版本**：它已被 `web/` 的 Vue 控制台
-取代，现在只会把人跳回同源根路径。想要一个自己托管的极简页面，照本节自己写一份即可；
+这种单文件页面是**历史方案**：它已被 `web/` 的 Vue 控制台取代,仓库里不再保留占位文件。
+想要一个自己托管的极简页面，照本节自己写一份即可；
 跨域部署时需把服务端的 `server.cors.allow_origins` 指到面板所在来源。

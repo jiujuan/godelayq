@@ -149,96 +149,97 @@
 ```shell
 godelayq/
 ├── README.md                 # 项目文档（本文件）
-├── go.mod / go.sum           # 模块定义与依赖校验
+├── go.mod / go.sum           # 模块定义与依赖校验（module github.com/jiujuan/godelayq）
 ├── .gitignore
 │
-├── cmd/                      # 可执行程序入口
+├── cmd/                      # 可执行程序入口——对外公开的只有这里
 │   ├── server/
 │   │   ├── main.go           # 服务器主程序（配置 → 存储 → 调度器 → API → 信号）
-│   │   ├── main_test.go
-│   │   └── main_integration_test.go
-│   └── hashpassword/         # 生成 server.auth.users 里要的 bcrypt 密码哈希
+│   │   ├── reload.go         # 配置热重载装配
+│   │   └── *_test.go         # 单元、集成与配置重载冒烟测试
+│   ├── hashpassword/         # 生成 server.auth.users 里要的 bcrypt 密码哈希
+│   └── gensecret/            # 生成 server.auth.jwt.secret 的 HS256 密钥
 │
-├── core/                     # 核心库（不依赖任何 web 框架）
-│   ├── heap.go               # 四叉堆（索引映射、Update、PopIfDue）
-│   ├── job.go                # 任务定义、状态（含 paused）、分组标签、快照与 CloneForRetry
-│   ├── scheduler.go          # 调度器：堆 + worker 池 + 取消表 + 暂停/强制暂停 + 调度总开关 + 事件总线
-│   ├── group_store.go        # 分组元数据存储（单 JSON 文件，同步原子落盘）
-│   ├── executor_profile_store.go # 档位文件（executors.profiles_path）：页面建的档位存这里，形态照 group_store
-│   ├── auth.go               # 控制台角色档位与权限比较
-│   ├── store.go              # 存储接口与 JSON 实现（合并落盘、终态留痕）
-│   ├── retry.go              # 指数退避重试策略（抖动 + 延迟上限）
-│   ├── cron.go               # Cron 表达式解析（5/6 段，可选秒级）
-│   ├── event.go              # 事件总线
-│   ├── config.go             # 运行配置（viper + GODELAYQ_* 环境变量）
-│   ├── logging.go            # slog 日志器构造与组件可选项
-│   ├── load.go               # 目录任务加载器（fsnotify）
-│   ├── websocket.go          # WebSocket 服务（只依赖连接/升级接口）
-│   └── *_test.go             # 与上述文件一一对应的单元测试
+├── internal/                 # 全部实现包。Go 编译器保证外部模块 import 不到，
+│   │                         # 集成方式是部署本服务 + REST API（见 docs/api.md）
+│   ├── core/                 # 核心库（不依赖任何 web 框架）
+│   │   ├── heap.go           # 四叉堆（索引映射、Update、PopIfDue）
+│   │   ├── job.go            # 任务定义、状态（含 paused）、分组标签、快照与 CloneForRetry
+│   │   ├── scheduler.go      # 调度器：堆 + worker 池 + 取消表 + 暂停/强制暂停 + 调度总开关 + 事件总线
+│   │   ├── group_store.go    # 分组元数据存储（单 JSON 文件，同步原子落盘）
+│   │   ├── executor_profile_store.go # 档位文件（executors.profiles_path）：页面建的档位存这里，形态照 group_store
+│   │   ├── auth.go           # 控制台角色档位与权限比较
+│   │   ├── store.go          # 存储接口与 JSON 实现（合并落盘、终态留痕）
+│   │   ├── retry.go          # 指数退避重试策略（抖动 + 延迟上限）
+│   │   ├── cron.go           # Cron 表达式解析（5/6 段，可选秒级）
+│   │   ├── event.go          # 事件总线
+│   │   ├── config.go         # 运行配置（viper + GODELAYQ_* 环境变量）
+│   │   ├── logging.go        # slog 日志器构造与组件可选项
+│   │   ├── load.go           # 目录任务加载器（fsnotify）
+│   │   ├── websocket.go      # WebSocket 服务（只依赖连接/升级接口）
+│   │   └── *_test.go         # 与上述文件一一对应的单元测试
+│   │
+│   ├── api/                  # HTTP API 层（gin）
+│   │   ├── server.go         # 路由、中间件、优雅关闭（可选依赖走 Option/WithGroupStore）
+│   │   ├── handlers.go       # 任务 CRUD、列表过滤（含 group）、统计
+│   │   ├── handlers_auth.go      # 登录、刷新、登出、身份、实时票据
+│   │   ├── handlers_lifecycle.go # 暂停/强制暂停/恢复 + batch-ops 批量操作
+│   │   ├── handlers_groups.go    # 分组注册表 CRUD（改名连带改写任务标签）
+│   │   ├── handlers_events.go    # 任务时间线与全局最近事件（装配了事件库时改读库）
+│   │   ├── handlers_artifacts.go # GET /jobs/:id/artifacts：按尝试列出输出尺寸与清理状态
+│   │   ├── handlers_executors.go # 档位清单、执行输出读取、提交期判定与凭据掩码
+│   │   ├── handlers_executor_profiles.go # 档位的在线管理：定义读口 + 增改删（ops 档，落盘先于生效）
+│   │   ├── handlers_admin.go     # ops 档：运行时诊断、调度总开关、清缓冲、写操作台账查询
+│   │   ├── handlers_users.go     # 控制台账号管理 API（管理库启用时可用）
+│   │   ├── audit.go          # 写操作台账：中间件、action/verdict 封闭词表、读写窄接口（观测层）
+│   │   ├── history.go        # 事件内存环形缓冲（订阅事件总线，重启即清空；启用事件库后它是兜底）
+│   │   ├── authenticator.go  # 账号校验与 JWT 签发/验签
+│   │   ├── authstore.go      # refresh 表、登出拒绝表、一次性 ticket
+│   │   ├── ratelimit.go      # 登录失败限流（IP+账号 与 IP 双维度）
+│   │   ├── dto.go            # 请求/响应数据结构
+│   │   ├── security.go       # 认证与角色中间件、跨域来源策略
+│   │   ├── logging.go        # 访问日志与 panic 恢复中间件（slog）
+│   │   ├── websocket.go      # gorilla/websocket 适配器
+│   │   ├── sse.go            # Server-Sent Events
+│   │   ├── console.go        # 内嵌控制台的托管与 SPA 回退（-tags dashboard 构建生效）
+│   │   └── *_test.go         # 契约、鉴权、关闭与流式测试
+│   │
+│   ├── executor/             # 执行层（把档位变成可注册的执行任务；默认不启用）
+│   │   ├── profile.go        # 档位加载与校验：两种路径模式（workspace 内 / 本机任意路径）、解释器白名单、参数与超时声明
+│   │   ├── registry.go       # "档位 + 可用性 + 来源"的登记表（配置项 executors.* 的唯一读取方，运行期可整表替换）
+│   │   ├── merge_profiles.go # 把档位文件那份合进 store 侧（只管 store：config 侧仍由 NewRegistry 加载，同名以 config 为准）
+│   │   ├── applier.go        # "校验+探测"与"整份文件生效"的入口（api 的写端点只经这一个口子改执行面）
+│   │   ├── register.go       # 把档位注册进调度器（Registrar 由调用方提供，不依赖具体实现）
+│   │   ├── probe.go          # 可用性探测：程序在不在 PATH、脚本在不在，不启动任何进程
+│   │   ├── args.go           # payload 解码、参数校验与命令行/URL 渲染（没有 shell，也没有内联源码）
+│   │   ├── env.go            # 子进程环境重建：固定注入 + env_allow 白名单，排除 GODELAYQ_ 前缀
+│   │   ├── proc.go           # 进程档位（script / binary）的执行主体：起进程、收输出、判超时
+│   │   ├── proc_unix.go      # Unix 侧进程组信号与终止
+│   │   ├── proc_windows.go   # Windows 侧整树终止（taskkill /T /F）与差异说明
+│   │   ├── exit.go           # 退出码 / 信号 / HTTP 状态到失败原因的归类（含"重试无意义"判定）
+│   │   ├── http.go           # HTTP 档位：拨号层禁内网与元数据地址、请求渲染、响应与头的落盘
+│   │   ├── result.go         # 一次执行的内存形态：结论摘要 + 两条输出流 + 预览裁剪
+│   │   ├── artifact.go       # 产物文件存储（a<n>.out / a<n>.err / meta.json）与 TTL、孤儿清理
+│   │   ├── artifact_index.go # 产物索引的可选依赖接口（ArtifactIndexer）：登记、标清理、启动对账
+│   │   └── *_test.go         # 与上述文件一一对应的单元测试（含真实进程与跨平台夹具）
+│   │
+│   ├── store/                # 存储实现（接口定义在消费方，这里只做实现）
+│   │   ├── sqlite/           # SQLite 公共地基（打开/PRAGMA/批量器）与观测库；全仓唯一 import 驱动的位置
+│   │   ├── observe/          # 观测库：job_events / artifact_index / write_audit 三面（依赖红线由守卫测试钉死）
+│   │   └── mgr/              # 管理库：账号、分组、档位的管理面存储（mgrstore.enabled 时启用）
+│   │
+│   └── web/                  # 前端产物 embed 包（vite 构建产物直落这里的 dist/）
+│       ├── embed_dashboard.go  # //go:build dashboard：//go:embed all:dist 暴露 web.Dist
+│       └── embed_stub.go       # //go:build !dashboard：web.Dist 恒为 nil，构建不依赖 npm
 │
-├── api/                      # HTTP API 层（gin）
-│   ├── server.go             # 路由、中间件、优雅关闭（可选依赖走 Option/WithGroupStore）
-│   ├── handlers.go           # 任务 CRUD、列表过滤（含 group）、统计
-│   ├── handlers_auth.go      # 登录、刷新、登出、身份、实时票据
-│   ├── handlers_lifecycle.go # 暂停/强制暂停/恢复 + batch-ops 批量操作
-│   ├── handlers_groups.go    # 分组注册表 CRUD（改名连带改写任务标签）
-│   ├── handlers_events.go    # 任务时间线与全局最近事件（装配了事件库时改读库）
-│   ├── handlers_artifacts.go # GET /jobs/:id/artifacts：按尝试列出输出尺寸与清理状态
-│   ├── handlers_executors.go # 档位清单、执行输出读取、提交期判定与凭据掩码
-│   ├── handlers_executor_profiles.go # 档位的在线管理：定义读口 + 增改删（ops 档，落盘先于生效）
-│   ├── handlers_admin.go     # ops 档：运行时诊断、调度总开关、清缓冲、写操作台账查询
-│   ├── audit.go              # 写操作台账：中间件、action/verdict 封闭词表、读写窄接口（观测层）
-│   ├── history.go            # 事件内存环形缓冲（订阅事件总线，重启即清空；启用事件库后它是兜底）
-│   ├── authenticator.go      # 账号校验与 JWT 签发/验签
-│   ├── authstore.go          # refresh 表、登出拒绝表、一次性 ticket
-│   ├── ratelimit.go          # 登录失败限流（IP+账号 与 IP 双维度）
-│   ├── dto.go                # 请求/响应数据结构
-│   ├── security.go           # 认证与角色中间件、跨域来源策略
-│   ├── logging.go            # 访问日志与 panic 恢复中间件（slog）
-│   ├── websocket.go          # gorilla/websocket 适配器
-│   ├── sse.go                # Server-Sent Events
-│   └── *_test.go             # 契约、鉴权、关闭与流式测试
-│
-├── executor/                 # 执行层（把档位变成可注册的执行任务；默认不启用）
-│   ├── profile.go            # 档位加载与校验：两种路径模式（workspace 内 / 本机任意路径）、解释器白名单、参数与超时声明
-│   ├── registry.go           # "档位 + 可用性 + 来源"的登记表（配置项 executors.* 的唯一读取方，运行期可整表替换）
-│   ├── merge_profiles.go     # 把档位文件那份合进 store 侧（只管 store：config 侧仍由 NewRegistry 加载，同名以 config 为准）
-│   ├── applier.go            # "校验+探测"与"整份文件生效"的入口（api 的写端点只经这一个口子改执行面）
-│   ├── register.go           # 把档位注册进调度器（Registrar 由调用方提供，不依赖具体实现）
-│   ├── probe.go              # 可用性探测：程序在不在 PATH、脚本在不在，不启动任何进程
-│   ├── args.go               # payload 解码、参数校验与命令行/URL 渲染（没有 shell，也没有内联源码）
-│   ├── env.go                # 子进程环境重建：固定注入 + env_allow 白名单，排除 GODELAYQ_ 前缀
-│   ├── proc.go               # 进程档位（script / binary）的执行主体：起进程、收输出、判超时
-│   ├── proc_unix.go          # Unix 侧进程组信号与终止
-│   ├── proc_windows.go       # Windows 侧整树终止（taskkill /T /F）与差异说明
-│   ├── exit.go               # 退出码 / 信号 / HTTP 状态到失败原因的归类（含"重试无意义"判定）
-│   ├── http.go               # HTTP 档位：拨号层禁内网与元数据地址、请求渲染、响应与头的落盘
-│   ├── result.go             # 一次执行的内存形态：结论摘要 + 两条输出流 + 预览裁剪
-│   ├── artifact.go           # 产物文件存储（a<n>.out / a<n>.err / meta.json）与 TTL、孤儿清理
-│   ├── artifact_index.go     # 产物索引的可选依赖接口（ArtifactIndexer）：登记、标清理、启动对账
-│   └── *_test.go             # 与上述文件一一对应的单元测试（含真实进程与跨平台夹具）
-│
-├── store/sqlite/             # 观测层存储（可选，一个 SQLite 文件；全仓唯一 import SQLite 驱动的包）
-│   ├── db.go                 # 打开与迁移、WAL/busy_timeout/synchronous 三个 PRAGMA、SetMaxOpenConns(1)
-│   ├── schema.go             # version 1 迁移：三张表与八个索引，逐字对齐设计文档 §6
-│   ├── batch.go              # 三个写入器共用的有界批量器（非阻塞入队、合并事务、重试一次后丢弃计数）
-│   ├── events.go             # job_events：事件写入器，同时是两个事件端点的读取方
-│   ├── artifacts.go          # artifact_index：产物索引实现（写失败只记日志，文件仍是权威）
-│   ├── audit.go              # write_audit：写操作台账的写入与查询（含两条保留淘汰）
-│   ├── doc.go                # 包说明与依赖边界
-│   └── *_test.go             # 往返、过滤分页、保留淘汰、队满丢弃与关闭幂等
-│
-├── examples/                 # 独立可运行示例
+├── examples/                 # 独立可运行示例。嵌入用法 import 走 internal/（仓内参考），
+│   │                         # 外部系统集成请走 REST API
 │   ├── demo1/                # 编程式提交与崩溃恢复
-│   └── demo2/                # 目录加载器
+│   └── demo2/                # 目录加载器（job_queue/ 是它监控的示例任务目录）
+│       └── job_queue/
 │
-├── dashboard/
-│   └── index.html            # 旧单文件监控页的跳转页（能力已并入 web/ 控制台的实时页）
-│
-├── web/                      # Vue 3 控制台前端（npm 工程；-tags dashboard 时产物内嵌进二进制）
-│   ├── vite.config.ts        # dev 代理 /api、/sse、/ws → :8080
-│   ├── embed_dashboard.go    # //go:build dashboard：//go:embed all:dist 暴露 web.Dist
-│   ├── embed_stub.go         # //go:build !dashboard：web.Dist 恒为 nil，构建不依赖 npm
+├── web/                      # Vue 3 控制台前端（纯 npm 工程，不含 Go 代码）
+│   ├── vite.config.ts        # dev 代理 /api、/sse、/ws → :8080；build.outDir → ../internal/web/dist
 │   ├── package.json          # 版本钉在设计文档 §4.1：Vite 7 / TS 5 / Pinia 3 / Router 4
 │   └── src/
 │       ├── api/              # types、client（401→刷新→重放一次）、auth、jobs、groups、events、admin、keys、stats
@@ -254,8 +255,7 @@ godelayq/
 ├── configs/
 │   └── config.example.yaml   # 运行配置模板（入库的就是这一份；本机那份含凭据、已 gitignore）
 │
-├── job_queue/                # 目录加载器的示例任务文件（demo2 监控此目录）
-├── data/                     # 默认 store.path 的数据文件（仓库内是空占位）
+├── data/                     # 运行时数据目录（任务/分组 JSON、SQLite 库；除占位外均不入库）
 │
 └── docs/
     ├── api.md                # API 详细文档
@@ -265,8 +265,8 @@ godelayq/
     └── design/
         ├── web-console-design.md            # Web 控制台设计与权限矩阵
         ├── executor-design.md               # 执行层设计（档位、结果与产物）
-        └── sqlite-observability-design.md   # 观测层设计（三张表、批量写入与端点）
-            └── tasks/            # 按卡实施：executor/ 19 张（E01…E19）、sqlite/ 8 张（S01…S08）
+        ├── sqlite-observability-design.md   # 观测层设计（三张表、批量写入与端点）
+        └── tasks/            # 按卡实施：executor/ 19 张（E01…E19）、sqlite/ 8 张（S01…S08）、go-layout/ 3 张（L01…L03）
 ```
 
 仓库不提供 Makefile、Dockerfile、docker-compose.yml 与运维脚本；构建直接用
@@ -344,7 +344,7 @@ godelayq/
 - **运维端点**：`GET /admin/runtime` 读 worker/队列/堆/缓冲占用，`POST /admin/scheduler/suspend|unsuspend`
   是维护窗口的调度总开关（进程内状态，重启自动解除）
 - **控制台**：`web/` 的 Vue 控制台共八个页面（概览、任务列表、任务详情、分组、实时、运维、设置、登录）；
-  带 `-tags dashboard` 构建时与 API 同源提供，旧 `dashboard/index.html` 只剩一个跳转页
+  带 `-tags dashboard` 构建时与 API 同源提供（旧的单文件监控页已删除，能力都在控制台的实时页）
 - **结构化日志**：全进程 `log/slog`，级别与格式可配，HTTP 访问日志与 panic 堆栈同流
 
 ### 5. 接入层安全
@@ -430,7 +430,7 @@ npm run dev        # http://localhost:5173，端口被占用时 Vite 自动顺�
 ```
 
 页面一律用相对路径请求 `/api`、`/ws`，所以顺延端口同样能用。校验命令：
-`npx vue-tsc --noEmit`（类型）与 `npm run build`（产物在 `web/dist`，已 gitignore）。
+`npx vue-tsc --noEmit`（类型）与 `npm run build`（产物直落 `internal/web/dist`，已 gitignore）。
 **依赖版本钉在设计文档 §4.1**（Vite 7 / TS 5 / Pinia 3 / vue-router 4），
 `npm install` 时不要随手升到最新大版本。
 
@@ -438,12 +438,12 @@ npm run dev        # http://localhost:5173，端口被占用时 Vite 自动顺�
 没有跨域、也不需要上面那条代理。**顺序必须先是 npm 再是 go**：
 
 ```bash
-cd web && npm run build && cd ..        # 产出 web/dist
+cd web && npm run build && cd ..        # 产物直落 internal/web/dist
 go build -tags dashboard -o godelayq-console ./cmd/server
 ./godelayq-console -config=configs/config.yaml   # 浏览器打开 http://localhost:8080/
 ```
 
-`-tags dashboard` 让 `web/embed_dashboard.go` 的 `//go:embed all:dist` 生效；
+`-tags dashboard` 让 `internal/web/embed_dashboard.go` 的 `//go:embed all:dist` 生效；
 没跑过 `npm run build` 时这一步会直接编译失败（`pattern all:dist: no matching files found`），
 而不是给出一个没有页面的二进制。不带这个 tag 的构建里 `web.Dist` 恒为 `nil`，
 服务端只提供 API——`go build ./...` 与全部测试因此完全不依赖 Node。

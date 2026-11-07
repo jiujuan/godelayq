@@ -66,4 +66,12 @@ go test ./...
 
 ## 10. 实现记录
 
-(执行时补写)
+- README 目录树整节重写,顺带补齐了旧树的缺漏条目(handlers_users.go、console.go、store/observe、store/mgr、cmd/gensecret、reload.go);README 本就是"部署服务优先"叙事,嵌入用法的降级注记落在目录树 examples 注释与 docs/example.md 示例头部,未做大幅改写。
+- docs 侧共改 9 处:example.md(import ×2、嵌入注记、dashboard 段)、deployment.md ×2、api.md ×2、core-analysis ×1;example.md 与 deployment.md 各有一处**示例日志输出**含 `path=job_queue\...`,那是运行时相对路径,保留不动。
+- **敏感信息审查(逐项,结论:无开源阻塞项)**:
+  - `configs/config.example.yaml`:仅占位符与注释示例(`$2a$10$...`),无真实凭据;
+  - `configs/config.yaml`:不在 HEAD、被 .gitignore 正确忽略,工作区 4 个凭据值均未入库;
+  - **历史考古**:af6c09f 曾把真实 config.yaml 改名为 example 并从此排除;其前一版(af6c09f~1)排除注释行后 0 个真实凭据(唯一命中是注释里的占位示例)——历史无泄漏;
+  - `docs/design/executor-design.md` 的 `api.internal` 为示意占位主机,非真实内网;
+  - 高熵疑似密钥扫描 0 命中;`data/jobs.json` 无敏感字段。
+- 使用者文档旧路径 `grep '"godelayq/|godelayq/core|web/dist|dashboard/index'` 零残留(历史 design 文档按归档口径未动,`git diff` 可证)。

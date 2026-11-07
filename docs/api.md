@@ -149,7 +149,7 @@ Web 控制台有两种部署形态，API 契约完全一致，区别只在前端
 `/api`、`/ws`（`ws: true`）、`/sse` 代理到 :8080。此时后端进程里没有产物，
 访问 `http://localhost:8080/` 得到 JSON 404 是正常的。
 
-**单二进制**：先 `cd web && npm run build` 产出 `web/dist`，再
+**单二进制**：先 `cd web && npm run build` 产出 `internal/web/dist`，再
 `go build -tags dashboard ./cmd/server`。`-tags dashboard` 会让
 `web/embed_dashboard.go` 的 `//go:embed all:dist` 生效；不带这个 tag 的构建里
 `web.Dist` 恒为 `nil`，服务端只提供 API——所以先 build 前端、后 build 二进制，
@@ -159,7 +159,7 @@ Web 控制台有两种部署形态，API 契约完全一致，区别只在前端
 
 | 请求 | 响应 |
 | --- | --- |
-| `GET /` | `web/dist/index.html`，`Cache-Control: no-cache` |
+| `GET /` | `internal/web/dist/index.html`，`Cache-Control: no-cache` |
 | `GET /assets/<name>` | 对应产物文件，`Cache-Control: public, max-age=31536000, immutable`（文件名带内容哈希） |
 | `GET /jobs/<id>` 等 SPA 深链，且 `Accept` 含 `text/html` | 回落 `index.html`，由前端路由决定显示什么 |
 | `GET /assets/<不存在>` | 404（不拿 index.html 兜，否则得到一个 200 的白屏 JS） |

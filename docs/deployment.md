@@ -107,7 +107,7 @@ go build -tags dashboard -o godelayq-server ./cmd/server
 ```
 
 - **顺序不能反**。`-tags dashboard` 下 `//go:embed all:dist` 在编译期就要求
-  `web/dist` 存在，缺了它构建直接失败（`pattern all:dist: no matching files found`），
+  `internal/web/dist` 存在，缺了它构建直接失败（`pattern all:dist: no matching files found`），
   不会给出一个"看起来成功、打开没有页面"的二进制。发布流水线里两步之间要有依赖关系，
   不能并行。
 - **不带 tag 的构建不含前端**：`go build ./...` 与全部测试因此不需要 Node，
@@ -119,7 +119,7 @@ go build -tags dashboard -o godelayq-server ./cmd/server
 - **缓存**：`index.html` 是 `no-cache`，`/assets/*` 是 `max-age=31536000, immutable`
   （文件名带内容哈希）。反代或 CDN 上如果给 `index.html` 加了缓存，升级后旧页面会去取
   已经不存在的哈希资源，表现是白屏而不是报错。
-- `web/dist` 不进版本库，发布时构建。
+- `internal/web/dist` 不进版本库，发布时构建。
 
 ### 接入层安全（账号、token 与跨域）
 

@@ -64,4 +64,8 @@ git log --follow --oneline internal/core/scheduler.go | tail -3
 
 ## 10. 实现记录
 
-(执行时补写)
+- **分支策略偏离**:Stage 0(先合 feat/db-migration)经决策跳过,本分支直接基于 feat/db-migration HEAD(799edcb)创建。剩余迁库卡(docs/前端/jobs)后续 rebase 时要注意:store/ 与全部 import 路径已改名。
+- **与惯例的偏离**:移动与 import 重写合并为单提交(6df7771)——"纯移动单独成提交"会产生编译必断的中间提交,与"每卡提交全绿"冲突。事后验证 rename 检测全部成功(相似度 93–100%),`git log --follow` 连续。
+- **执行口径**:Git Bash 下 `xargs` 会吃掉反斜杠路径,中转文件又带 `\r`,两次失败后改用 `grep -rlZ … | xargs -0`(null 分隔)一次通过;共重写 146 处 import + config_test.go 两行路径(全仓唯一深度依赖,已核查)。
+- **教训**:两次 `git add -u` 把开工前已存在的 data/jobs.json 运行时改动卷进提交,均用 `git restore --source=HEAD~1 --staged <file>` + `--amend` 摘除;此后提交一律显式列路径。
+- 全绿证据:`go build/vet/test ./...` 通过(cmd/server 6.4s、api 31.3s、core 20.5s、executor 24.4s、store/* 均 ok),旧路径 `grep '"godelayq/'` 零残留。

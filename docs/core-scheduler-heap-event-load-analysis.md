@@ -1,6 +1,6 @@
 # Core 延迟任务系统分析
 
-`godelayq/core/` 这一组代码把一个延迟任务系统拆成了四层：`Job` 数据模型、四叉堆 `QuaternaryHeap`、调度循环 `Scheduler`、事件总线 `EventBus`，以及外部数据接入器 `DirectoryLoader`。它们合起来形成了一个“任务进入 -> 排队 -> 到期执行 -> 事件广播 -> 持久化/恢复”的闭环。
+`internal/core/` 这一组代码把一个延迟任务系统拆成了四层：`Job` 数据模型、四叉堆 `QuaternaryHeap`、调度循环 `Scheduler`、事件总线 `EventBus`，以及外部数据接入器 `DirectoryLoader`。它们合起来形成了一个“任务进入 -> 排队 -> 到期执行 -> 事件广播 -> 持久化/恢复”的闭环。
 
 ## 1. 四叉堆负责“谁先执行”
 
