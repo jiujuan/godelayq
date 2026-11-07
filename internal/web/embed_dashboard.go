@@ -1,7 +1,7 @@
 //go:build dashboard
 
 // 单二进制发布形态：前端产物随二进制一起编译。
-// 构建顺序是先 `cd web && npm run build` 产出 web/dist，再 `go build -tags dashboard`。
+// 构建顺序是先 `cd web && npm run build`（vite outDir 已指向 internal/web/dist），再 `go build -tags dashboard`。
 package web
 
 import (
@@ -15,7 +15,7 @@ import (
 //go:embed all:dist
 var distFS embed.FS
 
-// Dist 是前端产物的根（即 web/dist 里的内容），index.html 就在这一层。
+// Dist 是前端产物的根（即 internal/web/dist 里的内容），index.html 就在这一层。
 var Dist fs.FS = subOrPanic(distFS, "dist")
 
 func subOrPanic(fsys fs.FS, dir string) fs.FS {

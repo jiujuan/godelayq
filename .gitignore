@@ -8,3 +8,6 @@ configs/config.yaml
 data/*.sqlite
 data/*.sqlite-wal
 data/*.sqlite-shm
+
+# 前端构建产物:vite outDir 直落这里,由 internal/web embed 进单二进制
+internal/web/dist/

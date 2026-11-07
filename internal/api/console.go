@@ -10,7 +10,7 @@ import (
 )
 
 // 嵌入形态（设计文档 §5.8 的方案 B）：前端产物由同一个进程、同一套路由提供，
-// 不存在跨域，也不需要 vite 那条代理。文件本身在 web/embed_dashboard.go 里，
+// 不存在跨域，也不需要 vite 那条代理。文件本身在 internal/web/embed_dashboard.go 里，
 // 只有 -tags dashboard 的构建才带得动。
 
 // consoleIndex 是 SPA 入口在产物根目录里的文件名。
