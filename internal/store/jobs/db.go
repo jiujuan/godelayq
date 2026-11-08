@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -10,12 +11,38 @@ import (
 
 	"github.com/jiujuan/godelayq/internal/core"
 	"github.com/jiujuan/godelayq/internal/store/engine"
+	"github.com/uptrace/bun"
 )
+
+// bgCtx 供无 ctx 入参的接口方法内部使用：core.Store 的签名不带 ctx，
+// 这里不发明新的传播方式，超时与取消由调用方（调度器/HTTP 层）在更外层控制。
+var bgCtx = context.Background()
 
 // Handle 是任务库的连接句柄：公共底座句柄嵌入。库文件级读数（行数、WAL 大小）
 // 若日后要进运维端点，挂在本类型上。
 type Handle struct {
 	*engine.DB
+}
+
+// jobRow 是 jobs 表的 bun 模型。表名、列名是冻结契约（schema.go），tag 全部
+// 显式给出，不依赖 bun 的命名推断。snapshot_json 是权威数据；其余四列是冗余，
+// 只服务于运维排查与留痕淘汰的轻查询。
+type jobRow struct {
+	bun.BaseModel `bun:"table:jobs"`
+
+	ID           string `bun:"column:id,pk"`
+	Name         string `bun:"column:name"`
+	Status       string `bun:"column:status"`
+	UpdatedAt    int64  `bun:"column:updated_at"`
+	SnapshotJSON string `bun:"column:snapshot_json"`
+}
+
+// metaRow 是 jobs_meta 表的 bun 模型：一次性导入标记的键值对。
+type metaRow struct {
+	bun.BaseModel `bun:"table:jobs_meta"`
+
+	Key   string `bun:"column:key,pk"`
+	Value string `bun:"column:value"`
 }
 
 // Store 是 jobs 表上的 core.Store 实现：直写、每变更一个事务，没有内存缓存
@@ -103,15 +130,20 @@ func (s *Store) upsert(snapshot core.JobSnapshot) error {
 	if err != nil {
 		return fmt.Errorf("jobs: marshal snapshot %s: %w", snapshot.ID, err)
 	}
-	if _, err := s.h.SQL().Exec(`INSERT INTO jobs (id, name, status, updated_at, snapshot_json)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(id) DO UPDATE SET
-  name = excluded.name,
-  status = excluded.status,
-  updated_at = excluded.updated_at,
-  snapshot_json = excluded.snapshot_json`,
-		snapshot.ID, snapshot.Name, core.JobStatus(snapshot.Status).String(),
-		snapshot.UpdatedAt.UnixNano(), string(payload)); err != nil {
+	row := &jobRow{
+		ID:           snapshot.ID,
+		Name:         snapshot.Name,
+		Status:       core.JobStatus(snapshot.Status).String(),
+		UpdatedAt:    snapshot.UpdatedAt.UnixNano(),
+		SnapshotJSON: string(payload),
+	}
+	if _, err := s.h.NewInsert().Model(row).
+		On("CONFLICT (id) DO UPDATE").
+		Set("name = EXCLUDED.name").
+		Set("status = EXCLUDED.status").
+		Set("updated_at = EXCLUDED.updated_at").
+		Set("snapshot_json = EXCLUDED.snapshot_json").
+		Exec(bgCtx); err != nil {
 		return fmt.Errorf("jobs: upsert %s: %w", snapshot.ID, err)
 	}
 	if core.JobStatus(snapshot.Status).IsTerminal() {
@@ -123,7 +155,9 @@ ON CONFLICT(id) DO UPDATE SET
 // Delete 移除一条快照。ID 不存在不是错误：调用方（调度器的取消链）语义是
 // "确保不在"，与 JSON 实现的 delete-缺失-无害一致。
 func (s *Store) Delete(jobID string) error {
-	if _, err := s.h.SQL().Exec(`DELETE FROM jobs WHERE id = ?`, jobID); err != nil {
+	if _, err := s.h.NewDelete().Model((*jobRow)(nil)).
+		Where("id = ?", jobID).
+		Exec(bgCtx); err != nil {
 		return fmt.Errorf("jobs: delete %s: %w", jobID, err)
 	}
 	return nil
@@ -131,25 +165,22 @@ func (s *Store) Delete(jobID string) error {
 
 // LoadAll 返回全部快照，含终态留痕；按状态过滤是调用方的事（接口契约）。
 func (s *Store) LoadAll() ([]core.JobSnapshot, error) {
-	rows, err := s.h.SQL().Query(`SELECT snapshot_json FROM jobs`)
-	if err != nil {
+	var payloads []string
+	if err := s.h.NewSelect().Model((*jobRow)(nil)).
+		ColumnExpr("snapshot_json").
+		Scan(bgCtx, &payloads); err != nil {
 		return nil, fmt.Errorf("jobs: load all: %w", err)
 	}
-	defer rows.Close()
 
-	out := make([]core.JobSnapshot, 0, 16)
-	for rows.Next() {
-		var payload string
-		if err := rows.Scan(&payload); err != nil {
-			return nil, fmt.Errorf("jobs: scan snapshot: %w", err)
-		}
+	out := make([]core.JobSnapshot, 0, len(payloads))
+	for _, payload := range payloads {
 		var snap core.JobSnapshot
 		if err := json.Unmarshal([]byte(payload), &snap); err != nil {
 			return nil, fmt.Errorf("jobs: unmarshal snapshot: %w", err)
 		}
 		out = append(out, snap)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // Flush 直写下没有"未落盘的内存态"，恒为 no-op。接口契约里"无变更时不产生
@@ -167,47 +198,36 @@ func (s *Store) Close() error {
 // 那个函数只读这三个字段）；行数受留痕上限约束（默认 1000），O(n) 判定
 // 不值得在 SQL 端复刻一份语义。
 func (s *Store) trimTerminal() error {
-	rows, err := s.h.SQL().Query(`SELECT id, status, updated_at FROM jobs`)
-	if err != nil {
+	var rows []jobRow
+	if err := s.h.NewSelect().Model(&rows).
+		ColumnExpr("id, status, updated_at").
+		Scan(bgCtx); err != nil {
 		return fmt.Errorf("jobs: trim scan: %w", err)
 	}
-	views := make(map[string]core.JobSnapshot)
-	for rows.Next() {
-		var id, statusName string
-		var updatedNano int64
-		if scanErr := rows.Scan(&id, &statusName, &updatedNano); scanErr != nil {
-			rows.Close()
-			return fmt.Errorf("jobs: trim scan row: %w", scanErr)
-		}
-		status, ok := core.ParseJobStatus(statusName)
+	views := make(map[string]core.JobSnapshot, len(rows))
+	for _, row := range rows {
+		status, ok := core.ParseJobStatus(row.Status)
 		if !ok {
-			rows.Close()
-			return fmt.Errorf("jobs: trim scan: unknown status %q in row %s", statusName, id)
+			return fmt.Errorf("jobs: trim scan: unknown status %q in row %s", row.Status, row.ID)
 		}
-		views[id] = core.JobSnapshot{ID: id, Status: int(status), UpdatedAt: time.Unix(0, updatedNano)}
+		views[row.ID] = core.JobSnapshot{ID: row.ID, Status: int(status), UpdatedAt: time.Unix(0, row.UpdatedAt)}
 	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return fmt.Errorf("jobs: trim scan: %w", err)
-	}
-	rows.Close()
 
 	stale := core.TrimTerminal(views, s.historyLimit.Load(), time.Duration(s.historyTTL.Load()))
 	if len(stale) == 0 {
 		return nil
 	}
-	tx, err := s.h.SQL().Begin()
-	if err != nil {
-		return fmt.Errorf("jobs: trim begin: %w", err)
-	}
-	for _, id := range stale {
-		if _, execErr := tx.Exec(`DELETE FROM jobs WHERE id = ?`, id); execErr != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("jobs: trim delete %s: %w", id, execErr)
+	if err := s.h.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
+		for _, id := range stale {
+			if _, execErr := tx.NewDelete().Model((*jobRow)(nil)).
+				Where("id = ?", id).
+				Exec(ctx); execErr != nil {
+				return fmt.Errorf("jobs: trim delete %s: %w", id, execErr)
+			}
 		}
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("jobs: trim commit: %w", err)
+		return nil
+	}); err != nil {
+		return fmt.Errorf("jobs: trim: %w", err)
 	}
 	return nil
 }

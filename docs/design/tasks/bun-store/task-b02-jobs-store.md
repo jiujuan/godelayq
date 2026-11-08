@@ -51,4 +51,8 @@ PG DDL(B05)、PG 测试挂载(B06)。
 
 ## 10. 实现记录
 
-(执行时填写)
+- 2026-11-08 完成。db.go/import.go 全部走 bun 构建器；`RunInTx` 实际签名为
+  `(ctx, *sql.TxOptions, fn)`（比设想多一个参数，传 nil）。
+- 测试重构：`openStore` → `storeOpener`/`openSQLiteStore` + `runWithStoreBackends`
+  （`storeOpt` 钩子同时覆盖配置节与留痕参数），断言体方言无关，B06 直接挂 PG。
+- 批量导入改为事务内一次多值 INSERT（空切片跳过），其余语义逐字保留。
