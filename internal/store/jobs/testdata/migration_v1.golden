@@ -1,0 +1,28 @@
+version 1 up:
+CREATE TABLE IF NOT EXISTS jobs (
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,             -- 冗余列：现场排障用，不参与接口查询
+  status        TEXT NOT NULL,             -- core.JobStatus 规范名（封闭词表）
+  updated_at    INTEGER NOT NULL,          -- 写入时的 UnixNano，留痕淘汰的排序键
+  snapshot_json TEXT NOT NULL              -- core.JobSnapshot 整体序列化，权威数据
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);
+CREATE TABLE IF NOT EXISTS jobs_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+version 1 up_postgres:
+CREATE TABLE IF NOT EXISTS jobs (
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,             -- 冗余列：现场排障用，不参与接口查询
+  status        TEXT NOT NULL,             -- core.JobStatus 规范名（封闭词表）
+  updated_at    BIGINT NOT NULL,           -- 写入时的 UnixNano，留痕淘汰的排序键
+  snapshot_json TEXT NOT NULL              -- core.JobSnapshot 整体序列化，权威数据
+);
+CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);
+CREATE TABLE IF NOT EXISTS jobs_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);

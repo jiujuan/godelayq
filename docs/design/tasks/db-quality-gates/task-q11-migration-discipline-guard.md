@@ -58,4 +58,21 @@ go test -run TestPackageGuard -count=1 ./internal/store/...   # 规则接线确�
 
 ## 10. 实现记录
 
-- 待实施。
+- 2026-11-09 完成。storeguard/migration.go：三条规则做成 **Check\*（返回问题清单）
+  + Require\*（接线包装）** 两层——与卡面"临时改动清单确认红后还原"的自证方式
+  偏差：自证改为**构造坏输入直接断言问题非空的永久用例**（storeguard/migration_test.go
+  四个用例），比临时改文件再还原更可靠且留作长期回归；接线面不变（各包
+  package_guard_test 调 Require\*）。
+- 三规则与范围：版本从 1 起步、严格递增无重复；UpPostgres 出现 AUTOINCREMENT
+  必须同句含 IDENTITY（大小写不敏感；**Up 通用语句集不查**——那里写 SQLite 专属
+  语法是 PG 迁移时的响亮故障，不是静默事故）；v1 冻结面是 Up + 非空 UpPostgres
+  （engine.Migration 没有 Down——迁移只进不退，回滚靠备份，卡面的"Up/Down"
+  以实现为准）。golden 文本为确定性折行（节标题 + 每语句一行）。
+- 接线：jobs/mgr/observe 三包 package_guard_test 各加 Test*MigrationDiscipline，
+  复用各包 SQL 快照的 `-update` 标志（同一测试二进制不许重复注册 flag）；
+  golden `testdata/migration_v1.golden` × 3 已生成，重写通道
+  `go test ./internal/store/<pkg>/ -run TestPackageGuard -update`。
+- 零误报验证：三包既有迁移清单全部通过（jobs v1–v4 / mgr / observe）；
+  storeguard 自证用例含每条规则的"既有形态必须通过"配对用例。
+- 自证：storeguard 4 用例绿（含重复/乱序/非正版本、裸 AUTOINCREMENT、v1 漂移、
+  缺 golden 报错、空清单零误报）；全量 10 包 EXIT=0；本机 PG 矩阵 7 包 EXIT=0。
