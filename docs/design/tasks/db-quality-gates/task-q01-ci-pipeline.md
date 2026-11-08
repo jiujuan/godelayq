@@ -52,4 +52,10 @@ windows 快档偶发超时——15 分钟上限按本地实测（全量 <5 分�
 
 ## 10. 实现记录
 
-(执行时填写)
+- 2026-11-08 完成。两 job：sqlite-fast（ubuntu+windows 矩阵，无服务依赖）+
+  postgres-matrix（postgres:17 service，pg_isready 健康检查，DSN 经 env 注入）。
+- go 版本走 go-version-file: go.mod（声明 go 1.25.0）；同 ref 并发取消；
+  contents: read 最小权限。
+- 本机自证：YAML 解析通过；两 job 的命令清单本地复跑全绿（build/vet/test 全量 +
+  PG 矩阵）。**首跑验证待推送/合并后**（工作流无法在本机执行），届时确认
+  setup-go 对 go.mod 的解析与 windows 快档时长。
