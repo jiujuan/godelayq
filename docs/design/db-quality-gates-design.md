@@ -72,12 +72,15 @@ LoadAll/ImportOnce、AuditLog.Append+Query、ArtifactIndex.Record…）触发全
 （`testdata/sql_snapshot_<dialect>.golden`）；PG 侧走 pgtest 门控，未配 DSN 跳过。
 更新通道：`go test -run TestSQLSnapshot -update` 重写 golden。
 
-**钉住什么**：占位符风格（`?` vs `$N`）、EXCLUDED 大小写、ORDER BY 表达式引号、
-`lower(name)` 冲突目标、IDENTITY 列省略、prune 子查询文本。bun 升级或改动查询时
-diff 逐行评审。
+**钉住什么**：SQL 形状——表/列序、`AS` 别名、EXCLUDED 大小写、ORDER BY 表达式、
+`lower(name)` 冲突目标（**golden 两侧 diff 恰好只反映该方言分支**）、多值 INSERT
+形态、prune 子查询文本。bun 升级或改动查询时 diff 逐行评审。
 
-**确定性保障**：操作序列固定；golden 里只有语句文本、无参数值（时间戳等都是占位符
-参数）；ImportOnce 等走 map 的路径用单条目入参；批量器经显式 Flush 同步落盘。
+**确定性保障**（bun v1.3 对构建器查询一律内联参数渲染，`Query`/`QueryTemplate` 同串，
+因此快照配两级掩码）：纪元量级数字（≥10 位，生产侧 `time.Now` 的写入时刻）掩成
+`<n>`；载荷里的 RFC3339 时间戳（`Save` 无条件覆盖 `UpdatedAt`，载荷必然带墙钟）掩成
+`<ts>`。数据值不进快照、形状变化照样红。另有两条测试侧纪律：bcrypt 用固定哈希常量
+（随机盐不进 golden）、操作序列固定 + ImportOnce 单条目入参 + 批量器显式 Flush。
 
 ## 6. 验证口径
 

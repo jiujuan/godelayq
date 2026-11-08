@@ -55,4 +55,16 @@ Flush 内；golden 抖动——发现即修操作序列而不是放宽比对。�
 
 ## 10. 实现记录
 
-(执行时填写)
+- 2026-11-08 完成。三包 sql_snapshot_test.go + 六份 golden（sqlite/postgres 各一）。
+- **实现与设计的三处修正**（都已回填设计文档 §5）：
+  1. bun v1.3 构建器查询一律内联参数渲染，`Query`/`QueryTemplate` 同串——不存在
+     占位符模板可捕；快照改为捕获渲染文本并配两级掩码（纪元数字 `<n>`、RFC3339
+     时间戳 `<ts>`）；
+  2. bcrypt 随机盐不进 golden：快照用固定哈希常量 snapshotHash（testHash 逐进程不同）；
+  3. 排查中确认 Save 无条件用 time.Now 覆盖 UpdatedAt，record_json/snapshot_json
+     载荷必然带墙钟——掩码规则因此而生。
+- **两侧 golden 的 diff 是本门禁的代表性产物**：mgr 两侧差异恰好只有 upsert 冲突目标
+  （`(name)` vs `(lower(name))`），jobs 两侧零差异——查询层方言中立性被 golden 直接
+  可见地钉住。
+- 自证：sqlite 与 PG 各连续两次运行零 diff；`-update` 重写通道验证可用。
+- PG 侧经本机 PostgreSQL 实测（GODELAYQ_TEST_PG_DSN 门控）。
