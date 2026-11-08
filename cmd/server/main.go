@@ -166,6 +166,51 @@ func (p *profileStoreAPI) configApplier() *executor.Applier {
 	return p.applier
 }
 
+// observabilityEnv 是观测层的装配产物（setupObservability 的返回值）：
+// db 在总开关打开时必非 nil；三个成员各自对应自己的子开关，关着就是 nil。
+// 原来是 run() 里三个散着声明的变量（events/audit/artifactIndex）加一个局部 db，
+// 合成一个 struct 之后，"这次部署装了哪些观测层记录器"有了一个可以整体传递的形状，
+// run() 的观测层阶段因此收敛成一次调用加一条 defer。
+type observabilityEnv struct {
+	db            observabilityDB
+	events        eventLogAPI
+	audit         auditLogAPI
+	artifactIndex executor.ArtifactIndexer
+}
+
+// close 按固定顺序收掉观测层句柄：先台账、再事件写入器、最后观测库。
+// 这个顺序原来是 run() 里三条 defer 的声明位次（后声明先执行）表达的，收拢后在此显式写出：
+// 写入器要先撤订阅、落完最后一批，然后才关连接（顺序反过来就是往已关闭的连接里写，
+// 设计文档 §7.3）。每个写入器关掉之后都要把丢弃数报出来：库里缺页是读不出来的（设计文档 §7.1）。
+// 产物索引没有独立关闭：它随观测库连接一起失效。
+// 错误路径与成功路径共用这一个方法——setupObservability 失败时 env 带着已建好的句柄交回，
+// run() 里那条 defer obsEnv.close 在两种路径上都走这里。
+func (e *observabilityEnv) close(logger *slog.Logger) {
+	if e.audit != nil {
+		if err := e.audit.Close(); err != nil {
+			logger.Error("failed to close observability audit writer", "error", err)
+		}
+		if dropped := e.audit.Dropped(); dropped > 0 {
+			logger.Warn("observability audit writer dropped records",
+				"dropped", dropped, "path", e.db.Path())
+		}
+	}
+	if e.events != nil {
+		if err := e.events.Close(); err != nil {
+			logger.Error("failed to close observability event writer", "error", err)
+		}
+		if dropped := e.events.Dropped(); dropped > 0 {
+			logger.Warn("observability event writer dropped records",
+				"dropped", dropped, "path", e.db.Path())
+		}
+	}
+	if e.db != nil {
+		if err := e.db.Close(); err != nil {
+			logger.Error("failed to close observability database", "error", err)
+		}
+	}
+}
+
 type runtimeDeps struct {
 	config core.Config
 	// configPath 是启动时真正读到的那个配置文件的绝对路径；空串表示进程在用代码默认值
@@ -373,75 +418,7 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 				RetentionAge:   cfg.Audit.RetentionAge,
 			}, logger)
 		},
-		newServer: func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry,
-			artifacts *executor.ArtifactStore, obs *observabilityAPI, profiles *profileStoreAPI) (serverAPI, error) {
-			coreScheduler, ok := scheduler.(*core.Scheduler)
-			if !ok {
-				return nil, fmt.Errorf("default server requires *core.Scheduler, got %T", scheduler)
-			}
-			security := api.Security{
-				Auth:             cfg.Server.Auth,
-				AllowOrigins:     cfg.Server.CORS.AllowOrigins,
-				AllowCredentials: cfg.Server.CORS.AllowCredentials,
-			}
-			// 分组注册表：mgrstore.enabled 时以库为准，否则走 JSON 文件。
-			// JSON 那条分支读不出来就别起服务：与其让 /groups 每个请求都 500，
-			// 不如在启动日志里就把文件权限/格式问题摆到眼前。
-			var groups core.GroupStore
-			if cfg.MgrStore.Enabled {
-				// run() 的装配顺序保证管理库先于服务构造打开，句柄必已就位。
-				groups = mgr.NewGroupStore(mgrDB.handle)
-			} else {
-				var groupErr error
-				groups, groupErr = core.NewJSONFileGroupStore(cfg.Store.GroupsPath)
-				if groupErr != nil {
-					return nil, groupErr
-				}
-			}
-			opts := []api.Option{
-				api.WithGroupStore(groups),
-				api.WithExecutorRegistry(executors),
-				// 执行器关闭时 artifacts 是 nil，等价于不注入：/jobs/:id/result 回 503，
-				// 而不是在没有任何产物文件的目录上读出"结果为空"。
-				api.WithArtifacts(artifacts),
-				// 不带 -tags dashboard 时 web.Dist 恒为 nil，这一行等价于"不提供控制台"。
-				// 写成无条件调用而不是两份装配，是为了让单二进制的差异只留在 web 包那一处。
-				api.WithConsole(web.Dist),
-			}
-			// 观测层的两面都按装没装配分岔：总开关或对应子开关关闭时那一面是 nil，
-			// 事件端点继续读内存缓冲、审计中间件继续只记日志（未启用时的默认行为必须一字不变）。
-			if obs != nil {
-				if obs.events != nil {
-					opts = append(opts, api.WithEventLog(obs.events))
-				}
-				if obs.audit != nil {
-					// 读写两面是同一个句柄：台账的写入方就是查询方
-					opts = append(opts, api.WithAuditLog(obs.audit, obs.audit))
-				}
-			}
-			// 管理库模式把账号存储交给服务：认证器随之切到库模式（改账号即时生效），
-			// 账号管理端点（/admin/users）也随之启用——两者共用这一个存储句柄。
-			// 关闭时账号走配置快照（遗留模式），管理端点不存在。
-			if cfg.MgrStore.Enabled {
-				opts = append(opts, api.WithUserStore(mgr.NewUserStore(mgrDB.handle)))
-			}
-			// 档位的在线管理两面同生同灭：web_enabled=false 时 profiles 整体是 nil，
-			// 三个写端点因此走到 503 那条明确分支，而不是"能建但建完不生效"。
-			if profiles != nil {
-				opts = append(opts,
-					api.WithExecutorProfileStore(profiles.store),
-					api.WithExecutorProfileApplier(profiles.applier),
-				)
-			}
-			// 重载状态的读口。注入条件与"开关开没开"绑，而不是与"watcher 建没建起来"绑：
-			// 后者没建起来的那些部署（没有可盯的文件、构造失败）恰恰要能被人读到结论，
-			// 未启用的部署才该整个键都不出现（卡 §5.4 第 1 条）。
-			// enabled 那一位给的是 cfg 里的进程配置，不是 State().Enabled（R05 的 D-R0503）。
-			if cfg.Reload.Enabled {
-				opts = append(opts, api.WithReloadState(reloadStatus, cfg.Reload.Enabled))
-			}
-			return api.NewServer(coreScheduler, store, port, security, logger, opts...), nil
-		},
+		newServer: defaultNewServer(cfg, mgrDB, reloadStatus, logger),
 		newConfigWatcher: func(path string, debounce time.Duration, onReload core.ReloadFunc,
 			logger *slog.Logger) (configWatcherAPI, error) {
 			watcher, err := core.NewConfigWatcher(path, debounce, onReload, logger)
@@ -457,6 +434,85 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 		notifySignals: signal.Notify,
 		timeout:       cfg.Scheduler.ShutdownTimeout,
 		logger:        logger,
+	}
+}
+
+// defaultNewServer 是 newServer 的默认实现：按装配结果把分组/账号存储、观测层两面、
+// 档位两面与重载读口注入 api.Server。
+// 原来是 defaultRuntimeDeps 字面量里的一个闭包，体量到了值得具名的程度才搬出来：
+// 捕获的四个变量（cfg、mgrDB、reloadStatus、logger）在这里变成显式参数，其余依赖仍由参数传入。
+func defaultNewServer(cfg core.Config, mgrDB *mgrDBHolder, reloadStatus *reloadStatusReader,
+	logger *slog.Logger) func(scheduler schedulerAPI, store core.Store, port string,
+	executors *executor.Registry, artifacts *executor.ArtifactStore, obs *observabilityAPI,
+	profiles *profileStoreAPI) (serverAPI, error) {
+	return func(scheduler schedulerAPI, store core.Store, port string, executors *executor.Registry,
+		artifacts *executor.ArtifactStore, obs *observabilityAPI, profiles *profileStoreAPI) (serverAPI, error) {
+		coreScheduler, ok := scheduler.(*core.Scheduler)
+		if !ok {
+			return nil, fmt.Errorf("default server requires *core.Scheduler, got %T", scheduler)
+		}
+		security := api.Security{
+			Auth:             cfg.Server.Auth,
+			AllowOrigins:     cfg.Server.CORS.AllowOrigins,
+			AllowCredentials: cfg.Server.CORS.AllowCredentials,
+		}
+		// 分组注册表：mgrstore.enabled 时以库为准，否则走 JSON 文件。
+		// JSON 那条分支读不出来就别起服务：与其让 /groups 每个请求都 500，
+		// 不如在启动日志里就把文件权限/格式问题摆到眼前。
+		var groups core.GroupStore
+		if cfg.MgrStore.Enabled {
+			// run() 的装配顺序保证管理库先于服务构造打开，句柄必已就位。
+			groups = mgr.NewGroupStore(mgrDB.handle)
+		} else {
+			var groupErr error
+			groups, groupErr = core.NewJSONFileGroupStore(cfg.Store.GroupsPath)
+			if groupErr != nil {
+				return nil, groupErr
+			}
+		}
+		opts := []api.Option{
+			api.WithGroupStore(groups),
+			api.WithExecutorRegistry(executors),
+			// 执行器关闭时 artifacts 是 nil，等价于不注入：/jobs/:id/result 回 503，
+			// 而不是在没有任何产物文件的目录上读出"结果为空"。
+			api.WithArtifacts(artifacts),
+			// 不带 -tags dashboard 时 web.Dist 恒为 nil，这一行等价于"不提供控制台"。
+			// 写成无条件调用而不是两份装配，是为了让单二进制的差异只留在 web 包那一处。
+			api.WithConsole(web.Dist),
+		}
+		// 观测层的两面都按装没装配分岔：总开关或对应子开关关闭时那一面是 nil，
+		// 事件端点继续读内存缓冲、审计中间件继续只记日志（未启用时的默认行为必须一字不变）。
+		if obs != nil {
+			if obs.events != nil {
+				opts = append(opts, api.WithEventLog(obs.events))
+			}
+			if obs.audit != nil {
+				// 读写两面是同一个句柄：台账的写入方就是查询方
+				opts = append(opts, api.WithAuditLog(obs.audit, obs.audit))
+			}
+		}
+		// 管理库模式把账号存储交给服务：认证器随之切到库模式（改账号即时生效），
+		// 账号管理端点（/admin/users）也随之启用——两者共用这一个存储句柄。
+		// 关闭时账号走配置快照（遗留模式），管理端点不存在。
+		if cfg.MgrStore.Enabled {
+			opts = append(opts, api.WithUserStore(mgr.NewUserStore(mgrDB.handle)))
+		}
+		// 档位的在线管理两面同生同灭：web_enabled=false 时 profiles 整体是 nil，
+		// 三个写端点因此走到 503 那条明确分支，而不是"能建但建完不生效"。
+		if profiles != nil {
+			opts = append(opts,
+				api.WithExecutorProfileStore(profiles.store),
+				api.WithExecutorProfileApplier(profiles.applier),
+			)
+		}
+		// 重载状态的读口。注入条件与"开关开没开"绑，而不是与"watcher 建没建起来"绑：
+		// 后者没建起来的那些部署（没有可盯的文件、构造失败）恰恰要能被人读到结论，
+		// 未启用的部署才该整个键都不出现（卡 §5.4 第 1 条）。
+		// enabled 那一位给的是 cfg 里的进程配置，不是 State().Enabled（R05 的 D-R0503）。
+		if cfg.Reload.Enabled {
+			opts = append(opts, api.WithReloadState(reloadStatus, cfg.Reload.Enabled))
+		}
+		return api.NewServer(coreScheduler, store, port, security, logger, opts...), nil
 	}
 }
 
@@ -532,7 +588,149 @@ func usableConfigFile(candidate string) (string, bool) {
 	return abs, true
 }
 
+// run 是进程的装配流水线：每个阶段一个函数（依赖校验 → 任务存储 → 调度器 → 管理库 →
+// 执行器 → 产物存储 → 观测层 → 服务 → 热重载链 → 启动 → 等信号收尾），
+// 本函数只负责按顺序接线与挂 defer。关闭顺序的单一事实来源仍然是这里的 defer 声明位次
+// （后声明先执行）：清理协程 → 观测层（台账 → 事件写入器 → 观测库）→ 管理库 → 任务存储
+// （设计文档 §7.3）——反过来就会在已关闭的连接上继续写入，或在已关闭的任务存储之上
+// 再读一次快照。管理库的三张表都是同步落库，无需先行收尾。
 func run(deps runtimeDeps) error {
+	if err := validateRuntimeDeps(deps); err != nil {
+		return err
+	}
+
+	cfg := deps.config.Normalized()
+	if deps.timeout <= 0 {
+		deps.timeout = cfg.Scheduler.ShutdownTimeout
+	}
+	if deps.logger == nil {
+		deps.logger = slog.Default()
+	}
+
+	store, err := deps.newStore()
+	if err != nil {
+		return err
+	}
+	// 存储按周期合并落盘，退出前必须收尾（早退路径同样覆盖）
+	defer func() {
+		if err := store.Close(); err != nil {
+			deps.logger.Error("failed to close store", "error", err)
+		}
+	}()
+
+	scheduler := newConfiguredScheduler(deps, cfg, store)
+
+	// 管理库在档位存储与服务构造之前打开：newExecutorProfileStore 与 newServer 两个闭包
+	// 都要读它的句柄（mgrDBHolder 晚绑定）。打开或导入失败都拒绝启动——
+	// mgrstore.enabled=true 表示部署方已决定以库为准，"半导半没导"的状态比起不来更难解释。
+	// Open 成功但后续失败时，句柄会原样交回，同样走这条 defer 收掉。
+	mgrdb, err := openMgrDatabase(deps, cfg)
+	if mgrdb != nil {
+		defer func() {
+			if err := mgrdb.Close(); err != nil {
+				deps.logger.Error("failed to close mgr database", "error", err)
+			}
+		}()
+	}
+	if err != nil {
+		return err
+	}
+
+	executors, profileStore, err := buildExecutorStack(deps, cfg)
+	if err != nil {
+		return err
+	}
+
+	artifacts, err := openArtifactStore(deps, cfg)
+	if err != nil {
+		return err
+	}
+
+	// 观测层（运行事件、产物索引、写操作审计三张表）只在总开关打开时装配。
+	// 失败时 env 会带着已建好的句柄交回（db 必非 nil），关闭统一由这条 defer 负责：
+	// 错误路径与成功路径共用同一个收尾，内部顺序是台账 → 事件写入器 → 观测库。
+	// 这条 defer 晚于上面 store.Close 与 mgrdb.Close 的声明，因此实际执行顺序是
+	// 先关观测层、再关管理库、最后关任务存储（设计文档 §7.3）。
+	obsEnv, err := setupObservability(deps, cfg, scheduler, artifacts)
+	if obsEnv != nil {
+		defer obsEnv.close(deps.logger)
+	}
+	if err != nil {
+		return err
+	}
+
+	// 产物清理协程在观测层挂好之后起：Start 的第一轮扫描是"孤儿清理 + TTL 清理 + 索引对账"，
+	// 对账要读索引，起早了那份索引还不在。
+	//
+	// 这里的 defer 比观测层那条 defer（obsEnv.close）后声明，因此关停顺序是：先停清理协程，
+	// 再关观测层（台账 → 事件写入器 → 观测库）、最后关任务存储。反过来就会让清理协程
+	// 在索引连接已关之后去删它该删的行。
+	if artifacts != nil {
+		cleanupCtx, stopCleanup := context.WithCancel(context.Background())
+		cleanerStopped := artifacts.Start(cleanupCtx, liveJobIDs(store))
+		// 先停清理协程再关存储（后声明的先执行）：否则协程可能在存储已关闭后再去读一次任务集合。
+		defer func() {
+			stopCleanup()
+			<-cleanerStopped
+		}()
+	}
+
+	// 观测层的两个写入器合成一个参数交给服务：都没装配时传 nil，
+	// 服务里两条注入都不发生（未启用观测层的部署行为与本卡之前一致）。
+	var obs *observabilityAPI
+	if obsEnv != nil && (obsEnv.events != nil || obsEnv.audit != nil) {
+		obs = &observabilityAPI{events: obsEnv.events, audit: obsEnv.audit}
+	}
+
+	profiles, err := buildProfileStoreAPI(deps, cfg, profileStore, scheduler, executors, artifacts)
+	if err != nil {
+		return err
+	}
+
+	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts, obs, profiles)
+	if err != nil {
+		return err
+	}
+	if err := registerHandlers(server, scheduler, executors, cfg, artifacts, deps.logger); err != nil {
+		return err
+	}
+
+	installRestoreGuard(scheduler, cfg)
+
+	// 配置热重载的链（TASK-R06）。整个 if 块在 reload.enabled=false（默认）时一个字节都不执行：
+	// 不建链、不建 goroutine，进程行为与本系列之前一致。
+	//
+	// 建在这里而不是建在 watcher 旁边：它要引用 store、调度器、两个观测层写入器、档位同步器与
+	// 级别载体，这几样到这里才齐；而它被调到的最早时机是 server.Start() 之后（下面那段）。
+	var chain reloadChain
+	if cfg.Reload.Enabled {
+		if deps.reloadStatus == nil {
+			// 只有测试手搓的 runtimeDeps 字面量会走到这里：attach/explain 得有地方写结论。
+			// 回填必须留在 run：buildReloadChain 按值收 deps，字段回写带不出来。
+			deps.reloadStatus = &reloadStatusReader{path: deps.configPath}
+		}
+		chain = buildReloadChain(deps, cfg, store, scheduler, obsEnv, profiles)
+	}
+
+	scheduler.Start()
+
+	if err := server.Start(); err != nil {
+		scheduler.Stop()
+		return err
+	}
+
+	// 监听器在服务开始监听之后才起、才跑循环；时序要求与三种"起不来"的降级取舍
+	// 见 startConfigWatcher。
+	watcher := startConfigWatcher(deps, cfg, chain)
+
+	return awaitSignalAndShutdown(deps, watcher, chain, server, scheduler)
+}
+
+// validateRuntimeDeps 把"这次部署用得到、却没装配"的依赖拦在启动期。
+// 每一条都是"闭包在不在"与"这次部署用不用得到"的合取：开关关着时少配闭包是预期行为，
+// 开关打开却少了闭包的后果写在各自的注释里——共同点是"看起来正常、实际没记"，
+// 必须停在启动期，而不是让部署带着哑掉的存储或观测层上线。
+func validateRuntimeDeps(deps runtimeDeps) error {
 	if deps.newStore == nil || deps.newScheduler == nil || deps.newExecutorRegistry == nil ||
 		deps.newArtifactStore == nil || deps.newObservabilityDB == nil ||
 		deps.newServer == nil ||
@@ -572,26 +770,12 @@ func run(deps runtimeDeps) error {
 	if deps.config.Reload.Enabled && deps.configPath != "" && deps.newConfigWatcher == nil {
 		return fmt.Errorf("runtime dependencies are incomplete")
 	}
+	return nil
+}
 
-	cfg := deps.config.Normalized()
-	if deps.timeout <= 0 {
-		deps.timeout = cfg.Scheduler.ShutdownTimeout
-	}
-	if deps.logger == nil {
-		deps.logger = slog.Default()
-	}
-
-	store, err := deps.newStore()
-	if err != nil {
-		return err
-	}
-	// 存储按周期合并落盘，退出前必须收尾（早退路径同样覆盖）
-	defer func() {
-		if err := store.Close(); err != nil {
-			deps.logger.Error("failed to close store", "error", err)
-		}
-	}()
-
+// newConfiguredScheduler 建调度器并把启动期的池规模一次配齐。
+// 池规模的取值规则与执行器开关的关系见函数内注释（schedulerAPI 同名方法的说明）。
+func newConfiguredScheduler(deps runtimeDeps, cfg core.Config, store core.Store) schedulerAPI {
 	scheduler := deps.newScheduler(store, &core.ExponentialBackoffRetry{
 		MaxDelay: cfg.Scheduler.MaxRetryDelay,
 	}, nil)
@@ -609,57 +793,65 @@ func run(deps runtimeDeps) error {
 	}
 	// 事件里输出预览的字节上限：取值已在 Normalized 里补齐，非法值的兜底由调度器负责。
 	scheduler.SetEventPreviewLimit(cfg.Executors.Output.InlinePreview)
+	return scheduler
+}
 
-	// 管理库在档位存储与服务构造之前打开：newExecutorProfileStore 与 newServer 两个闭包
-	// 都要读它的句柄（mgrDBHolder 晚绑定）。打开或导入失败都拒绝启动——
-	// mgrstore.enabled=true 表示部署方已决定以库为准，"半导半没导"的状态比起不来更难解释。
-	// 关闭顺序由 defer 的声明位次决定（后声明先执行）：观测层写入器 → 观测库 →
-	// 管理库 → 任务存储；管理库的三张表都是同步落库，无需先行收尾。
-	if cfg.MgrStore.Enabled {
-		mgrdb, err := deps.newMgrDB(cfg, deps.logger)
-		if err != nil {
-			return err
-		}
-		defer func() {
-			if err := mgrdb.Close(); err != nil {
-				deps.logger.Error("failed to close mgr database", "error", err)
-			}
-		}()
-		handle, ok := mgrdb.(*mgr.Handle)
-		if !ok {
-			// 与 newEventLog 的断言同一处置：导入要真连接，接了假句柄就报错。
-			return fmt.Errorf("mgr db needs the real handle, got %T", mgrdb)
-		}
-		deps.logger.Info("mgr database opened",
-			"path", handle.Path(), "journal_mode", handle.JournalMode(), "synchronous", handle.Synchronous())
-		if err := mgr.ImportOnce(handle, mgr.ImportSource{
-			AuthUsers:    cfg.Server.Auth.Users,
-			GroupsPath:   cfg.Store.GroupsPath,
-			ProfilesPath: cfg.Executors.ProfilesPath,
-		}, deps.logger); err != nil {
-			return err
-		}
+// openMgrDatabase 打开 SQLite 管理库并完成一次性导入，只在 mgrstore.enabled=true 时动作，
+// 否则交回 (nil, nil)。
+//
+// 返回值的形状要专门说明：Open 成功但后续失败（句柄断言不过、导入失败）时，
+// 句柄会随错误一起交回——调用方据此把 Close 挂上 defer，早退路径同样收掉，
+// 与拆分前"defer 在 Open 之后立刻声明、早退同样执行"的形状一致。
+func openMgrDatabase(deps runtimeDeps, cfg core.Config) (mgrAPI, error) {
+	if !cfg.MgrStore.Enabled {
+		return nil, nil
 	}
+	mgrdb, err := deps.newMgrDB(cfg, deps.logger)
+	if err != nil {
+		return nil, err
+	}
+	handle, ok := mgrdb.(*mgr.Handle)
+	if !ok {
+		// 与 newEventLog 的断言同一处置：导入要真连接，接了假句柄就报错。
+		return mgrdb, fmt.Errorf("mgr db needs the real handle, got %T", mgrdb)
+	}
+	deps.logger.Info("mgr database opened",
+		"path", handle.Path(), "journal_mode", handle.JournalMode(), "synchronous", handle.Synchronous())
+	if err := mgr.ImportOnce(handle, mgr.ImportSource{
+		AuthUsers:    cfg.Server.Auth.Users,
+		GroupsPath:   cfg.Store.GroupsPath,
+		ProfilesPath: cfg.Executors.ProfilesPath,
+	}, deps.logger); err != nil {
+		return mgrdb, err
+	}
+	return mgrdb, nil
+}
 
-	// 档位文件在登记表之前读、在注册之前合。两个时点都有理由：
-	//   - 读不出来就没有"这一批档位"可合，那种状态不该带着起服务（见 newExecutorProfileStore）；
-	//   - 合批必须早于 registerHandlers，因为崩溃恢复守卫按注册表里的类别改判
-	//     （installRestoreGuard 与 Start 第一步的 Restore 都晚于注册）。
-	//     晚一步注册的那批档位，它的崩溃现场会查不到类别、跳过 paused 改判直接重排。
-	//     这条顺序由 TestRun_StoredProfilesAreRegisteredBeforeTheRestoreGuard 钉住。
-	//
-	// 存储实例只建这一份：启动合并与页面写入共用同一个内存视图，
-	// 否则"页面上刚存的档位"与"下一次 Apply 读到的内容"会各看一份文件状态。
+// buildExecutorStack 装配执行器一侧：档位文件、登记表与两者的合并。
+// 登记表之外还把档位存储一并交回——buildProfileStoreAPI 要用同一个实例
+// （页面写入），reload 链的 executors.commands 热更也要（ApplyConfig）。
+//
+// 档位文件在登记表之前读、在注册之前合。两个时点都有理由：
+//   - 读不出来就没有"这一批档位"可合，那种状态不该带着起服务（见 newExecutorProfileStore）；
+//   - 合批必须早于 registerHandlers，因为崩溃恢复守卫按注册表里的类别改判
+//     （installRestoreGuard 与 Start 第一步的 Restore 都晚于注册）。
+//     晚一步注册的那批档位，它的崩溃现场会查不到类别、跳过 paused 改判直接重排。
+//     这条顺序由 TestRun_StoredProfilesAreRegisteredBeforeTheRestoreGuard 钉住。
+//
+// 存储实例只建这一份：启动合并与页面写入共用同一个内存视图，
+// 否则"页面上刚存的档位"与"下一次 Apply 读到的内容"会各看一份文件状态。
+func buildExecutorStack(deps runtimeDeps, cfg core.Config) (*executor.Registry, core.ExecutorProfileStore, error) {
 	var profileStore core.ExecutorProfileStore
 	var storedProfiles []core.ExecutorProfileRecord
 	if cfg.Executors.WebEnabled {
+		var err error
 		profileStore, err = deps.newExecutorProfileStore(cfg)
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 		storedProfiles, err = profileStore.List()
 		if err != nil {
-			return err
+			return nil, nil, err
 		}
 	}
 
@@ -667,7 +859,7 @@ func run(deps runtimeDeps) error {
 	if err != nil {
 		// 档位配置非法（越界路径、引用未声明的参数等）属于装配期错误：
 		// 带着半套配置启动，任务会在触发时才失败，那时已经看不出是哪一条配置的问题。
-		return err
+		return nil, nil, err
 	}
 	if cfg.Executors.WebEnabled {
 		// 合并规则全在 executor 包里（一份校验、单条不连坐、撞名降级），这里只做接线。
@@ -679,7 +871,7 @@ func run(deps runtimeDeps) error {
 		if err := executors.ApplyStore(entries); err != nil {
 			// 走到这里是"文件里两条记录占同一个注册键"或编程错误：
 			// 那种表面对不上的登记表会让接口与调度器各说一套，不让它带着起服务。
-			return err
+			return nil, nil, err
 		}
 	}
 	if cfg.Executors.Enabled && !cfg.Server.Auth.Enabled() {
@@ -688,274 +880,219 @@ func run(deps runtimeDeps) error {
 		deps.logger.Error("executors are enabled while server authentication is disabled",
 			"hint", "set server.auth.token or server.auth.users before exposing executors")
 	}
+	return executors, profileStore, nil
+}
 
-	// 产物存储与清理协程只在打开执行器时建。变量声明在 if 之外：
-	// 接口要拿它注入 api.Server，关闭时保持 nil，/jobs/:id/result 据此回 503。
-	var artifacts *executor.ArtifactStore
-	if cfg.Executors.Enabled {
-		// 产物目录只在打开执行器时创建：关闭状态下不可能有输出需要安放，
-		// 无谓地建出 ./data/exec 会让"这次部署没启用执行器"看起来像在写文件。
-		var err error
-		artifacts, err = deps.newArtifactStore(cfg, deps.logger)
-		if err != nil {
-			// 目录建不起来等于输出无处可写，与档位配置非法同级：不让进程带着"结果一定会丢"启动。
-			return err
-		}
-		// 清理协程到观测层挂好之后再起：Start 的第一轮扫描里要做索引对账
-		// （见下面观测层那段），提前起就看不到索引。
+// openArtifactStore 建产物存储，只在打开执行器时建，否则交回 nil：
+// 接口要拿它注入 api.Server，保持 nil 时 /jobs/:id/result 据此回 503，
+// 而不是在没有任何产物文件的目录上读出"结果为空"。
+func openArtifactStore(deps runtimeDeps, cfg core.Config) (*executor.ArtifactStore, error) {
+	if !cfg.Executors.Enabled {
+		return nil, nil
 	}
-
-	// 事件写入器在观测层装配那段里创建，声明放在外面：它同时是 api.Server 的事件读取方，
-	// 而 newServer 在观测层之后调用。未启用时保持 nil，两个事件端点因此走内存缓冲。
-	var events eventLogAPI
-	// 产物索引同样声明在外面：挂给它的是产物存储（SetIndex），而日志要知道这次到底挂没挂。
-	var artifactIndex executor.ArtifactIndexer
-	// 台账也声明在外面：它既要在观测层那段里创建与关停，又要作为观测层参数交给服务。
-	var audit auditLogAPI
-
-	// 观测层（运行事件、产物索引、写操作审计三张表）只在总开关打开时装配。
-	//
-	// defer 的顺序有讲究：这里的 defer 晚于上面 store.Close 的 defer 声明，因此实际执行顺序
-	// 是先关事件写入器、再关观测库、最后关任务存储（设计文档 §7.3）。反过来就会在已关闭的
-	// 连接上继续写入，或在已关闭的任务存储之上再读一次快照。
-	if cfg.Observability.Enabled {
-		db, err := deps.newObservabilityDB(cfg, deps.logger)
-		if err != nil {
-			// 建不起库等于什么都记不住，与档位配置非法、产物目录建不起来同一口径：
-			// 不让进程带着"这次部署其实一行历史都不会留下"的状态上线。
-			return err
-		}
-		// 收尾立刻挂上，再读迁移版本：Stats 失败也要把这份句柄关掉，
-		// 否则早退路径留下一条没人认领的连接。
-		defer func() {
-			if err := db.Close(); err != nil {
-				deps.logger.Error("failed to close observability database", "error", err)
-			}
-		}()
-
-		stats, err := db.Stats()
-		if err != nil {
-			// Open 已经成功却读不出迁移版本，说明这份库文件本身有问题（权限、被外部改坏）。
-			// 报出来比让三张表安静地空着强。
-			return fmt.Errorf("observability database %s is unusable: %w", db.Path(), err)
-		}
-
-		// 事件写入器必须在 scheduler.Start() 之前挂上：Restore 是 Start 的第一步，
-		// 恢复阶段会重新发布一批 job.scheduled。挂晚了的后果是这一批静默不进库，
-		// 而"重启后时间线少了头几条"看起来跟"任务本来就没排期"一模一样，事后无从分辨。
-		//
-		// 它的读取面同时交给 api.Server（下面的 deps.newServer 把它作为事件读取方注入）：
-		// 装配了事件库之后两个事件端点改读库，没装配时这里保持 nil，端点走内存缓冲。
-		if cfg.Observability.Events.Enabled {
-			events, err = deps.newEventLog(scheduler.GetEventBus(), db, cfg.Observability, deps.logger)
-			if err != nil {
-				return fmt.Errorf("observability event writer: %w", err)
-			}
-			// 这条 defer 晚于上面 db.Close 的那条，因此先执行：撤订阅 → 等转发协程退出 →
-			// 落完最后一批，然后才关连接（顺序反过来就是往已关闭的连接里写）。
-			defer func() {
-				if err := events.Close(); err != nil {
-					deps.logger.Error("failed to close observability event writer", "error", err)
-				}
-				// 丢了多少必须在关停时也能看见：库里缺页是读不出来的（设计文档 §7.1）。
-				if dropped := events.Dropped(); dropped > 0 {
-					deps.logger.Warn("observability event writer dropped records",
-						"dropped", dropped, "path", db.Path())
-				}
-			}()
-		}
-
-		// 产物索引挂在产物存储上：写侧（两个执行器）与读侧（列表端点）拿的是同一份可选依赖，
-		// 所以这里只挂一次，不往 api 的注入参数里再加一位。
-		//
-		// 三个开关缺一不可：观测层总开关关着就没有这张表；事件之外单独关产物子开关时
-		// 文件照写、索引不记，此时列表端点明确 503；executors.enabled=false 时压根没有产物，
-		// 建索引等于在库里留一张空表。
-		if cfg.Observability.Artifacts.Enabled && artifacts != nil {
-			artifactIndex, err = deps.newArtifactIndex(db, cfg.Observability, artifacts.Dir(), deps.logger)
-			if err != nil {
-				return fmt.Errorf("observability artifact index: %w", err)
-			}
-			artifacts.SetIndex(artifactIndex)
-		}
-
-		// 写操作台账：中间件装在 api 侧，行由这里创建的写入器落盘。
-		// 未启用审计子开关时不创建，中间件因此退回"只记一行结构化日志"那条路径（本卡 §3.2）。
-		if cfg.Observability.Audit.Enabled {
-			audit, err = deps.newAuditLog(db, cfg.Observability, deps.logger)
-			if err != nil {
-				return fmt.Errorf("observability audit writer: %w", err)
-			}
-			// 与事件写入器同一位置：晚于 db.Close 声明，因此先执行——剩余行先落盘再关连接。
-			defer func() {
-				if err := audit.Close(); err != nil {
-					deps.logger.Error("failed to close observability audit writer", "error", err)
-				}
-				if dropped := audit.Dropped(); dropped > 0 {
-					deps.logger.Warn("observability audit writer dropped records",
-						"dropped", dropped, "path", db.Path())
-				}
-			}()
-		}
-
-		// journal_mode 记的是实际生效值：网络文件系统上 WAL 会静默退回 delete，
-		// 只看配置文件里的写法看不出降级已经发生（本卡 §9 风险 2）。
-		deps.logger.Info("observability enabled",
-			"path", db.Path(),
-			"schema_version", stats.SchemaVersion,
-			"journal_mode", db.JournalMode(),
-			"events_writer", events != nil,
-			"artifact_index", artifactIndex != nil,
-			"audit_writer", audit != nil)
-	}
-
-	// 产物清理协程在观测层挂好之后起：Start 的第一轮扫描是"孤儿清理 + TTL 清理 + 索引对账"，
-	// 对账要读索引，起早了那份索引还不在。
-	//
-	// 这里的 defer 比观测层那两个 defer 后声明，因此关停顺序是：先停清理协程，
-	// 再撤事件订阅、关观测库、最后关任务存储。反过来就会让清理协程在索引连接已关之后
-	// 去删它该删的行。
-	if artifacts != nil {
-		cleanupCtx, stopCleanup := context.WithCancel(context.Background())
-		cleanerStopped := artifacts.Start(cleanupCtx, liveJobIDs(store))
-		// 先停清理协程再关存储（后声明的先执行）：否则协程可能在存储已关闭后再去读一次任务集合。
-		defer func() {
-			stopCleanup()
-			<-cleanerStopped
-		}()
-	}
-
-	// 观测层的两个写入器合成一个参数交给服务：都没装配时传 nil，
-	// 服务里两条注入都不发生（未启用观测层的部署行为与本卡之前一致）。
-	var obs *observabilityAPI
-	if events != nil || audit != nil {
-		obs = &observabilityAPI{events: events, audit: audit}
-	}
-
-	// 档位在线管理的两面也合成一个参数：web_enabled=false 时整体是 nil，
-	// 三个写端点走到 requireExecutorProfiles 那条明确的 503，
-	// 不会出现"能建档位、建完不生效"这种半套部署。
-	// 同步器在这里建而不是在服务里建：它要同时握调度器、登记表、存储与产物存储，
-	// 这四样都在装配方手里，服务只该拿到已经接好的东西。
-	//
-	// 构造条件在 web_enabled 之外再加一支 reload：热重载 executors.commands 要用同一个 Applier
-	// 的 ApplyConfig（config 侧整表替换）。但**不为 reload 打开档位文件**——profileStore 的
-	// 打开条件仍只看 web_enabled（上面那段，一字未改）。所以 web_enabled=false、reload=true 的
-	// 部署拿到的是不接 store 的 NewConfigApplier：档位文件照旧一次都不碰（W01 的关闭即惰性口径），
-	// 那条 store 路径（Apply）在这种部署里返回明确错误而不是 panic，ApplyConfig 照常可用。
-	// 写端点的 503 判定看的是 profileStore 与 applier 成对在场，而这里 store 是 nil，
-	// 服务据此仍回 503——放宽构造条件不会把写端点打开。
-	var profiles *profileStoreAPI
-	if cfg.Executors.WebEnabled || (cfg.Reload.Enabled && cfg.Executors.Enabled) {
-		var applier *executor.Applier
-		var err error
-		if cfg.Executors.WebEnabled {
-			applier, err = executor.NewApplier(profileStore, scheduler, executors, artifacts, deps.logger)
-		} else {
-			// reload 打开但 web 关闭：不接 store，只服务 config 批次热更。
-			applier, err = executor.NewConfigApplier(scheduler, executors, artifacts, deps.logger)
-		}
-		if err != nil {
-			return err
-		}
-		profiles = &profileStoreAPI{store: profileStore, applier: applier}
-	}
-
-	server, err := deps.newServer(scheduler, store, cfg.Server.Port, executors, artifacts, obs, profiles)
+	// 产物目录只在打开执行器时创建：关闭状态下不可能有输出需要安放，
+	// 无谓地建出 ./data/exec 会让"这次部署没启用执行器"看起来像在写文件。
+	artifacts, err := deps.newArtifactStore(cfg, deps.logger)
 	if err != nil {
-		return err
+		// 目录建不起来等于输出无处可写，与档位配置非法同级：不让进程带着"结果一定会丢"启动。
+		return nil, err
 	}
-	if err := registerHandlers(server, scheduler, executors, cfg, artifacts, deps.logger); err != nil {
-		return err
+	// 清理协程不在这里起：Start 的第一轮扫描里要做索引对账，要等观测层挂好之后再起
+	//（run 里 openArtifactStore 与 setupObservability 之间的先后即为此而设）。
+	return artifacts, nil
+}
+
+// setupObservability 装配观测层的三个写入器（运行事件、产物索引、写操作审计），
+// 只在总开关打开时动作，否则交回 (nil, nil)。
+//
+// 失败路径的形状要专门说明：Open 成功之后的任何一步失败（迁移版本读不出、某个写入器建不起来），
+// env 都会带着已建好的句柄原样交回（db 必非 nil），关闭由 run() 的 defer obsEnv.close 负责——
+// 拆分前这是几条在 Open 之后立刻挂上的 defer，早退路径同样执行；拆分后错误路径与成功路径
+// 共用同一个收尾（observabilityEnv.close），不存在第二条关闭代码路径。
+//
+// 事件写入器必须在 scheduler.Start() 之前挂上：Restore 是 Start 的第一步，
+// 恢复阶段会重新发布一批 job.scheduled。挂晚了的后果是这一批静默不进库，
+// 而"重启后时间线少了头几条"看起来跟"任务本来就没排期"一模一样，事后无从分辨。
+// 它的读取面同时交给 api.Server（run 把它合进 observabilityAPI 注入）：
+// 装配了事件库之后两个事件端点改读库，没装配时保持 nil，端点走内存缓冲。
+func setupObservability(deps runtimeDeps, cfg core.Config, scheduler schedulerAPI,
+	artifacts *executor.ArtifactStore) (*observabilityEnv, error) {
+	if !cfg.Observability.Enabled {
+		return nil, nil
+	}
+	db, err := deps.newObservabilityDB(cfg, deps.logger)
+	if err != nil {
+		// 建不起库等于什么都记不住，与档位配置非法、产物目录建不起来同一口径：
+		// 不让进程带着"这次部署其实一行历史都不会留下"的状态上线。
+		return nil, err
+	}
+	env := &observabilityEnv{db: db}
+
+	stats, err := db.Stats()
+	if err != nil {
+		// Open 已经成功却读不出迁移版本，说明这份库文件本身有问题（权限、被外部改坏）。
+		// 报出来比让三张表安静地空着强。
+		return env, fmt.Errorf("observability database %s is unusable: %w", db.Path(), err)
 	}
 
-	installRestoreGuard(scheduler, cfg)
+	if cfg.Observability.Events.Enabled {
+		env.events, err = deps.newEventLog(scheduler.GetEventBus(), db, cfg.Observability, deps.logger)
+		if err != nil {
+			return env, fmt.Errorf("observability event writer: %w", err)
+		}
+	}
 
-	// 配置热重载的链（TASK-R06）。整个 if 块在 reload.enabled=false（默认）时一个字节都不执行：
-	// 不建链、不建 goroutine，进程行为与本系列之前一致。
+	// 产物索引挂在产物存储上：写侧（两个执行器）与读侧（列表端点）拿的是同一份可选依赖，
+	// 所以这里只挂一次，不往 api 的注入参数里再加一位。
 	//
-	// 建在这里而不是建在 watcher 旁边：它要引用 store、调度器、两个观测层写入器、档位同步器与
-	// 级别载体，这几样到这里才齐；而它被调到的最早时机是 server.Start() 之后（下面那段）。
-	var (
-		chain   reloadChain
-		watcher configWatcherAPI
-	)
-	if cfg.Reload.Enabled {
-		if deps.reloadStatus == nil {
-			// 只有测试手搓的 runtimeDeps 字面量会走到这里：attach/explain 得有地方写结论。
-			deps.reloadStatus = &reloadStatusReader{path: deps.configPath}
+	// 三个开关缺一不可：观测层总开关关着就没有这张表；事件之外单独关产物子开关时
+	// 文件照写、索引不记，此时列表端点明确 503；executors.enabled=false 时压根没有产物，
+	// 建索引等于在库里留一张空表。
+	if cfg.Observability.Artifacts.Enabled && artifacts != nil {
+		env.artifactIndex, err = deps.newArtifactIndex(db, cfg.Observability, artifacts.Dir(), deps.logger)
+		if err != nil {
+			return env, fmt.Errorf("observability artifact index: %w", err)
 		}
-		build := deps.newReloadChain
-		if build == nil {
-			build = func(d reloadDeps) reloadChain { return newReloader(d) }
-		}
-		chain = build(reloadDeps{
-			cfgPath:          deps.configPath,
-			applied:          cfg,
-			store:            store,
-			scheduler:        scheduler,
-			events:           events,
-			audit:            audit,
-			applier:          profiles.configApplier(),
-			executorsEnabled: cfg.Executors.Enabled,
-			levelVar:         deps.levelVar,
-			logger:           deps.logger,
-		})
+		artifacts.SetIndex(env.artifactIndex)
 	}
 
-	scheduler.Start()
-
-	if err := server.Start(); err != nil {
-		scheduler.Stop()
-		return err
-	}
-
-	// 监听器在服务开始监听之后才起、才跑循环：那条链会换处理函数表、改并发数，
-	// 在服务还没监听时就开始改现网，等于给"启动到就绪"这段窗口加了一条没人看着的写路径。
-	//
-	// 三种"起不来/起不了"的部署都继续提供服务，不阻止启动（卡 §3.4）：
-	// 热重载是便利，不是承重结构，因它起不来而让进程拒启等于把新能力变成新故障面。
-	// 但每一种都要留下说得出口的结论（I3）：一条日志，加进 /admin/runtime 的 reload 对象。
-	if chain != nil {
-		if deps.configPath == "" {
-			deps.logger.Warn("config hot reload is enabled but no config file was loaded at startup",
-				"hint", "用 -config 指一个真实存在的文件，或放置 configs/config.yaml 后重启；"+
-					"在此之前进程按当前生效的取值一直跑下去，改文件不会有任何反应")
-			deps.reloadStatus.explain("", "reload.enabled=true，但进程启动时没有读到任何配置文件，监听器没有建立")
-		} else {
-			started, err := deps.newConfigWatcher(deps.configPath, cfg.Reload.Debounce, chain.Reload, deps.logger)
-			if err != nil {
-				deps.logger.Error("config watcher failed to start, serving without hot reload",
-					"error", err, "path", deps.configPath)
-				deps.reloadStatus.explain(deps.configPath, "监听器没有建立："+err.Error())
-			} else {
-				watcher = started
-				// 顺序要紧：读口先接上，链先拿到防抖落点，最后才放事件循环进来。
-				// 这三步都早于 go Run，所以没有任何并发方看得到"半条链"。
-				deps.reloadStatus.attach(watcher)
-				chain.bindDebounce(watcher)
-				go watcher.Run(context.Background())
-				deps.logger.Info("config hot reload enabled",
-					"path", deps.configPath, "debounce", cfg.Reload.Debounce)
-			}
+	// 写操作台账：中间件装在 api 侧，行由这里创建的写入器落盘。
+	// 未启用审计子开关时不创建，中间件因此退回"只记一行结构化日志"那条路径（本卡 §3.2）。
+	if cfg.Observability.Audit.Enabled {
+		env.audit, err = deps.newAuditLog(db, cfg.Observability, deps.logger)
+		if err != nil {
+			return env, fmt.Errorf("observability audit writer: %w", err)
 		}
 	}
 
+	// journal_mode 记的是实际生效值：网络文件系统上 WAL 会静默退回 delete，
+	// 只看配置文件里的写法看不出降级已经发生（本卡 §9 风险 2）。
+	deps.logger.Info("observability enabled",
+		"path", db.Path(),
+		"schema_version", stats.SchemaVersion,
+		"journal_mode", db.JournalMode(),
+		"events_writer", env.events != nil,
+		"artifact_index", env.artifactIndex != nil,
+		"audit_writer", env.audit != nil)
+	return env, nil
+}
+
+// buildProfileStoreAPI 把档位在线管理的两面合成一个参数（存储 + 同步器）。
+// web_enabled=false 且 reload 不涉及执行器时整体交回 nil：三个写端点走到
+// requireExecutorProfiles 那条明确的 503，不会出现"能建档位、建完不生效"这种半套部署。
+//
+// 同步器在这里建而不是在服务里建：它要同时握调度器、登记表、存储与产物存储，
+// 这四样都在装配方手里，服务只该拿到已经接好的东西。
+//
+// 构造条件在 web_enabled 之外再加一支 reload：热重载 executors.commands 要用同一个 Applier
+// 的 ApplyConfig（config 侧整表替换）。但**不为 reload 打开档位文件**——profileStore 的
+// 打开条件仍只看 web_enabled（buildExecutorStack，一字未改）。所以 web_enabled=false、
+// reload=true 的部署拿到的是不接 store 的 NewConfigApplier：档位文件照旧一次都不碰
+// （W01 的关闭即惰性口径），那条 store 路径（Apply）在这种部署里返回明确错误而不是 panic，
+// ApplyConfig 照常可用。写端点的 503 判定看的是 profileStore 与 applier 成对在场，
+// 而这里 store 是 nil，服务据此仍回 503——放宽构造条件不会把写端点打开。
+func buildProfileStoreAPI(deps runtimeDeps, cfg core.Config, profileStore core.ExecutorProfileStore,
+	scheduler schedulerAPI, executors *executor.Registry,
+	artifacts *executor.ArtifactStore) (*profileStoreAPI, error) {
+	if !cfg.Executors.WebEnabled && !(cfg.Reload.Enabled && cfg.Executors.Enabled) {
+		return nil, nil
+	}
+	var applier *executor.Applier
+	var err error
+	if cfg.Executors.WebEnabled {
+		applier, err = executor.NewApplier(profileStore, scheduler, executors, artifacts, deps.logger)
+	} else {
+		// reload 打开但 web 关闭：不接 store，只服务 config 批次热更。
+		applier, err = executor.NewConfigApplier(scheduler, executors, artifacts, deps.logger)
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &profileStoreAPI{store: profileStore, applier: applier}, nil
+}
+
+// buildReloadChain 建热重载链（TASK-R06）。调用方（run）保证只在 reload.enabled=true 时进来，
+// 并保证 deps.reloadStatus 已就位——那句测试兜底的回填必须留在 run：
+// 本函数按值收 deps，字段回写带不出来。
+func buildReloadChain(deps runtimeDeps, cfg core.Config, store core.Store, scheduler schedulerAPI,
+	obsEnv *observabilityEnv, profiles *profileStoreAPI) reloadChain {
+	var events eventLogAPI
+	var audit auditLogAPI
+	if obsEnv != nil {
+		events = obsEnv.events
+		audit = obsEnv.audit
+	}
+	build := deps.newReloadChain
+	if build == nil {
+		build = func(d reloadDeps) reloadChain { return newReloader(d) }
+	}
+	return build(reloadDeps{
+		cfgPath:          deps.configPath,
+		applied:          cfg,
+		store:            store,
+		scheduler:        scheduler,
+		events:           events,
+		audit:            audit,
+		applier:          profiles.configApplier(),
+		executorsEnabled: cfg.Executors.Enabled,
+		levelVar:         deps.levelVar,
+		logger:           deps.logger,
+	})
+}
+
+// startConfigWatcher 在服务开始监听之后起配置监听器并放跑事件循环。
+// 必须晚于 server.Start()：那条链会换处理函数表、改并发数，
+// 在服务还没监听时就开始改现网，等于给"启动到就绪"这段窗口加了一条没人看着的写路径。
+//
+// 三种"起不来/起不了"的部署都继续提供服务，不阻止启动（卡 §3.4）：
+// 热重载是便利，不是承重结构，因它起不来而让进程拒启等于把新能力变成新故障面。
+// 但每一种都要留下说得出口的结论（I3）：一条日志，加进 /admin/runtime 的 reload 对象。
+// chain 为 nil（reload 未启用）时交回 nil。
+func startConfigWatcher(deps runtimeDeps, cfg core.Config, chain reloadChain) configWatcherAPI {
+	if chain == nil {
+		return nil
+	}
+	if deps.configPath == "" {
+		deps.logger.Warn("config hot reload is enabled but no config file was loaded at startup",
+			"hint", "用 -config 指一个真实存在的文件，或放置 configs/config.yaml 后重启；"+
+				"在此之前进程按当前生效的取值一直跑下去，改文件不会有任何反应")
+		deps.reloadStatus.explain("", "reload.enabled=true，但进程启动时没有读到任何配置文件，监听器没有建立")
+		return nil
+	}
+	started, err := deps.newConfigWatcher(deps.configPath, cfg.Reload.Debounce, chain.Reload, deps.logger)
+	if err != nil {
+		deps.logger.Error("config watcher failed to start, serving without hot reload",
+			"error", err, "path", deps.configPath)
+		deps.reloadStatus.explain(deps.configPath, "监听器没有建立："+err.Error())
+		return nil
+	}
+	// 顺序要紧：读口先接上，链先拿到防抖落点，最后才放事件循环进来。
+	// 这三步都早于 go Run，所以没有任何并发方看得到"半条链"。
+	deps.reloadStatus.attach(started)
+	chain.bindDebounce(started)
+	go started.Run(context.Background())
+	deps.logger.Info("config hot reload enabled",
+		"path", deps.configPath, "debounce", cfg.Reload.Debounce)
+	return started
+}
+
+// awaitSignalAndShutdown 等信号并按固定四步收尾（卡 §3.4，判据是 §5.2 #14 的那条调用流水）：
+//
+//	watcher.Close() → chain.Stop() → server.Stop(ctx) → scheduler.Stop()
+//
+// 为什么写成显式一段而不是 defer：run() 里已有的那几条 defer（观测层写入器、观测库、任务存储）
+// 晚于这里执行，而重载链必须在它们之前彻底停手——往已关闭的连接上写留痕是 deferred bug。
+// 为什么第二步不可省：R05 的 Close 明确**不等**在途的那次 ReloadFunc（它可能正握着写链的锁，
+// 等它只会把关停拖死），所以 Close 返回之后仍可能有一次 ApplyConfig 在改处理函数表，
+// 而那正是设计文档 §7.8 要避免的交错。chain.Stop() 拿一次链的串行锁，等于等在途那一串走完。
+func awaitSignalAndShutdown(deps runtimeDeps, watcher configWatcherAPI, chain reloadChain,
+	server serverAPI, scheduler schedulerAPI) error {
 	quit := make(chan os.Signal, 1)
 	deps.notifySignals(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
 	deps.logger.Info("shutting down server")
 
-	// 关闭顺序四步（卡 §3.4，判据是 §5.2 #14 的那条调用流水）：
-	//
-	//	watcher.Close() → chain.Stop() → server.Stop(ctx) → scheduler.Stop()
-	//
-	// 为什么写成显式一段而不是 defer：run() 里已有的那几条 defer（观测层写入器、观测库、任务存储）
-	// 晚于这里执行，而重载链必须在它们之前彻底停手——往已关闭的连接上写留痕是 deferred bug。
-	// 为什么第二步不可省：R05 的 Close 明确**不等**在途的那次 ReloadFunc（它可能正握着写链的锁，
-	// 等它只会把关停拖死），所以 Close 返回之后仍可能有一次 ApplyConfig 在改处理函数表，
-	// 而那正是设计文档 §7.8 要避免的交错。chain.Stop() 拿一次链的串行锁，等于等在途那一串走完。
 	if watcher != nil {
 		if err := watcher.Close(); err != nil {
 			// 事件循环没在有界时间内退出：这既是一条 error，也要留在读数里让人事后读得到（I3）。
