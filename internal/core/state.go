@@ -58,6 +58,18 @@ func canTransition(from, to JobStatus) bool {
 //
 // 返回 false 表示转移被拒绝，调用方照常返回（本方法已处理日志与事件）。
 func (s *Scheduler) transition(job *Job, to JobStatus, events ...Event) bool {
+	return s.transitionWithAttempt(job, to, nil, events...)
+}
+
+// transitionWithAttempt 是 transition 的账本扩展（W1/Q08）：状态转移与账本开始行
+// 同事务落库（出箱模式）。executeJob 的 running 落盘与 beginAttempt 原本是两次
+// 独立事务，合并后快照、出箱行、账本行同生共死。
+//
+// attempt 为 nil 时与本变体存在之前逐字节一致（persistAndEmitWithAttempt 内部分派）：
+// JSON 部署没有账本，直发模式的行为不得因合并通道的存在而改变。
+// 校验语义与 transition 共用（见上）：from 由本方法读取，非法转移放弃状态写、
+// 事件照发。
+func (s *Scheduler) transitionWithAttempt(job *Job, to JobStatus, attempt *Attempt, events ...Event) bool {
 	from := job.Status
 	if !canTransition(from, to) {
 		s.logger.Error("illegal job status transition rejected; keeping current status",
@@ -69,7 +81,7 @@ func (s *Scheduler) transition(job *Job, to JobStatus, events ...Event) bool {
 	}
 	job.Status = to
 	job.UpdatedAt = time.Now()
-	s.persistAndEmit(job, events...)
+	s.persistAndEmitWithAttempt(job, attempt, events...)
 	return true
 }
 
@@ -114,6 +126,30 @@ func (s *Scheduler) persistAndEmit(job *Job, events ...Event) error {
 		s.emit(events[i])
 	}
 	return persistErr
+}
+
+// persistAndEmitWithAttempt 是 persistAndEmit 的账本扩展（W1/Q08），三种能力组合：
+//   - 出箱 + 账本：一次事务落快照、出箱行、账本行（UpdateWithEventsAndAttempt），
+//     任何一步失败三者一起回滚——本变体存在的目的；
+//   - 出箱、无账本（attempt nil）：交回 persistAndEmit，与既有通道一字不差；
+//   - 无出箱（JSON 部署，账本必为 nil；第三方实现可能只给账本不给出箱——防御性
+//     保序）：快照与事件走既有通道，账本行独立补写，顺序与改动前的
+//     transition→beginAttempt 一致。
+func (s *Scheduler) persistAndEmitWithAttempt(job *Job, attempt *Attempt, events ...Event) error {
+	if attempt == nil {
+		return s.persistAndEmit(job, events...)
+	}
+	if s.outbox == nil {
+		persistErr := s.persistAndEmit(job, events...)
+		s.writeBeginAttempt(*attempt)
+		return persistErr
+	}
+	if err := s.outbox.UpdateWithEventsAndAttempt(job.ToSnapshot(), events, *attempt); err != nil {
+		s.logger.Error("failed to persist job snapshot with outbox events and attempt",
+			"job_id", job.ID, "status", job.Status.String(), "error", err)
+		return err
+	}
+	return nil
 }
 
 // emit 是"不带状态写的事件"的惟一出口：不伴随快照变化的事件（job.resumed、

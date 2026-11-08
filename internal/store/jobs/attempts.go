@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"time"
@@ -61,9 +62,17 @@ func (s *Store) FinishAttempt(jobID string, seq int, rec core.Attempt) error {
 }
 
 // upsertAttempt 把一行账本写进表：冲突目标 (job_id, seq)，更新全部业务列。
+// 直写路径（句柄直连）；合并事务（W1/Q08）走 upsertAttemptOn，两条路径共用
+// 同一条冲突更新链，golden 快照钉住文本、漂移当场红。
 func (s *Store) upsertAttempt(rec core.Attempt) error {
+	return upsertAttemptOn(bgCtx, s.h.DB.DB, rec)
+}
+
+// upsertAttemptOn 是账本 upsert 的共享实现：直写路径传句柄（s.h.DB.DB——
+// Handle.Dialect 遮蔽了 bun.IDB，须穿透到内嵌 *bun.DB），合并事务传 tx。
+func upsertAttemptOn(ctx context.Context, db bun.IDB, rec core.Attempt) error {
 	row := attemptRecord(rec)
-	if _, err := s.h.NewInsert().Model(&row).
+	if _, err := db.NewInsert().Model(&row).
 		On("CONFLICT (job_id, seq) DO UPDATE").
 		Set("status = EXCLUDED.status").
 		Set("trigger_source = EXCLUDED.trigger_source").
@@ -76,7 +85,7 @@ func (s *Store) upsertAttempt(rec core.Attempt) error {
 		Set("signal = EXCLUDED.signal").
 		Set("http_status = EXCLUDED.http_status").
 		Set("error_text = EXCLUDED.error_text").
-		Exec(bgCtx); err != nil {
+		Exec(ctx); err != nil {
 		return fmt.Errorf("jobs: upsert attempt %s#%d: %w", rec.JobID, rec.Seq, err)
 	}
 	return nil

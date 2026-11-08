@@ -51,8 +51,10 @@ const (
 // 终态时的留痕淘汰（含账本级联，trimTerminalTx 复用）。任何一步失败整体回滚——
 // "状态落了事件没了"的窗口由本方法关闭。
 //
-// 刻意不含 attempt 行：账本的 begin/finish 由 worker 协程单独调用，崩溃遗留的
-// running 行由 Restore 收口为 abandoned（自愈），不进本事务。
+// 账本开始行自 W1/Q08 起经 UpdateWithEventsAndAttempt 并进 running 落盘的同一
+// 事务；本方法保留为首次排期（pending）与 identity 写的通道。finish/abandon 仍由
+// worker 协程与 Restore 单独调用（崩溃遗留的 running 行由 Restore 收口为
+// abandoned，自愈），不进本事务。
 func (s *Store) UpdateWithEvents(snapshot core.JobSnapshot, events []core.Event) error {
 	err := s.h.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
 		if err := upsertSnapshot(tx, snapshot); err != nil {
@@ -70,6 +72,39 @@ func (s *Store) UpdateWithEvents(snapshot core.JobSnapshot, events []core.Event)
 	})
 	if err != nil {
 		return fmt.Errorf("jobs: update with events %s: %w", snapshot.ID, err)
+	}
+	return nil
+}
+
+// UpdateWithEventsAndAttempt 在同一事务里落任务快照、出箱事件与账本开始行
+//（core.EventOutbox 的 W1/Q08 扩展，调用方 transitionWithAttempt）。
+//
+// 事务内容：快照 upsert + 出箱批量 INSERT + 账本开始行 upsert（与直写路径共用
+// 同一条冲突更新链）+ 终态时的留痕淘汰。任何一步失败整体回滚——"状态落了、
+// 账本没开行"的半截现场由本方法关闭。
+//
+// 主用场是 running 落盘（非终态）；终态分支保留只为与 UpdateWithEvents 同构，
+// 不为调用方承诺（finish 自有通道）。
+func (s *Store) UpdateWithEventsAndAttempt(snapshot core.JobSnapshot, events []core.Event, attempt core.Attempt) error {
+	err := s.h.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
+		if err := upsertSnapshot(tx, snapshot); err != nil {
+			return err
+		}
+		if len(events) > 0 {
+			if err := insertOutboxEvents(ctx, tx, events); err != nil {
+				return err
+			}
+		}
+		if err := upsertAttemptOn(ctx, tx, attempt); err != nil {
+			return err
+		}
+		if core.JobStatus(snapshot.Status).IsTerminal() {
+			return trimTerminalTx(ctx, tx, s.historyLimit.Load(), time.Duration(s.historyTTL.Load()))
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("jobs: update with events and attempt %s: %w", snapshot.ID, err)
 	}
 	return nil
 }

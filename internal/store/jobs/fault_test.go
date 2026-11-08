@@ -85,3 +85,62 @@ func TestUpdateWithEvents_TerminalTrimSameTransaction(t *testing.T) {
 		require.EqualValues(t, 1, count, "同一事务里出箱行已落库")
 	})
 }
+
+// TestUpdateWithEventsAndAttempt_RollsBackOnMidTxFailure（W1/Q08）：快照、出箱行、
+// 账本行同生共死——trim 撞上脏行让事务失败，三者一起回滚，
+// 不留"状态落了、账本没开行"的半截现场。
+func TestUpdateWithEventsAndAttempt_RollsBackOnMidTxFailure(t *testing.T) {
+	runWithStoreBackends(t, func(t *testing.T, open storeOpener) {
+		s := open(t)
+		seedCorruptJobRow(t, s, "corrupt-row")
+
+		// 终态写入触发 trim → 扫描撞上非法状态 → 事务失败 → 整体回滚
+		err := s.UpdateWithEventsAndAttempt(snapshot("rollback-a", core.StatusSuccess, time.Now()), []core.Event{
+			{Type: core.EventJobCompleted, JobID: "rollback-a", JobName: "job-rollback-a", Status: core.StatusSuccess},
+		}, core.Attempt{JobID: "rollback-a", Seq: 1, Status: core.AttemptRunning, Trigger: core.AttemptTriggerScheduled})
+		require.Error(t, err, "trim 撞上非法状态必须让事务失败")
+
+		// 回滚的四个面：新快照不在、出箱行不在、账本行不在、预埋的脏行原样还在
+		_, found, err := s.Get("rollback-a")
+		require.NoError(t, err)
+		require.False(t, found, "事务回滚后快照不得落库")
+
+		outboxCount, err := s.h.NewSelect().Model((*outboxRow)(nil)).
+			Where("job_id = ?", "rollback-a").
+			Count(bgCtx)
+		require.NoError(t, err)
+		require.EqualValues(t, 0, outboxCount, "事务回滚后出箱行不得落库")
+
+		attemptCount, err := s.h.NewSelect().Model((*attemptRow)(nil)).
+			Where("job_id = ?", "rollback-a").
+			Count(bgCtx)
+		require.NoError(t, err)
+		require.EqualValues(t, 0, attemptCount, "事务回滚后账本行不得落库")
+
+		all, err := s.LoadAll()
+		require.NoError(t, err)
+		require.Len(t, all, 1, "只有预埋的脏行留在库里")
+	})
+}
+
+// TestUpdateWithEventsAndAttempt_LandsAllThree（W1/Q08 正路径）：running 快照、
+// 出箱行、账本开始行一次事务全部落库。
+func TestUpdateWithEventsAndAttempt_LandsAllThree(t *testing.T) {
+	runWithStoreBackends(t, func(t *testing.T, open storeOpener) {
+		s := open(t)
+
+		require.NoError(t, s.UpdateWithEventsAndAttempt(snapshot("w1-ok", core.StatusRunning, time.Now()), []core.Event{
+			{Type: core.EventJobStarted, JobID: "w1-ok", JobName: "job-w1-ok", Status: core.StatusRunning},
+		}, core.Attempt{JobID: "w1-ok", Seq: 1, Status: core.AttemptRunning, Trigger: core.AttemptTriggerScheduled}))
+
+		snap, found, err := s.Get("w1-ok")
+		require.NoError(t, err)
+		require.True(t, found)
+		require.Equal(t, core.StatusRunning, core.JobStatus(snap.Status))
+
+		attempts, err := s.Attempts("w1-ok", 10)
+		require.NoError(t, err)
+		require.Len(t, attempts, 1, "账本开始行与快照同事务落库")
+		require.Equal(t, core.AttemptRunning, attempts[0].Status)
+	})
+}

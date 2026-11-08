@@ -61,4 +61,31 @@ finishAttempt/prune 的合并（Q09/Q10）、失败路径合并、单写协程�
 
 ## 10. 实现记录
 
-- 待实施。
+- 2026-11-09 完成。store：`UpdateWithEventsAndAttempt(snapshot, events, attempt)`
+  （outbox.go）——快照 upsert + 出箱批量 INSERT + 账本开始行 upsert +（终态时）
+  留痕淘汰，一个事务；`upsertAttemptOn(ctx, bun.IDB, rec)` 把账本 upsert 的冲突
+  更新链抽成共享实现（直写路径穿 `s.h.DB.DB` 到内嵌 *bun.DB——Handle.Dialect
+  遮蔽了 bun.IDB；合并事务传 tx），两条路径共用同一条 ON CONFLICT 链，golden
+  钉住文本。
+- core：`EventOutbox` 接口扩 `UpdateWithEventsAndAttempt`（编译期断言先红后绿）；
+  `transition` 收窄为 `transitionWithAttempt(job, to, nil, events...)` 的薄委托
+  （校验/赋值语义单份）；`persistAndEmitWithAttempt` 三组合分派——出箱+账本走
+  合并事务；attempt nil 交回 persistAndEmit（JSON 部署零变化）；无出箱有账本
+  （第三方防御性组合）按改动前顺序"先落盘发事件、后独立 BeginAttempt"。
+- executeJob：`newRunningAttempt`（ledger nil 返回 nil）+ `transitionWithAttempt`
+  替换原 transition+beginAttempt 两次调用；`writeBeginAttempt` 承接直发补写。
+- 测试：core 四分支（合并恰好一次且 ledger.begin 不再单独调用 / nil attempt 回退 /
+  直发保序 / 非法转移事件照发且不落库不记账）；store 回滚四方面（快照、出箱行、
+  账本行、脏行）+ 正路径三件齐落；双方言 golden 重生成。
+- **golden diff 评审记录**（sqlite 与 postgres 同构）：合并事务的三条语句
+  （jobs upsert / job_outbox INSERT / job_attempts upsert）落在同一个
+  BEGIN…COMMIT 内，attempt 的冲突更新链与既有 BeginAttempt 直写链逐字节相同；
+  下游 dispatched 标记的 seq 顺移一位（ob-2 的出箱行占了 seq 2）——预期后果。
+  重生成后复跑零 diff。预期语句序列变化之外零变化。
+- "Q05 读数佐证"的口径修正：写事务次数 6→5 是构造事实（golden 的单
+  BEGIN/COMMIT 即证据）；QueryHook 数的是构建器查询（合并前后同为 3 条），
+  分辨不出事务边界；`db.pool.wait_*` 的运行期对比属部署级基准，不在单测覆盖内
+  ——以 golden diff + 构造为证。
+- 直发模式不变由既有测试共同佐证（JSON 相关用例零改动全绿，含 core faultinject
+  的 Update 失败路径——attempt nil 走原通道）。
+- 自证：全量 9 包 EXIT=0；本机 PG 矩阵 6 包 EXIT=0（回滚/正路径/golden PG 侧真跑）。

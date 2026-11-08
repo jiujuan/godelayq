@@ -39,12 +39,18 @@ INSERT INTO "jobs" AS "job_row" ("id", "name", "status", "updated_at", "snapshot
 INSERT INTO "job_outbox" ("job_id", "type", "payload_json", "status", "created_at", "dispatched_at") VALUES ('ob-1', 'job.scheduled', '{"type":"job.scheduled","job_id":"ob-1","job_name":"job-ob-1","status":0,"timestamp":"<ts>"}', 'pending', <n>, NULL) RETURNING "seq";
 COMMIT;
 BEGIN;
+INSERT INTO "jobs" AS "job_row" ("id", "name", "status", "updated_at", "snapshot_json") VALUES ('ob-2', 'job-ob-2', 'running', <n>, '{"id":"ob-2","name":"job-ob-2","payload":null,"trigger_at":"<ts>","cron_expr":"","is_repeat":false,"timeout":0,"max_retries":0,"retry_count":0,"retry_delay":0,"status":1,"created_at":"<ts>","updated_at":"<ts>","attempts":0}') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, snapshot_json = EXCLUDED.snapshot_json;
+INSERT INTO "job_outbox" ("job_id", "type", "payload_json", "status", "created_at", "dispatched_at") VALUES ('ob-2', 'job.started', '{"type":"job.started","job_id":"ob-2","job_name":"job-ob-2","status":1,"timestamp":"<ts>"}', 'pending', <n>, NULL) RETURNING "seq";
+INSERT INTO "job_attempts" AS "attempt_row" ("job_id", "seq", "status", "trigger_source", "started_at", "finished_at", "duration_ms", "class", "retryable", "exit_code", "signal", "http_status", "error_text") VALUES ('ob-2', 1, 'running', 'scheduled', <n>, NULL, 0, NULL, NULL, NULL, NULL, NULL, NULL) ON CONFLICT (job_id, seq) DO UPDATE SET status = EXCLUDED.status, trigger_source = EXCLUDED.trigger_source, started_at = EXCLUDED.started_at, finished_at = EXCLUDED.finished_at, duration_ms = EXCLUDED.duration_ms, class = EXCLUDED.class, retryable = EXCLUDED.retryable, exit_code = EXCLUDED.exit_code, signal = EXCLUDED.signal, http_status = EXCLUDED.http_status, error_text = EXCLUDED.error_text;
+COMMIT;
+BEGIN;
 INSERT INTO "job_outbox" ("job_id", "type", "payload_json", "status", "created_at", "dispatched_at") VALUES ('ob-1', 'job.started', '{"type":"job.started","job_id":"ob-1","job_name":"job-ob-1","status":1,"timestamp":"<ts>"}', 'pending', <n>, NULL) RETURNING "seq";
 COMMIT;
 SELECT "outbox_row"."seq", "outbox_row"."job_id", "outbox_row"."type", "outbox_row"."payload_json", "outbox_row"."status", "outbox_row"."created_at", "outbox_row"."dispatched_at" FROM "job_outbox" AS "outbox_row" WHERE (status = 'pending') ORDER BY seq ASC LIMIT 256;
 BEGIN;
 UPDATE "job_outbox" AS "outbox_row" SET status = 'dispatched', dispatched_at = <n> WHERE (seq = 1) AND (status = 'pending');
 UPDATE "job_outbox" AS "outbox_row" SET status = 'dispatched', dispatched_at = <n> WHERE (seq = 2) AND (status = 'pending');
+UPDATE "job_outbox" AS "outbox_row" SET status = 'dispatched', dispatched_at = <n> WHERE (seq = 3) AND (status = 'pending');
 COMMIT;
 DELETE FROM "job_outbox" AS "outbox_row" WHERE (status = 'dispatched') AND (dispatched_at < <n>);
 SELECT count(*) FROM "job_outbox" AS "outbox_row" WHERE (status = 'pending')

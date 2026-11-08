@@ -20,6 +20,12 @@ type EventOutbox interface {
 	// UpdateWithEvents 在同一事务里落任务快照与出箱事件。events 可为空
 	//（纯状态写）；调用后调用方不得再 Publish 这些事件。
 	UpdateWithEvents(snapshot JobSnapshot, events []Event) error
+	// UpdateWithEventsAndAttempt 在同一事务里落任务快照、出箱事件与账本开始行
+	//（W1/Q08）：running 转移的"落盘 + 记账"从此一次事务，三者同生共死——
+	// 任何一步失败整体回滚，不留"状态落了、账本没开行"的半截现场。
+	// attempt 的语义与 AttemptLedger.BeginAttempt 相同（running 行，冲突时按
+	// (job_id, seq) 覆盖）。
+	UpdateWithEventsAndAttempt(snapshot JobSnapshot, events []Event, attempt Attempt) error
 	// AppendOutbox 只入箱不写快照（emit 通道用：事件先于/伴随状态变化但
 	// 没有自己的快照写）。独立事务——事件与状态同事务的原子性只在
 	// UpdateWithEvents 承诺，这里只承担"不丢"。

@@ -11,12 +11,14 @@ import (
 	"time"
 )
 
-// beginAttempt 在运行态落盘之后记账本开始行（TASK-RE02）。
-// 只由 executeJob 调用：worker 协程持有任务，无并发写者。seq 取自增后的
-// job.Attempts，trigger 取派发来源（CloneForRetry/Restore 盖章，零值即 scheduled）。
-func (s *Scheduler) beginAttempt(job *Job) {
+// newRunningAttempt 组装本次尝试的账本开始行（W1/Q08 拆分自 beginAttempt）。
+// 出箱模式把它并进 running 落盘的同一事务；ledger 不可用（JSON 部署）返回 nil，
+// 调用方据此退回"落盘、账本各自独立"的既有路径。只由 executeJob 调用：
+// worker 协程持有任务，无并发写者。seq 取自增后的 job.Attempts，
+// trigger 取派发来源（CloneForRetry/Restore 盖章，零值即 scheduled）。
+func (s *Scheduler) newRunningAttempt(job *Job) *Attempt {
 	if s.ledger == nil {
-		return
+		return nil
 	}
 	rec := Attempt{
 		JobID:     job.ID,
@@ -25,8 +27,14 @@ func (s *Scheduler) beginAttempt(job *Job) {
 		Trigger:   job.dispatchSource,
 		StartedAt: time.Now(),
 	}
-	if err := s.ledger.BeginAttempt(job.ID, rec); err != nil {
-		s.logger.Error("failed to begin attempt", "job_id", job.ID, "seq", rec.Seq, "error", err)
+	return &rec
+}
+
+// writeBeginAttempt 把开始行写给账本（直发路径的独立补写；出箱路径由合并事务
+// 承担，不经过这里）。调用方已保证 ledger 非 nil。
+func (s *Scheduler) writeBeginAttempt(rec Attempt) {
+	if err := s.ledger.BeginAttempt(rec.JobID, rec); err != nil {
+		s.logger.Error("failed to begin attempt", "job_id", rec.JobID, "seq", rec.Seq, "error", err)
 	}
 }
 
@@ -164,14 +172,13 @@ func (s *Scheduler) executeJob(job *Job) {
 		execCtx = withTimeout
 	}
 
-	// 运行态落盘经 transition 收口（TASK-RE01）：pending→running。
+	// 运行态落盘与账本开始行（TASK-RE02 → W1/Q08）：出箱模式下两者同事务落库
+	//（transitionWithAttempt），任何一步失败一起回滚；JSON 部署（attempt 为 nil）
+	// 退回"先落盘、后记账"的独立两次调用，与改动前逐字节一致。
 	// Attempts 先自增再落盘（快照带本次尝试号）；崩溃后重启能从快照看出
 	// 哪些任务当时在执行（由 Restore 复位为待执行），统计接口也不再依赖进程内状态。
 	job.Attempts++
-	s.transition(job, StatusRunning)
-
-	// 账本开始行（TASK-RE02）：运行态已落盘，此刻起的尝试有据可查。
-	s.beginAttempt(job)
+	s.transitionWithAttempt(job, StatusRunning, s.newRunningAttempt(job))
 
 	err := job.Handler(execCtx, job)
 

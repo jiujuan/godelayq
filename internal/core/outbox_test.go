@@ -18,12 +18,26 @@ type stubOutbox struct {
 		snapshot JobSnapshot
 		events   []Event
 	}
-	appends []Event
+	attemptUpserts []Attempt
+	appends        []Event
 }
 
 func (s *stubOutbox) UpdateWithEvents(snapshot JobSnapshot, events []Event) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.updates = append(s.updates, struct {
+		snapshot JobSnapshot
+		events   []Event
+	}{snapshot, events})
+	return nil
+}
+
+// UpdateWithEventsAndAttempt（W1/Q08）：合并通道的替身——记 attempt 并照常记
+// 快照/事件，供"合并 vs 独立"的分派断言读。
+func (s *stubOutbox) UpdateWithEventsAndAttempt(snapshot JobSnapshot, events []Event, attempt Attempt) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.attemptUpserts = append(s.attemptUpserts, attempt)
 	s.updates = append(s.updates, struct {
 		snapshot JobSnapshot
 		events   []Event
@@ -87,7 +101,7 @@ func waitForStubSnapshotStatus(t *testing.T, outbox *stubOutbox, jobID string, w
 }
 
 // TestScheduler_OutboxModeTerminalCarriesEvents：Schedule 的写带 scheduled 事件
-//（同事务原子性的调用侧形状）；UpdatePending 的 identity 写无事件，也走出箱通道。
+// （同事务原子性的调用侧形状）；UpdatePending 的 identity 写无事件，也走出箱通道。
 func TestScheduler_OutboxModeTerminalCarriesEvents(t *testing.T) {
 	outbox := &stubOutbox{}
 	scheduler := NewScheduler(newMockStore(), nil, nil, quietLogger(), WithEventOutbox(outbox))
@@ -111,4 +125,83 @@ func TestScheduler_OutboxModeTerminalCarriesEvents(t *testing.T) {
 	outbox.mu.Unlock()
 	require.Equal(t, "nightly", last.snapshot.Group)
 	require.Empty(t, last.events, "identity 写没有事件")
+}
+
+// W1/Q08：running 转移与账本开始行的合并分派。
+//
+//   - 出箱 + 账本：走 UpdateWithEventsAndAttempt（一次调用带 attempt），
+//     ledger.BeginAttempt 不再被单独调用；
+//   - attempt nil（JSON 部署形状）：退回 UpdateWithEvents，stub 收不到 attempt；
+//   - 无出箱 + 账本（第三方只给账本的防御性组合）：store.Update + 独立 BeginAttempt，
+//     顺序与改动前的 transition→beginAttempt 一致；
+//   - 非法转移：事件照发、不出箱、不记账。
+func TestScheduler_TransitionWithAttempt_MergedDispatch(t *testing.T) {
+	t.Run("outbox and ledger merged", func(t *testing.T) {
+		outbox := &stubOutbox{}
+		ledger := newMockLedger()
+		scheduler := NewScheduler(newMockStore(), nil, nil, quietLogger(),
+			WithEventOutbox(outbox), WithAttemptLedger(ledger, 20))
+
+		job := &Job{ID: "w1-a", Name: "n", Status: StatusPending}
+		ok := scheduler.transitionWithAttempt(job, StatusRunning, &Attempt{
+			JobID: "w1-a", Seq: 1, Status: AttemptRunning,
+		})
+		require.True(t, ok)
+
+		outbox.mu.Lock()
+		merged := len(outbox.attemptUpserts)
+		plainUpdates := len(outbox.updates)
+		outbox.mu.Unlock()
+		require.Equal(t, 1, merged, "合并通道恰好一次")
+		require.Equal(t, 1, plainUpdates, "快照经合并调用落库")
+		require.Equal(t, 0, len(ledger.begins), "ledger.BeginAttempt 不得再被单独调用")
+	})
+
+	t.Run("nil attempt falls back to plain update", func(t *testing.T) {
+		outbox := &stubOutbox{}
+		scheduler := NewScheduler(newMockStore(), nil, nil, quietLogger(), WithEventOutbox(outbox))
+
+		job := &Job{ID: "w1-b", Name: "n", Status: StatusPending}
+		require.True(t, scheduler.transitionWithAttempt(job, StatusRunning, nil))
+
+		outbox.mu.Lock()
+		merged := len(outbox.attemptUpserts)
+		outbox.mu.Unlock()
+		require.Equal(t, 0, merged, "attempt nil 不得走合并通道")
+		require.Equal(t, StatusRunning, job.Status)
+	})
+
+	t.Run("direct mode keeps separate order", func(t *testing.T) {
+		store := newMockStore()
+		ledger := newMockLedger()
+		scheduler := NewScheduler(store, nil, nil, quietLogger(), WithAttemptLedger(ledger, 20))
+
+		job := &Job{ID: "w1-c", Name: "n", Status: StatusPending}
+		require.True(t, scheduler.transitionWithAttempt(job, StatusRunning, &Attempt{
+			JobID: "w1-c", Seq: 1, Status: AttemptRunning,
+		}))
+		require.Equal(t, 1, len(ledger.begins), "直发模式账本行独立补写")
+		snap, ok := store.snapshotOf("w1-c")
+		require.True(t, ok)
+		require.Equal(t, StatusRunning, JobStatus(snap.Status))
+	})
+
+	t.Run("illegal transition still emits events", func(t *testing.T) {
+		outbox := &stubOutbox{}
+		ledger := newMockLedger()
+		scheduler := NewScheduler(newMockStore(), nil, nil, quietLogger(),
+			WithEventOutbox(outbox), WithAttemptLedger(ledger, 20))
+
+		job := &Job{ID: "w1-d", Name: "n", Status: StatusSuccess}
+		ok := scheduler.transitionWithAttempt(job, StatusRunning, &Attempt{JobID: "w1-d", Seq: 1},
+			Event{Type: EventJobStarted, JobID: "w1-d"})
+		require.False(t, ok, "终态无出边")
+
+		outbox.mu.Lock()
+		merged, updates := len(outbox.attemptUpserts), len(outbox.updates)
+		outbox.mu.Unlock()
+		require.Equal(t, 0, merged, "拒绝的转移不落库")
+		require.Equal(t, 0, updates, "拒绝的转移不落库")
+		require.Equal(t, 0, len(ledger.begins), "拒绝的转移不记账")
+	})
 }
