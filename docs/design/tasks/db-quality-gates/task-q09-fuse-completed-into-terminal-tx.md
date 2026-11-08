@@ -63,4 +63,28 @@ GODELAYQ_TEST_PG_DSN='...' go test -count=1 ./internal/store/... ./cmd/server/
 
 ## 10. 实现记录
 
-- 待实施。
+- 2026-11-09 完成。executeJob 成功分支：completed 事件组装一次（duration_ms 仍按
+  job.UpdatedAt 算定，组装时刻早于 transition 改 UpdatedAt——基准不变的注释钉在
+  代码里），发布点按能力分派：直发模式原地立即 emit（既有顺序语义逐字节不动）；
+  出箱模式把事件交给 handleSuccess。
+- handleSuccess(job, completed) 三路分派：
+  - 终态路径（非 cron，含 cron 表达式算不出下一轮的兜底）：出箱模式随
+    transition(success) 的同一事务（persistAndEmit → UpdateWithEvents）；
+  - cron 重排旁路：出箱模式在 Schedule 前独立 emit（completed 先于 scheduled）；
+  - 强制暂停旁路：**顺序难点**——paused 事件在 parkForcedPause 内部随转移发出，
+    completed 要抢在它之前，而"会不会 park"只有认领才知道。解法：新增
+    `forcedPausePending`（只读偷看标记），判定会 park 就提前发；偷看到认领之间
+    才落进来的标记是竞态窗口，窗口里在 park 返回后补偿发出（顺序让步、事件不丢，
+    注释写明）。直发模式两条旁路都不经过这段（executeJob 已发）。
+- 既有测试更新：TestScheduler_OutboxModeNoDirectPublish 的 appends 断言 2→1
+  （completed 不再经 AppendOutbox），并加"终态写恰好携带 completed"断言；
+  stubOutbox 加全局 trace 流水（update/append 混序断言）+ 三个测试调用点补
+  handleSuccess 的事件参数。新增两用例：cron 旁路与强制暂停旁路的保序断言
+  （直接驱动 handleSuccess——满载下等两轮真实执行会引入时钟抖动，而断言只关心
+  分派顺序）。
+- golden：**零 diff**（无新语句形状——completed 随行的 UpdateWithEvents 与既有
+  通道同一条 SQL；重生成后比对确认）。
+- outbox seq 单调：合并事务里 completed 的出箱行在 started 之后插入（started 走
+  AppendOutbox 独立事务先落），seq 由插入序决定——顺序保持，读侧去重不受影响。
+- 自证：全量 9 包 EXIT=0；本机 PG 矩阵 6 包 EXIT=0；golden 两次生成零 diff。
+- 直发模式零变化：JSON 相关既有用例零改动全绿。
