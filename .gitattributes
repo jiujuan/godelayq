@@ -1,0 +1,2 @@
+# bash 脚本必须保持 LF：Windows 上 autocrlf 会把检出的 dev.sh 变 CRLF，bash 直接跑不了
+*.sh text eol=lf
