@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/jiujuan/godelayq/internal/store/pgtest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -42,10 +43,26 @@ func openSQLiteStore(t *testing.T, opts ...storeOpt) *Store {
 	return s
 }
 
+// openPostgresStore 在一次性 PG 测试库里开一个任务库，测试结束自动关闭与拆库。
+// 配置节走 dialect: postgres + dsn：与真实部署切方言时的取值形态一致。
+func openPostgresStore(t *testing.T, opts ...storeOpt) *Store {
+	t.Helper()
+	cfg := core.StoreSQLiteConfig{Dialect: "postgres", DSN: pgtest.Database(t, "jobs")}
+	limit, ttl := 0, time.Duration(0)
+	for _, opt := range opts {
+		opt(&cfg, &limit, &ttl)
+	}
+	s, err := Open(cfg, limit, ttl, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
 // runWithStoreBackends 把同一批断言跑在每个可用后端上。
-// SQLite 恒跑；PostgreSQL 后端自 B06 起经 GODELAYQ_TEST_PG_DSN 挂载。
+// SQLite 恒跑；PostgreSQL 后端经 GODELAYQ_TEST_PG_DSN 挂载（未配置时干净跳过）。
 func runWithStoreBackends(t *testing.T, run func(t *testing.T, open storeOpener)) {
 	t.Run("sqlite", func(t *testing.T) { run(t, openSQLiteStore) })
+	t.Run("postgres", func(t *testing.T) { run(t, openPostgresStore) })
 }
 
 func snapshot(id string, status core.JobStatus, updatedAt time.Time) core.JobSnapshot {

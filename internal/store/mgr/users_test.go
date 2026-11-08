@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/jiujuan/godelayq/internal/store/pgtest"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -21,12 +22,20 @@ type mgrStoreFactory func(t *testing.T) core.MgrStoreConfig
 type mgrOpener func(t *testing.T) *Handle
 
 // runWithMgrBackends 把同一批断言跑在每个可用后端上。
-// SQLite 恒跑；PostgreSQL 后端自 B06 起经 GODELAYQ_TEST_PG_DSN 挂载。
+// SQLite 恒跑；PostgreSQL 后端经 GODELAYQ_TEST_PG_DSN 挂载（未配置时干净跳过）。
+// 工厂在同一测试内返回同一个 PG 库，Reopen 用例的两次 Open 落到同一个后端。
 func runWithMgrBackends(t *testing.T, run func(t *testing.T, open mgrOpener, factory mgrStoreFactory)) {
 	t.Run("sqlite", func(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "mgr.sqlite")
 		factory := func(*testing.T) core.MgrStoreConfig {
 			return core.MgrStoreConfig{Enabled: true, Path: path}
+		}
+		run(t, openWithFactory(factory), factory)
+	})
+	t.Run("postgres", func(t *testing.T) {
+		dsn := pgtest.Database(t, "mgr")
+		factory := func(*testing.T) core.MgrStoreConfig {
+			return core.MgrStoreConfig{Enabled: true, Dialect: "postgres", DSN: dsn}
 		}
 		run(t, openWithFactory(factory), factory)
 	})
