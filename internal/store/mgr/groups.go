@@ -24,38 +24,33 @@ func NewGroupStore(h *Handle) core.GroupStore {
 // 编译期钉住接口实现。
 var _ core.GroupStore = (*groupStore)(nil)
 
-// List 按名称字典序返回全部分组。
+// List 按名称字典序返回全部分组（lower(name) 排序，与 users.List 同一口径）。
 func (s *groupStore) List() ([]core.Group, error) {
-	rows, err := s.h.SQL().Query(`SELECT name, description, color, created_at, updated_at
-FROM mgr_groups ORDER BY name`)
-	if err != nil {
+	var rows []groupRow
+	if err := s.h.NewSelect().Model(&rows).OrderExpr("lower(name)").Scan(bgCtx); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	out := make([]core.Group, 0, 8)
-	for rows.Next() {
-		group, scanErr := scanGroup(rows)
-		if scanErr != nil {
-			return nil, scanErr
-		}
-		out = append(out, group)
+	out := make([]core.Group, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, groupOf(row))
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // Get 忽略大小写查找一个分组。
 func (s *groupStore) Get(name string) (core.Group, bool, error) {
-	row := s.h.SQL().QueryRow(`SELECT name, description, color, created_at, updated_at
-FROM mgr_groups WHERE name = ?`, strings.TrimSpace(name))
-	group, err := scanGroup(row)
+	var row groupRow
+	err := s.h.NewSelect().Model(&row).
+		Where("lower(name) = lower(?)", strings.TrimSpace(name)).
+		Scan(bgCtx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.Group{}, false, nil
 	}
 	if err != nil {
 		return core.Group{}, false, err
 	}
-	return group, true, nil
+	return groupOf(row), true, nil
 }
 
 // Save 新建或整体覆盖一个分组；已存在时保留其 CreatedAt（除非调用方显式带了值）。
@@ -83,20 +78,26 @@ func (s *groupStore) Save(group core.Group) error {
 		}
 	}
 
-	_, err := s.h.SQL().Exec(`INSERT INTO mgr_groups (name, description, color, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(name) DO UPDATE SET
-  description = excluded.description,
-  color       = excluded.color,
-  updated_at  = excluded.updated_at`,
-		group.Name, group.Description, group.Color,
-		group.CreatedAt.Unix(), group.UpdatedAt.Unix())
+	_, err := s.h.NewInsert().Model(&groupRow{
+		Name:        group.Name,
+		Description: group.Description,
+		Color:       group.Color,
+		CreatedAt:   group.CreatedAt.Unix(),
+		UpdatedAt:   group.UpdatedAt.Unix(),
+	}).
+		On(nameConflictClause(s.h.Dialect())).
+		Set("description = EXCLUDED.description").
+		Set("color = EXCLUDED.color").
+		Set("updated_at = EXCLUDED.updated_at").
+		Exec(bgCtx)
 	return err
 }
 
 // Delete 忽略大小写删除；不存在返回 core.ErrGroupNotFound。
 func (s *groupStore) Delete(name string) error {
-	res, err := s.h.SQL().Exec(`DELETE FROM mgr_groups WHERE name = ?`, strings.TrimSpace(name))
+	res, err := s.h.NewDelete().Model((*groupRow)(nil)).
+		Where("lower(name) = lower(?)", strings.TrimSpace(name)).
+		Exec(bgCtx)
 	if err != nil {
 		return err
 	}
@@ -110,14 +111,13 @@ func (s *groupStore) Delete(name string) error {
 	return nil
 }
 
-// scanGroup 把一行读成 core.Group。
-func scanGroup(row rowScanner) (core.Group, error) {
-	var group core.Group
-	var created, updated int64
-	if err := row.Scan(&group.Name, &group.Description, &group.Color, &created, &updated); err != nil {
-		return core.Group{}, err
+// groupOf 把一行 bun 模型读成 core.Group。时间戳一律 Unix 秒。
+func groupOf(row groupRow) core.Group {
+	return core.Group{
+		Name:        row.Name,
+		Description: row.Description,
+		Color:       row.Color,
+		CreatedAt:   time.Unix(row.CreatedAt, 0),
+		UpdatedAt:   time.Unix(row.UpdatedAt, 0),
 	}
-	group.CreatedAt = time.Unix(created, 0)
-	group.UpdatedAt = time.Unix(updated, 0)
-	return group, nil
 }

@@ -52,4 +52,12 @@ lower() 在 SQLite 是 ASCII 折叠,与 NOCASE 同语义——大小写变体用
 
 ## 10. 实现记录
 
-(执行时填写)
+- 2026-11-08 完成。新增 `models.go`（四个 row 模型 + `nameConflictClause` 方言收口点）；
+  users/groups/profiles/import 全走构建器；查询统一 `lower(name) = lower(?)` /
+  `OrderExpr("lower(name)")`。
+- **踩坑记录**：bun 的 `Order(expr)` 会把无空格表达式整体当列名加引号
+  （`ORDER BY "lower(name)"`，SQLite 把它当常量 → 排序失效返回插入序）。表达式排序
+  必须用 `OrderExpr`。含空格的 `"seq DESC"` 会被正确拆成 `"seq" DESC`，不受影响。
+- 新增 `TestUserStore_CaseVariantSemantics`：钉住变体 upsert 命中同一行（名字保留
+  首次书写形式——与迁移前行为一致）、变体删除、大小写混合排序。
+- bun `Count` 返回 int64，`core.UserStore.Count()` 处显式收窄为 int。

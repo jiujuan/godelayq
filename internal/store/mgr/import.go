@@ -176,7 +176,10 @@ func importProfiles(h *Handle, path string, logger *slog.Logger) error {
 // metaGet 读一个标记。缺失返回空串而不是错误——"还没导过"是正常状态。
 func metaGet(h *Handle, key string) (string, error) {
 	var value string
-	err := h.SQL().QueryRow(`SELECT value FROM mgr_meta WHERE key = ?`, key).Scan(&value)
+	err := h.NewSelect().Model((*metaRow)(nil)).
+		ColumnExpr("value").
+		Where("key = ?", key).
+		Scan(bgCtx, &value)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
@@ -185,7 +188,12 @@ func metaGet(h *Handle, key string) (string, error) {
 
 // metaSetNow 写一个标记，值是当前时刻——只为现场排障看"导没导过、什么时候导的"。
 func metaSetNow(h *Handle, key string) error {
-	_, err := h.SQL().Exec(`INSERT INTO mgr_meta (key, value) VALUES (?, ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value`, key, strconv.FormatInt(time.Now().Unix(), 10))
+	_, err := h.NewInsert().Model(&metaRow{
+		Key:   key,
+		Value: strconv.FormatInt(time.Now().Unix(), 10),
+	}).
+		On("CONFLICT (key) DO UPDATE").
+		Set("value = EXCLUDED.value").
+		Exec(bgCtx)
 	return err
 }
