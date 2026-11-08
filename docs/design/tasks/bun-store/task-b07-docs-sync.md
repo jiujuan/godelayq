@@ -46,4 +46,10 @@ grep -rn "store/sqlite" README.md docs/architecture.md   # 应无残留(历史�
 
 ## 10. 实现记录
 
-(执行时填写)
+- 2026-11-08 完成。architecture.md（分层图/§2.2 驱动收敛/模块表/依赖图）、README
+  （存储分层图、模块表增 engine 与双方言矩阵说明）与实现一致；grep 无 store/sqlite
+  残留（历史设计文档与设计文档的"现状盘点"除外——那是迁移前的事实陈述）。
+- 设计文档回填"完成状态"一节，指向各卡实现记录。
+- 终验：`go build ./...`、`go vet ./...`、`go test -count=1 ./...` 全绿（无 PG 环境时
+  PG 用例干净跳过）；配 `GODELAYQ_TEST_PG_DSN` 后 store 四包 + cmd/server 全矩阵
+  在本机 PostgreSQL 上全绿。

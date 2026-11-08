@@ -170,3 +170,13 @@ env 传递，脚本与仓库不落明文。
 | B05 | PG 方言：pgx 驱动、PG DDL、配置面、诊断适配 | 本机 PG 可起三库（冒烟） |
 | B06 | PG 集成测试矩阵 + 双平台脚本 + 手工验收 | 方言矩阵全绿 |
 | B07 | 文档同步 | architecture/README 与实现一致 |
+
+## 10. 完成状态（2026-11-08）
+
+B00–B07 全部落地于 `feat/store-bun` 分支，一卡一提交。实现与设计的差异已记录在各卡
+"实现记录"：bun `RunInTx` 多一个 `*sql.TxOptions` 参数；`Order(expr)` 会把无空格表达式
+整体当列名引起来（表达式排序必须 `OrderExpr`）；PG DDL 的整数列统一升 BIGINT
+（32 位 INTEGER 装不下 UnixNano/微秒时间戳）；engine.Migrate 的记账 INSERT 按方言取
+占位符（pgx 不转译 `?`）。`ON CONFLICT (lower(name))` 表达式冲突目标经本机 PostgreSQL
+实证可用。观测层 45 个既有 sqlite 测试未做 opener 包装，由 B06 的 PG 矩阵文件覆盖
+关键路径（记录于 B04 卡）。
