@@ -168,9 +168,22 @@ type Job struct {
 	// 最坏结果是"这条任务没有专用名额"，不是"任务消失"。
 	class JobClass
 
+	// dispatchSource 是本次派发的触发来源（TASK-RE02）：账本 BeginAttempt 的
+	// trigger_source 取它。不入 JSON/快照——它描述"这一次执行为什么发生"，
+	// 只在内存对象从创建（Schedule/CloneForRetry/Restore）到派发期间有意义。
+	// 零值即 AttemptTriggerScheduled：新提交与 cron 的新一轮天然落在这。
+	dispatchSource AttemptTrigger
+
 	// Cron 重复任务支持
 	CronExpr string `json:"cron_expr,omitempty"` // Cron表达式，空表示一次性任务
 	IsRepeat bool   `json:"is_repeat"`
+
+	// Timezone 是 cron 展开用的 IANA 时区名（TASK-RE06），空 = 服务器本地（既有行为）。
+	// 只对 cron 表达式有意义：一次性任务的触发时刻是绝对时刻，不做时区换算。
+	Timezone string `json:"timezone,omitempty"`
+	// MisfirePolicy 是这条任务错过触发窗口的策略（TASK-RE06）：
+	// fire_once（补跑一次）| skip（跳到下一窗口）；空 = 继承全局默认。
+	MisfirePolicy string `json:"misfire_policy,omitempty"`
 
 	// 重试配置
 	MaxRetries int           `json:"max_retries"`
@@ -184,6 +197,11 @@ type Job struct {
 
 	// 元数据
 	Attempts int `json:"attempts"` // 总尝试次数（含重试）
+
+	// Fingerprint 是创建请求的内容指纹（TASK-RE03，api 层按 §7.3 口径计算）。
+	// 幂等的 job_id 撞车判定拿它与重发请求的指纹比对。core 只存储不解释——
+	// 服务端内部创建的任务（目录加载等）没有指纹，空串即"不可比"，撞 ID 一律判冲突。
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 // Handler 任务处理函数
@@ -207,11 +225,41 @@ func (j *Job) HandlerKey() string {
 	return j.Name
 }
 
+// EffectiveLocation 返回 cron 展开用的时区：任务声明了 IANA 名就用它，
+// 解析失败回本地（提交侧已拒非法值，这里是防御），空即服务器本地（既有行为）。
+func (j *Job) EffectiveLocation() *time.Location {
+	if j.Timezone == "" {
+		return time.Local
+	}
+	if loc, err := time.LoadLocation(j.Timezone); err == nil {
+		return loc
+	}
+	return time.Local
+}
+
+// EffectiveMisfirePolicy 返回这条任务生效的 misfire 策略：任务级字段优先，
+// 空 = 全局默认；仍未知取值时按 fire_once 兜底（现状语义，可预期性优先）。
+func (j *Job) EffectiveMisfirePolicy(globalDefault string) string {
+	policy := j.MisfirePolicy
+	if policy == "" {
+		policy = globalDefault
+	}
+	if policy != "skip" {
+		return "fire_once"
+	}
+	return policy
+}
+
 // CloneForRetry 创建重试副本。
 // 保留原 ID 以维持任务链（查询/取消/存储清理按同一 ID）；
 // 清除 Cron 属性，避免一次性任务失败重试后被误当作周期任务重新排期。
 // 不带上一次的 Exec：副本代表一次新的执行，留着旧结论会让 GET /jobs/:id
 // 在新一轮还没跑完时就显示上一次的退出码与输出预览。
+//
+// Attempts 原样带过去（TASK-RE02 修复：此前漏拷导致重试后计数清零，
+// 与"总尝试次数（含重试）"的字段语义矛盾）；下一次执行在 executeJob 自增，
+// 账本的 seq 因此跨重试单调。dispatchSource 盖 retry 章：账本要能区分
+// "排期到期"和"失败重跑"。
 func (j *Job) CloneForRetry(nextTime time.Time) *Job {
 	return &Job{
 		ID:         j.ID,
@@ -230,27 +278,40 @@ func (j *Job) CloneForRetry(nextTime time.Time) *Job {
 		Status:     StatusPending,
 		CreatedAt:  j.CreatedAt,
 		UpdatedAt:  time.Now(),
+		Attempts:   j.Attempts,
+
+		dispatchSource: AttemptTriggerRetry,
+
+		// 指纹跟着逻辑任务走：重试是同一份内容的新一轮（job_id 撞车判定要用它）。
+		Fingerprint: j.Fingerprint,
 	}
 }
 
 // JobSnapshot 用于持久化的任务快照（不含函数指针）
 type JobSnapshot struct {
-	ID         string    `json:"id"`
-	Name       string    `json:"name"`
-	Type       string    `json:"type,omitempty"`
-	Payload    []byte    `json:"payload"`
-	TriggerAt  time.Time `json:"trigger_at"`
-	Group      string    `json:"group,omitempty"`
-	CronExpr   string    `json:"cron_expr"`
-	IsRepeat   bool      `json:"is_repeat"`
-	Timeout    int64     `json:"timeout"` // nanoseconds
-	MaxRetries int       `json:"max_retries"`
-	RetryCount int       `json:"retry_count"`
-	RetryDelay int64     `json:"retry_delay"` // nanoseconds
-	Status     int       `json:"status"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
-	Attempts   int       `json:"attempts"`
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Type      string    `json:"type,omitempty"`
+	Payload   []byte    `json:"payload"`
+	TriggerAt time.Time `json:"trigger_at"`
+	Group     string    `json:"group,omitempty"`
+	CronExpr  string    `json:"cron_expr"`
+	IsRepeat  bool      `json:"is_repeat"`
+	// Timezone/MisfirePolicy 是 TASK-RE06 增量；老数据文件里没有这两个键，解码后为空
+	//（空 = 服务器本地 / 继承全局 misfire 默认）。
+	Timezone      string    `json:"timezone,omitempty"`
+	MisfirePolicy string    `json:"misfire_policy,omitempty"`
+	Timeout       int64     `json:"timeout"` // nanoseconds
+	MaxRetries    int       `json:"max_retries"`
+	RetryCount    int       `json:"retry_count"`
+	RetryDelay    int64     `json:"retry_delay"` // nanoseconds
+	Status        int       `json:"status"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
+	Attempts      int       `json:"attempts"`
+
+	// Fingerprint 是创建请求的内容指纹（TASK-RE03）；老数据文件里没有这个键，解码后为空。
+	Fingerprint string `json:"fingerprint,omitempty"`
 
 	// Exec 是执行结论摘要；老数据文件里没有这个键，解码后为 nil。
 	// 用 omitempty：绝大多数任务不是执行器任务，不该在每条快照里都写出一个空 exec 键。
@@ -272,27 +333,31 @@ func (sn *JobSnapshot) HandlerKey() string {
 // ToSnapshot 转换为可持久化格式
 func (j *Job) ToSnapshot() JobSnapshot {
 	return JobSnapshot{
-		ID:         j.ID,
-		Name:       j.Name,
-		Type:       j.Type,
-		Payload:    j.Payload,
-		TriggerAt:  j.TriggerAt,
-		Group:      j.Group,
-		CronExpr:   j.CronExpr,
-		IsRepeat:   j.IsRepeat,
-		Timeout:    int64(j.Timeout),
-		MaxRetries: j.MaxRetries,
-		RetryCount: j.RetryCount,
-		RetryDelay: int64(j.RetryDelay),
-		Status:     int(j.Status),
-		CreatedAt:  j.CreatedAt,
-		UpdatedAt:  j.UpdatedAt,
-		Attempts:   j.Attempts,
+		ID:            j.ID,
+		Name:          j.Name,
+		Type:          j.Type,
+		Payload:       j.Payload,
+		TriggerAt:     j.TriggerAt,
+		Group:         j.Group,
+		CronExpr:      j.CronExpr,
+		IsRepeat:      j.IsRepeat,
+		Timezone:      j.Timezone,
+		MisfirePolicy: j.MisfirePolicy,
+		Timeout:       int64(j.Timeout),
+		MaxRetries:    j.MaxRetries,
+		RetryCount:    j.RetryCount,
+		RetryDelay:    int64(j.RetryDelay),
+		Status:        int(j.Status),
+		CreatedAt:     j.CreatedAt,
+		UpdatedAt:     j.UpdatedAt,
+		Attempts:      j.Attempts,
 
 		// Exec 复制的是指针，不复制对象：写出快照之后不要再改这个 ExecMeta，
 		// 因为存储里的快照与任务对象指向同一份内容（事件发布读的也是它）。
 		// 收尾顺序本来就是"先填摘要、再 Update(ToSnapshot())"，共享指针不会读到半成品。
 		Exec: j.Exec,
+
+		Fingerprint: j.Fingerprint,
 	}
 }
 
@@ -306,6 +371,8 @@ func (j *Job) FromSnapshot(s JobSnapshot) {
 	j.TriggerAt = s.TriggerAt
 	j.Group = s.Group
 	j.CronExpr = s.CronExpr
+	j.Timezone = s.Timezone
+	j.MisfirePolicy = s.MisfirePolicy
 	j.IsRepeat = s.IsRepeat
 	j.Timeout = time.Duration(s.Timeout)
 	j.MaxRetries = s.MaxRetries
@@ -316,4 +383,5 @@ func (j *Job) FromSnapshot(s JobSnapshot) {
 	j.UpdatedAt = s.UpdatedAt
 	j.Attempts = s.Attempts
 	j.Exec = s.Exec
+	j.Fingerprint = s.Fingerprint
 }

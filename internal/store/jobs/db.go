@@ -128,6 +128,18 @@ func (s *Store) Update(snapshot core.JobSnapshot) error {
 }
 
 func (s *Store) upsert(snapshot core.JobSnapshot) error {
+	if err := upsertSnapshot(s.h.DB.DB, snapshot); err != nil {
+		return err
+	}
+	if core.JobStatus(snapshot.Status).IsTerminal() {
+		return s.trimTerminal()
+	}
+	return nil
+}
+
+// upsertSnapshot 把快照 upsert 进 jobs 表。db 抽象掉句柄与事务：直写路径传句柄，
+// UpdateWithEvents（outbox.go）传事务——两处必须共享同一条冲突更新链。
+func upsertSnapshot(db bun.IDB, snapshot core.JobSnapshot) error {
 	payload, err := json.Marshal(snapshot)
 	if err != nil {
 		return fmt.Errorf("jobs: marshal snapshot %s: %w", snapshot.ID, err)
@@ -139,7 +151,7 @@ func (s *Store) upsert(snapshot core.JobSnapshot) error {
 		UpdatedAt:    snapshot.UpdatedAt.UnixNano(),
 		SnapshotJSON: string(payload),
 	}
-	if _, err := s.h.NewInsert().Model(row).
+	if _, err := db.NewInsert().Model(row).
 		On("CONFLICT (id) DO UPDATE").
 		Set("name = EXCLUDED.name").
 		Set("status = EXCLUDED.status").
@@ -148,19 +160,27 @@ func (s *Store) upsert(snapshot core.JobSnapshot) error {
 		Exec(bgCtx); err != nil {
 		return fmt.Errorf("jobs: upsert %s: %w", snapshot.ID, err)
 	}
-	if core.JobStatus(snapshot.Status).IsTerminal() {
-		return s.trimTerminal()
-	}
 	return nil
 }
 
 // Delete 移除一条快照。ID 不存在不是错误：调用方（调度器的取消链）语义是
 // "确保不在"，与 JSON 实现的 delete-缺失-无害一致。
+// 账本行随任务一起删（TASK-RE02）：接口语义是"这条任务不存在了"。
 func (s *Store) Delete(jobID string) error {
-	if _, err := s.h.NewDelete().Model((*jobRow)(nil)).
-		Where("id = ?", jobID).
-		Exec(bgCtx); err != nil {
-		return fmt.Errorf("jobs: delete %s: %w", jobID, err)
+	if err := s.h.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
+		if _, err := tx.NewDelete().Model((*jobRow)(nil)).
+			Where("id = ?", jobID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("jobs: delete %s: %w", jobID, err)
+		}
+		if _, err := tx.NewDelete().Model((*attemptRow)(nil)).
+			Where("job_id = ?", jobID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("jobs: delete attempts %s: %w", jobID, err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -200,10 +220,19 @@ func (s *Store) Close() error {
 // 那个函数只读这三个字段）；行数受留痕上限约束（默认 1000），O(n) 判定
 // 不值得在 SQL 端复刻一份语义。
 func (s *Store) trimTerminal() error {
+	return s.h.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
+		return trimTerminalTx(ctx, tx, s.historyLimit.Load(), time.Duration(s.historyTTL.Load()))
+	})
+}
+
+// trimTerminalTx 在给定事务里执行终态留痕淘汰（含账本级联删除）。
+// 独立成函数是因为 UpdateWithEvents（outbox.go）要在自己的事务里复用同一份
+// 语义——淘汰规则只许有一处，事务边界由调用方决定。
+func trimTerminalTx(ctx context.Context, tx bun.Tx, historyLimit int64, historyTTL time.Duration) error {
 	var rows []jobRow
-	if err := s.h.NewSelect().Model(&rows).
+	if err := tx.NewSelect().Model(&rows).
 		ColumnExpr("id, status, updated_at").
-		Scan(bgCtx); err != nil {
+		Scan(ctx); err != nil {
 		return fmt.Errorf("jobs: trim scan: %w", err)
 	}
 	views := make(map[string]core.JobSnapshot, len(rows))
@@ -215,21 +244,24 @@ func (s *Store) trimTerminal() error {
 		views[row.ID] = core.JobSnapshot{ID: row.ID, Status: int(status), UpdatedAt: time.Unix(0, row.UpdatedAt)}
 	}
 
-	stale := core.TrimTerminal(views, s.historyLimit.Load(), time.Duration(s.historyTTL.Load()))
+	stale := core.TrimTerminal(views, historyLimit, historyTTL)
 	if len(stale) == 0 {
 		return nil
 	}
-	if err := s.h.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
-		for _, id := range stale {
-			if _, execErr := tx.NewDelete().Model((*jobRow)(nil)).
-				Where("id = ?", id).
-				Exec(ctx); execErr != nil {
-				return fmt.Errorf("jobs: trim delete %s: %w", id, execErr)
-			}
+	for _, id := range stale {
+		if _, execErr := tx.NewDelete().Model((*jobRow)(nil)).
+			Where("id = ?", id).
+			Exec(ctx); execErr != nil {
+			return fmt.Errorf("jobs: trim delete %s: %w", id, execErr)
 		}
-		return nil
-	}); err != nil {
-		return fmt.Errorf("jobs: trim: %w", err)
+	}
+	// 账本随任务走（TASK-RE02）：任务快照被终态留痕淘汰，它的逐次尝试行
+	// 一起删——留着一堆"任务已不存在"的账本行只会在读端点制造 404 悬案。
+	// 与快照删除同事务：不存在"快照没了账本还在"的中间态。
+	if _, execErr := tx.NewDelete().Model((*attemptRow)(nil)).
+		Where("job_id IN (?)", bun.In(stale)).
+		Exec(ctx); execErr != nil {
+		return fmt.Errorf("jobs: trim delete attempts: %w", execErr)
 	}
 	return nil
 }

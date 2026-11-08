@@ -26,6 +26,10 @@ const (
 	EventJobPaused EventType = "job.paused"
 	// EventJobResumed 表示暂停的任务被恢复排期。
 	EventJobResumed EventType = "job.resumed"
+	// EventJobMisfired 表示 cron 任务错过了触发窗口（TASK-RE06）。
+	// metadata：missed_count（错过的窗口数，封顶截断时附 missed_count_truncated）、
+	// first_missed_at（第一个错过的触发时刻）、policy（fire_once|skip）。
+	EventJobMisfired EventType = "job.misfired"
 	// EventHeapUpdate 预留给堆状态变化或监控场景使用。
 	EventHeapUpdate EventType = "heap.updated"
 )
@@ -46,6 +50,10 @@ type Event struct {
 	Data json.RawMessage `json:"data,omitempty"`
 	// Metadata 保存结构化附加信息，例如重试次数、耗时等。
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	// OutboxSeq 是该事件的出箱序号（TASK-RE07）：中继器从 job_outbox 投递时回填，
+	// 读侧（observe.EventLog）按它去重——at-least-once 重放不产生重复行。
+	// 直发模式（JSON 部署）恒为 0，序列化时整个键不出现。
+	OutboxSeq int64 `json:"outbox_seq,omitempty"`
 }
 
 // eventSubscription 保存单个订阅的内部元数据。

@@ -24,6 +24,7 @@ var publishedEventTypes = []core.EventType{
 	core.EventJobRetrying,
 	core.EventJobPaused,
 	core.EventJobResumed,
+	core.EventJobMisfired,
 }
 
 // handleSSE 以 Server-Sent Events 推送事件。

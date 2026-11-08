@@ -78,6 +78,62 @@ func (s *Scheduler) restoreGuardFn() RestoreGuard {
 	return s.restoreGuard
 }
 
+// applyMisfirePolicy 判定一条 cron 任务是否错过了触发窗口并按策略处置（TASK-RE06）。
+// 判定：IsRepeat + CronExpr + TriggerAt 非零 + TriggerAt 早于 now-宽限期；
+// 未来时刻与宽限内的过期时刻直接返回（后者会立即触发，比"跳到下一窗口"
+// 更贴近排期意图，也是 misfire 语义不把小抖动当故障的边界）。
+// 处置（两种都发 job.misfired 事件留痕）：
+//   - fire_once（默认）：保持过期的 TriggerAt——调度循环马上弹出补跑一次，
+//     派发来源盖 misfire 章（账本上能认出这是补跑）；
+//   - skip：TriggerAt 改写为下一个未来窗口，派发来源回 scheduled
+//    （之后那次执行是正常窗口，不是补跑）；改写失败（表达式此刻解析不出）
+//     保持原时刻立即补跑——好过静默跳过，非法表达式在执行侧自有失败出口。
+//
+// 调用点：Restore（快照重入堆之前）与 Schedule 的 cron 分支——两处都在任务
+// 入堆之前，改写不会与执行侧竞态。
+func (s *Scheduler) applyMisfirePolicy(job *Job, now time.Time) {
+	if !job.IsRepeat || job.CronExpr == "" || job.TriggerAt.IsZero() {
+		return
+	}
+	cutoff := now.Add(-s.misfireGrace)
+	if !job.TriggerAt.Before(cutoff) {
+		return
+	}
+
+	firstMissedAt := job.TriggerAt
+	missed, truncated := s.cronParser.CountMissedWindows(job.CronExpr, firstMissedAt, now)
+
+	policy := job.EffectiveMisfirePolicy(s.misfirePolicy)
+	if policy == "skip" {
+		if next, err := s.cronParser.Next(job.CronExpr, now, job.EffectiveLocation()); err == nil {
+			job.TriggerAt = next
+			job.dispatchSource = AttemptTriggerScheduled
+		}
+	} else {
+		job.dispatchSource = AttemptTriggerMisfire
+	}
+
+	metadata := map[string]interface{}{
+		"missed_count":    missed,
+		"first_missed_at": firstMissedAt,
+		"policy":          policy,
+	}
+	if truncated {
+		metadata["missed_count_truncated"] = true
+	}
+	s.emit(Event{
+		Type:      EventJobMisfired,
+		JobID:     job.ID,
+		JobName:   job.Name,
+		Status:    StatusPending,
+		Timestamp: now,
+		Metadata:  metadata,
+	})
+	s.logger.Warn("cron job missed its trigger window",
+		"job_id", job.ID, "policy", policy, "missed_count", missed,
+		"first_missed_at", firstMissedAt, "next_trigger_at", job.TriggerAt)
+}
+
 // Restore 从持久化存储重建调度队列（崩溃/重启恢复）。
 // 快照中仅 Pending/Running 状态的任务会被重新入队，状态重置为 Pending；
 // 终态留痕与 paused 任务都不入队——暂停是人为决定，重启不该替用户取消它。
@@ -115,9 +171,29 @@ func (s *Scheduler) Restore() error {
 		job.FromSnapshot(snap)
 		// 上次崩溃时处于 Running 的任务在此复位为待执行
 		job.Status = StatusPending
+		// 派发来源盖 restore 章（TASK-RE02）：账本要能区分补跑与常规排期。
+		job.dispatchSource = AttemptTriggerRestore
 		// 类别不在快照里，按注册表重新盖章：Start 之前处理函数已经注册完，
 		// 恢复出来的执行器任务因此照样落在自己的池里。
 		job.class = s.classOfKey(job.HandlerKey())
+
+		// 崩溃瞬间在跑的尝试没有结局可写（TASK-RE02）：账本行落 abandoned，
+		// finished_at 补记在重启时刻。无论后面改判成 replay 还是 pause，
+		// "那次尝试没跑完"都是事实，这一步对两种策略同样发生。
+		// 账本不可用的部署（JSON 存储）自然跳过。
+		if JobStatus(snap.Status) == StatusRunning && s.ledger != nil {
+			if err := s.ledger.AbandonAttempts(snap.ID, snap.Attempts, time.Now()); err != nil {
+				s.logger.Error("failed to abandon the interrupted attempt",
+					"job_id", snap.ID, "seq", snap.Attempts, "error", err)
+			}
+		}
+
+		// cron 快照错过窗口的判定（TASK-RE06）：在改判与入堆之前应用策略——
+		// fire_once 保持过期时刻立即补跑（dispatchSource 被 misfire 章覆盖），
+		// skip 改写为下一窗口并回 scheduled 章；没错过则维持 restore 章。
+		if job.IsRepeat && job.CronExpr != "" {
+			s.applyMisfirePolicy(job, time.Now())
+		}
 
 		// 改判发生在入堆之前：一旦进了堆就可能被 worker 取走，那时再停它要走取消。
 		// LoadAll 给的是新切片，钩子期间没有持任何锁，因此它可以回头查注册表。
@@ -167,20 +243,14 @@ func (s *Scheduler) askRestoreGuard(snap JobSnapshot) (status JobStatus, hold bo
 
 // holdRestored 把改判后的任务落盘并发布事件，它不进堆。
 //
+// 落盘与状态转移走 transition 收口（TASK-RE01）：崩溃快照是 running，
+// running→paused 是转移表里的合法边（Restore 守卫改判）。
 // 落盘失败的后果是"下次启动再判一次"（存储里还是 running 快照），可接受，
 // 但必须留下日志：这条任务本进程已经不执行了，存储与内存此刻不一致。
 // 事件按 newStatus 分派：改判成 paused 才发 job.paused，
 // 改判成别的状态时发暂停事件就是在说谎，那种用法将来要另配事件类型。
 func (s *Scheduler) holdRestored(job *Job, newStatus JobStatus) {
-	job.Status = newStatus
-	job.UpdatedAt = time.Now()
-
-	if s.store != nil {
-		if err := s.store.Update(job.ToSnapshot()); err != nil {
-			s.logger.Error("failed to persist the restored job status",
-				"job_id", job.ID, "status", newStatus, "error", err)
-		}
-	}
+	s.transition(job, newStatus)
 
 	if newStatus != StatusPaused {
 		s.logger.Warn("restored job held out of the queue without a matching event",
@@ -188,7 +258,7 @@ func (s *Scheduler) holdRestored(job *Job, newStatus JobStatus) {
 		return
 	}
 
-	s.eventBus.Publish(Event{
+	s.emit(Event{
 		Type:      EventJobPaused,
 		JobID:     job.ID,
 		JobName:   job.Name,
@@ -312,6 +382,9 @@ func (s *Scheduler) Start() {
 	// 退场余额与停止信号同理：跨重启不留残留名额。上一代的 worker 已经全部退出
 	// （Stop 等过 wg），留下的名额只会让这一代凭空少几个 worker。
 	s.retireRequests.Store(0)
+	// cancelRequested 与 suspended 同理是进程内意图：上一代没被认领的取消请求
+	// （比如收尾还没跑完进程就退了）不该拦住这一代的执行。
+	s.cancelRequested = make(map[string]struct{})
 	// 调度总开关不跨重启：suspend 是给"这次发版/维护窗口"用的进程内意图，
 	// 进程都换了，留着它只会让人对着一个不出任务的调度器猜原因。
 	s.suspended.Store(false)

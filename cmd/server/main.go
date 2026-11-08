@@ -332,7 +332,22 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 			}
 		},
 		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
-			return core.NewScheduler(store, retryPolicy, eventBus, core.WithLogger(logger))
+			opts := []core.Option{core.WithLogger(logger)}
+			// 账本能力（TASK-RE02）：任务库实现了 AttemptLedger 就注入（同一连接、
+			// 与快照同库）；JSON 存储没有这项能力，不注入即降级（调度器构造日志说明）。
+			// keepLast 从 store.attempts_keep_last 传入，Normalized 已折过默认值。
+			if ledger, ok := store.(core.AttemptLedger); ok {
+				opts = append(opts, core.WithAttemptLedger(ledger, cfg.Store.AttemptsKeepLast))
+			}
+			// misfire 全局默认（TASK-RE06）：策略与宽限从 scheduler 节传入，
+			// 任务级 misfire_policy 字段在 core 侧优先。
+			opts = append(opts, core.WithMisfirePolicy(cfg.Scheduler.MisfirePolicy, cfg.Scheduler.MisfireGracePeriod))
+			// 出箱能力（TASK-RE07）：任务库实现了 EventOutbox 就注入——状态变更
+			// 与事件同事务落库，投递由中继器接管；JSON 存储不注入即直发（现状）。
+			if ob, ok := store.(core.EventOutbox); ok {
+				opts = append(opts, core.WithEventOutbox(ob))
+			}
+			return core.NewScheduler(store, retryPolicy, eventBus, opts...)
 		},
 		newExecutorRegistry: executor.NewRegistry,
 		newExecutorProfileStore: func(cfg core.Config) (core.ExecutorProfileStore, error) {
@@ -490,6 +505,26 @@ func defaultNewServer(cfg core.Config, mgrDB *mgrDBHolder, reloadStatus *reloadS
 				// 读写两面是同一个句柄：台账的写入方就是查询方
 				opts = append(opts, api.WithAuditLog(obs.audit, obs.audit))
 			}
+		}
+		// 账本读取方（TASK-RE02）：store 是任务库时注入（它同时实现了账本能力），
+		// JSON 部署不注入——/jobs/:id/attempts 走 ledger:false 的降级形状。
+		// store 参数就是 newStore 闭包的产物，类型断言在这里做一次，业务包不感知后端类型。
+		if reader, ok := store.(interface {
+			Attempts(jobID string, limit int) ([]core.Attempt, error)
+		}); ok {
+			opts = append(opts, api.WithAttemptReader(reader))
+		}
+		// 幂等登记表（TASK-RE03）：任务库实现即注入（持久，重启有效）；
+		// JSON 部署退回进程内 map——幂等只在进程生命周期内成立（能力边界，
+		// deployment.md 说明）。TTL 来自 store.idempotency_ttl。
+		if ids, ok := store.(interface {
+			LookupIdempotency(key string) (string, string, bool, error)
+			PutIdempotency(key string, jobID string, fingerprint string) error
+			PruneExpiredIdempotency(ttl time.Duration) error
+		}); ok {
+			opts = append(opts, api.WithIdempotencyStore(ids, cfg.Store.IdempotencyTTL))
+		} else {
+			opts = append(opts, api.WithMemoryIdempotencyStore(cfg.Store.IdempotencyTTL))
 		}
 		// 管理库模式把账号存储交给服务：认证器随之切到库模式（改账号即时生效），
 		// 账号管理端点（/admin/users）也随之启用——两者共用这一个存储句柄。
@@ -659,6 +694,30 @@ func run(deps runtimeDeps) error {
 		return err
 	}
 
+	// 出箱中继器（TASK-RE07）：任务库模式下把出箱事件异步投递给事件总线。
+	// 启动位次在观测层写入器挂上之后、scheduler.Start 之前——启动重放的那批
+	// 崩溃残留事件要被 EventLog 收进库。JSON 存储没有出箱能力，跳过（直发现状）。
+	//
+	// 关停顺序：defer 声明晚于 obsEnv.close 那条，因此先执行 relay.Stop 再关
+	// 观测层——发布落在已关闭的订阅通道上会 panic，这条位次是硬约束。
+	var outboxRelay *jobs.OutboxRelay
+	if relayStore, ok := store.(*jobs.Store); ok {
+		outboxRelay, err = relayStore.NewOutboxRelay(scheduler.GetEventBus(), jobs.OutboxRelayOptions{
+			FlushInterval: cfg.Store.OutboxFlushInterval,
+			RetentionAge:  cfg.Store.OutboxRetentionAge,
+			MaxPending:    cfg.Store.OutboxMaxPending,
+		}, deps.logger)
+		if err != nil {
+			return err
+		}
+		outboxRelay.Start()
+		defer func() {
+			if err := outboxRelay.Stop(); err != nil {
+				deps.logger.Error("failed to stop outbox relay", "error", err)
+			}
+		}()
+	}
+
 	// 产物清理协程在观测层挂好之后起：Start 的第一轮扫描是"孤儿清理 + TTL 清理 + 索引对账"，
 	// 对账要读索引，起早了那份索引还不在。
 	//
@@ -695,7 +754,7 @@ func run(deps runtimeDeps) error {
 		return err
 	}
 
-	installRestoreGuard(scheduler, cfg)
+	installRestoreGuard(scheduler, cfg, deps.logger)
 
 	// 配置热重载的链（TASK-R06）。整个 if 块在 reload.enabled=false（默认）时一个字节都不执行：
 	// 不建链、不建 goroutine，进程行为与本系列之前一致。
@@ -1166,15 +1225,62 @@ func registerHandlers(server serverAPI, scheduler schedulerAPI, reg *executor.Re
 //   - 没打开执行器（这个进程里根本没有执行器任务）；
 //   - executors.restore_policy=replay（部署方明确表态"重复执行的后果我自己承担"）。
 //
+// installRestoreGuard 按 scheduler.recovery_policy（TASK-RE05）决定崩溃恢复策略：
+//
+//   - replay：不装守卫，所有类别一律复位 pending 重放；
+//   - pause：装"拦一切 running"的守卫，所有类别停 paused（保守部署）；
+//   - auto（缺省，含空）：维持 TASK-E14 的既有语义——执行器启用且
+//     executors.restore_policy!=replay 时装"只拦执行器类 running"的守卫，
+//     普通任务照旧重放。
+//
+// 优先级：新键（全局）显式配置时压过旧键（只管执行器）——两者同时显式且
+// 结论不同时记一条 warn（不拒启：旧键是既定契约，新键是全局覆盖，矛盾说明
+// 部署方在迁移路上，warn 给迁移留痕）。
+//
 // 必须在 Start 之前调用：Restore 是 Start 的第一步，任务这时已经跑起来了再装就来不及了。
-func installRestoreGuard(scheduler schedulerAPI, cfg core.Config) {
-	if !cfg.Executors.Enabled {
-		return
+func installRestoreGuard(scheduler schedulerAPI, cfg core.Config, logger *slog.Logger) {
+	policy := strings.TrimSpace(cfg.Scheduler.RecoveryPolicy)
+	if policy == "" {
+		policy = "auto"
 	}
-	if strings.TrimSpace(cfg.Executors.RestorePolicy) == "replay" {
-		return
+
+	oldPolicy := strings.TrimSpace(cfg.Executors.RestorePolicy)
+	// 结论分歧判定：仅当旧键显式给出、且两键的组合不产生同一结果时 warn。
+	// （replay+replay 两键同为"不装守卫"，不打扰；其余组合的作用域或结论都不同。）
+	if policy != "auto" && cfg.Executors.Enabled && oldPolicy != "" &&
+		!(policy == "replay" && oldPolicy == "replay") {
+		logger.Warn("scheduler.recovery_policy overrides executors.restore_policy",
+			"recovery_policy", policy, "restore_policy", oldPolicy)
 	}
-	scheduler.SetRestoreGuard(pauseRunningExecOnRestore(scheduler))
+
+	switch policy {
+	case "replay":
+		return
+	case "pause":
+		scheduler.SetRestoreGuard(pauseAllRunningOnRestore())
+		return
+	default: // auto
+		if !cfg.Executors.Enabled {
+			return
+		}
+		if oldPolicy == "replay" {
+			return
+		}
+		scheduler.SetRestoreGuard(pauseRunningExecOnRestore(scheduler))
+	}
+}
+
+// pauseAllRunningOnRestore 是 scheduler.recovery_policy=pause 的守卫（TASK-RE05）：
+// 拦下所有崩溃前 running 的快照，不分执行类别。running 快照的含义是"进程确实
+// 起来过、结果未知"——外部副作用不可重放的任务一律停住等人确认。
+// 优雅关闭不走这里：那条路径由 handleInterrupted 把任务落成 pending，重启后照常重跑。
+func pauseAllRunningOnRestore() core.RestoreGuard {
+	return func(snap core.JobSnapshot) (core.JobStatus, bool) {
+		if core.JobStatus(snap.Status) == core.StatusRunning {
+			return core.StatusPaused, true
+		}
+		return 0, false
+	}
 }
 
 // pauseRunningExecOnRestore 是装上调度器的那个守卫：只拦"快照还是 running 的执行器任务"。

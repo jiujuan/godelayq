@@ -239,18 +239,21 @@ func TestScheduler_Resume_ExpiredOneShotRunsImmediately(t *testing.T) {
 	}
 }
 
-func TestScheduler_Resume_CronJobGetsFutureTrigger(t *testing.T) {
+// TASK-RE06 后的 Resume cron 契约：宽限内刚过期的触发时刻不算错过，
+// 原样保留（调度循环立即触发该窗口），不发 misfired 事件、不丢表达式。
+// 超宽限的处置（补跑/跳过）由 misfire_test.go 按策略覆盖。
+func TestScheduler_Resume_CronJobKeepsRecentTrigger(t *testing.T) {
 	store := newMockStore()
-	scheduler := NewScheduler(store, nil, nil)
+	scheduler := NewScheduler(store, nil, nil, WithMisfirePolicy("fire_once", time.Minute))
+	events := collectEvents(scheduler.GetEventBus())
 
-	before := time.Now()
 	job := &Job{
 		ID:        "resume-cron",
 		Name:      "tick",
 		Type:      "tick",
 		CronExpr:  "*/5 * * * * *", // 每 5 秒
 		IsRepeat:  true,
-		TriggerAt: before.Add(-time.Minute),
+		TriggerAt: time.Now().Add(-time.Second), // 宽限（1 分钟）之内
 	}
 	if err := scheduler.Schedule(job); err != nil {
 		t.Fatalf("Schedule 失败: %v", err)
@@ -263,11 +266,14 @@ func TestScheduler_Resume_CronJobGetsFutureTrigger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resume 失败: %v", err)
 	}
-	if !resumed.TriggerAt.After(before) {
-		t.Errorf("Cron 任务恢复后应排在将来时刻，实际 %v（早于 %v）", resumed.TriggerAt, before)
+	if resumed.TriggerAt.After(time.Now()) {
+		t.Errorf("宽限内的触发时刻应原样保留（立即触发该窗口），实际被改写为 %v", resumed.TriggerAt)
 	}
 	if resumed.CronExpr != "*/5 * * * * *" {
 		t.Errorf("恢复不该丢 Cron 表达式，实际 %q", resumed.CronExpr)
+	}
+	if events.has(EventJobMisfired, "resume-cron") {
+		t.Error("宽限内的恢复不该发 misfired 事件")
 	}
 }
 
@@ -299,7 +305,10 @@ func TestScheduler_Resume_RejectsNonPausedAndUnknown(t *testing.T) {
 	}
 }
 
-func TestScheduler_Cancel_PausedJobIsStillDeletable(t *testing.T) {
+// TASK-RE01：暂停中的任务仍然可以被取消，但取消改为落 cancelled 终态快照，
+// 不再删除——"这条任务存在过且被取消"在存储里可查（可审计），
+// 且受终态留痕淘汰策略管理、Restore 跳过终态不会复活。
+func TestScheduler_Cancel_PausedJobLandsCancelled(t *testing.T) {
 	store := newMockStore()
 	scheduler := NewScheduler(store, nil, nil)
 	events := collectEvents(scheduler.GetEventBus())
@@ -311,15 +320,19 @@ func TestScheduler_Cancel_PausedJobIsStillDeletable(t *testing.T) {
 		t.Fatalf("Pause 失败: %v", err)
 	}
 
-	// 暂停后不在堆里也不在执行中，若 Cancel 只认这两种，任务就再也删不掉了
+	// 暂停后不在堆里也不在执行中，若 Cancel 只认这两种，任务就再也取消不掉了
 	if err := scheduler.Cancel("cancel-paused"); err != nil {
 		t.Fatalf("Cancel 暂停任务失败: %v", err)
 	}
-	if _, ok := store.snapshotOf("cancel-paused"); ok {
-		t.Error("Cancel 应连同快照一起删除")
+	stored, ok := store.snapshotOf("cancel-paused")
+	if !ok {
+		t.Fatal("Cancel 应把暂停中的任务落成 cancelled 终态快照")
 	}
-	if store.GetDeleteCalls() != 1 {
-		t.Errorf("应发生一次存储删除，实际 %d 次", store.GetDeleteCalls())
+	if JobStatus(stored.Status) != StatusCancelled {
+		t.Errorf("终态应为 cancelled，实际 %v", JobStatus(stored.Status))
+	}
+	if store.GetDeleteCalls() != 0 {
+		t.Errorf("取消不应删除快照，实际删除 %d 次", store.GetDeleteCalls())
 	}
 
 	events.waitFor(t, EventJobCancelled, "cancel-paused", time.Second)

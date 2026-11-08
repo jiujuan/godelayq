@@ -12,6 +12,12 @@ type CreateJobRequest struct {
 	// 任务标识
 	Name string `json:"name" binding:"required" example:"payment_check"`
 
+	// JobID 客户端指定的任务 ID（可选，TASK-RE03）：[A-Za-z0-9_-]{1,64}。
+	// 给了它，这条任务就以它为主键（幂等提交的天然键）：撞既有任务时按指纹
+	// 区分重放（200，返回既有任务）与冲突（409）。判定走快照直查，与登记表
+	// 无关，重启后依然有效。
+	JobID string `json:"job_id,omitempty"`
+
 	// Type 决定这条任务跑什么：调度器注册表里的键（普通处理函数名，或档位的注册键 exec.<name>）。
 	//
 	// 为空时按旧写法处理：Name 兼作这个键，并且 Name 不套标签规则
@@ -28,6 +34,13 @@ type CreateJobRequest struct {
 	// 任务内容
 	Payload  json.RawMessage `json:"payload,omitempty" swaggertype:"object"` // 任务数据
 	IsRepeat bool            `json:"is_repeat,omitempty"`                    // 是否重复执行（Cron任务）
+
+	// Timezone 是 cron 展开用的 IANA 时区（可选，TASK-RE06），如 Asia/Shanghai；
+	// 空 = 服务器本地。仅对 cron 表达式有意义，一次性任务给的是绝对时刻。
+	Timezone string `json:"timezone,omitempty" example:"Asia/Shanghai"`
+	// MisfirePolicy 是 cron 错过窗口的策略（可选，TASK-RE06）：
+	// fire_once（默认，补跑一次）| skip（跳到下一窗口）；空 = 继承全局默认。
+	MisfirePolicy string `json:"misfire_policy,omitempty"`
 
 	// Group 分组标签，可留空。不要求分组已在 /groups 注册（见 docs/design/web-console-design.md §5.3），
 	// 取值受 core 的名称规则约束，因为它会出现在 URL 查询参数里。

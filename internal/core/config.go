@@ -155,6 +155,19 @@ type SchedulerConfig struct {
 	MaxRetryDelay time.Duration `mapstructure:"max_retry_delay"`
 	// ShutdownTimeout 优雅关闭等待时长，必须为正
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
+	// RecoveryPolicy 崩溃恢复策略（TASK-RE05）：崩溃瞬间仍是 running 的快照重启后怎么办。
+	//   auto（缺省）：维持既有语义——执行器任务停 paused 等人确认（executors.enabled
+	//   且 executors.restore_policy!=replay 时装守卫），普通任务重放；
+	//   replay：所有类别一律复位 pending 重放；
+	//   pause：所有类别一律停 paused（保守部署：外部副作用不可重放的任务都等人确认）。
+	// 显式配置（非空非 auto）时全局生效，优先于只管执行器的 executors.restore_policy。
+	RecoveryPolicy string `mapstructure:"recovery_policy"`
+	// MisfirePolicy cron 错过窗口的全局默认策略（TASK-RE06）：fire_once（缺省，
+	// 补跑一次）| skip（跳到下一窗口）。任务级 misfire_policy 字段优先于它。
+	MisfirePolicy string `mapstructure:"misfire_policy"`
+	// MisfireGracePeriod misfire 判定的宽限期（TASK-RE06）：TriggerAt 早于
+	// now-宽限才算错过。0 表示 DefaultMisfireGracePeriod；负值同样回默认。
+	MisfireGracePeriod time.Duration `mapstructure:"misfire_grace_period"`
 }
 
 // StoreConfig 持久化配置
@@ -172,6 +185,21 @@ type StoreConfig struct {
 	HistoryLimit int `mapstructure:"history_limit"`
 	// HistoryTTL 终态快照保留时长，0 表示不按时间淘汰
 	HistoryTTL time.Duration `mapstructure:"history_ttl"`
+	// AttemptsKeepLast 每任务账本保留条数（TASK-RE02，仅 sqlite/PG 后端生效；
+	// JSON 后端没有账本）。0 表示 DefaultAttemptsKeepLast。收尾即裁剪，
+	// cron 任务滚动保新，不会随轮次无限增长。
+	AttemptsKeepLast int `mapstructure:"attempts_keep_last"`
+	// IdempotencyTTL 幂等键登记的保留时长（TASK-RE03）。0 表示 DefaultIdempotencyTTL。
+	// JSON 后端的登记表在进程内，重启即失效，本键对它同样生效（进程生命周期内）。
+	IdempotencyTTL time.Duration `mapstructure:"idempotency_ttl"`
+	// OutboxFlushInterval 出箱中继器的批量周期（TASK-RE07，仅 sqlite/PG 后端生效：
+	// JSON 模式没有出箱，事件照旧直发）。0 表示 DefaultOutboxFlushInterval，
+	// 低于 MinOutboxFlushInterval 直接拒启。
+	OutboxFlushInterval time.Duration `mapstructure:"outbox_flush_interval"`
+	// OutboxRetentionAge 已投递出箱行的保留时长（TASK-RE07）。0 表示 DefaultOutboxRetentionAge。
+	OutboxRetentionAge time.Duration `mapstructure:"outbox_retention_age"`
+	// OutboxMaxPending pending 出箱行的积压上限（TASK-RE07）。0 表示 DefaultOutboxMaxPending。
+	OutboxMaxPending int64 `mapstructure:"outbox_max_pending"`
 	// GroupsPath 分组元数据文件路径，与任务快照分文件存放：
 	// 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
 	GroupsPath string `mapstructure:"groups_path"`
@@ -832,6 +860,25 @@ const (
 	DefaultJobsBusyTimeout = DefaultObserveBusyTimeout
 	// DefaultJobsSynchronous 任务快照库 synchronous PRAGMA 取值。
 	DefaultJobsSynchronous = DefaultObserveSynchronous
+	// DefaultIdempotencyTTL 幂等键登记的保留时长（TASK-RE03，store.idempotency_ttl
+	// 的 0/缺省取值）。窗口内同一键重放返回既有任务；过期后同一键可以再建新任务。
+	DefaultIdempotencyTTL = 24 * time.Hour
+	// DefaultMisfirePolicy cron 错过窗口的全局默认策略（TASK-RE06）：
+	// fire_once = 补跑一次（既有行为的显式化）。
+	DefaultMisfirePolicy = "fire_once"
+	// DefaultMisfireGracePeriod misfire 判定的宽限期（TASK-RE06）：TriggerAt 早于
+	// now-宽限才算错过。秒级停机重启不该刷 misfire 事件，60s 起步。
+	DefaultMisfireGracePeriod = 60 * time.Second
+	// DefaultOutboxFlushInterval 出箱中继器的批量周期（TASK-RE07）：
+	// 也是事件到 WS/SSE 的可见延迟上界。与观测层批量同口径（200ms）。
+	DefaultOutboxFlushInterval = DefaultObserveFlushInterval
+	// MinOutboxFlushInterval 中继周期的下限：低于它等价于"每条事件一个事务"。
+	MinOutboxFlushInterval = 10 * time.Millisecond
+	// DefaultOutboxRetentionAge 已投递（dispatched）出箱行的保留时长（TASK-RE07）。
+	DefaultOutboxRetentionAge = 72 * time.Hour
+	// DefaultOutboxMaxPending pending 出箱行的积压上限（TASK-RE07）：
+	// 超过按最旧截断并记 error——防病态场景（订阅方长期全满 + 高事件率）无界增长。
+	DefaultOutboxMaxPending = 100000
 )
 
 // MgrStoreConfig 管理库：控制台账号、分组元数据、执行器档位的 SQLite 存储。
@@ -959,19 +1006,27 @@ func DefaultConfig() Config {
 			},
 		},
 		Scheduler: SchedulerConfig{
-			Workers:         DefaultConcurrency,
-			QueueCapacity:   0, // 与 Workers 相等
-			MaxRetryDelay:   30 * time.Minute,
-			ShutdownTimeout: 5 * time.Second,
+			Workers:            DefaultConcurrency,
+			QueueCapacity:      0, // 与 Workers 相等
+			MaxRetryDelay:      30 * time.Minute,
+			ShutdownTimeout:    5 * time.Second,
+			RecoveryPolicy:     "auto",
+			MisfirePolicy:      DefaultMisfirePolicy,
+			MisfireGracePeriod: DefaultMisfireGracePeriod,
 		},
 		Store: StoreConfig{
-			Type:          "json",
-			Path:          "./data/jobs.json",
-			FlushInterval: DefaultFlushInterval,
-			HistoryLimit:  DefaultHistoryLimit,
-			HistoryTTL:    0,
-			GroupsPath:    DefaultGroupsPath,
-			SQLite:        StoreSQLiteConfig{Path: DefaultJobsDBPath, Dialect: "sqlite"},
+			Type:                "json",
+			Path:                "./data/jobs.json",
+			FlushInterval:       DefaultFlushInterval,
+			HistoryLimit:        DefaultHistoryLimit,
+			HistoryTTL:          0,
+			AttemptsKeepLast:    DefaultAttemptsKeepLast,
+			IdempotencyTTL:      DefaultIdempotencyTTL,
+			OutboxFlushInterval: DefaultOutboxFlushInterval,
+			OutboxRetentionAge:  DefaultOutboxRetentionAge,
+			OutboxMaxPending:    DefaultOutboxMaxPending,
+			GroupsPath:          DefaultGroupsPath,
+			SQLite:              StoreSQLiteConfig{Path: DefaultJobsDBPath, Dialect: "sqlite"},
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
@@ -1198,6 +1253,19 @@ func (c Config) Validate() error {
 	if c.Scheduler.ShutdownTimeout <= 0 {
 		return fmt.Errorf("scheduler.shutdown_timeout must be positive, got %v", c.Scheduler.ShutdownTimeout)
 	}
+	switch c.Scheduler.RecoveryPolicy {
+	case "", "auto", "replay", "pause":
+	default:
+		return fmt.Errorf("scheduler.recovery_policy %q is invalid, use auto, replay or pause", c.Scheduler.RecoveryPolicy)
+	}
+	switch c.Scheduler.MisfirePolicy {
+	case "", "fire_once", "skip":
+	default:
+		return fmt.Errorf("scheduler.misfire_policy %q is invalid, use fire_once or skip", c.Scheduler.MisfirePolicy)
+	}
+	if c.Scheduler.MisfireGracePeriod < 0 {
+		return fmt.Errorf("scheduler.misfire_grace_period must not be negative, got %v", c.Scheduler.MisfireGracePeriod)
+	}
 
 	switch c.Store.Type {
 	case "json":
@@ -1223,6 +1291,9 @@ func (c Config) Validate() error {
 	}
 	if c.Store.HistoryTTL < 0 {
 		return fmt.Errorf("store.history_ttl must not be negative, got %v", c.Store.HistoryTTL)
+	}
+	if c.Store.OutboxFlushInterval > 0 && c.Store.OutboxFlushInterval < MinOutboxFlushInterval {
+		return fmt.Errorf("store.outbox_flush_interval %v is below the minimum %v", c.Store.OutboxFlushInterval, MinOutboxFlushInterval)
 	}
 	if c.Store.GroupsPath == "" {
 		return fmt.Errorf("store.groups_path must not be empty")
@@ -1301,6 +1372,15 @@ func (c Config) Normalized() Config {
 	if c.Scheduler.Workers == 0 {
 		c.Scheduler.Workers = defaults.Scheduler.Workers
 	}
+	if c.Scheduler.RecoveryPolicy == "" {
+		c.Scheduler.RecoveryPolicy = defaults.Scheduler.RecoveryPolicy
+	}
+	if c.Scheduler.MisfirePolicy == "" {
+		c.Scheduler.MisfirePolicy = defaults.Scheduler.MisfirePolicy
+	}
+	if c.Scheduler.MisfireGracePeriod <= 0 {
+		c.Scheduler.MisfireGracePeriod = defaults.Scheduler.MisfireGracePeriod
+	}
 	if c.Scheduler.ShutdownTimeout <= 0 {
 		c.Scheduler.ShutdownTimeout = defaults.Scheduler.ShutdownTimeout
 	}
@@ -1315,6 +1395,23 @@ func (c Config) Normalized() Config {
 	}
 	if c.Store.HistoryLimit == 0 {
 		c.Store.HistoryLimit = defaults.Store.HistoryLimit
+	}
+	if c.Store.AttemptsKeepLast <= 0 {
+		// 0 是"没配"，负数不解释成"不留账本"——账本裁剪没有"全留"的合理场景，
+		// 写错就回默认（与 history_limit 的 -1 语义刻意不同，那是有意的关闸）。
+		c.Store.AttemptsKeepLast = defaults.Store.AttemptsKeepLast
+	}
+	if c.Store.IdempotencyTTL <= 0 {
+		c.Store.IdempotencyTTL = defaults.Store.IdempotencyTTL
+	}
+	if c.Store.OutboxFlushInterval == 0 {
+		c.Store.OutboxFlushInterval = defaults.Store.OutboxFlushInterval
+	}
+	if c.Store.OutboxRetentionAge <= 0 {
+		c.Store.OutboxRetentionAge = defaults.Store.OutboxRetentionAge
+	}
+	if c.Store.OutboxMaxPending <= 0 {
+		c.Store.OutboxMaxPending = defaults.Store.OutboxMaxPending
 	}
 	if c.Store.GroupsPath == "" {
 		c.Store.GroupsPath = defaults.Store.GroupsPath

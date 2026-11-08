@@ -118,7 +118,7 @@ func TestRun_PostgresStoresEndToEnd(t *testing.T) {
 	stats, err := obsAgain.Stats()
 	require.NoError(t, err)
 	require.Equal(t, int64(2), stats.Events)
-	require.Equal(t, 1, stats.SchemaVersion)
+	require.Equal(t, 2, stats.SchemaVersion)
 
 	// 重新打开管理库：分组在、大小写变体可查（lower(name) 唯一索引那条链）。
 	mgrAgain, err := mgr.Open(cfg.MgrStore, slog.New(slog.NewTextHandler(io.Discard, nil)))

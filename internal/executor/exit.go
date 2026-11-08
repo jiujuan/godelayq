@@ -90,6 +90,16 @@ type ExitError struct {
 	// 于是一个分类不明的失败会被反复投给同一个脚本，把副作用执行好几遍。
 	Retryable bool
 
+	// Class 是失败类别文本（TASK-RE04，failureClass.String() 的取值）：
+	// 账本行 class 列与 job.failed 事件 metadata 的来源。core 按 AttemptOutcome
+	// 接口读它，不认识本类型。
+	Class string
+
+	// HTTPStatus 是 http 档位拿到的响应状态码；其余类别为 0。
+	// 单独存而不是复用 ExitCode：把 502 写成"退出码 502"是假信息（newStatusFailure
+	// 的注释），账本的两列也要分得开。
+	HTTPStatus int
+
 	// Reason 是失败的类别文本，用于起进程之前就失败的情形
 	// （如 "invalid submission"、"concurrency limit"）。
 	Reason string
@@ -141,11 +151,55 @@ func (e *ExitError) Unwrap() error { return e.Detail }
 // Permanent 是 core 侧重试判定要读的接口方法（设计文档 §6.3）。
 func (e *ExitError) Permanent() bool { return !e.Retryable }
 
+// AttemptOutcome 是 core 侧账本/事件读取失败明细的接口（TASK-RE04）。
+// 五个方法的 ok 语义见 core.AttemptOutcome 的注释：exit_code/http_status 两列
+// 只在各自类别下给出，其余类别冒充对方是假信息。
+func (e *ExitError) AttemptClass() string           { return e.Class }
+func (e *ExitError) AttemptRetryable() (bool, bool) { return e.Retryable, true }
+func (e *ExitError) AttemptExitCode() (int, bool) {
+	return e.ExitCode, e.Class == failureExitCode.String()
+}
+func (e *ExitError) AttemptSignal() string { return e.Signal }
+func (e *ExitError) AttemptHTTPStatus() (int, bool) {
+	return e.HTTPStatus, e.Class == failureHTTPStatus.String()
+}
+func (e *ExitError) AttemptErrorText() string { return e.Error() }
+
+// String 返回失败类别的规范文本（TASK-RE04 §6.4 词表）：账本 class 列与事件
+// metadata 的封闭取值，全仓只有这一份映射。
+func (f failureClass) String() string {
+	switch f {
+	case failureInvalidSubmission:
+		return "invalid_submission"
+	case failureProfileUnavailable:
+		return "profile_unavailable"
+	case failureNotAllowed:
+		return "not_allowed"
+	case failureTimeout:
+		return "timeout"
+	case failurePermitWait:
+		return "permit_wait"
+	case failureInterrupted:
+		return "interrupted"
+	case failureExitCode:
+		return "exit_code"
+	case failureHTTPStatus:
+		return "http_status"
+	case failureAddressRefused:
+		return "address_refused"
+	case failureTransport:
+		return "transport"
+	default:
+		return "unknown"
+	}
+}
+
 // 这两条断言在编译期固定住对外承诺的形状：core 靠 core.PermanentError 认"永久失败"，
-// 方法签名一改，重试判定会静默退化成"所有失败都可重试"。
+// 靠 core.AttemptOutcome 读失败明细，方法签名一改，对应判定会静默退化。
 var (
 	_ error               = (*ExitError)(nil)
 	_ core.PermanentError = (*ExitError)(nil)
+	_ core.AttemptOutcome = (*ExitError)(nil)
 )
 
 // summaryPermanent 给出任务摘要里该写的 permanent（core.ExecMeta.Permanent）。
@@ -239,6 +293,7 @@ func newFailure(p *Profile, class failureClass, exitCode int, reason string, det
 		Detail:    detail,
 		TimedOut:  class == failureTimeout || class == failurePermitWait,
 		Cancelled: class == failureInterrupted,
+		Class:     class.String(),
 	}
 	failure.Retryable = classifyExit(class, exitCode, p.RetryOnExit)
 	return failure
@@ -248,6 +303,8 @@ func newFailure(p *Profile, class failureClass, exitCode int, reason string, det
 //
 // 不复用 newFailure 的 exitCode 位置：那个值会进摘要的 exit_code 字段，
 // 把响应状态码 502 写成"进程退出码 502"是一条假信息（摘要里 HTTPStatus 才是它的位置）。
+// 状态码同样落在 ExitError.HTTPStatus（TASK-RE04）：账本的 http_status 列与
+// exit_code 列分得开，core 按 AttemptOutcome 的类别判断读哪一列。
 // 重试标记仍然读 classifyExit 那同一张表，只是把状态码作为数值结论交进去。
 //
 // 三个 http 类别（状态码不符、地址被拒、连接层失败）都不涉及超时与取消，
@@ -255,11 +312,13 @@ func newFailure(p *Profile, class failureClass, exitCode int, reason string, det
 // failureTimeout / failureInterrupted，与进程路径同一个类别。
 func newStatusFailure(p *Profile, class failureClass, status int, reason string, detail error) *ExitError {
 	failure := &ExitError{
-		Profile:   p.Name,
-		Reason:    reason,
-		Detail:    detail,
-		Retryable: classifyExit(class, status, nil),
+		Profile:    p.Name,
+		Reason:     reason,
+		Detail:     detail,
+		Class:      class.String(),
+		HTTPStatus: status,
 	}
+	failure.Retryable = classifyExit(class, status, nil)
 	return failure
 }
 

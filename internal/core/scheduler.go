@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -43,6 +44,11 @@ type Scheduler struct {
 	// 指针指向的是"接口值本身"，因此读写都是整条策略一次换掉，不存在半新半旧的策略。
 	retryPolicy atomic.Pointer[RetryPolicy]
 	cronParser  CronParser
+
+	// misfirePolicy/misfireGrace 是 cron 错过窗口的全局默认（TASK-RE06），
+	// 构造后不变（配置归 ClassRestart）；任务级 MisfirePolicy 字段优先于全局默认。
+	misfirePolicy string
+	misfireGrace  time.Duration
 
 	// 控制
 	mu      sync.RWMutex
@@ -124,6 +130,12 @@ type Scheduler struct {
 	// 用集合而不是存指针：中止是异步的，标记由 handleInterrupted/handleSuccess/
 	// handleFailure 三条收尾路径之一消费，谁先回来谁负责把任务停在 paused。
 	forcedPause map[string]struct{}
+	// cancelRequested 记下"已请求取消、等待执行收尾认领"的任务 ID（TASK-RE01）。
+	// 与 forcedPause 同形同理由：取消是异步的，Cancel 调用侧只登记标记并取消上下文，
+	// 落 cancelled 终态由收尾路径认领——事件对应"确实停住了"这个事实。
+	// 认领顺序：parkForcedPause 的标记先于本标记检查（强制暂停优先于一切）；
+	// 三条收尾路径都会消费它，Handler 不响应取消而正常收尾时也不泄漏。
+	cancelRequested map[string]struct{}
 
 	// inFlight 已进入 Handler 执行、尚未返回的任务数，供统计接口读取
 	inFlight atomic.Int32
@@ -132,6 +144,20 @@ type Scheduler struct {
 	// 放在调度器而不是调用方：判断"崩溃瞬间在跑的执行器任务要不要停住"要读注册表里的类别，
 	// 而注册表只有调度器握着。
 	restoreGuard RestoreGuard
+
+	// ledger 是逐次尝试账本（TASK-RE02），构造后不再变更；nil 表示本次部署没有
+	// 账本能力（JSON 存储）：begin/finish/abandon 全部跳过，降级在构造日志里说明一次。
+	// begin/finish 只由持有任务的 worker 协程调用，abandon 只在启动期 Restore 里调用，
+	// 不需要额外的锁。
+	ledger AttemptLedger
+
+	// attemptsKeepLast 每任务账本保留条数，收尾后裁剪用；仅 ledger 非 nil 时有意义。
+	attemptsKeepLast int
+
+	// outbox 是事务性事件出口（TASK-RE07），构造后不再变更；nil 表示本次部署
+	// 没有出箱能力（JSON 存储）：persistAndEmit/emit 退回直发（Update+Publish，
+	// 与 RE01 之前逐字节等价）。注入后事件经中继器投递，调度器不再直接 Publish。
+	outbox EventOutbox
 
 	eventBus *EventBus // 新增
 
@@ -164,6 +190,8 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 		handlerClasses: make(map[string]JobClass),
 		cancelMap:      make(map[string]context.CancelFunc),
 		forcedPause:    make(map[string]struct{}),
+		// cancelRequested 与 forcedPause 同批初始化（见字段注释）。
+		cancelRequested: make(map[string]struct{}),
 		// 预览上限默认取配置默认值：不装配执行器的程序也一样，事件里的预览不会没头没尾。
 		eventPreviewLimit: DefaultExecInlinePreview,
 		eventBus:          eventBus,
@@ -174,6 +202,33 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 	// targetWorkers 与 concurrency 成对初始化：构造完到 Start 之前，RuntimeStats 的
 	// Workers 读的是前者，少这一行会让没显式设置过并发的调度器报出 0 而不是 DefaultConcurrency。
 	s.targetWorkers.Store(int32(s.concurrency))
+
+	// 账本能力（TASK-RE02）：注入即启用，nil 即降级。降级只在这里说一次——
+	// 执行路径上每个尝试都记日志会把"没这能力"放大成噪音。
+	s.ledger = settings.ledger
+	if s.ledger != nil {
+		s.attemptsKeepLast = settings.attemptsKeepLast
+		if s.attemptsKeepLast <= 0 {
+			s.attemptsKeepLast = DefaultAttemptsKeepLast
+		}
+	} else {
+		s.logger.Info("attempt ledger not available; per-attempt records are disabled (audit relies on the event stream)")
+	}
+
+	// misfire 全局默认（TASK-RE06）：未注入用默认（fire_once + 60s 宽限），
+	// 与"什么都不配 = 现状行为"对齐。
+	s.misfirePolicy = settings.misfirePolicy
+	if s.misfirePolicy == "" {
+		s.misfirePolicy = DefaultMisfirePolicy
+	}
+	s.misfireGrace = settings.misfireGrace
+	if s.misfireGrace <= 0 {
+		s.misfireGrace = DefaultMisfireGracePeriod
+	}
+
+	// 出箱能力（TASK-RE07）：注入即启用，nil 即直发。两条通道的分派收口在
+	// state.go 的 persistAndEmit/emit，调用方不感知。
+	s.outbox = settings.outbox
 	return s
 }
 
@@ -190,11 +245,20 @@ func (s *Scheduler) notifyExecSlot() {
 
 // findSnapshot 按 ID 取存储中的快照。
 //
-// 线性扫描 LoadAll：与 hasStoredJob 同一代价，当前 history_limit 量级可接受。
-// 等 Store 有 Get(jobID) 之后这两处一起收敛。
+// Store 提供 SnapshotReader 能力时直查（TASK-RE03，JSON 与任务库都实现）；
+// 第三方 Store 没有这项能力时回退 LoadAll 线性扫描（既有行为，量级由
+// history_limit 约束）。这条回退是有意的兼容层，不是待删代码。
 func (s *Scheduler) findSnapshot(jobID string) (JobSnapshot, bool) {
 	if s.store == nil {
 		return JobSnapshot{}, false
+	}
+	if reader, ok := s.store.(SnapshotReader); ok {
+		snap, found, err := reader.Get(jobID)
+		if err != nil {
+			s.logger.Error("failed to load a job snapshot", "job_id", jobID, "error", err)
+			return JobSnapshot{}, false
+		}
+		return snap, found
 	}
 
 	snapshots, err := s.store.LoadAll()

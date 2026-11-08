@@ -134,6 +134,18 @@ var migrations = []engine.Migration{
 			`CREATE INDEX IF NOT EXISTS idx_audit_verdict ON write_audit(verdict, ts_us);`,
 		},
 	},
+	// Version 2（TASK-RE07）：outbox 去重列。中继器按 at-least-once 投递，崩溃重放
+	// 会重复发布同一事件；outbox_seq 是任务库出箱行的自增序号，部分唯一索引让
+	// EventLog 的插入按"冲突忽略"去重。旧行全 NULL：NULL 互不冲突，直发模式
+	// （JSON 部署 + 观测库）行为不变。两方言的 DDL 与冲突子句逐字一致——
+	// 部分唯一索引的冲突目标语法两边同形，不设方言分支点。
+	{
+		Version: 2,
+		Up: []string{
+			`ALTER TABLE job_events ADD COLUMN outbox_seq INTEGER;`,
+			`CREATE UNIQUE INDEX IF NOT EXISTS idx_events_outbox ON job_events(outbox_seq) WHERE outbox_seq IS NOT NULL;`,
+		},
+	},
 }
 
 // currentSchemaVersion 读已应用的最高版本号；迁移表刚建好时返回 0。

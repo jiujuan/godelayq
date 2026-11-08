@@ -201,8 +201,14 @@ func TestScheduler_CancelRunningJobNotResurrected(t *testing.T) {
 	// 给执行协程走完收尾分类
 	time.Sleep(100 * time.Millisecond)
 
-	if _, ok := store.jobs["cancel-me"]; ok {
-		t.Error("Cancelled job must not remain persisted")
+	// TASK-RE01：取消收尾认领后落 cancelled 终态快照（不再删除）。
+	// "不会被复活"的保证换了机制：终态被 Restore 跳过，且受留痕淘汰管理。
+	stored, ok := store.snapshotOf("cancel-me")
+	if !ok {
+		t.Fatal("Cancelled job should land a cancelled terminal snapshot")
+	}
+	if JobStatus(stored.Status) != StatusCancelled {
+		t.Errorf("Expected terminal status Cancelled, got %v", JobStatus(stored.Status))
 	}
 	if scheduler.heap.Get("cancel-me") != nil {
 		t.Error("Cancelled job must not be re-queued")

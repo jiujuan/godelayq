@@ -72,12 +72,26 @@ var configClasses = map[string]ConfigClass{
 	"server.port":                ClassRestart,
 	"scheduler.queue_capacity":   ClassRestart,
 	"scheduler.shutdown_timeout": ClassRestart,
+	// 恢复策略（TASK-RE05）：读数在 installRestoreGuard 装配时消费，热改不生效。
+	"scheduler.recovery_policy":  ClassRestart,
+	// misfire 策略与宽限（TASK-RE06）：读数在调度器构造时注入，热改不生效。
+	"scheduler.misfire_policy":   ClassRestart,
+	"scheduler.misfire_grace_period": ClassRestart,
 	"logging.format":             ClassRestart,
 	"reload.enabled":             ClassRestart,
 	// 其余全部落在重启档：用一张默认表反而看不清"哪些键想过关"，
 	// 所以下面这些也逐条列出（值相同，作用是让读的人知道它们被认真归过类）。
 	"store.type": ClassRestart, "store.path": ClassRestart,
 	"store.flush_interval": ClassRestart, "store.groups_path": ClassRestart,
+	// 账本保留条数（TASK-RE02）：读数在调度器构造时注入，热改不生效
+	// （history_limit/history_ttl 是热档，在上方单独登记）。
+	"store.attempts_keep_last": ClassRestart,
+	// 幂等键 TTL（TASK-RE03）：读数在 api 服务构造时注入，热改不生效。
+	"store.idempotency_ttl": ClassRestart,
+	// 出箱中继器三键（TASK-RE07）：读数在中继器构造时消费，热改不生效。
+	"store.outbox_flush_interval": ClassRestart,
+	"store.outbox_retention_age":  ClassRestart,
+	"store.outbox_max_pending":    ClassRestart,
 	// 任务快照 SQLite 后端（TASK-M03）：与 mgrstore.* 同为重启档。
 	"store.sqlite.path": ClassRestart, "store.sqlite.busy_timeout": ClassRestart,
 	"store.sqlite.synchronous": ClassRestart, "store.sqlite.dialect": ClassRestart,

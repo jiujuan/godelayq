@@ -177,7 +177,7 @@ func TestHandleFailure_WrappedPermanent(t *testing.T) {
 	job := &Job{ID: "wrapped", Name: "wrapped", MaxRetries: 3, RetryCount: 1}
 	wrapped := fmt.Errorf("executor run failed: %w", permanentStubError{permanent: true})
 
-	scheduler.handleFailure(job, wrapped)
+	scheduler.handleFailure(job, wrapped, "profile_unavailable")
 
 	if scheduler.heap.Len() != 0 {
 		t.Errorf("包一层之后仍要认出永久失败，不该排期重试，堆长度 %d", scheduler.heap.Len())
@@ -203,7 +203,7 @@ func TestHandleFailure_ForcedPauseTakesPrecedence(t *testing.T) {
 	scheduler.forcedPause[jobID] = struct{}{}
 	scheduler.mu.Unlock()
 
-	scheduler.handleFailure(job, permanentStubError{permanent: true, message: "failed anyway"})
+	scheduler.handleFailure(job, permanentStubError{permanent: true, message: "failed anyway"}, "handler_error")
 
 	if job.Status != StatusPaused {
 		t.Errorf("强制暂停要优先于永久失败，停在 paused，实际 %s", job.Status)
@@ -244,7 +244,7 @@ func TestHandleFailure_NilErrOrPlainErr(t *testing.T) {
 			scheduler := NewScheduler(newMockStore(), &mockRetryPolicy{delay: 30 * time.Second}, nil)
 			job := &Job{ID: "plain-" + tc.label, Name: "plain", MaxRetries: 2, RetryCount: 0}
 
-			scheduler.handleFailure(job, tc.given)
+			scheduler.handleFailure(job, tc.given, "handler_error")
 
 			if job.Status == StatusFailed {
 				t.Errorf("还有重试名额时不该直接落 failed，实际 %s", job.Status)
@@ -262,7 +262,7 @@ func TestHandleFailure_NilErrOrPlainErr(t *testing.T) {
 	// 重试名额用完之后仍然是老结论：永久判定没有改写"耗尽重试"这条路径
 	exhausted := NewScheduler(newMockStore(), nil, nil)
 	job := &Job{ID: "exhausted", Name: "plain", MaxRetries: 1, RetryCount: 1}
-	exhausted.handleFailure(job, errors.New("handler said no"))
+	exhausted.handleFailure(job, errors.New("handler said no"), "handler_error")
 	if job.Status != StatusFailed {
 		t.Errorf("重试耗尽要落 failed，实际 %s", job.Status)
 	}

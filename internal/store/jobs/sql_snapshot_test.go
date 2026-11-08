@@ -95,9 +95,52 @@ func runSQLSnapshot(t *testing.T, s *Store, dialect string) {
 	require.NotEmpty(t, loaded)
 	require.NoError(t, s.Delete("j2"))
 
-	// 留痕淘汰：留痕上限 1，第二笔终态写入触发 trim 的扫描 + 删除。
+	// 留痕淘汰：留痕上限 1，第二笔终态写入触发 trim 的扫描 + 删除（含账本级联）。
 	require.NoError(t, s.Update(snapshot("t1", core.StatusSuccess, now)))
 	require.NoError(t, s.Update(snapshot("t2", core.StatusSuccess, now)))
+
+	// 账本链（TASK-RE02）：开始 → 收口（带结论列）→ 重试开始 → 放弃 → 读回 → 裁剪。
+	// upsert 的冲突目标、UPDATE 的表达式列、裁剪子查询的形状都靠这段进 golden。
+	require.NoError(t, s.BeginAttempt("j1", core.Attempt{
+		JobID: "j1", Seq: 1, Status: core.AttemptRunning, Trigger: core.AttemptTriggerScheduled,
+		StartedAt: now,
+	}))
+	require.NoError(t, s.FinishAttempt("j1", 1, core.Attempt{
+		JobID: "j1", Seq: 1, Status: core.AttemptFailed, Trigger: core.AttemptTriggerRetry,
+		StartedAt: now, FinishedAt: now.Add(time.Second), DurationMs: 1000,
+		Class: "timeout", Retryable: true, RetryableSet: true,
+		ExitCode: 0, ExitCodeSet: true,
+	}))
+	require.NoError(t, s.BeginAttempt("j1", core.Attempt{
+		JobID: "j1", Seq: 2, Status: core.AttemptRunning, Trigger: core.AttemptTriggerRetry,
+		StartedAt: now.Add(2 * time.Second),
+	}))
+	require.NoError(t, s.AbandonAttempts("j1", 2, now.Add(3*time.Second)))
+	attempts, err := s.Attempts("j1", 10)
+	require.NoError(t, err)
+	require.Len(t, attempts, 2)
+	require.NoError(t, s.PruneAttempts("j1", 1))
+
+	// 幂等链（TASK-RE03）：快照直查（SnapshotReader）+ 登记表的查/登（先到先得）/淘汰。
+	_, _, _ = s.Get("j1")
+	_, _, _, _ = s.LookupIdempotency("key-1")
+	require.NoError(t, s.PutIdempotency("key-1", "j1", "fp-1"))
+	require.NoError(t, s.PutIdempotency("key-1", "j2", "fp-2"))
+	require.NoError(t, s.PruneExpiredIdempotency(time.Hour))
+
+	// 出箱链（TASK-RE07）：UpdateWithEvents 同事务写、AppendOutbox 入队、
+	// 中继器的取批/标记/淘汰。总线无订阅者，Publish 按既有契约丢弃。
+	bus := core.NewEventBus(10)
+	require.NoError(t, s.UpdateWithEvents(snapshot("ob-1", core.StatusPending, now), []core.Event{
+		{Type: core.EventJobScheduled, JobID: "ob-1", JobName: "job-ob-1", Status: core.StatusPending},
+	}))
+	require.NoError(t, s.AppendOutbox([]core.Event{
+		{Type: core.EventJobStarted, JobID: "ob-1", JobName: "job-ob-1", Status: core.StatusRunning},
+	}))
+	relay, err := s.NewOutboxRelay(bus, OutboxRelayOptions{}, nil)
+	require.NoError(t, err)
+	require.NoError(t, relay.dispatchBatch())
+	relay.prune()
 
 	require.NotEmpty(t, rec.queries, "捕获不到语句：hook 是否挂上了？")
 	compareGolden(t, dialect, strings.Join(rec.queries, ";\n"))
