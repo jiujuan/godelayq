@@ -1,7 +1,6 @@
 package observe
 
 import (
-	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -58,25 +57,13 @@ func NewArtifactIndex(db *Handle, opts ArtifactIndexOptions, logger *slog.Logger
 	return &ArtifactIndex{db: db, rootDir: root, now: opts.Now, logger: logger}, nil
 }
 
-// insertArtifact 是一行的写入语句。冲突时整行覆盖，created_at 跟着更新：
-// 同一次尝试被二次登记（清理后重读、重试撞上同一个 attempt）说的是
-// "这份文件现在长这样"，留旧时间会让 TTL 相关的判断读到一个已经不存在的事实。
-const insertArtifact = `INSERT INTO artifact_index
-	(job_id, attempt, kind, profile, out_rel, err_rel, out_bytes, err_bytes, truncated, state, created_at)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-	ON CONFLICT(job_id, attempt) DO UPDATE SET
-		kind = excluded.kind,
-		profile = excluded.profile,
-		out_rel = excluded.out_rel,
-		err_rel = excluded.err_rel,
-		out_bytes = excluded.out_bytes,
-		err_bytes = excluded.err_bytes,
-		truncated = excluded.truncated,
-		state = excluded.state,
-		created_at = excluded.created_at`
-
 // Record 登记一次执行。写入状态恒为 available：调用点在文件刚关完之后，
 // IndexRecord 里的 State 与 CreatedAt 在写侧被忽略（见该结构的字段注释）。
+//
+// 冲突时整行覆盖，created_at 跟着更新：同一次尝试被二次登记（清理后重读、
+// 重试撞上同一个 attempt）说的是"这份文件现在长这样"，留旧时间会让 TTL 相关的
+// 判断读到一个已经不存在的事实。(job_id, attempt) 复合主键两个方言都直接支持，
+// 冲突目标不需要方言分支。
 func (i *ArtifactIndex) Record(rec core.ArtifactIndexRecord) error {
 	if err := core.CheckArtifactJobID(rec.JobID); err != nil {
 		return fmt.Errorf("sqlite: artifact index: %w", err)
@@ -98,11 +85,31 @@ func (i *ArtifactIndex) Record(rec core.ArtifactIndexRecord) error {
 	if rec.Info.Truncated {
 		truncated = 1
 	}
-	_, err = i.db.SQL().Exec(insertArtifact,
-		rec.JobID, rec.Attempt, rec.Kind, rec.Profile, outRel, errRel,
-		rec.Info.OutBytes, rec.Info.ErrBytes, truncated,
-		core.ArtifactAvailable, i.now().Unix())
-	if err != nil {
+	row := &artifactRow{
+		JobID:      rec.JobID,
+		Attempt:    rec.Attempt,
+		Kind:       rec.Kind,
+		Profile:    rec.Profile,
+		OutRel:     outRel,
+		ErrRel:     errRel,
+		OutBytes:   rec.Info.OutBytes,
+		ErrBytes:   rec.Info.ErrBytes,
+		Truncated:  truncated,
+		State:      core.ArtifactAvailable,
+		CreatedSec: i.now().Unix(),
+	}
+	if _, err := i.db.NewInsert().Model(row).
+		On("CONFLICT (job_id, attempt) DO UPDATE").
+		Set("kind = EXCLUDED.kind").
+		Set("profile = EXCLUDED.profile").
+		Set("out_rel = EXCLUDED.out_rel").
+		Set("err_rel = EXCLUDED.err_rel").
+		Set("out_bytes = EXCLUDED.out_bytes").
+		Set("err_bytes = EXCLUDED.err_bytes").
+		Set("truncated = EXCLUDED.truncated").
+		Set("state = EXCLUDED.state").
+		Set("created_at = EXCLUDED.created_at").
+		Exec(bgCtx); err != nil {
 		return fmt.Errorf("sqlite: record artifact %s/%d: %w", rec.JobID, rec.Attempt, err)
 	}
 	return nil
@@ -127,24 +134,19 @@ func (i *ArtifactIndex) relative(path string) (string, error) {
 
 // markPurged 把一个或全部尝试标成已清理，返回改动的行数。
 //
-// 谓词里带上 state = available：SQLite 的 UPDATE 把"匹配到但值没变"的行也算进
+// 谓词里带上 state = available：UPDATE 把"匹配到但值没变"的行也算进
 // RowsAffected，那样对账每轮都会把同一批行重新计一次数，日志里的数字没有意义。
 // 加上这一条之后重复标注既不改动行也不计数，标注因此是幂等的。
 func (i *ArtifactIndex) markPurged(jobID string, attempt *int) (int64, error) {
-	var (
-		res  sql.Result
-		err  error
-		args []any
-	)
-	if attempt == nil {
-		args = []any{core.ArtifactPurged, jobID, core.ArtifactAvailable}
-		res, err = i.db.SQL().Exec(
-			`UPDATE artifact_index SET state = ? WHERE job_id = ? AND state = ?`, args...)
-	} else {
-		args = []any{core.ArtifactPurged, jobID, *attempt, core.ArtifactAvailable}
-		res, err = i.db.SQL().Exec(
-			`UPDATE artifact_index SET state = ? WHERE job_id = ? AND attempt = ? AND state = ?`, args...)
+	q := i.db.NewUpdate().Model((*artifactRow)(nil)).
+		Set("state = ?", core.ArtifactPurged).
+		Where("job_id = ?", jobID)
+	if attempt != nil {
+		q = q.Where("attempt = ?", *attempt)
 	}
+	q = q.Where("state = ?", core.ArtifactAvailable)
+
+	res, err := q.Exec(bgCtx)
 	if err != nil {
 		return 0, fmt.Errorf("sqlite: mark artifact purged for %s: %w", jobID, err)
 	}
@@ -179,39 +181,31 @@ func (i *ArtifactIndex) DeleteByJob(jobID string) error {
 	if err := core.CheckArtifactJobID(jobID); err != nil {
 		return fmt.Errorf("sqlite: artifact index: %w", err)
 	}
-	if _, err := i.db.SQL().Exec(`DELETE FROM artifact_index WHERE job_id = ?`, jobID); err != nil {
+	if _, err := i.db.NewDelete().Model((*artifactRow)(nil)).
+		Where("job_id = ?", jobID).
+		Exec(bgCtx); err != nil {
 		return fmt.Errorf("sqlite: delete artifacts for %s: %w", jobID, err)
 	}
 	return nil
 }
-
-// artifactSelect 是读取语句的列序，与 scanArtifact 一一对应。
-const artifactSelect = `SELECT job_id, attempt, kind, profile, out_rel, err_rel,
-	out_bytes, err_bytes, truncated, state, created_at
-	FROM artifact_index`
 
 // List 按 attempt 升序返回一个任务的全部行：重试链的自然阅读顺序。
 func (i *ArtifactIndex) List(jobID string) ([]core.ArtifactIndexRecord, error) {
 	if err := core.CheckArtifactJobID(jobID); err != nil {
 		return nil, fmt.Errorf("sqlite: artifact index: %w", err)
 	}
-	rows, err := i.db.SQL().Query(artifactSelect+` WHERE job_id = ? ORDER BY attempt ASC`, jobID)
-	if err != nil {
+	var rows []artifactRow
+	if err := i.db.NewSelect().Model(&rows).
+		Where("job_id = ?", jobID).
+		OrderExpr("attempt ASC").
+		Scan(bgCtx); err != nil {
 		return nil, fmt.Errorf("sqlite: list artifacts for %s: %w", jobID, err)
 	}
-	defer rows.Close()
 
 	// 空列表而不是 nil：端点把它序列化出去是 []，调用方不必再判一次
-	out := make([]core.ArtifactIndexRecord, 0, 4)
-	for rows.Next() {
-		rec, err := scanArtifact(rows)
-		if err != nil {
-			return nil, fmt.Errorf("sqlite: scan artifact: %w", err)
-		}
-		out = append(out, rec)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("sqlite: iterate artifacts: %w", err)
+	out := make([]core.ArtifactIndexRecord, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, artifactOf(row))
 	}
 	return out, nil
 }
@@ -221,63 +215,36 @@ func (i *ArtifactIndex) Exists(jobID string, attempt int) (bool, error) {
 	if err := core.CheckArtifactJobID(jobID); err != nil {
 		return false, fmt.Errorf("sqlite: artifact index: %w", err)
 	}
-	var one int
-	err := i.db.SQL().QueryRow(
-		`SELECT 1 FROM artifact_index WHERE job_id = ? AND attempt = ? LIMIT 1`, jobID, attempt).Scan(&one)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
+	exists, err := i.db.NewSelect().Model((*artifactRow)(nil)).
+		Where("job_id = ?", jobID).
+		Where("attempt = ?", attempt).
+		Exists(bgCtx)
 	if err != nil {
 		return false, fmt.Errorf("sqlite: check artifact %s/%d: %w", jobID, attempt, err)
 	}
-	return true, nil
+	return exists, nil
 }
 
-// rowArtifacts 是 *sql.Rows 的最小读面，让行还原能单独被测。
-type rowArtifacts interface {
-	Scan(dest ...any) error
-}
-
-// scanArtifact 还原一行。时间与路径都是"读侧字段"：写侧的 State/CreatedAt/Info.OutPath
+// artifactOf 还原一行。时间与路径都是"读侧字段"：写侧的 State/CreatedAt/Info.OutPath
 // 由实现自己填，读回来放在这里，调用方不会拿它们去开文件。
-func scanArtifact(row rowArtifacts) (core.ArtifactIndexRecord, error) {
-	var (
-		jobID      string
-		attempt    int
-		kind       string
-		profile    sql.NullString
-		outRel     sql.NullString
-		errRel     sql.NullString
-		outBytes   int64
-		errBytes   int64
-		truncated  int
-		state      string
-		createdSec int64
-	)
-	err := row.Scan(&jobID, &attempt, &kind, &profile, &outRel, &errRel,
-		&outBytes, &errBytes, &truncated, &state, &createdSec)
-	if err != nil {
-		return core.ArtifactIndexRecord{}, err
-	}
-
-	rec := core.ArtifactIndexRecord{
-		JobID:     jobID,
-		Attempt:   attempt,
-		Kind:      kind,
-		Profile:   profile.String,
-		State:     state,
-		CreatedAt: time.Unix(createdSec, 0),
-		OutRel:    outRel.String,
-		ErrRel:    errRel.String,
+func artifactOf(row artifactRow) core.ArtifactIndexRecord {
+	return core.ArtifactIndexRecord{
+		JobID:     row.JobID,
+		Attempt:   row.Attempt,
+		Kind:      row.Kind,
+		Profile:   row.Profile,
+		State:     row.State,
+		CreatedAt: time.Unix(row.CreatedSec, 0),
+		OutRel:    row.OutRel,
+		ErrRel:    row.ErrRel,
 		Info: core.ArtifactInfo{
-			JobID:     jobID,
-			Attempt:   attempt,
-			OutBytes:  outBytes,
-			ErrBytes:  errBytes,
-			Truncated: truncated != 0,
+			JobID:     row.JobID,
+			Attempt:   row.Attempt,
+			OutBytes:  row.OutBytes,
+			ErrBytes:  row.ErrBytes,
+			Truncated: row.Truncated != 0,
 		},
 	}
-	return rec, nil
 }
 
 // ReconcileMissing 把"索引里有、目录已经不在"的 available 行标成 purged，返回标注的行数。
@@ -289,29 +256,19 @@ func (i *ArtifactIndex) ReconcileMissing(dirExists func(jobID string) bool) (int
 		return 0, errNeedDirCheck
 	}
 
-	rows, err := i.db.SQL().Query(
-		`SELECT DISTINCT job_id FROM artifact_index WHERE state = ?`, core.ArtifactAvailable)
-	if err != nil {
+	var jobIDs []string
+	if err := i.db.NewSelect().Model((*artifactRow)(nil)).
+		ColumnExpr("DISTINCT job_id").
+		Where("state = ?", core.ArtifactAvailable).
+		Scan(bgCtx, &jobIDs); err != nil {
 		return 0, fmt.Errorf("sqlite: list indexed jobs: %w", err)
-	}
-	defer rows.Close()
-
-	var missing []string
-	for rows.Next() {
-		var jobID string
-		if err := rows.Scan(&jobID); err != nil {
-			return 0, fmt.Errorf("sqlite: scan indexed job id: %w", err)
-		}
-		if !dirExists(jobID) {
-			missing = append(missing, jobID)
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return 0, fmt.Errorf("sqlite: iterate indexed jobs: %w", err)
 	}
 
 	marked := 0
-	for _, jobID := range missing {
+	for _, jobID := range jobIDs {
+		if dirExists(jobID) {
+			continue
+		}
 		affected, err := i.markPurged(jobID, nil)
 		if err != nil {
 			return marked, err

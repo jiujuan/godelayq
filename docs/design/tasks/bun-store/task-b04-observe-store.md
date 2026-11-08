@@ -52,4 +52,14 @@ PG DDL(IDENTITY 序列)与测试挂载(B05/B06)。
 
 ## 10. 实现记录
 
-(执行时填写)
+- 2026-11-08 完成。新增 `models.go`（eventRecord/auditRecord/artifactRow bun 模型，字段
+  导出化——bun 反射不能写未导出字段）；events/audit/artifacts 全走构建器。
+- 批量写：tx+Prepare+循环 → `RunInTx` 内一次多值 INSERT；prune 两条 DELETE 走构建器
+  （子查询原样保留）；audit 动态 WHERE 改为 `Apply(auditScope)` 链式过滤。
+- 行还原函数（scanEvent/scanAudit/scanArtifact/rowScanner）被 `eventOf/auditEntryOf/
+  artifactOf`（bun 行 → core 结构）替代；audit 的 role 列维持写原样字符串（与迁移前
+  逐字一致）。
+- **测试策略调整**：observe 45 个既有测试保持原样作为 SQLite 套件（仅字段名导出化
+  跟进），不做逐个 opener 包装——B06 以独立的 PG 矩阵测试文件复用同一批场景断言，
+  覆盖关键路径（往返/排序/保留/过滤分页/对账）。
+- self-review 抓获并修复一处重写引入的逻辑倒置（ReconcileMissing 的 dirExists 判断）。

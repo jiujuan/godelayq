@@ -75,8 +75,8 @@ func queryEvents(t *testing.T, db *Handle) []eventRecord {
 	var got []eventRecord
 	for rows.Next() {
 		var record eventRecord
-		if err := rows.Scan(&record.timestampUS, &record.typ, &record.jobID, &record.jobName,
-			&record.status, &record.data, &record.metadata); err != nil {
+		if err := rows.Scan(&record.TimestampUS, &record.Type, &record.JobID, &record.JobName,
+			&record.Status, &record.Data, &record.Metadata); err != nil {
 			t.Fatalf("scan events failed: %v", err)
 		}
 		got = append(got, record)
@@ -127,13 +127,13 @@ func TestEventLog_PersistsAllEventTypes(t *testing.T) {
 
 	got := queryEvents(t, db)
 	for i, item := range types {
-		if got[i].typ != string(item.eventType) {
-			t.Errorf("row %d: expected type %q, got %q", i, item.eventType, got[i].typ)
+		if got[i].Type != string(item.eventType) {
+			t.Errorf("row %d: expected type %q, got %q", i, item.eventType, got[i].Type)
 		}
-		if got[i].status != int(item.status) {
-			t.Errorf("row %d: expected status %d, got %d", i, item.status, got[i].status)
+		if got[i].Status != int(item.status) {
+			t.Errorf("row %d: expected status %d, got %d", i, item.status, got[i].Status)
 		}
-		if got[i].jobID != fmt.Sprintf("job-%d", i) || got[i].jobName != "demo" {
+		if got[i].JobID != fmt.Sprintf("job-%d", i) || got[i].JobName != "demo" {
 			t.Errorf("row %d: job fields wrong: %+v", i, got[i])
 		}
 	}
@@ -192,22 +192,22 @@ func TestEventLog_PreservesDataAndMetadata(t *testing.T) {
 		t.Fatalf("expected two rows, got %d", len(got))
 	}
 	// data 存原文：重新序列化会改键序，排障时比对的就不是同一段文本了
-	if got[0].data.String != string(raw) || !got[0].data.Valid {
-		t.Fatalf("expected the raw JSON in data, got %q (valid=%v)", got[0].data.String, got[0].data.Valid)
+	if got[0].Data.String != string(raw) || !got[0].Data.Valid {
+		t.Fatalf("expected the raw JSON in data, got %q (valid=%v)", got[0].Data.String, got[0].Data.Valid)
 	}
 	var metadata map[string]any
-	if err := json.Unmarshal([]byte(got[0].metadata.String), &metadata); err != nil {
-		t.Fatalf("metadata is not valid JSON: %v (column=%q)", err, got[0].metadata.String)
+	if err := json.Unmarshal([]byte(got[0].Metadata.String), &metadata); err != nil {
+		t.Fatalf("metadata is not valid JSON: %v (column=%q)", err, got[0].Metadata.String)
 	}
 	if metadata["retry_count"] != float64(2) || metadata["permanent"] != true {
 		t.Fatalf("metadata keys drifted after the round trip: %v", metadata)
 	}
 	// 没有 Data 的事件存 NULL，而不是字符串 "null"
-	if got[1].data.Valid {
-		t.Fatalf("expected a NULL data column for an event without data, got %q", got[1].data.String)
+	if got[1].Data.Valid {
+		t.Fatalf("expected a NULL data column for an event without data, got %q", got[1].Data.String)
 	}
-	if got[1].metadata.Valid {
-		t.Fatalf("expected a NULL metadata column, got %q", got[1].metadata.String)
+	if got[1].Metadata.Valid {
+		t.Fatalf("expected a NULL metadata column, got %q", got[1].Metadata.String)
 	}
 }
 
@@ -224,13 +224,13 @@ func TestEventLog_MapEvent(t *testing.T) {
 	if !ok {
 		t.Fatal("a normal event must be mapped")
 	}
-	if record.timestampUS != fixedTime.UnixMicro() {
-		t.Errorf("expected the injected Now for a zero timestamp, got %d", record.timestampUS)
+	if record.TimestampUS != fixedTime.UnixMicro() {
+		t.Errorf("expected the injected Now for a zero timestamp, got %d", record.TimestampUS)
 	}
-	if record.status != int(core.StatusRunning) {
-		t.Errorf("expected status %d, got %d", core.StatusRunning, record.status)
+	if record.Status != int(core.StatusRunning) {
+		t.Errorf("expected status %d, got %d", core.StatusRunning, record.Status)
 	}
-	if record.data.Valid || record.metadata.Valid {
+	if record.Data.Valid || record.Metadata.Valid {
 		t.Errorf("expected both optional columns to be NULL, got %+v", record)
 	}
 
@@ -243,8 +243,8 @@ func TestEventLog_MapEvent(t *testing.T) {
 	if !ok {
 		t.Fatal("an unserializable metadata must not drop the whole event")
 	}
-	if broken.metadata.Valid {
-		t.Errorf("expected a NULL metadata column after the marshal failure, got %q", broken.metadata.String)
+	if broken.Metadata.Valid {
+		t.Errorf("expected a NULL metadata column after the marshal failure, got %q", broken.Metadata.String)
 	}
 }
 
@@ -265,12 +265,12 @@ func TestEventLog_OrderIsStableWithinSameMicrosecond(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("expected two rows, got %d", len(got))
 	}
-	if got[0].typ != string(core.EventJobScheduled) || got[1].typ != string(core.EventJobStarted) {
-		t.Fatalf("expected the publish order back from the table, got %q then %q", got[0].typ, got[1].typ)
+	if got[0].Type != string(core.EventJobScheduled) || got[1].Type != string(core.EventJobStarted) {
+		t.Fatalf("expected the publish order back from the table, got %q then %q", got[0].Type, got[1].Type)
 	}
-	if got[0].timestampUS != got[1].timestampUS {
+	if got[0].TimestampUS != got[1].TimestampUS {
 		t.Fatalf("the two rows must carry the same timestamp for this case to mean anything: %d vs %d",
-			got[0].timestampUS, got[1].timestampUS)
+			got[0].TimestampUS, got[1].TimestampUS)
 	}
 	// seq 由 AUTOINCREMENT 给出并且严格递增，是读侧 ORDER BY 的依据
 	var seqs []int64
@@ -386,7 +386,7 @@ func TestEventLog_RetentionCount(t *testing.T) {
 	// 留的是最新的 5 条，不是最早那 5 条
 	for i, record := range got {
 		want := fmt.Sprintf("job-%d", 15+i)
-		if record.jobID != want {
+		if record.JobID != want {
 			t.Fatalf("expected the newest rows, got %v (row %d should be %s)", jobIDs(got), i, want)
 		}
 	}
@@ -424,7 +424,7 @@ func TestEventLog_RetentionAge(t *testing.T) {
 		t.Fatalf("second Flush failed: %v", err)
 	}
 	got := queryEvents(t, db)
-	if len(got) != 2 || got[0].jobID != "new-0" || got[1].jobID != "new-1" {
+	if len(got) != 2 || got[0].JobID != "new-0" || got[1].JobID != "new-1" {
 		t.Fatalf("expected only the recent rows, got %v", jobIDs(got))
 	}
 }
@@ -443,7 +443,7 @@ func TestEventLog_RetentionAgeZeroKeepsEverything(t *testing.T) {
 		t.Fatalf("Flush failed: %v", err)
 	}
 
-	if got := queryEvents(t, db); len(got) != 1 || got[0].jobID != "ancient" {
+	if got := queryEvents(t, db); len(got) != 1 || got[0].JobID != "ancient" {
 		t.Fatalf("expected the four-hundred-day-old row to survive, got %v", jobIDs(got))
 	}
 }
@@ -596,7 +596,7 @@ func TestEventLog_WriteFailureIsRetriedOnce(t *testing.T) {
 func jobIDs(records []eventRecord) []string {
 	out := make([]string, len(records))
 	for i, record := range records {
-		out[i] = record.jobID
+		out[i] = record.JobID
 	}
 	return out
 }
