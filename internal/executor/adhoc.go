@@ -284,6 +284,14 @@ func checkAdhocScript(p *Profile, raw string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// 提交值可能带着 8.3 短名写法（Windows 的 TEMP 环境变量就是短名），而
+	// workspace 侧已经由 resolveWorkspace 规范成长名：prefix/扩展名/存在性判定
+	// 必须与它处在同一名字空间，否则 withinDirectory 的目录边界比较必然失配，
+	// 短名绝对路径会被误判越界。与 resolveInside 同一取向：路径存在才
+	// EvalSymlinks，缺失交给后面的文件判据给可解释的拒绝理由。
+	if real, linkErr := evalSymlinks(absolute); linkErr == nil {
+		absolute = filepath.Clean(real)
+	}
 
 	if len(p.AdhocPathPrefixes) > 0 {
 		inside := false

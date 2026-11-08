@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -177,7 +178,14 @@ func TestBuildProfilePathAnywhereAcceptsRootedAndClimbingPaths(t *testing.T) {
 	workspace := ec.Workspace
 
 	t.Run("绝对路径", func(t *testing.T) {
-		for _, written := range []string{"/srv/report/main.py", `D:\srv\report\main.py`, "../outside/run.sh"} {
+		// 盘符写法只在 Windows 上是"根写法"：Linux 把它当普通文件名按 workspace 拼接。
+		rooted := []string{"../outside/run.sh"}
+		if runtime.GOOS == "windows" {
+			rooted = append(rooted, `D:\srv\report\main.py`)
+		} else {
+			rooted = append(rooted, "/srv/report/main.py")
+		}
+		for _, written := range rooted {
 			profile, err := BuildProfile(core.ExecutorCommand{
 				Name: "loose", Kind: "script", Runtime: "python", Script: written,
 			}, ec, PathAnywhere)

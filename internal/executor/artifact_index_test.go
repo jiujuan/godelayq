@@ -443,8 +443,12 @@ func TestConcurrent_ExecuteWhilePurging(t *testing.T) {
 	require.Len(t, profiles, 1)
 	runner := NewRunner(profiles[0], store, normalized.Executors, quietLogger())
 
-	// 先放一个已经过期的目录，保证清理侧第一轮就有东西可删
-	createArtifactDir(t, store, "job-victim", 1)
+	// 先放一个已经过期的目录，保证清理侧第一轮就有东西可删。
+	// TTL 只有 1ms：刚建出来的目录要等 1ms 墙钟才真过期——CI 快机器上
+	// 30 轮清理能在同一毫秒内跑完，"已过期"不能赌机器速度，直接拨表。
+	victim := createArtifactDir(t, store, "job-victim", 1)
+	stale := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(victim, stale, stale))
 
 	var wg sync.WaitGroup
 	wg.Add(2)

@@ -324,7 +324,7 @@ func TestValidateSubmission_Positional(t *testing.T) {
 
 	argv, err := etl.Render(sub)
 	require.NoError(t, err)
-	assert.Equal(t, []string{filepath.Join(workspace, "bin", "etl"), "--window=20260929", "a.csv", "b.csv"}, argv)
+	assert.Equal(t, []string{locationOf(t, filepath.Join(workspace, "bin", "etl")), "--window=20260929", "a.csv", "b.csv"}, argv)
 
 	cases := map[string]string{
 		"超过条数上限": `{"args":{"_positional":["a","b","c","d"]}}`,

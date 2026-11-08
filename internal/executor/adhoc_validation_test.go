@@ -52,6 +52,13 @@ func locationOf(t *testing.T, absolute string) string {
 
 	resolved, err := filepath.Abs(filepath.Clean(absolute))
 	require.NoError(t, err)
+	// 与生产同一规范化（profile.go 的约定：生产路径永远是 filepath.EvalSymlinks）。
+	// CI 的 Windows 跑步机 TEMP 用 8.3 短名（RUNNER~1），不折过去的话
+	// 期望值与实际值差一个名字空间。路径不存在时保持 Abs 写法，
+	// "不存在"的断言由各自的用例负责。
+	if real, linkErr := filepath.EvalSymlinks(resolved); linkErr == nil {
+		return filepath.Clean(real)
+	}
 	return resolved
 }
 
@@ -428,7 +435,7 @@ func TestRender_NonAdhocUnchanged(t *testing.T) {
 
 	argv, err := profile.Render(sub)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"bash", filepath.Join(workspace, "scripts", "deploy.sh"), "--day=today"}, argv,
+	assert.Equal(t, []string{"bash", locationOf(t, filepath.Join(workspace, "scripts", "deploy.sh")), "--day=today"}, argv,
 		"普通档位的 argv 仍是解释器 + 档位里的脚本 + args_render")
 
 	_, err = ValidateSubmission(profile, []byte(`{"args":{"day":"today"},"script":"scripts/deploy.sh"}`))

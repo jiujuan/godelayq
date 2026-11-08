@@ -44,6 +44,11 @@ func newAdhocEnv(t *testing.T, requiredRole string, tune ...func(*core.Config)) 
 	t.Helper()
 
 	workspace := t.TempDir()
+	// 与生产同一规范化（档位加载会把 workspace 折进真实长名空间）：
+	// CI 的 Windows 跑步机 TEMP 是 8.3 短名，期望值必须与提示语同空间。
+	if real, err := filepath.EvalSymlinks(workspace); err == nil {
+		workspace = real
+	}
 	cfg := core.DefaultConfig()
 	cfg.Executors.Enabled = true
 	cfg.Executors.Workspace = workspace
@@ -249,6 +254,11 @@ func TestAdhocMetadata_HintFollowsTheEffectiveConfig(t *testing.T) {
 // 这四条键根本不存在，普通条目的 adhoc 是 false 而不是缺键。
 func TestAdhocMetadata_EnabledFalseKeepsShape(t *testing.T) {
 	workspace := t.TempDir()
+	// 与生产同一规范化（档位加载会把 workspace 折进真实长名空间）：
+	// CI 的 Windows 跑步机 TEMP 是 8.3 短名，期望值必须与提示语同空间。
+	if real, err := filepath.EvalSymlinks(workspace); err == nil {
+		workspace = real
+	}
 	cfg := core.DefaultConfig()
 	cfg.Executors.Enabled = true
 	cfg.Executors.Workspace = workspace
