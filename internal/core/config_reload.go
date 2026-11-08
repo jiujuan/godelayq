@@ -72,6 +72,8 @@ var configClasses = map[string]ConfigClass{
 	"server.port":                ClassRestart,
 	"scheduler.queue_capacity":   ClassRestart,
 	"scheduler.shutdown_timeout": ClassRestart,
+	// 恢复策略（TASK-RE05）：读数在 installRestoreGuard 装配时消费，热改不生效。
+	"scheduler.recovery_policy":  ClassRestart,
 	"logging.format":             ClassRestart,
 	"reload.enabled":             ClassRestart,
 	// 其余全部落在重启档：用一张默认表反而看不清"哪些键想过关"，

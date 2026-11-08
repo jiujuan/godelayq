@@ -155,6 +155,13 @@ type SchedulerConfig struct {
 	MaxRetryDelay time.Duration `mapstructure:"max_retry_delay"`
 	// ShutdownTimeout 优雅关闭等待时长，必须为正
 	ShutdownTimeout time.Duration `mapstructure:"shutdown_timeout"`
+	// RecoveryPolicy 崩溃恢复策略（TASK-RE05）：崩溃瞬间仍是 running 的快照重启后怎么办。
+	//   auto（缺省）：维持既有语义——执行器任务停 paused 等人确认（executors.enabled
+	//   且 executors.restore_policy!=replay 时装守卫），普通任务重放；
+	//   replay：所有类别一律复位 pending 重放；
+	//   pause：所有类别一律停 paused（保守部署：外部副作用不可重放的任务都等人确认）。
+	// 显式配置（非空非 auto）时全局生效，优先于只管执行器的 executors.restore_policy。
+	RecoveryPolicy string `mapstructure:"recovery_policy"`
 }
 
 // StoreConfig 持久化配置
@@ -973,6 +980,7 @@ func DefaultConfig() Config {
 			QueueCapacity:   0, // 与 Workers 相等
 			MaxRetryDelay:   30 * time.Minute,
 			ShutdownTimeout: 5 * time.Second,
+			RecoveryPolicy:  "auto",
 		},
 		Store: StoreConfig{
 			Type:             "json",
@@ -1210,6 +1218,11 @@ func (c Config) Validate() error {
 	if c.Scheduler.ShutdownTimeout <= 0 {
 		return fmt.Errorf("scheduler.shutdown_timeout must be positive, got %v", c.Scheduler.ShutdownTimeout)
 	}
+	switch c.Scheduler.RecoveryPolicy {
+	case "", "auto", "replay", "pause":
+	default:
+		return fmt.Errorf("scheduler.recovery_policy %q is invalid, use auto, replay or pause", c.Scheduler.RecoveryPolicy)
+	}
 
 	switch c.Store.Type {
 	case "json":
@@ -1312,6 +1325,9 @@ func (c Config) Normalized() Config {
 	}
 	if c.Scheduler.Workers == 0 {
 		c.Scheduler.Workers = defaults.Scheduler.Workers
+	}
+	if c.Scheduler.RecoveryPolicy == "" {
+		c.Scheduler.RecoveryPolicy = defaults.Scheduler.RecoveryPolicy
 	}
 	if c.Scheduler.ShutdownTimeout <= 0 {
 		c.Scheduler.ShutdownTimeout = defaults.Scheduler.ShutdownTimeout

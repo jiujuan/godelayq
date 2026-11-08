@@ -54,6 +54,12 @@
 - **风险：新旧两个恢复配置键语义混淆**（`executors.restore_policy` vs `scheduler.recovery_policy`）。缓解：Validate 阶段同时出现且矛盾时记 warn（不拒启——旧键是既定契约）；两者关系写进 deployment.md（RE08）与本卡注释。
 - 回滚：revert 后回硬编码现状；配置键残留无害。
 
-## 10. 实现记录
+## 10. 实现记录（2026-11-08）
 
-（待实现后回填。）
+分支 `feat/reliable-execution`。按卡交付，无设计偏离：
+
+- **core/config.go**：`scheduler.recovery_policy`（auto|replay|pause，缺省 auto）；Validate 拒未知取值，Normalized 空值回 auto；热更档 ClassRestart；两份 YAML 同步。
+- **cmd/server**：`installRestoreGuard` 三分支——`replay` 不装守卫（全局重放）、`pause` 装新守卫 `pauseAllRunningOnRestore`（拦一切 running，不分类别）、`auto` 维持既有语义（执行器启用且旧键≠replay 时装 `pauseRunningExecOnRestore`）。新键显式配置压过旧键，结论分歧时 warn 留迁移痕（replay+replay 同结论不打扰）；调用点补 logger 参数。
+- **abandoned 收口**：RE02 已把 `AbandonAttempts` 放在 Restore 通用路径（改判之前），本卡矩阵用例验证三种策略下都发生——该断言由 core/attempts_test.go 的 RestoreAbandons 覆盖（策略无关），矩阵用例侧重改判结果。
+- **测试**：cmd/server/recovery_policy_test.go——六组合矩阵（auto/auto+旧replay/replay/pause/pause压replay/replay压pause）× 两类别 + 新旧键矛盾 warn 断言 + auto 且执行器未启用时不装守卫的等价性用例；fakeStore 最小替身（core 的 mockStore 在测试包内不可导入）。
+- **验证**：`go build/vet` 干净；`go test ./... -count=1` 九包全绿。

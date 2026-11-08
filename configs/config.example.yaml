@@ -52,6 +52,7 @@ scheduler:
   queue_capacity: 0     # 执行队列容量；0 表示与 workers 相等。队列满时调度循环阻塞入队
   max_retry_delay: 30m  # 指数退避的单次重试延迟上限
   shutdown_timeout: 5s  # 优雅关闭等待时长
+  recovery_policy: auto # 崩溃恢复策略（TASK-RE05）：auto（执行器停paused，普通重放）|replay|pause
 
 store:
   type: json            # 存储后端：json（默认，合并落盘）|sqlite（直写，TASK-M03）；切换需重启

@@ -722,7 +722,7 @@ func run(deps runtimeDeps) error {
 		return err
 	}
 
-	installRestoreGuard(scheduler, cfg)
+	installRestoreGuard(scheduler, cfg, deps.logger)
 
 	// 配置热重载的链（TASK-R06）。整个 if 块在 reload.enabled=false（默认）时一个字节都不执行：
 	// 不建链、不建 goroutine，进程行为与本系列之前一致。
@@ -1193,15 +1193,62 @@ func registerHandlers(server serverAPI, scheduler schedulerAPI, reg *executor.Re
 //   - 没打开执行器（这个进程里根本没有执行器任务）；
 //   - executors.restore_policy=replay（部署方明确表态"重复执行的后果我自己承担"）。
 //
+// installRestoreGuard 按 scheduler.recovery_policy（TASK-RE05）决定崩溃恢复策略：
+//
+//   - replay：不装守卫，所有类别一律复位 pending 重放；
+//   - pause：装"拦一切 running"的守卫，所有类别停 paused（保守部署）；
+//   - auto（缺省，含空）：维持 TASK-E14 的既有语义——执行器启用且
+//     executors.restore_policy!=replay 时装"只拦执行器类 running"的守卫，
+//     普通任务照旧重放。
+//
+// 优先级：新键（全局）显式配置时压过旧键（只管执行器）——两者同时显式且
+// 结论不同时记一条 warn（不拒启：旧键是既定契约，新键是全局覆盖，矛盾说明
+// 部署方在迁移路上，warn 给迁移留痕）。
+//
 // 必须在 Start 之前调用：Restore 是 Start 的第一步，任务这时已经跑起来了再装就来不及了。
-func installRestoreGuard(scheduler schedulerAPI, cfg core.Config) {
-	if !cfg.Executors.Enabled {
-		return
+func installRestoreGuard(scheduler schedulerAPI, cfg core.Config, logger *slog.Logger) {
+	policy := strings.TrimSpace(cfg.Scheduler.RecoveryPolicy)
+	if policy == "" {
+		policy = "auto"
 	}
-	if strings.TrimSpace(cfg.Executors.RestorePolicy) == "replay" {
-		return
+
+	oldPolicy := strings.TrimSpace(cfg.Executors.RestorePolicy)
+	// 结论分歧判定：仅当旧键显式给出、且两键的组合不产生同一结果时 warn。
+	// （replay+replay 两键同为"不装守卫"，不打扰；其余组合的作用域或结论都不同。）
+	if policy != "auto" && cfg.Executors.Enabled && oldPolicy != "" &&
+		!(policy == "replay" && oldPolicy == "replay") {
+		logger.Warn("scheduler.recovery_policy overrides executors.restore_policy",
+			"recovery_policy", policy, "restore_policy", oldPolicy)
 	}
-	scheduler.SetRestoreGuard(pauseRunningExecOnRestore(scheduler))
+
+	switch policy {
+	case "replay":
+		return
+	case "pause":
+		scheduler.SetRestoreGuard(pauseAllRunningOnRestore())
+		return
+	default: // auto
+		if !cfg.Executors.Enabled {
+			return
+		}
+		if oldPolicy == "replay" {
+			return
+		}
+		scheduler.SetRestoreGuard(pauseRunningExecOnRestore(scheduler))
+	}
+}
+
+// pauseAllRunningOnRestore 是 scheduler.recovery_policy=pause 的守卫（TASK-RE05）：
+// 拦下所有崩溃前 running 的快照，不分执行类别。running 快照的含义是"进程确实
+// 起来过、结果未知"——外部副作用不可重放的任务一律停住等人确认。
+// 优雅关闭不走这里：那条路径由 handleInterrupted 把任务落成 pending，重启后照常重跑。
+func pauseAllRunningOnRestore() core.RestoreGuard {
+	return func(snap core.JobSnapshot) (core.JobStatus, bool) {
+		if core.JobStatus(snap.Status) == core.StatusRunning {
+			return core.StatusPaused, true
+		}
+		return 0, false
+	}
 }
 
 // pauseRunningExecOnRestore 是装上调度器的那个守卫：只拦"快照还是 running 的执行器任务"。
