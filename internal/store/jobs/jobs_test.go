@@ -37,7 +37,7 @@ func openSQLiteStore(t *testing.T, opts ...storeOpt) *Store {
 	for _, opt := range opts {
 		opt(&cfg, &limit, &ttl)
 	}
-	s, err := Open(cfg, limit, ttl, nil)
+	s, err := Open(cfg, limit, ttl, 0, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	return s
@@ -52,7 +52,7 @@ func openPostgresStore(t *testing.T, opts ...storeOpt) *Store {
 	for _, opt := range opts {
 		opt(&cfg, &limit, &ttl)
 	}
-	s, err := Open(cfg, limit, ttl, nil)
+	s, err := Open(cfg, limit, ttl, 0, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	return s

@@ -92,6 +92,8 @@ var configClasses = map[string]ConfigClass{
 	"store.outbox_flush_interval": ClassRestart,
 	"store.outbox_retention_age":  ClassRestart,
 	"store.outbox_max_pending":    ClassRestart,
+	// 慢查询日志阈值（G5/Q06）：钩子在 engine.Open 时挂上，热改不能重挂，重启才生效。
+	"store.slow_query_threshold": ClassRestart,
 	// 任务快照 SQLite 后端（TASK-M03）：与 mgrstore.* 同为重启档。
 	"store.sqlite.path": ClassRestart, "store.sqlite.busy_timeout": ClassRestart,
 	"store.sqlite.synchronous": ClassRestart, "store.sqlite.dialect": ClassRestart,

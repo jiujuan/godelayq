@@ -63,14 +63,16 @@ type Store struct {
 var _ core.Store = (*Store)(nil)
 
 // Open 建好父目录、打开连接、设置 PRAGMA、建表并应用任务库迁移。
-// historyLimit/historyTTL 的取值口径与 core.StoreOptions 一条（limit==0 用
-// DefaultHistoryLimit、limit<0 不留痕、ttl<=0 不按时间淘汰），由装配方从
-// store.history_limit/history_ttl 原样传入。Path/BusyTimeout/Synchronous 的
+// historyLimit/historyTTL/slowQueryThreshold 的取值口径与 core.StoreConfig 一条
+// （limit==0 用 DefaultHistoryLimit、limit<0 不留痕、ttl<=0 不按时间淘汰、
+// slowQuery<=0 不挂慢查询钩子），由装配方从 store.history_limit/history_ttl/
+// slow_query_threshold 原样传入。Path/BusyTimeout/Synchronous 的
 // 空值已在 core.Config.Normalized() 折成各自默认，这里不再兜底。
 //
 // 打不开任务库等于快照无处安放，任何一步失败都返回错误，由装配方拒绝启动——
 // 与管理库、观测库同一口径。
-func Open(cfg core.StoreSQLiteConfig, historyLimit int, historyTTL time.Duration, logger *slog.Logger) (*Store, error) {
+func Open(cfg core.StoreSQLiteConfig, historyLimit int, historyTTL time.Duration,
+	slowQueryThreshold time.Duration, logger *slog.Logger) (*Store, error) {
 	db, err := engine.Open(engine.Options{
 		Dialect:     engine.Dialect(cfg.Dialect),
 		Path:        cfg.Path,
@@ -79,7 +81,8 @@ func Open(cfg core.StoreSQLiteConfig, historyLimit int, historyTTL time.Duration
 		Synchronous: cfg.Synchronous,
 		// 单连接：调度器是唯一的写方（API 的写都经它），读只有启动恢复与
 		// 留痕轻查询；与观测库、管理库同一取舍，消除 SQLITE_BUSY 的主要来源。
-		MaxOpenConns: 1,
+		MaxOpenConns:       1,
+		SlowQueryThreshold: slowQueryThreshold,
 	}, logger)
 	if err != nil {
 		return nil, err

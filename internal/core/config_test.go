@@ -907,3 +907,27 @@ func TestValidate_Reload(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parse config failed")
 }
+
+// 慢查询日志阈值（G5/Q06）：缺省 0=关；负数与低于下限拒启（对齐 outbox_flush_interval
+// 的下限守卫模式）。
+func TestLoadConfig_SlowQueryThreshold(t *testing.T) {
+	omitted, err := LoadConfig(writeConfigFile(t, "store:\n  slow_query_threshold: 0s\n"))
+	require.NoError(t, err, "0 表示关闭，必须放过")
+	assert.Zero(t, omitted.Store.SlowQueryThreshold)
+
+	// 负数拒启：0 才是"关"，负值只可能是笔误，静默折成 0 会把"想开但写错"埋成"开着默认"
+	_, err = LoadConfig(writeConfigFile(t, "store:\n  slow_query_threshold: -5s\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "slow_query_threshold")
+	assert.Contains(t, err.Error(), "must not be negative")
+
+	// 低于下限拒启：本地常规查询在亚毫秒级，压到下限以下等于日志洪水开关
+	_, err = LoadConfig(writeConfigFile(t, "store:\n  slow_query_threshold: 500us\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "below the minimum")
+
+	// 下界本身合法
+	floor, err := LoadConfig(writeConfigFile(t, "store:\n  slow_query_threshold: 1ms\n"))
+	require.NoError(t, err)
+	assert.Equal(t, MinSlowQueryThreshold, floor.Store.SlowQueryThreshold)
+}

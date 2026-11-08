@@ -53,4 +53,31 @@ hook 每查询都走（即使关）的开销为一次整数比较。回退：配
 
 ## 10. 实现记录
 
-- 待实施。
+- 2026-11-09 完成。钩子落在 `internal/store/engine/slowquery.go`：`slowQueryHook`
+  （threshold/maxBytes/dialect/logger），AfterQuery 阶段 `time.Since(event.StartTime)`
+  判定——`StartTime` 由 bun 在 beforeQuery 打点，且**无钩子时 bun 连 QueryEvent 都
+  不建**（hook.go 短路），关闭路径是真零开销。Open 统一装配（Options.SlowQueryThreshold
+  >0 才挂），业务包只传阈值。
+- 日志形状：`msg="slow query"` + `sql`（前 1024 字节，`DefaultSlowQueryLogBytes`，
+  rune 边界收口 + `…(truncated)` 标记）+ `elapsed` + `dialect` + `op`
+  （bun `event.Operation()`，不用自己解析首关键字）+ 失败时的 `error`。
+  "慢且失败"与"慢且成功"都记录。
+- 配置：`store.slow_query_threshold`（core.StoreConfig，仅 sqlite/PG 后端生效）；
+  校验两条——负数拒启（0 才是"关"，负值只可能是笔误）+ `>0 && <1ms` 拒启
+  （`MinSlowQueryThreshold = 1ms`，本地常规查询亚毫秒级，压更低等于日志洪水）；
+  reload 档位 `ClassRestart`（钩子 Open 时挂，热改不能重挂）。
+- 映射链：jobs.Open 加 `slowQueryThreshold` 参数（historyLimit/historyTTL 同款
+  显式传参）→ engine.Options；cmd/server 传 `cfg.Store.SlowQueryThreshold`。
+- 测试发现并修正的一处：Windows 粗时钟下快速查询的 `elapsed` 可能为 0，
+  "1ns 阈值 + 真跑 SQL"的触发用例不可靠——钩子判定/日志形状/截断改为**构造
+  QueryEvent 的确定性单测**，Open 装配链路用真实慢查询（递归 CTE 纯计算 30 万
+  次迭代，无 I/O 随机性，比 10ms 阈值慢两个数量级）验证。
+- hook 并存：慢查询钩子 BeforeQuery 不改事件字段，快照捕获只发生在 BeforeQuery，
+  golden 不受影响（engine 并存用例断言两个库捕获文本逐字节一致；快照测试保持
+  0 阈值生成）。golden 两次生成零 diff（全量测试佐证）。
+- 文档：deployment.md 存储节参数行 + 调参建议一条（含"W 系列基线证据来源、
+  配合 /admin/runtime 的 db.pool.wait_* 读数"的用法）；config.example.yaml 同步。
+  reload 矩阵表不补键名——该表本就不列全量重启档键（outbox 三键也不在），
+  代码的 ClassRestart 表是权威。
+- 自证：`go build ./... && go vet ./... && go test ./...` 全绿（默认关零输出）；
+  PG 矩阵见提交前复跑记录。

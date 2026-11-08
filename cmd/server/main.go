@@ -317,7 +317,8 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 			case "sqlite":
 				// 直写后端：建不起库或导入失败都拦住启动——快照无处安放与
 				// 配置非法是同一量级的故障，不带病上线。
-				store, err := jobs.Open(cfg.Store.SQLite, cfg.Store.HistoryLimit, cfg.Store.HistoryTTL, logger)
+				store, err := jobs.Open(cfg.Store.SQLite, cfg.Store.HistoryLimit, cfg.Store.HistoryTTL,
+					cfg.Store.SlowQueryThreshold, logger)
 				if err != nil {
 					return nil, fmt.Errorf("open jobs sqlite store: %w", err)
 				}

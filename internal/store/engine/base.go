@@ -61,6 +61,11 @@ type Options struct {
 	// 观测库传 1：写入批量单点、读是短查询，单连接同时消除 SQLITE_BUSY 的主要来源
 	// （设计文档 §7.2）。
 	MaxOpenConns int
+	// SlowQueryThreshold 慢查询日志阈值（G5/Q06）：>0 时挂 bun QueryHook，
+	// 单条查询耗时超过阈值打 Warn（SQL 截断文本 + 耗时 + 方言）；0（默认）不挂
+	// 钩子，每查询零开销。取值合法性与下限守卫归调用方的配置层（core.Validate），
+	// 本包只认"正数即开启"。
+	SlowQueryThreshold time.Duration
 }
 
 // DB 是一个数据库的句柄。它是纯机制对象：不认识任何一张业务表，
@@ -99,14 +104,31 @@ func Open(opts Options, logger *slog.Logger) (*DB, error) {
 	if dialect == "" {
 		dialect = DialectSQLite
 	}
+	var db *DB
+	var err error
 	switch dialect {
 	case DialectSQLite:
-		return openSQLite(opts, logger)
+		db, err = openSQLite(opts, logger)
 	case DialectPostgres:
-		return openPostgres(opts, logger)
+		db, err = openPostgres(opts, logger)
 	default:
 		return nil, fmt.Errorf("engine: unknown dialect %q, use sqlite or postgres", opts.Dialect)
 	}
+	if err != nil {
+		return nil, err
+	}
+	// 慢查询钩子（G5/Q06）挂在 Open：业务包经 Options 传阈值，钩子装配只有这一处。
+	// 关闭（0）时一条钩子都不挂——bun 在无钩子时连 QueryEvent 都不建（hook.go
+	// beforeQuery 的短路），关闭路径是真的零开销。
+	if opts.SlowQueryThreshold > 0 {
+		db.AddQueryHook(&slowQueryHook{
+			threshold: opts.SlowQueryThreshold,
+			maxBytes:  DefaultSlowQueryLogBytes,
+			dialect:   db.dialect,
+			logger:    logger,
+		})
+	}
+	return db, nil
 }
 
 // openSQLite 建好父目录、打开连接、设置 PRAGMA（sqlite 方言分支）。

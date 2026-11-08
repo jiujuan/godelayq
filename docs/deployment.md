@@ -44,6 +44,7 @@ store:
   outbox_flush_interval: 200ms # 出箱中继周期（仅 sqlite/PG 生效）；也是事件可见延迟上界
   outbox_retention_age: 72h   # 已投递出箱行的保留时长（仅 sqlite/PG 生效）
   outbox_max_pending: 100000  # pending 积压上限；超过按最旧截断并记 error
+  slow_query_threshold: 0s    # 慢查询日志阈值（仅 sqlite/PG 生效）；0=关（默认），开启后下限 1ms
   groups_path: /var/lib/godelayq/groups.json  # 分组注册表（改动即同步落盘）
   sqlite:                     # 仅 type: sqlite 时生效（TASK-M03）
     path: /var/lib/godelayq/goqsys_jobs.sqlite
@@ -89,6 +90,12 @@ logging:
   默认 60s 起步；cron 窗口比 1 分钟还密的部署可以酌情调小。
 - `attempts_keep_last` 是每任务上限（默认 20），cron 任务滚动保新；需要更长审计窗口
   优先调观测层的 `observability.events.retention_*`（事件流），不要盲目放大账本。
+- `slow_query_threshold` 开启后（下限 1ms），任务库上超过阈值的查询各记一条 Warn：
+  SQL 文本只保留前 1024 字节（内联参数渲染会把 payload 值打进语句文本，截断既是
+  排版也是安全闸）、耗时、方言与语句类别；失败的慢查询同样记录并带 `error` 字段。
+  这是 W 系列（写合并）改动的基线证据来源——开它跑一轮到期风暴，对比
+  `/admin/runtime` 的 `db.pool.wait_*` 前后读数。钩子在启动装配时挂上，热改阈值
+  不生效（重启档）；要把日志阈值压到下限以下应该用基准而不是改配置。
 - `scheduler.recovery_policy` 显式配置（非 `auto`）时全局生效，压过只管执行器的
   `executors.restore_policy`；两者同时显式且结论不同时启动日志会有一条 warn 迁移提示。
 
