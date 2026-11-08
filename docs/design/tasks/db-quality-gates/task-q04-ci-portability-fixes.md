@@ -72,3 +72,14 @@ git push && gh run watch   # 两个 job 全绿
   GOOS 化（unix 用 /srv/...，windows 才有盘符写法）；并发清理 victim 目录
   os.Chtimes 拨回一小时（"已过期"从对机器速度的赌注变成事实）。
 - 本机（Windows）全量绿；并发与 GOOS 用例 -count=5 稳定。ubuntu 行为由 CI 复跑验证。
+- **第二轮 CI（42477163459）**：ubuntu ✓ / postgres-matrix ✓；windows 暴露残部——
+  locationOf 只对"存在的路径"生效，bin/etl 这类不存在的档位路径仍走 Abs 兜底短名。
+  本地 8.3 探针实证：EvalSymlinks 展开短名但对缺失路径报错、Rel(长,短) 产生畸形爬升。
+- **系统性收口**：executor 测试包新增 tempWorkspace(t)（TempDir + EvalSymlinks，
+  目录必存在故必能展开），137 处 t.TempDir() 全量替换——路径在源头进长名空间，
+  成员派生与断言自然对齐，不再逐断言打补丁。
+- **第三轮 CI（42477867138）**：executor/api 清零，windows 只剩 SQL 快照——
+  正是设计期预判的 golden CRLF 问题（autocrlf 检出转 CRLF vs 运行时 LF）。
+   钉 *.golden text eol=lf 收口。
+- **第四轮 CI（42478145828）：三 job 全绿**。门禁闭环：CI 此后每次 push/PR
+  自动跑 SQLite 快档（双 OS）+ PG 全矩阵。
