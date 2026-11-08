@@ -42,8 +42,14 @@ func (s *Scheduler) writeBeginAttempt(rec Attempt) {
 // 时长按 job.UpdatedAt（运行态落盘时刻，与 job.completed 事件的 duration_ms 同一基准）
 // 计，transition 会把它改成本次收尾时刻。status 是这次尝试的结论
 // （success/failed/cancelled）；outcome 由调用方按需填充失败明细（TASK-RE04，
-// 仅 failed 行有），nil 表示无明细。裁剪紧随收尾：主键 (job_id, seq) 前缀索引
-// 使代价为常数，失败不影响执行链路。
+// 仅 failed 行有），nil 表示无明细。
+//
+// 裁剪按 seq 取模降频（W3/Q10）：job.Attempts % attemptsKeepLast == 0 时才跑
+// PruneAttempts——cron 高频任务每轮收尾都空跑一次 DELETE（表里几乎永远没有可删
+// 的行）是纯开销。规则不加后台协程、可从账本行 seq 推导（可复现、可解释）；
+// 不恰逢取模点的收尾不补裁，单任务行数上界 keepLast + 未裁窗口（≤ 2×keepLast），
+// 读侧 Attempts 按 limit 取最近 N 条不受影响。终态收尾恰逢取模点时照常裁剪，
+// 不额外补裁。ledger nil（JSON 部署）整段跳过，降级在构造日志里说明过一次。
 func (s *Scheduler) finishAttempt(job *Job, status AttemptStatus, outcome func(*Attempt)) {
 	if s.ledger == nil {
 		return
@@ -62,8 +68,11 @@ func (s *Scheduler) finishAttempt(job *Job, status AttemptStatus, outcome func(*
 	if err := s.ledger.FinishAttempt(job.ID, job.Attempts, rec); err != nil {
 		s.logger.Error("failed to finish attempt", "job_id", job.ID, "seq", rec.Seq, "error", err)
 	}
-	if err := s.ledger.PruneAttempts(job.ID, s.attemptsKeepLast); err != nil {
-		s.logger.Error("failed to prune attempts", "job_id", job.ID, "error", err)
+	// 除数恒 ≥1：ledger 非 nil 时构造器已把 attemptsKeepLast 折成 DefaultAttemptsKeepLast。
+	if job.Attempts%s.attemptsKeepLast == 0 {
+		if err := s.ledger.PruneAttempts(job.ID, s.attemptsKeepLast); err != nil {
+			s.logger.Error("failed to prune attempts", "job_id", job.ID, "error", err)
+		}
 	}
 }
 

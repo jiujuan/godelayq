@@ -58,4 +58,16 @@ GODELAYQ_TEST_PG_DSN='...' go test -count=1 ./internal/store/... ./cmd/server/
 
 ## 10. 实现记录
 
-- 待实施。
+- 2026-11-09 完成。规则落点：`finishAttempt`（core/scheduler_exec.go）——
+  `job.Attempts % attemptsKeepLast == 0` 才调 `PruneAttempts`；除数恒 ≥1 的依据
+  写在注释里（ledger 非 nil 时构造器已把 attemptsKeepLast 折成
+  DefaultAttemptsKeepLast）。不加后台协程；函数注释写明上界（keepLast + 未裁
+  窗口 ≤ 2×keepLast）与"终态不逢取模不补裁"的口径。Job 删除路径未动
+  （store.Delete 的账本级联照旧）。
+- 测试：core 位置断言（keepLast=3、seq 1..7 逐 seq 累计 prune 次数恰为
+  0,0,1,1,1,2,2；seq=9 取模点恰逢终态照常裁剪）——mockLedger 记的是 keepLast
+  不是 seq，位置用"逐 seq 的累计次数"表达；jobs 窗口上界（真实 store SQL，
+  keepLast=3 跑 9 个 seq，任意时刻 ≤ 2×3，终态行数收回 k，双方言门控）。
+- golden：**零 diff**（prune 的 DELETE 语句形状不变，仍由快照序列里显式的
+  PruneAttempts 直调钉住；重生成后比对确认）。
+- 自证：全量 9 包 EXIT=0；本机 PG 矩阵 6 包 EXIT=0。
