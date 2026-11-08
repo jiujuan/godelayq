@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -18,7 +19,7 @@ func execConfigForMode(t *testing.T) core.ExecutorsConfig {
 	t.Helper()
 
 	ec := core.DefaultConfig().Executors
-	ec.Workspace = t.TempDir()
+	ec.Workspace = tempWorkspace(t)
 	return ec
 }
 
@@ -158,7 +159,7 @@ func TestBuildProfileSameRulesAsLoadProfiles(t *testing.T) {
 // LoadProfiles 必须一直走严格模式：这是"config.yaml 侧口径不变"的落点。
 func TestLoadProfilesAlwaysStrictEvenWithLooseDefaults(t *testing.T) {
 	ec := execConfigForMode(t)
-	absolute := filepath.Join(t.TempDir(), "outside.py")
+	absolute := filepath.Join(tempWorkspace(t), "outside.py")
 
 	cfg := core.Config{Executors: ec}
 	cfg.Executors.Commands = []core.ExecutorCommand{{
@@ -177,7 +178,14 @@ func TestBuildProfilePathAnywhereAcceptsRootedAndClimbingPaths(t *testing.T) {
 	workspace := ec.Workspace
 
 	t.Run("绝对路径", func(t *testing.T) {
-		for _, written := range []string{"/srv/report/main.py", `D:\srv\report\main.py`, "../outside/run.sh"} {
+		// 盘符写法只在 Windows 上是"根写法"：Linux 把它当普通文件名按 workspace 拼接。
+		rooted := []string{"../outside/run.sh"}
+		if runtime.GOOS == "windows" {
+			rooted = append(rooted, `D:\srv\report\main.py`)
+		} else {
+			rooted = append(rooted, "/srv/report/main.py")
+		}
+		for _, written := range rooted {
 			profile, err := BuildProfile(core.ExecutorCommand{
 				Name: "loose", Kind: "script", Runtime: "python", Script: written,
 			}, ec, PathAnywhere)
@@ -303,7 +311,7 @@ func TestPathAnywhereDoesNotTurnProgramNameIntoPath(t *testing.T) {
 func TestProbeConsumesLooseProfileWithoutChanges(t *testing.T) {
 	ec := execConfigForMode(t)
 
-	dir := t.TempDir()
+	dir := tempWorkspace(t)
 	real := filepath.Join(dir, "present.py")
 	if err := os.WriteFile(real, []byte("print(1)\n"), 0o644); err != nil {
 		t.Fatalf("预置脚本失败: %v", err)

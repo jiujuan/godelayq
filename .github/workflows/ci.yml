@@ -1,0 +1,72 @@
+# godelayq CI：数据库质量门禁的自动执行面（db-quality-gates-design.md Q01）。
+#
+# 两个 job、一份口径：
+#   - sqlite-fast：不依赖任何服务，PG 用例因未配 GODELAYQ_TEST_PG_DSN 自然跳过——
+#     快档在两个 OS 上把全仓 build/vet/test 跑满。
+#   - postgres-matrix：services 起 postgres:17，注入 GODELAYQ_TEST_PG_DSN 跑 store
+#     四包 + cmd/server——与本地 scripts/test-pg.ps1|sh 逐字同一份命令。
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - "feat/**"
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sqlite-fast:
+    name: sqlite-fast (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: build
+        run: go build ./...
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -count=1 ./...
+
+  postgres-matrix:
+    name: postgres-matrix (postgres:17)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: godelayq
+          POSTGRES_PASSWORD: godelayq-ci
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U godelayq"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      GODELAYQ_TEST_PG_DSN: postgres://godelayq:godelayq-ci@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # 与 scripts/test-pg.sh 的测试集一致：门禁只有一份，本地与 CI 跑同一批包。
+      - name: postgres test matrix
+        run: go test -count=1 ./internal/store/... ./cmd/server/

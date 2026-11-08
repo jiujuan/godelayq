@@ -1,6 +1,7 @@
 package observe
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -11,13 +12,8 @@ import (
 	"time"
 
 	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/uptrace/bun"
 )
-
-// insertEvent 是一行 job_events 的写入语句。seq 由 AUTOINCREMENT 给出，不由代码算：
-// 同一次执行会在同一毫秒内连发 job.scheduled 与 job.started，只有 seq 能定出因果
-// （设计文档 §6）。
-const insertEvent = `INSERT INTO job_events (ts_us, type, job_id, job_name, status, data, metadata)
-VALUES (?, ?, ?, ?, ?, ?, ?)`
 
 // EventLogOptions 是事件写入器的参数。零值一律回到 core 的观测层默认，
 // 只有 RetentionAge 的 0 例外——它是"不按时间淘汰"的有意取值（S01 的口径）。
@@ -34,18 +30,6 @@ type EventLogOptions struct {
 	// Now 是时间源，nil 时用 time.Now。事件自带时间戳，注入的 Now 只在两个地方生效：
 	// 时间戳为零值的事件（测试与第三方发布者）补上它，以及按时间淘汰的截止点。
 	Now func() time.Time
-}
-
-// eventRecord 是 job_events 的一行，字段与列一一对应。
-// data 与 metadata 用 sql.NullString：两列都可空，空与空字符串在库里是两回事。
-type eventRecord struct {
-	timestampUS int64
-	typ         string
-	jobID       string
-	jobName     string
-	status      int
-	data        sql.NullString
-	metadata    sql.NullString
 }
 
 // EventLog 是 EventBus 的第二个订阅者：把带任务归属的事件写进 job_events。
@@ -71,7 +55,7 @@ type EventLog struct {
 	closeErr  error
 
 	// writeRounds 记 writeBatch 被真正调用的次数（空批不算）。它是"空批不产生事务"
-	// 这条口径唯一的观察办法：seq 由 AUTOINCREMENT 给出，一次空事务不会留下任何痕迹，
+	// 这条口径唯一的观察办法：seq 由自增列给出，一次空事务不会留下任何痕迹，
 	// 而计数值不对使用者有意义，所以只在本包内可见。
 	writeRounds atomic.Int64
 }
@@ -171,23 +155,23 @@ func (e *EventLog) mapEvent(event core.Event) (eventRecord, bool) {
 	}
 
 	record := eventRecord{
-		timestampUS: timestamp.UnixMicro(),
-		typ:         string(event.Type),
-		jobID:       event.JobID,
-		jobName:     event.JobName,
-		status:      int(event.Status),
+		TimestampUS: timestamp.UnixMicro(),
+		Type:        string(event.Type),
+		JobID:       event.JobID,
+		JobName:     event.JobName,
+		Status:      int(event.Status),
 		// Data 已是 json.RawMessage，原文入库：重新序列化会改键序，
 		// 而排障时最常比对的正是"事件里写的那段错误原文"
-		data: nullableText(event.Data),
+		Data: nullableText(event.Data),
 	}
 	if event.Metadata != nil {
 		encoded, err := json.Marshal(event.Metadata)
 		if err != nil {
 			// 一条事件的元数据不该挡住整批：存 NULL 并记 warn，读侧把这列当缺失处理
 			e.logger.Warn("observability event metadata is not serializable",
-				"job_id", event.JobID, "type", record.typ, "error", err)
+				"job_id", event.JobID, "type", record.Type, "error", err)
 		} else {
-			record.metadata = sql.NullString{String: string(encoded), Valid: true}
+			record.Metadata = sql.NullString{String: string(encoded), Valid: true}
 		}
 	}
 	return record, true
@@ -206,32 +190,19 @@ func nullableText(raw []byte) sql.NullString {
 // 这是 batcher 的落盘回调，不做重试以外的事情：失败就返回错误，由 batcher 决定再试一次还是放弃。
 func (e *EventLog) writeBatch(rows []eventRecord) error {
 	e.writeRounds.Add(1)
-	tx, err := e.db.SQL().Begin()
-	if err != nil {
-		return fmt.Errorf("sqlite: begin event batch: %w", err)
-	}
-	stmt, err := tx.Prepare(insertEvent)
-	if err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("sqlite: prepare event insert: %w", err)
-	}
-	for _, row := range rows {
-		if _, err := stmt.Exec(row.timestampUS, row.typ, row.jobID, row.jobName, row.status, row.data, row.metadata); err != nil {
-			_ = stmt.Close()
-			_ = tx.Rollback()
-			return fmt.Errorf("sqlite: insert event %s/%s: %w", row.typ, row.jobID, err)
+	err := e.db.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
+		// 一次多值插入替代 Prepare+逐行 Exec：同一事务、同一批数据，
+		// 往返从 N 次降到 1 次。rows 恒非空（batcher 不调空批回调）。
+		if _, err := tx.NewInsert().Model(&rows).Exec(ctx); err != nil {
+			return fmt.Errorf("sqlite: insert event batch: %w", err)
 		}
-	}
-	if err := stmt.Close(); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("sqlite: close event statement: %w", err)
-	}
-	if err := e.prune(tx); err != nil {
-		_ = tx.Rollback()
+		if err := e.prune(ctx, tx); err != nil {
+			return err
+		}
+		return nil
+	})
+	if err != nil {
 		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlite: commit event batch: %w", err)
 	}
 	return nil
 }
@@ -245,11 +216,12 @@ func (e *EventLog) writeBatch(rows []eventRecord) error {
 //
 // 两个原子值在开头各读一次：一次淘汰里"跳过时间淘汰"的判断与算截止点必须用同一个时长，
 // 中间插进一次 SetRetention 就会让两条判断对上两套值。
-func (e *EventLog) prune(tx *sql.Tx) error {
+func (e *EventLog) prune(ctx context.Context, tx bun.Tx) error {
 	retentionCount := e.retentionCount.Load()
 	retentionAge := time.Duration(e.retentionAge.Load())
-	if _, err := tx.Exec(`DELETE FROM job_events WHERE seq <= (SELECT COALESCE(MAX(seq)-?, 0) FROM job_events)`,
-		retentionCount); err != nil {
+	if _, err := tx.NewDelete().Model((*eventRecord)(nil)).
+		Where("seq <= (SELECT COALESCE(MAX(seq)-?, 0) FROM job_events)", retentionCount).
+		Exec(ctx); err != nil {
 		return fmt.Errorf("sqlite: prune events by count: %w", err)
 	}
 	if retentionAge <= 0 {
@@ -257,14 +229,13 @@ func (e *EventLog) prune(tx *sql.Tx) error {
 		return nil
 	}
 	cutoff := e.now().Add(-retentionAge).UnixMicro()
-	if _, err := tx.Exec(`DELETE FROM job_events WHERE ts_us < ?`, cutoff); err != nil {
+	if _, err := tx.NewDelete().Model((*eventRecord)(nil)).
+		Where("ts_us < ?", cutoff).
+		Exec(ctx); err != nil {
 		return fmt.Errorf("sqlite: prune events by age: %w", err)
 	}
 	return nil
 }
-
-// eventColumns 是两条读路径共用的列序，顺序与 scanEvent 一一对应。
-const eventColumns = `ts_us, type, job_id, job_name, status, data, metadata`
 
 // eventsReadLimitFallback 是 limit 传了零或负数时使用的行数上界。
 // 调用方里的读端点自带一个同值的响应上界（api/handlers_events.go 的 eventsQueryLimit）：
@@ -276,44 +247,47 @@ const eventsReadLimitFallback = 1000
 // 读的是 seq 而不是 ts_us：同一微秒内连发的 scheduled 与 started 只有 seq 分得出先后，
 // 而时间线把这两条的先后当作因果（设计文档 §6）。
 func (e *EventLog) Events(jobID string, limit int) ([]core.Event, error) {
-	return e.readEvents(
-		`SELECT `+eventColumns+` FROM job_events WHERE job_id = ? ORDER BY seq DESC LIMIT ?`,
-		limit, jobID)
+	return e.readEvents(func(q *bun.SelectQuery) *bun.SelectQuery {
+		return q.Where("job_id = ?", jobID)
+	}, limit)
 }
 
 // Recent 读回跨任务的最近 limit 条事件，结果按写入顺序升序。
 func (e *EventLog) Recent(limit int) ([]core.Event, error) {
-	return e.readEvents(
-		`SELECT `+eventColumns+` FROM job_events ORDER BY seq DESC LIMIT ?`,
-		limit)
+	return e.readEvents(func(q *bun.SelectQuery) *bun.SelectQuery {
+		return q
+	}, limit)
 }
 
 // readEvents 执行一次降序查询，再把结果整体反转成升序。
 //
 // 降序 + 反转而不是升序 + 偏移：要拿的是"最后 N 条"，降序走 seq 索引只需读 N 行，
-// 升序取尾必须先跳过前面所有行。args 是 WHERE 的参数，limit 单独追加。
-func (e *EventLog) readEvents(query string, limit int, args ...any) ([]core.Event, error) {
+// 升序取尾必须先跳过前面所有行。scope 是调用方附加的过滤条件（按任务或全表）。
+func (e *EventLog) readEvents(scope func(*bun.SelectQuery) *bun.SelectQuery, limit int) ([]core.Event, error) {
 	if limit <= 0 {
 		limit = eventsReadLimitFallback
 	}
-	rows, err := e.db.SQL().Query(query, append(args, limit)...)
-	if err != nil {
+	if scope == nil {
+		scope = func(q *bun.SelectQuery) *bun.SelectQuery { return q }
+	}
+
+	var rows []eventRecord
+	if err := scope(e.db.NewSelect().Model(&rows)).
+		OrderExpr("seq DESC").
+		Limit(int64(limit)).
+		Scan(bgCtx); err != nil {
 		return nil, fmt.Errorf("sqlite: query events: %w", err)
 	}
-	defer rows.Close()
 
 	// 端点把空列表序列化成了 "items": []，读侧也保持同一个形状：
 	// 返回 nil 切片会让 JSON 变成 null，前端两处都按数组处理。
 	items := make([]core.Event, 0, min(limit, 256))
-	for rows.Next() {
-		event, err := scanEvent(rows)
+	for _, row := range rows {
+		event, err := eventOf(row)
 		if err != nil {
 			return nil, fmt.Errorf("sqlite: scan event: %w", err)
 		}
 		items = append(items, event)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("sqlite: iterate events: %w", err)
 	}
 
 	// 库里按 seq 降序取回，反转为升序：调用方拿到的时间线方向与内存缓冲一致
@@ -323,44 +297,26 @@ func (e *EventLog) readEvents(query string, limit int, args ...any) ([]core.Even
 	return items, nil
 }
 
-// rowScanner 是 *sql.Rows 的最小读面，让行还原能单独被测。
-type rowScanner interface {
-	Scan(dest ...any) error
-}
-
-// scanEvent 把一行还原成 core.Event。
+// eventOf 把一行还原成 core.Event。
 //
 // ts_us 只到微秒，还原出的 Time 丢了原来的纳秒部分与原始时区偏移（这里是本地时区）：
 // 两个时刻相同，精度界限见设计文档 §9 与本卡 §9 的第一条风险。
 // data 存的是发布方的 JSON 原文，这里不重新序列化，读侧拿到的字节与写入时一致。
-func scanEvent(row rowScanner) (core.Event, error) {
-	var (
-		timestampUS int64
-		typ         string
-		jobID       string
-		jobName     string
-		status      int
-		data        sql.NullString
-		metadata    sql.NullString
-	)
-	if err := row.Scan(&timestampUS, &typ, &jobID, &jobName, &status, &data, &metadata); err != nil {
-		return core.Event{}, err
-	}
-
+func eventOf(row eventRecord) (core.Event, error) {
 	event := core.Event{
-		Type:      core.EventType(typ),
-		JobID:     jobID,
-		JobName:   jobName,
-		Status:    core.JobStatus(status),
-		Timestamp: time.UnixMicro(timestampUS),
+		Type:      core.EventType(row.Type),
+		JobID:     row.JobID,
+		JobName:   row.JobName,
+		Status:    core.JobStatus(row.Status),
+		Timestamp: time.UnixMicro(row.TimestampUS),
 	}
-	if data.Valid {
-		event.Data = json.RawMessage(data.String)
+	if row.Data.Valid {
+		event.Data = json.RawMessage(row.Data.String)
 	}
-	if metadata.Valid {
+	if row.Metadata.Valid {
 		parsed := map[string]interface{}{}
-		if err := json.Unmarshal([]byte(metadata.String), &parsed); err != nil {
-			return core.Event{}, fmt.Errorf("metadata of job %s is not decodable: %w", jobID, err)
+		if err := json.Unmarshal([]byte(row.Metadata.String), &parsed); err != nil {
+			return core.Event{}, fmt.Errorf("metadata of job %s is not decodable: %w", row.JobID, err)
 		}
 		event.Metadata = parsed
 	}
@@ -380,8 +336,8 @@ func (e *EventLog) Dropped() int64 {
 
 // Count 返回库内事件行数，主要是给读端点与验收命令对照用。
 func (e *EventLog) Count() (int64, error) {
-	var count int64
-	if err := e.db.SQL().QueryRow(`SELECT COUNT(*) FROM job_events`).Scan(&count); err != nil {
+	count, err := e.db.NewSelect().Model((*eventRecord)(nil)).Count(bgCtx)
+	if err != nil {
 		return 0, fmt.Errorf("sqlite: count events: %w", err)
 	}
 	return count, nil

@@ -1,0 +1,19 @@
+SELECT value FROM "jobs_meta" AS "meta_row" WHERE (key = 'jobs_imported_from_file');
+SELECT count(*) FROM "jobs" AS "job_row";
+BEGIN;
+INSERT INTO "jobs" ("id", "name", "status", "updated_at", "snapshot_json") VALUES ('imp', 'job-imp', 'pending', <n>, '{"id":"imp","name":"job-imp","payload":null,"trigger_at":"<ts>","cron_expr":"","is_repeat":false,"timeout":0,"max_retries":0,"retry_count":0,"retry_delay":0,"status":0,"created_at":"<ts>","updated_at":"<ts>","attempts":0}');
+COMMIT;
+INSERT INTO "jobs_meta" AS "meta_row" ("key", "value") VALUES ('jobs_imported_from_file', '<n>') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+SELECT value FROM "jobs_meta" AS "meta_row" WHERE (key = 'jobs_imported_from_file');
+INSERT INTO "jobs" AS "job_row" ("id", "name", "status", "updated_at", "snapshot_json") VALUES ('j1', 'job-j1', 'pending', <n>, '{"id":"j1","name":"job-j1","payload":null,"trigger_at":"<ts>","cron_expr":"","is_repeat":false,"timeout":0,"max_retries":0,"retry_count":0,"retry_delay":0,"status":0,"created_at":"<ts>","updated_at":"<ts>","attempts":0}') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, snapshot_json = EXCLUDED.snapshot_json;
+INSERT INTO "jobs" AS "job_row" ("id", "name", "status", "updated_at", "snapshot_json") VALUES ('j1', 'job-j1', 'running', <n>, '{"id":"j1","name":"job-j1","payload":null,"trigger_at":"<ts>","cron_expr":"","is_repeat":false,"timeout":0,"max_retries":0,"retry_count":0,"retry_delay":0,"status":1,"created_at":"<ts>","updated_at":"<ts>","attempts":0}') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, snapshot_json = EXCLUDED.snapshot_json;
+INSERT INTO "jobs" AS "job_row" ("id", "name", "status", "updated_at", "snapshot_json") VALUES ('j2', 'job-j2', 'pending', -<n>, '{"id":"j2","name":"job-j2","payload":null,"trigger_at":"<ts>","cron_expr":"","is_repeat":false,"timeout":0,"max_retries":0,"retry_count":0,"retry_delay":0,"status":0,"created_at":"<ts>","updated_at":"<ts>","attempts":0}') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, snapshot_json = EXCLUDED.snapshot_json;
+SELECT snapshot_json FROM "jobs" AS "job_row";
+DELETE FROM "jobs" AS "job_row" WHERE (id = 'j2');
+INSERT INTO "jobs" AS "job_row" ("id", "name", "status", "updated_at", "snapshot_json") VALUES ('t1', 'job-t1', 'success', <n>, '{"id":"t1","name":"job-t1","payload":null,"trigger_at":"<ts>","cron_expr":"","is_repeat":false,"timeout":0,"max_retries":0,"retry_count":0,"retry_delay":0,"status":2,"created_at":"<ts>","updated_at":"<ts>","attempts":0}') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, snapshot_json = EXCLUDED.snapshot_json;
+SELECT id, status, updated_at FROM "jobs" AS "job_row";
+INSERT INTO "jobs" AS "job_row" ("id", "name", "status", "updated_at", "snapshot_json") VALUES ('t2', 'job-t2', 'success', <n>, '{"id":"t2","name":"job-t2","payload":null,"trigger_at":"<ts>","cron_expr":"","is_repeat":false,"timeout":0,"max_retries":0,"retry_count":0,"retry_delay":0,"status":2,"created_at":"<ts>","updated_at":"<ts>","attempts":0}') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, status = EXCLUDED.status, updated_at = EXCLUDED.updated_at, snapshot_json = EXCLUDED.snapshot_json;
+SELECT id, status, updated_at FROM "jobs" AS "job_row";
+BEGIN;
+DELETE FROM "jobs" AS "job_row" WHERE (id = 't2');
+COMMIT

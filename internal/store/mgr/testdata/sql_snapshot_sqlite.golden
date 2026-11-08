@@ -1,0 +1,27 @@
+SELECT value FROM "mgr_meta" AS "meta_row" WHERE (key = 'users_imported_from_config');
+SELECT count(*) FROM "mgr_users" AS "user_row";
+SELECT "user_row"."name", "user_row"."password_bcrypt", "user_row"."role", "user_row"."created_at", "user_row"."updated_at" FROM "mgr_users" AS "user_row" WHERE (lower(name) = lower('admin'));
+INSERT INTO "mgr_users" AS "user_row" ("name", "password_bcrypt", "role", "created_at", "updated_at") VALUES ('admin', '$2a$10$CeOkGdzSwX6zs7hU5PdbFedCkhjXBfBi3vfwjwOtEz3XgKh4sbf8.', 'admin', <n>, <n>) ON CONFLICT (name) DO UPDATE SET password_bcrypt = EXCLUDED.password_bcrypt, role = EXCLUDED.role, updated_at = EXCLUDED.updated_at;
+INSERT INTO "mgr_meta" AS "meta_row" ("key", "value") VALUES ('users_imported_from_config', '<n>') ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value;
+SELECT value FROM "mgr_meta" AS "meta_row" WHERE (key = 'users_imported_from_config');
+SELECT "user_row"."name", "user_row"."password_bcrypt", "user_row"."role", "user_row"."created_at", "user_row"."updated_at" FROM "mgr_users" AS "user_row" WHERE (lower(name) = lower('alice'));
+INSERT INTO "mgr_users" AS "user_row" ("name", "password_bcrypt", "role", "created_at", "updated_at") VALUES ('alice', '$2a$10$CeOkGdzSwX6zs7hU5PdbFedCkhjXBfBi3vfwjwOtEz3XgKh4sbf8.', 'operator', <n>, <n>) ON CONFLICT (name) DO UPDATE SET password_bcrypt = EXCLUDED.password_bcrypt, role = EXCLUDED.role, updated_at = EXCLUDED.updated_at;
+SELECT "user_row"."name", "user_row"."password_bcrypt", "user_row"."role", "user_row"."created_at", "user_row"."updated_at" FROM "mgr_users" AS "user_row" WHERE (lower(name) = lower('ALICE'));
+INSERT INTO "mgr_users" AS "user_row" ("name", "password_bcrypt", "role", "created_at", "updated_at") VALUES ('ALICE', '$2a$10$CeOkGdzSwX6zs7hU5PdbFedCkhjXBfBi3vfwjwOtEz3XgKh4sbf8.', 'admin', <n>, <n>) ON CONFLICT (name) DO UPDATE SET password_bcrypt = EXCLUDED.password_bcrypt, role = EXCLUDED.role, updated_at = EXCLUDED.updated_at;
+SELECT "user_row"."name", "user_row"."password_bcrypt", "user_row"."role", "user_row"."created_at", "user_row"."updated_at" FROM "mgr_users" AS "user_row" WHERE (lower(name) = lower('alice'));
+SELECT "user_row"."name", "user_row"."password_bcrypt", "user_row"."role", "user_row"."created_at", "user_row"."updated_at" FROM "mgr_users" AS "user_row" WHERE (lower(name) = lower('ALICE'));
+SELECT "user_row"."name", "user_row"."password_bcrypt", "user_row"."role", "user_row"."created_at", "user_row"."updated_at" FROM "mgr_users" AS "user_row" ORDER BY lower(name);
+SELECT count(*) FROM "mgr_users" AS "user_row";
+DELETE FROM "mgr_users" AS "user_row" WHERE (lower(name) = lower('alice'));
+DELETE FROM "mgr_users" AS "user_row" WHERE (lower(name) = lower('alice'));
+SELECT "group_row"."name", "group_row"."description", "group_row"."color", "group_row"."created_at", "group_row"."updated_at" FROM "mgr_groups" AS "group_row" WHERE (lower(name) = lower('prod'));
+INSERT INTO "mgr_groups" AS "group_row" ("name", "description", "color", "created_at", "updated_at") VALUES ('prod', '生产环境', '#ff0000', <n>, <n>) ON CONFLICT (name) DO UPDATE SET description = EXCLUDED.description, color = EXCLUDED.color, updated_at = EXCLUDED.updated_at;
+SELECT "group_row"."name", "group_row"."description", "group_row"."color", "group_row"."created_at", "group_row"."updated_at" FROM "mgr_groups" AS "group_row" WHERE (lower(name) = lower('prod'));
+INSERT INTO "mgr_groups" AS "group_row" ("name", "description", "color", "created_at", "updated_at") VALUES ('prod', '生产', '#00ff00', <n>, <n>) ON CONFLICT (name) DO UPDATE SET description = EXCLUDED.description, color = EXCLUDED.color, updated_at = EXCLUDED.updated_at;
+SELECT "group_row"."name", "group_row"."description", "group_row"."color", "group_row"."created_at", "group_row"."updated_at" FROM "mgr_groups" AS "group_row" WHERE (lower(name) = lower('PROD'));
+SELECT "group_row"."name", "group_row"."description", "group_row"."color", "group_row"."created_at", "group_row"."updated_at" FROM "mgr_groups" AS "group_row" ORDER BY lower(name);
+DELETE FROM "mgr_groups" AS "group_row" WHERE (lower(name) = lower('prod'));
+INSERT INTO "mgr_executor_profiles" AS "profile_row" ("name", "record_json", "updated_at") VALUES ('demo', '{"name":"demo","kind":"script","runtime":"bash","script":"echo hi","created_at":"<ts>","updated_at":"<ts>"}', <n>) ON CONFLICT (name) DO UPDATE SET record_json = EXCLUDED.record_json, updated_at = EXCLUDED.updated_at;
+SELECT record_json FROM "mgr_executor_profiles" AS "profile_row" WHERE (lower(name) = lower('DEMO'));
+SELECT record_json FROM "mgr_executor_profiles" AS "profile_row" ORDER BY lower(name);
+DELETE FROM "mgr_executor_profiles" AS "profile_row" WHERE (lower(name) = lower('demo'))

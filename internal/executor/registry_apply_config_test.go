@@ -21,7 +21,7 @@ import (
 func newConfigSideRegistry(t *testing.T, webEnabled bool, names ...string) (*Registry, string) {
 	t.Helper()
 
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := configAllowing(workspace, []string{selfExecutable(t)})
 	cfg.Executors.WebEnabled = webEnabled
 	for _, name := range names {

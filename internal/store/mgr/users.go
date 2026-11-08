@@ -24,38 +24,34 @@ func NewUserStore(h *Handle) core.UserStore {
 // 编译期钉住接口实现：core.UserStore 的方法集一旦改动，这里立刻报错。
 var _ core.UserStore = (*userStore)(nil)
 
-// List 按名字字典序返回全部账号（NOCASE 排序，大小写变体相邻）。
+// List 按名字字典序返回全部账号（lower(name) 排序：SQLite 上与 NOCASE 列同为
+// ASCII 折叠，大小写变体相邻；PG 上与 lower(name) 唯一索引同一口径）。
 func (s *userStore) List() ([]core.UserRecord, error) {
-	rows, err := s.h.SQL().Query(`SELECT name, password_bcrypt, role, created_at, updated_at
-FROM mgr_users ORDER BY name`)
-	if err != nil {
+	var rows []userRow
+	if err := s.h.NewSelect().Model(&rows).OrderExpr("lower(name)").Scan(bgCtx); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	out := make([]core.UserRecord, 0, 8)
-	for rows.Next() {
-		rec, scanErr := scanUser(rows)
-		if scanErr != nil {
-			return nil, scanErr
-		}
-		out = append(out, rec)
+	out := make([]core.UserRecord, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, userRecordOf(row))
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
-// Get 按名字查找（NOCASE 列，大小写不敏感命中）。
+// Get 按名字查找（lower(name) 命中，大小写不敏感）。
 func (s *userStore) Get(name string) (core.UserRecord, bool, error) {
-	row := s.h.SQL().QueryRow(`SELECT name, password_bcrypt, role, created_at, updated_at
-FROM mgr_users WHERE name = ?`, strings.TrimSpace(name))
-	rec, err := scanUser(row)
+	var row userRow
+	err := s.h.NewSelect().Model(&row).
+		Where("lower(name) = lower(?)", strings.TrimSpace(name)).
+		Scan(bgCtx)
 	if errors.Is(err, sql.ErrNoRows) {
 		return core.UserRecord{}, false, nil
 	}
 	if err != nil {
 		return core.UserRecord{}, false, err
 	}
-	return rec, true, nil
+	return userRecordOf(row), true, nil
 }
 
 // Save 新建或整体覆盖一个账号；已存在时保留其 CreatedAt（除非调用方显式带了值，
@@ -81,20 +77,26 @@ func (s *userStore) Save(record core.UserRecord) error {
 		}
 	}
 
-	_, err := s.h.SQL().Exec(`INSERT INTO mgr_users (name, password_bcrypt, role, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?)
-ON CONFLICT(name) DO UPDATE SET
-  password_bcrypt = excluded.password_bcrypt,
-  role            = excluded.role,
-  updated_at      = excluded.updated_at`,
-		record.Name, record.PasswordBcrypt, record.Role,
-		record.CreatedAt.Unix(), record.UpdatedAt.Unix())
+	_, err := s.h.NewInsert().Model(&userRow{
+		Name:           record.Name,
+		PasswordBcrypt: record.PasswordBcrypt,
+		Role:           record.Role,
+		CreatedAt:      record.CreatedAt.Unix(),
+		UpdatedAt:      record.UpdatedAt.Unix(),
+	}).
+		On(nameConflictClause(s.h.Dialect())).
+		Set("password_bcrypt = EXCLUDED.password_bcrypt").
+		Set("role = EXCLUDED.role").
+		Set("updated_at = EXCLUDED.updated_at").
+		Exec(bgCtx)
 	return err
 }
 
 // Delete 忽略大小写删除；不存在返回 core.ErrUserNotFound。
 func (s *userStore) Delete(name string) error {
-	res, err := s.h.SQL().Exec(`DELETE FROM mgr_users WHERE name = ?`, strings.TrimSpace(name))
+	res, err := s.h.NewDelete().Model((*userRow)(nil)).
+		Where("lower(name) = lower(?)", strings.TrimSpace(name)).
+		Exec(bgCtx)
 	if err != nil {
 		return err
 	}
@@ -110,24 +112,17 @@ func (s *userStore) Delete(name string) error {
 
 // Count 返回账号总数。
 func (s *userStore) Count() (int, error) {
-	var count int
-	err := s.h.SQL().QueryRow(`SELECT COUNT(*) FROM mgr_users`).Scan(&count)
-	return count, err
+	n, err := s.h.NewSelect().Model((*userRow)(nil)).Count(bgCtx)
+	return int(n), err
 }
 
-// scanUser 把一行读成 UserRecord。rowScanner 同时覆盖 *sql.Row 与 *sql.Rows。
-func scanUser(row rowScanner) (core.UserRecord, error) {
-	var rec core.UserRecord
-	var created, updated int64
-	if err := row.Scan(&rec.Name, &rec.PasswordBcrypt, &rec.Role, &created, &updated); err != nil {
-		return core.UserRecord{}, err
+// userRecordOf 把一行 bun 模型读成 UserRecord。时间戳一律 Unix 秒。
+func userRecordOf(row userRow) core.UserRecord {
+	return core.UserRecord{
+		Name:           row.Name,
+		PasswordBcrypt: row.PasswordBcrypt,
+		Role:           row.Role,
+		CreatedAt:      time.Unix(row.CreatedAt, 0),
+		UpdatedAt:      time.Unix(row.UpdatedAt, 0),
 	}
-	rec.CreatedAt = time.Unix(created, 0)
-	rec.UpdatedAt = time.Unix(updated, 0)
-	return rec, nil
-}
-
-// rowScanner 是 *sql.Row 与 *sql.Rows 的公共读面，与 observe 包同一手法。
-type rowScanner interface {
-	Scan(dest ...any) error
 }

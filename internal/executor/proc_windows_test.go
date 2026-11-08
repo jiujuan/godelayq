@@ -279,7 +279,7 @@ func TestKillTree_Windows_TaskkillMissing(t *testing.T) {
 	require.True(t, processAlive(grandchild), "前提：孙进程此刻还在跑")
 
 	logs := captureDefaultLogs(t, slog.LevelInfo)
-	missing := filepath.Join(t.TempDir(), "no-such-taskkill.exe")
+	missing := filepath.Join(tempWorkspace(t), "no-such-taskkill.exe")
 	withTaskkillPath(t, missing)
 
 	require.NoError(t, killTree(cmd, killGrace), "taskkill 缺失时应当降级返回成功，而不是把执行结论改掉")
@@ -324,7 +324,7 @@ func TestKillTree_Windows_TimeoutPath(t *testing.T) {
 // 做法是把 taskkillPath 换成一个"只会打印一行标记"的批处理：
 // 标记出现在日志里说明它确实被调用并产生了输出，同时产物里必须干净得像只有任务自己的输出。
 func TestTaskkillOutput_NotInArtifact(t *testing.T) {
-	fake := filepath.Join(t.TempDir(), "fake_taskkill.cmd")
+	fake := filepath.Join(tempWorkspace(t), "fake_taskkill.cmd")
 	require.NoError(t, os.WriteFile(fake,
 		[]byte("@echo off\r\necho TASKKILL_OUTPUT_MARKER\r\nexit /b 0\r\n"), 0o600))
 	withTaskkillPath(t, fake)

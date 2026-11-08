@@ -32,7 +32,7 @@ func newApplierFixture(t *testing.T, configNames ...string) *applierFixture {
 	t.Helper()
 
 	executable := selfExecutable(t)
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := configAllowing(workspace, []string{executable})
 	for _, name := range configNames {
 		cfg.Executors.Commands = append(cfg.Executors.Commands, namedScript(t, workspace, name))
@@ -41,7 +41,7 @@ func newApplierFixture(t *testing.T, configNames ...string) *applierFixture {
 	registry, err := NewRegistry(cfg, quietLogger())
 	require.NoError(t, err)
 
-	store, err := core.NewJSONFileExecutorProfileStore(filepath.Join(t.TempDir(), "exec-profiles.json"))
+	store, err := core.NewJSONFileExecutorProfileStore(filepath.Join(tempWorkspace(t), "exec-profiles.json"))
 	require.NoError(t, err)
 
 	syncer := newFakeRegistrar()
@@ -104,9 +104,9 @@ func (f *applierFixture) configWithCommands(t *testing.T, names ...string) core.
 }
 
 func TestApplier_NewApplierRequiresItsDeps(t *testing.T) {
-	store, err := core.NewJSONFileExecutorProfileStore(filepath.Join(t.TempDir(), "exec-profiles.json"))
+	store, err := core.NewJSONFileExecutorProfileStore(filepath.Join(tempWorkspace(t), "exec-profiles.json"))
 	require.NoError(t, err)
-	registry, err := NewRegistry(configWith(t.TempDir()), quietLogger())
+	registry, err := NewRegistry(configWith(tempWorkspace(t)), quietLogger())
 	require.NoError(t, err)
 	syncer := newFakeRegistrar()
 
@@ -257,7 +257,7 @@ func TestApplier_ValidateUsesTheRegistryConfig(t *testing.T) {
 	executable := selfExecutable(t)
 
 	// 宽松模式：越界路径也接受（D5 的口子）
-	outside := t.TempDir()
+	outside := tempWorkspace(t)
 	absScript := filepath.Join(outside, declareFile(t, outside, "x.mjs"))
 	profile, probe, err := fixture.applier.Validate(core.ExecutorCommand{
 		Name: "elsewhere", Kind: "script", Runtime: executable, Script: absScript,

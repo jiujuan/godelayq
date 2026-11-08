@@ -10,7 +10,7 @@ import (
 )
 
 func TestNewResult_FillsKindAndProfile(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	profile := profileFrom(t, configAllowing(workspace, []string{selfExecutable(t)},
 		namedScript(t, workspace, "nightly")), 0)
 

@@ -154,12 +154,12 @@ func TestRunner_IndexFailureDoesNotAffectResult(t *testing.T) {
 	// 这一条要看到索引写失败的那条 warn，而索引挂在产物存储上、日志走存储那份 logger，
 	// 所以这里自建一套"存储与执行器共用一个日志缓冲"的现场，不用 fixture 的静默存储。
 	var logs bytes.Buffer
-	cfg := configWith(t.TempDir(), shellCommand(t, "echo hello"))
+	cfg := configWith(tempWorkspace(t), shellCommand(t, "echo hello"))
 	normalized := cfg.Normalized()
 	profiles := mustLoad(t, normalized)
 	require.Len(t, profiles, 1)
 
-	root := filepath.Join(t.TempDir(), "exec")
+	root := filepath.Join(tempWorkspace(t), "exec")
 	store, err := NewArtifactStore(ArtifactOptions{Dir: root, MaxBytes: core.DefaultExecMaxOutputBytes},
 		bufferLogger(&logs))
 	require.NoError(t, err)
@@ -210,7 +210,7 @@ func TestHTTPRunner_RecordsIndex(t *testing.T) {
 }
 
 func TestPurgeExpired_DeletesIndexRowsAfterDirectory(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "exec")
+	root := filepath.Join(tempWorkspace(t), "exec")
 	now := time.Now()
 	store := newStoreWithClock(t, root, time.Hour, func() time.Time { return now })
 	index := &fakeIndex{root: root}
@@ -232,7 +232,7 @@ func TestPurgeExpired_DeletesIndexRowsAfterDirectory(t *testing.T) {
 // TestPurgeExpired_KeepsRowsWhenRemovalFails 守的是"先删目录、再删行"的反面：
 // 目录没删掉时行必须留着。挡得住删除的平台才测得到这条，挡不住时如实跳过。
 func TestPurgeExpired_KeepsRowsWhenRemovalFails(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "exec")
+	root := filepath.Join(tempWorkspace(t), "exec")
 	now := time.Now()
 	store := newStoreWithClock(t, root, time.Hour, func() time.Time { return now })
 	index := &fakeIndex{root: root}
@@ -251,7 +251,7 @@ func TestPurgeExpired_KeepsRowsWhenRemovalFails(t *testing.T) {
 }
 
 func TestPurgeOrphans_DeletesIndexRows(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "exec")
+	root := filepath.Join(tempWorkspace(t), "exec")
 	store := newStoreWithClock(t, root, 0, time.Now)
 	index := &fakeIndex{root: root}
 	store.SetIndex(index)
@@ -271,7 +271,7 @@ func TestPurgeOrphans_DeletesIndexRows(t *testing.T) {
 }
 
 func TestPurge_IndexDeleteFailureOnlyLogs(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "exec")
+	root := filepath.Join(tempWorkspace(t), "exec")
 	var logs bytes.Buffer
 	store, err := NewArtifactStore(ArtifactOptions{Dir: root, MaxBytes: core.DefaultExecMaxOutputBytes},
 		bufferLogger(&logs))
@@ -321,7 +321,7 @@ func TestIndexAccessors_NilStoreIsSafe(t *testing.T) {
 }
 
 func TestStart_ReconcilesIndexAfterPurges(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "exec")
+	root := filepath.Join(tempWorkspace(t), "exec")
 	var logs bytes.Buffer
 	store, err := NewArtifactStore(ArtifactOptions{Dir: root, MaxBytes: core.DefaultExecMaxOutputBytes},
 		bufferLogger(&logs))
@@ -350,7 +350,7 @@ func TestStart_ReconcilesIndexAfterPurges(t *testing.T) {
 }
 
 func TestStart_ReconcileFailureOnlyLogs(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "exec")
+	root := filepath.Join(tempWorkspace(t), "exec")
 	var logs bytes.Buffer
 	store, err := NewArtifactStore(ArtifactOptions{Dir: root, MaxBytes: core.DefaultExecMaxOutputBytes},
 		bufferLogger(&logs))
@@ -369,7 +369,7 @@ func TestStart_ReconcileFailureOnlyLogs(t *testing.T) {
 // TestStart_WithoutReconcilerIsFine 覆盖只实现必需方法的那类索引：
 // 对账是可选能力，实现没有它时启动扫描照常跑完，也不报错。
 func TestStart_WithoutReconcilerIsFine(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "exec")
+	root := filepath.Join(tempWorkspace(t), "exec")
 	var logs bytes.Buffer
 	store, err := NewArtifactStore(ArtifactOptions{Dir: root, MaxBytes: core.DefaultExecMaxOutputBytes},
 		bufferLogger(&logs))
@@ -432,19 +432,23 @@ func (r *raceIndex) Exists(string, int) (bool, error) { return false, nil }
 // 这里要的是两件事——-race 干净，以及"先删目录、再删行"在并发下依然成立
 // （每次 DeleteByJob 回看目录都必须已经没了）。
 func TestConcurrent_ExecuteWhilePurging(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "exec")
+	root := filepath.Join(tempWorkspace(t), "exec")
 	store := newStoreWithClock(t, root, time.Millisecond, time.Now)
 	index := &raceIndex{root: root}
 	store.SetIndex(index)
 
-	cfg := configWith(t.TempDir(), shellCommand(t, "echo hello"))
+	cfg := configWith(tempWorkspace(t), shellCommand(t, "echo hello"))
 	normalized := cfg.Normalized()
 	profiles := mustLoad(t, normalized)
 	require.Len(t, profiles, 1)
 	runner := NewRunner(profiles[0], store, normalized.Executors, quietLogger())
 
-	// 先放一个已经过期的目录，保证清理侧第一轮就有东西可删
-	createArtifactDir(t, store, "job-victim", 1)
+	// 先放一个已经过期的目录，保证清理侧第一轮就有东西可删。
+	// TTL 只有 1ms：刚建出来的目录要等 1ms 墙钟才真过期——CI 快机器上
+	// 30 轮清理能在同一毫秒内跑完，"已过期"不能赌机器速度，直接拨表。
+	victim := createArtifactDir(t, store, "job-victim", 1)
+	stale := time.Now().Add(-time.Hour)
+	require.NoError(t, os.Chtimes(victim, stale, stale))
 
 	var wg sync.WaitGroup
 	wg.Add(2)

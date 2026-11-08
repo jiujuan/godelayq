@@ -9,21 +9,60 @@ import (
 	"time"
 
 	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/jiujuan/godelayq/internal/store/pgtest"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-// openStore 建一个落在临时目录的任务库，测试结束自动关闭。
-func openStore(t *testing.T, opts ...func(*core.StoreSQLiteConfig)) *Store {
+// storeOpener 为一次测试开一个任务库并登记关闭。opts 钩子可调配置节与留痕参数；
+// 断言函数一律通过它拿 Store，不直接 Open——同一批断言才能在 SQLite 与
+// PostgreSQL（B06 挂载）两个后端上复用。
+type storeOpener func(t *testing.T, opts ...storeOpt) *Store
+
+// storeOpt 调整一次打开的配置节或留痕参数。
+type storeOpt func(cfg *core.StoreSQLiteConfig, historyLimit *int, historyTTL *time.Duration)
+
+// withHistory 覆盖留痕参数（口径与 Open 的 historyLimit/historyTTL 相同）。
+func withHistory(limit int, ttl time.Duration) storeOpt {
+	return func(_ *core.StoreSQLiteConfig, limitDst *int, ttlDst *time.Duration) {
+		*limitDst, *ttlDst = limit, ttl
+	}
+}
+
+// openSQLiteStore 建一个落在临时目录的 SQLite 任务库，测试结束自动关闭。
+func openSQLiteStore(t *testing.T, opts ...storeOpt) *Store {
 	t.Helper()
 	cfg := core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}
+	limit, ttl := 0, time.Duration(0)
 	for _, opt := range opts {
-		opt(&cfg)
+		opt(&cfg, &limit, &ttl)
 	}
-	s, err := Open(cfg, 0, 0, nil)
+	s, err := Open(cfg, limit, ttl, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 	return s
+}
+
+// openPostgresStore 在一次性 PG 测试库里开一个任务库，测试结束自动关闭与拆库。
+// 配置节走 dialect: postgres + dsn：与真实部署切方言时的取值形态一致。
+func openPostgresStore(t *testing.T, opts ...storeOpt) *Store {
+	t.Helper()
+	cfg := core.StoreSQLiteConfig{Dialect: "postgres", DSN: pgtest.Database(t, "jobs")}
+	limit, ttl := 0, time.Duration(0)
+	for _, opt := range opts {
+		opt(&cfg, &limit, &ttl)
+	}
+	s, err := Open(cfg, limit, ttl, nil)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = s.Close() })
+	return s
+}
+
+// runWithStoreBackends 把同一批断言跑在每个可用后端上。
+// SQLite 恒跑；PostgreSQL 后端经 GODELAYQ_TEST_PG_DSN 挂载（未配置时干净跳过）。
+func runWithStoreBackends(t *testing.T, run func(t *testing.T, open storeOpener)) {
+	t.Run("sqlite", func(t *testing.T) { run(t, openSQLiteStore) })
+	t.Run("postgres", func(t *testing.T) { run(t, openPostgresStore) })
 }
 
 func snapshot(id string, status core.JobStatus, updatedAt time.Time) core.JobSnapshot {
@@ -47,7 +86,11 @@ func ids(snapshots []core.JobSnapshot) []string {
 }
 
 func TestStoreRoundTrip(t *testing.T) {
-	s := openStore(t)
+	runWithStoreBackends(t, testStoreRoundTrip)
+}
+
+func testStoreRoundTrip(t *testing.T, open storeOpener) {
+	s := open(t)
 	now := time.Now()
 
 	// Save 入口：Job → 快照
@@ -80,9 +123,11 @@ func TestStoreRoundTrip(t *testing.T) {
 }
 
 func TestStoreFlushIsNoOpAndCloseIdempotent(t *testing.T) {
-	cfg := core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}
-	s, err := Open(cfg, 0, 0, nil)
-	require.NoError(t, err)
+	runWithStoreBackends(t, testStoreFlushIsNoOpAndCloseIdempotent)
+}
+
+func testStoreFlushIsNoOpAndCloseIdempotent(t *testing.T, open storeOpener) {
+	s := open(t)
 
 	require.NoError(t, s.Flush()) // 直写下恒为 no-op，任何时刻调用都安全
 	require.NoError(t, s.Close())
@@ -90,20 +135,21 @@ func TestStoreFlushIsNoOpAndCloseIdempotent(t *testing.T) {
 	require.NoError(t, s.Flush()) // 关闭后同样无害
 
 	// 关闭后再读是错误（连接已断），但绝不能 panic
-	_, err = s.LoadAll()
+	_, err := s.LoadAll()
 	assert.Error(t, err)
 }
 
 func TestStoreHistoryRetention(t *testing.T) {
+	runWithStoreBackends(t, testStoreHistoryRetention)
+}
+
+func testStoreHistoryRetention(t *testing.T, open storeOpener) {
 	now := time.Now()
 	old := now.Add(-2 * time.Hour)
 	recent := now.Add(-time.Minute)
 
 	t.Run("条数上限保留最新", func(t *testing.T) {
-		cfg := core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}
-		s, err := Open(cfg, 2, 0, nil)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = s.Close() })
+		s := open(t, withHistory(2, 0))
 
 		require.NoError(t, s.Update(snapshot("t1", core.StatusSuccess, old)))
 		require.NoError(t, s.Update(snapshot("t2", core.StatusSuccess, recent)))
@@ -117,10 +163,7 @@ func TestStoreHistoryRetention(t *testing.T) {
 	})
 
 	t.Run("TTL 淘汰过期终态", func(t *testing.T) {
-		cfg := core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}
-		s, err := Open(cfg, 0, time.Hour, nil)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = s.Close() })
+		s := open(t, withHistory(0, time.Hour))
 
 		require.NoError(t, s.Update(snapshot("t1", core.StatusFailed, old)))     // 超时
 		require.NoError(t, s.Update(snapshot("t2", core.StatusCancelled, now))) // 未超时
@@ -132,10 +175,7 @@ func TestStoreHistoryRetention(t *testing.T) {
 	})
 
 	t.Run("负数不留痕", func(t *testing.T) {
-		cfg := core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}
-		s, err := Open(cfg, -1, 0, nil)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = s.Close() })
+		s := open(t, withHistory(-1, 0))
 
 		require.NoError(t, s.Update(snapshot("t1", core.StatusSuccess, now)))
 		require.NoError(t, s.Update(snapshot("p1", core.StatusPending, now)))
@@ -145,10 +185,7 @@ func TestStoreHistoryRetention(t *testing.T) {
 	})
 
 	t.Run("运行期调整生效", func(t *testing.T) {
-		cfg := core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}
-		s, err := Open(cfg, 100, 0, nil)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = s.Close() })
+		s := open(t, withHistory(100, 0))
 
 		require.NoError(t, s.Update(snapshot("t1", core.StatusSuccess, now)))
 		s.SetHistoryRetention(-1, 0) // 下一笔终态写入起不留痕（写入即删除）
@@ -163,6 +200,10 @@ func TestStoreHistoryRetention(t *testing.T) {
 }
 
 func TestImportOnce(t *testing.T) {
+	runWithStoreBackends(t, testImportOnce)
+}
+
+func testImportOnce(t *testing.T, open storeOpener) {
 	newSource := func(t *testing.T, jobs map[string]core.JobSnapshot) string {
 		t.Helper()
 		path := filepath.Join(t.TempDir(), "jobs.json")
@@ -177,10 +218,7 @@ func TestImportOnce(t *testing.T) {
 	}
 
 	t.Run("空库加有文件则导入并打标", func(t *testing.T) {
-		cfg := core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}
-		s, err := Open(cfg, 0, 0, nil)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = s.Close() })
+		s := open(t)
 
 		now := time.Now()
 		source := newSource(t, map[string]core.JobSnapshot{
@@ -199,10 +237,7 @@ func TestImportOnce(t *testing.T) {
 	})
 
 	t.Run("已打标后不再导入", func(t *testing.T) {
-		cfg := core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}
-		s, err := Open(cfg, 0, 0, nil)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = s.Close() })
+		s := open(t)
 
 		source := newSource(t, map[string]core.JobSnapshot{"j1": snapshot("j1", core.StatusPending, time.Now())})
 		require.NoError(t, ImportOnce(s.h, source))
@@ -216,10 +251,7 @@ func TestImportOnce(t *testing.T) {
 	})
 
 	t.Run("库非空不导入但补标记", func(t *testing.T) {
-		cfg := core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}
-		s, err := Open(cfg, 0, 0, nil)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = s.Close() })
+		s := open(t)
 
 		require.NoError(t, s.Update(snapshot("j1", core.StatusPending, time.Now())))
 		source := newSource(t, map[string]core.JobSnapshot{"jX": snapshot("jX", core.StatusPending, time.Now())})
@@ -231,10 +263,7 @@ func TestImportOnce(t *testing.T) {
 	})
 
 	t.Run("无来源文件打空标", func(t *testing.T) {
-		cfg := core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}
-		s, err := Open(cfg, 0, 0, nil)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = s.Close() })
+		s := open(t)
 
 		require.NoError(t, ImportOnce(s.h, filepath.Join(t.TempDir(), "absent.json")))
 		imported, err := alreadyImported(s.h)
@@ -247,6 +276,10 @@ func TestImportOnce(t *testing.T) {
 // 留痕语义只有 core.TrimTerminal 一份，这里防的是"语义共享之外"的漂移：
 // 触发时机、可见范围、删除的完整性。
 func TestParityWithJSONStore(t *testing.T) {
+	runWithStoreBackends(t, testParityWithJSONStore)
+}
+
+func testParityWithJSONStore(t *testing.T, open storeOpener) {
 	now := time.Now()
 	sequence := []core.JobSnapshot{
 		snapshot("a", core.StatusSuccess, now.Add(-3*time.Hour)),
@@ -262,7 +295,7 @@ func TestParityWithJSONStore(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = jsonStore.Close() })
 
-	jobsStore := openStore(t, func(cfg *core.StoreSQLiteConfig) {})
+	jobsStore := open(t)
 	// openStore 用默认留痕（1000），这里重设成与 JSON 侧相同
 	jobsStore.SetHistoryRetention(2, 0)
 

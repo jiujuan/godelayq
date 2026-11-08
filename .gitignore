@@ -11,3 +11,6 @@ data/*.sqlite-shm
 
 # 前端构建产物:vite outDir 直落这里,由 internal/web embed 进单二进制
 internal/web/dist/
+
+# ZCode 会话本地目录（plans 等），不入库
+.zcode/

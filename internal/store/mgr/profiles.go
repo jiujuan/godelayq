@@ -26,40 +26,39 @@ func NewExecutorProfileStore(h *Handle) core.ExecutorProfileStore {
 // 编译期钉住接口实现。
 var _ core.ExecutorProfileStore = (*profileStore)(nil)
 
-// List 按档位名字典序返回全部记录。排序在 SQL 里用 NOCASE 列，
+// List 按档位名字典序返回全部记录。排序用 lower(name)（与 users/groups 同一口径），
 // 记录自身的 Name 字段保留用户书写的大小写（与 JSON 存储同一读法）。
 func (s *profileStore) List() ([]core.ExecutorProfileRecord, error) {
-	rows, err := s.h.SQL().Query(`SELECT record_json FROM mgr_executor_profiles
-ORDER BY name`)
-	if err != nil {
+	var raws []string
+	if err := s.h.NewSelect().Model((*profileRow)(nil)).
+		ColumnExpr("record_json").
+		OrderExpr("lower(name)").
+		Scan(bgCtx, &raws); err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	out := make([]core.ExecutorProfileRecord, 0, 8)
-	for rows.Next() {
-		var raw string
-		if err := rows.Scan(&raw); err != nil {
-			return nil, err
-		}
+	out := make([]core.ExecutorProfileRecord, 0, len(raws))
+	for _, raw := range raws {
 		var record core.ExecutorProfileRecord
 		if err := json.Unmarshal([]byte(raw), &record); err != nil {
 			return nil, err
 		}
 		out = append(out, record)
 	}
-	return out, rows.Err()
+	return out, nil
 }
 
 // Get 忽略大小写查找一条档位。
 func (s *profileStore) Get(name string) (core.ExecutorProfileRecord, bool, error) {
-	row := s.h.SQL().QueryRow(`SELECT record_json FROM mgr_executor_profiles
-WHERE name = ?`, strings.TrimSpace(name))
 	var raw string
-	if err := row.Scan(&raw); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return core.ExecutorProfileRecord{}, false, nil
-		}
+	err := s.h.NewSelect().Model((*profileRow)(nil)).
+		ColumnExpr("record_json").
+		Where("lower(name) = lower(?)", strings.TrimSpace(name)).
+		Scan(bgCtx, &raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return core.ExecutorProfileRecord{}, false, nil
+	}
+	if err != nil {
 		return core.ExecutorProfileRecord{}, false, err
 	}
 	var record core.ExecutorProfileRecord
@@ -96,18 +95,23 @@ func (s *profileStore) Save(record core.ExecutorProfileRecord) error {
 		return err
 	}
 
-	_, err = s.h.SQL().Exec(`INSERT INTO mgr_executor_profiles (name, record_json, updated_at)
-VALUES (?, ?, ?)
-ON CONFLICT(name) DO UPDATE SET
-  record_json = excluded.record_json,
-  updated_at  = excluded.updated_at`,
-		record.Name, string(payload), record.UpdatedAt.Unix())
+	_, err = s.h.NewInsert().Model(&profileRow{
+		Name:       record.Name,
+		RecordJSON: string(payload),
+		UpdatedAt:  record.UpdatedAt.Unix(),
+	}).
+		On(nameConflictClause(s.h.Dialect())).
+		Set("record_json = EXCLUDED.record_json").
+		Set("updated_at = EXCLUDED.updated_at").
+		Exec(bgCtx)
 	return err
 }
 
 // Delete 忽略大小写删除；不存在返回 core.ErrProfileNotFound。
 func (s *profileStore) Delete(name string) error {
-	res, err := s.h.SQL().Exec(`DELETE FROM mgr_executor_profiles WHERE name = ?`, strings.TrimSpace(name))
+	res, err := s.h.NewDelete().Model((*profileRow)(nil)).
+		Where("lower(name) = lower(?)", strings.TrimSpace(name)).
+		Exec(bgCtx)
 	if err != nil {
 		return err
 	}

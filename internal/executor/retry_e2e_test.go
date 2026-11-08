@@ -30,7 +30,7 @@ type schedulerRun struct {
 func startSchedulerWithRunner(t *testing.T, fixture *runnerFixture, job *core.Job) *schedulerRun {
 	t.Helper()
 
-	store, err := core.NewJSONFileStore(filepath.Join(t.TempDir(), "jobs.json"))
+	store, err := core.NewJSONFileStore(filepath.Join(tempWorkspace(t), "jobs.json"))
 	require.NoError(t, err)
 
 	eventBus := core.NewEventBus(64)

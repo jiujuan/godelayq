@@ -41,7 +41,7 @@ func TestAdhocProfiles_DisabledByDefault(t *testing.T) {
 }
 
 func TestAdhocProfiles_BuildsFourInFixedOrder(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := adhocEnabled(configWith(workspace))
 
 	profiles, skipped, err := AdhocProfiles(cfg)
@@ -97,7 +97,7 @@ func assertPositiveDuration(t *testing.T, value time.Duration, profileName strin
 func TestAdhocProfiles_FiltersRuntimesOutsideAllowList(t *testing.T) {
 	// 把白名单收成只有 bash：php 与 python 两条构造不出来，但这不是错误
 	// ——一份只用 shell 与 HTTP 的部署是合法配置。
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := adhocEnabled(configWith(workspace))
 	cfg.Executors.RuntimeAllow = []string{"bash"}
 
@@ -115,7 +115,7 @@ func TestAdhocProfiles_FiltersRuntimesOutsideAllowList(t *testing.T) {
 }
 
 func TestAdhocProfiles_ShellRuntimeComesFromConfig(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := adhocEnabled(configWith(workspace))
 	cfg.Executors.Adhoc.ShellRuntime = "sh"
 
@@ -125,7 +125,7 @@ func TestAdhocProfiles_ShellRuntimeComesFromConfig(t *testing.T) {
 }
 
 func TestAdhocProfiles_EmptyHostsAreAllowedForBuiltinOnly(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	// 内置那条：url_hosts 留空（= 不限主机）是合法取值。
 	profiles, _, err := AdhocProfiles(adhocEnabled(configWith(workspace)))
@@ -142,7 +142,7 @@ func TestAdhocProfiles_EmptyHostsAreAllowedForBuiltinOnly(t *testing.T) {
 
 func TestAdhocProfiles_BuiltinHostsEntriesStillChecked(t *testing.T) {
 	// 空列表放过，但写了的每一项仍按同一份主机判据走：内置档位不该比用户档位更宽松。
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := adhocEnabled(configWith(workspace))
 	cfg.Executors.Adhoc.URLHosts = []string{"https://api.example.com"}
 
@@ -152,7 +152,7 @@ func TestAdhocProfiles_BuiltinHostsEntriesStillChecked(t *testing.T) {
 }
 
 func TestAdhocProfiles_ExtensionRequirementCanBeTurnedOff(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := adhocEnabled(configWith(workspace))
 	off := false
 	cfg.Executors.Adhoc.RequireExtension = &off
@@ -168,7 +168,7 @@ func TestAdhocProfiles_ExtensionRequirementCanBeTurnedOff(t *testing.T) {
 }
 
 func TestAdhocProfiles_PrivateRangeSwitchReachesProfile(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := adhocEnabled(configWith(workspace))
 	cfg.Executors.Adhoc.URLAllowPrivate = true
 
@@ -182,7 +182,7 @@ func TestAdhocProfiles_PrivateRangeSwitchReachesProfile(t *testing.T) {
 // TestProbe_AdhocScriptOnlyChecksRuntime 落实 §3.2 与 §10 风险 5：
 // 内置档位没有文件可探，探测结论只能关于解释器。
 func TestProbe_AdhocScriptOnlyChecksRuntime(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	self := selfExecutable(t)
 
 	cfg := adhocEnabled(configWith(workspace))
@@ -240,7 +240,7 @@ func listedProfile(t *testing.T, items []ListedProfile, key string) ListedProfil
 
 func TestNewRegistry_RegistersAdhocAndYieldsOnClash(t *testing.T) {
 	t.Run("打开后四条进登记表", func(t *testing.T) {
-		registry, err := NewRegistry(adhocEnabled(configWith(t.TempDir())), nil)
+		registry, err := NewRegistry(adhocEnabled(configWith(tempWorkspace(t))), nil)
 		require.NoError(t, err)
 
 		keys := registry.Keys()
@@ -259,7 +259,7 @@ func TestNewRegistry_RegistersAdhocAndYieldsOnClash(t *testing.T) {
 	})
 
 	t.Run("与配置侧档位撞名时内置让位", func(t *testing.T) {
-		workspace := t.TempDir()
+		workspace := tempWorkspace(t)
 		script := declareFile(t, workspace, "scripts/deploy.sh")
 
 		cfg := adhocEnabled(configWith(workspace, scriptUsingRuntime("bash", script)))
@@ -281,7 +281,7 @@ func TestNewRegistry_RegistersAdhocAndYieldsOnClash(t *testing.T) {
 }
 
 func TestApplyStore_KeepsAdhocAndLetsItYield(t *testing.T) {
-	registry, err := NewRegistry(adhocEnabled(configWith(t.TempDir())), nil)
+	registry, err := NewRegistry(adhocEnabled(configWith(tempWorkspace(t))), nil)
 	require.NoError(t, err)
 	require.Len(t, registry.Keys(), 4)
 
@@ -311,7 +311,7 @@ func TestApplyStore_KeepsAdhocAndLetsItYield(t *testing.T) {
 }
 
 func TestRegister_BuiltInProfilesUseExecPoolAndCountSkips(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	script := declareFile(t, workspace, "scripts/deploy.sh")
 
 	cfg := adhocEnabled(configWith(workspace, scriptUsingRuntime("bash", script)))

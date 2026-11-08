@@ -1,4 +1,4 @@
-package sqlite
+package engine
 
 import (
 	"go/parser"
@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-// 本测试钉死 store/sqlite 作为公共底座的一条红线（doc.go）：本包对仓内业务包
+// 本测试钉死 store/engine 作为公共底座的一条红线（doc.go）：本包对仓内业务包
 // （godelayq/core、godelayq/api、godelayq/executor…）零依赖。机制包一旦反过来
 // 依赖某个业务域，其它域再想复用就得连着业务一起拖进来，"公共"二字随即失效。
 //
@@ -17,7 +17,7 @@ import (
 // 用例必须能在那个时点就把问题指出来，而不是让编译器给一条不带解释的报错。
 // 与 config_reload_test.go 的 TestEveryLeafKeyIsClassed 同一取向：清单靠不住时，
 // 守卫替人记住。
-func TestSQLitePackageImportsNothingInRepo(t *testing.T) {
+func TestEnginePackageImportsNothingInRepo(t *testing.T) {
 	dir, err := filepath.Abs(".")
 	if err != nil {
 		t.Fatalf("resolve package dir: %v", err)
@@ -42,7 +42,7 @@ func TestSQLitePackageImportsNothingInRepo(t *testing.T) {
 		for _, imp := range f.Imports {
 			path := strings.Trim(imp.Path.Value, `"`)
 			if strings.HasPrefix(path, "github.com/jiujuan/godelayq/internal/") {
-				t.Errorf("%s imports %q: the common sqlite base must not depend on any in-repo package (see doc.go)", name, path)
+				t.Errorf("%s imports %q: the common engine base must not depend on any in-repo package (see doc.go)", name, path)
 			}
 		}
 	}

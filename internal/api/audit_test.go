@@ -21,7 +21,7 @@ import (
 )
 
 // auditCapture 是台账读写两面的替身：中间件用例只看自己被怎么调用，
-// 真库的写入与查询在 store/sqlite 有用例。
+// 真库的写入与查询在 store/engine 有用例。
 type auditCapture struct {
 	entries []core.AuditEntry
 	err     error

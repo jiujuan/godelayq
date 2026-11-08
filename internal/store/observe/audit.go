@@ -1,24 +1,18 @@
 package observe
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/uptrace/bun"
 )
-
-// insertAudit 是一行 write_audit 的写入语句。seq 由 AUTOINCREMENT 给出：
-// 台账的顺序就是发生顺序，而同一毫秒内的两次提交只有 seq 分得出先后。
-const insertAudit = `INSERT INTO write_audit
-	(ts_us, actor, actor_kind, role, action, method, route, status, latency_us, verdict,
-	 exec_verdict, exec_reason_code, handler_key, profile, job_id, remote_ip, user_agent)
-	VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 // AuditLogOptions 是台账写入器的参数。零值一律回到 core 的观测层默认，
 // 只有 RetentionAge 的 0 例外——它是"不按时间淘汰"的有意取值（S01 的口径）。
@@ -34,30 +28,6 @@ type AuditLogOptions struct {
 	// Now 是时间源，nil 时用 time.Now。台账行自带时间（请求到达的那一刻），
 	// 注入的 Now 只用在按时间淘汰的截止点上。
 	Now func() time.Time
-}
-
-// auditRecord 是 write_audit 的一行。可空列用 sql.NullString：
-// "没有执行器结论"与"执行器结论是空串"在库里必须是两回事，
-// 否则普通任务提交看起来像一次被拒的执行器提交。
-type auditRecord struct {
-	timestampUS int64
-	actor       string
-	actorKind   string
-	role        string
-	action      string
-	method      string
-	route       string
-	status      int
-	latencyUS   int64
-	verdict     string
-
-	execVerdict sql.NullString
-	execReason  sql.NullString
-	handlerKey  sql.NullString
-	profile     sql.NullString
-	jobID       sql.NullString
-	remoteIP    sql.NullString
-	userAgent   sql.NullString
 }
 
 // AuditLog 把每个写操作登记成一行台账，并回答 /admin/audit 的查询。
@@ -157,7 +127,8 @@ func (a *AuditLog) SetRetention(count int, age time.Duration) {
 }
 
 // mapEntry 把 api 侧的行折成库里的一行。空字符串的可空列写成 NULL，
-// 读回来时也是空字符串，往返不丢信息。
+// 读回来时也是空字符串，往返不丢信息。role 列不参与这个映射：它写原样
+// 字符串（未认证记空串），与迁移前同一写法。
 func (a *AuditLog) mapEntry(entry core.AuditEntry) auditRecord {
 	timestamp := entry.Time
 	if timestamp.IsZero() {
@@ -165,23 +136,23 @@ func (a *AuditLog) mapEntry(entry core.AuditEntry) auditRecord {
 	}
 
 	record := auditRecord{
-		timestampUS: timestamp.UnixMicro(),
-		actor:       entry.Actor,
-		actorKind:   entry.ActorKind,
-		role:        entry.Role,
-		action:      entry.Action,
-		method:      entry.Method,
-		route:       entry.Route,
-		status:      entry.Status,
-		latencyUS:   entry.Latency.Microseconds(),
-		verdict:     entry.Verdict,
-		execVerdict: optionalText(entry.ExecVerdict),
-		execReason:  optionalText(entry.ExecReasonCode),
-		handlerKey:  optionalText(entry.HandlerKey),
-		profile:     optionalText(entry.Profile),
-		jobID:       optionalText(entry.JobID),
-		remoteIP:    optionalText(entry.RemoteIP),
-		userAgent:   optionalText(entry.UserAgent),
+		TimestampUS: timestamp.UnixMicro(),
+		Actor:       entry.Actor,
+		ActorKind:   entry.ActorKind,
+		Role:        entry.Role,
+		Action:      entry.Action,
+		Method:      entry.Method,
+		Route:       entry.Route,
+		Status:      entry.Status,
+		LatencyUS:   entry.Latency.Microseconds(),
+		Verdict:     entry.Verdict,
+		ExecVerdict: optionalText(entry.ExecVerdict),
+		ExecReason:  optionalText(entry.ExecReasonCode),
+		HandlerKey:  optionalText(entry.HandlerKey),
+		Profile:     optionalText(entry.Profile),
+		JobID:       optionalText(entry.JobID),
+		RemoteIP:    optionalText(entry.RemoteIP),
+		UserAgent:   optionalText(entry.UserAgent),
 	}
 	return record
 }
@@ -196,37 +167,17 @@ func optionalText(value string) sql.NullString {
 
 // writeBatch 在一个事务里写完这批台账，并按保留策略淘汰旧行。
 func (a *AuditLog) writeBatch(rows []auditRecord) error {
-	tx, err := a.db.SQL().Begin()
-	if err != nil {
-		return fmt.Errorf("sqlite: begin audit batch: %w", err)
-	}
-	stmt, err := tx.Prepare(insertAudit)
-	if err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("sqlite: prepare audit insert: %w", err)
-	}
-	for _, row := range rows {
-		if _, err := stmt.Exec(row.timestampUS, row.actor, row.actorKind, row.role, row.action,
-			row.method, row.route, row.status, row.latencyUS, row.verdict,
-			row.execVerdict, row.execReason, row.handlerKey, row.profile, row.jobID,
-			row.remoteIP, row.userAgent); err != nil {
-			_ = stmt.Close()
-			_ = tx.Rollback()
-			return fmt.Errorf("sqlite: insert audit row %s %s: %w", row.method, row.action, err)
+	return a.db.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
+		// 一次多值插入替代 Prepare+逐行 Exec：同一事务、同一批数据，往返降到 1 次。
+		// rows 恒非空（batcher 不调空批回调）。
+		if _, err := tx.NewInsert().Model(&rows).Exec(ctx); err != nil {
+			return fmt.Errorf("sqlite: insert audit batch: %w", err)
 		}
-	}
-	if err := stmt.Close(); err != nil {
-		_ = tx.Rollback()
-		return fmt.Errorf("sqlite: close audit statement: %w", err)
-	}
-	if err := a.prune(tx); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("sqlite: commit audit batch: %w", err)
-	}
-	return nil
+		if err := a.prune(ctx, tx); err != nil {
+			return err
+		}
+		return nil
+	})
 }
 
 // prune 按保留条数与保留时长淘汰旧行，与插入同一个事务。形状与事件表那条相同（S03）：
@@ -234,27 +185,25 @@ func (a *AuditLog) writeBatch(rows []auditRecord) error {
 //
 // 两个原子值在开头各读一次：一次淘汰里"跳过时间淘汰"的判断与算截止点必须用同一个时长，
 // 中间插进一次 SetRetention 就会让两条判断对上两套值。
-func (a *AuditLog) prune(tx *sql.Tx) error {
+func (a *AuditLog) prune(ctx context.Context, tx bun.Tx) error {
 	retentionCount := a.retentionCount.Load()
 	retentionAge := time.Duration(a.retentionAge.Load())
-	if _, err := tx.Exec(`DELETE FROM write_audit WHERE seq <= (SELECT COALESCE(MAX(seq)-?, 0) FROM write_audit)`,
-		retentionCount); err != nil {
+	if _, err := tx.NewDelete().Model((*auditRecord)(nil)).
+		Where("seq <= (SELECT COALESCE(MAX(seq)-?, 0) FROM write_audit)", retentionCount).
+		Exec(ctx); err != nil {
 		return fmt.Errorf("sqlite: prune audit by count: %w", err)
 	}
 	if retentionAge <= 0 {
 		return nil
 	}
 	cutoff := a.now().Add(-retentionAge).UnixMicro()
-	if _, err := tx.Exec(`DELETE FROM write_audit WHERE ts_us < ?`, cutoff); err != nil {
+	if _, err := tx.NewDelete().Model((*auditRecord)(nil)).
+		Where("ts_us < ?", cutoff).
+		Exec(ctx); err != nil {
 		return fmt.Errorf("sqlite: prune audit by age: %w", err)
 	}
 	return nil
 }
-
-// auditColumns 是读取路径的列序，与 scanAudit 一一对应。
-const auditColumns = `ts_us, actor, actor_kind, role, action, method, route, status,
-	latency_us, verdict, exec_verdict, exec_reason_code, handler_key, profile, job_id,
-	remote_ip, user_agent`
 
 // auditReadLimitFallback 是 filter 没带 limit 时使用的行数上界。
 // 端点那一侧有一个同值上限（api/handlers_admin.go 的 auditMaxLimit）：两处都要改，
@@ -263,18 +212,18 @@ const auditReadLimitFallback = 500
 
 // Query 按过滤条件读台账，顺序是 seq 降序（最新在前），并返回不带 limit/offset 的匹配总数。
 //
-// 总数用第二条 COUNT 查询而不是窗口函数：SQLite 的 `COUNT(*) OVER ()` 要 3.25 以上，
-// 而这里每条返回都带一份相同的数，窗口函数省下的是一次往返、多付的是每行一个重复值。
-// 台账的读频率是"运维查一次"，两条语句的形态更好读，也更不容易在改分页时被改错。
+// 总数用第二条 COUNT 查询而不是窗口函数：窗口函数省下的是一次往返、多付的是每行一个
+// 重复值。台账的读频率是"运维查一次"，两条语句的形态更好读，也更不容易在改分页时被改错。
 //
 // Since/Until 都是闭区间（>= 与 <=），两端都含：运维圈一天的范围时不该纠结边界那条算不算。
 func (a *AuditLog) Query(f core.AuditFilter) ([]core.AuditEntry, int, error) {
-	where, args := auditWhere(f)
-
-	var total int
-	if err := a.db.SQL().QueryRow(`SELECT COUNT(*) FROM write_audit`+where, args...).Scan(&total); err != nil {
+	total64, err := a.db.NewSelect().Model((*auditRecord)(nil)).
+		Apply(auditScope(f)).
+		Count(bgCtx)
+	if err != nil {
 		return nil, 0, fmt.Errorf("sqlite: count audit rows: %w", err)
 	}
+	total := int(total64)
 
 	limit := f.Limit
 	if limit <= 0 {
@@ -285,108 +234,69 @@ func (a *AuditLog) Query(f core.AuditFilter) ([]core.AuditEntry, int, error) {
 		offset = 0
 	}
 
-	rows, err := a.db.SQL().Query(
-		`SELECT `+auditColumns+` FROM write_audit`+where+` ORDER BY seq DESC LIMIT ? OFFSET ?`,
-		append(args, limit, offset)...)
-	if err != nil {
+	var rows []auditRecord
+	if err := a.db.NewSelect().Model(&rows).
+		Apply(auditScope(f)).
+		OrderExpr("seq DESC").
+		Limit(int64(limit)).
+		Offset(int64(offset)).
+		Scan(bgCtx); err != nil {
 		return nil, 0, fmt.Errorf("sqlite: query audit rows: %w", err)
 	}
-	defer rows.Close()
 
 	// 空列表而不是 nil：端点把它序列化出去是 []
 	items := make([]core.AuditEntry, 0, min(limit, 256))
-	for rows.Next() {
-		entry, err := scanAudit(rows)
-		if err != nil {
-			return nil, 0, fmt.Errorf("sqlite: scan audit row: %w", err)
-		}
-		items = append(items, entry)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, 0, fmt.Errorf("sqlite: iterate audit rows: %w", err)
+	for _, row := range rows {
+		items = append(items, auditEntryOf(row))
 	}
 	return items, total, nil
 }
 
-// auditWhere 把过滤条件拼成参数化谓词。返回的空串表示不带 WHERE。
-// 每个值都走语句参数，没有任何拼接进来的字符串。
-func auditWhere(f core.AuditFilter) (string, []any) {
-	var clauses []string
-	var args []any
-
-	if f.Actor != "" {
-		clauses = append(clauses, `actor = ?`)
-		args = append(args, f.Actor)
+// auditScope 把过滤条件折成构建器的 Where 链。每个值都走语句参数，
+// 没有任何拼接进来的字符串；无过滤条件时原样返回。
+func auditScope(f core.AuditFilter) func(*bun.SelectQuery) *bun.SelectQuery {
+	return func(q *bun.SelectQuery) *bun.SelectQuery {
+		if f.Actor != "" {
+			q = q.Where("actor = ?", f.Actor)
+		}
+		if f.Action != "" {
+			q = q.Where("action = ?", f.Action)
+		}
+		if f.Verdict != "" {
+			q = q.Where("verdict = ?", f.Verdict)
+		}
+		if f.Since != nil {
+			q = q.Where("ts_us >= ?", f.Since.UnixMicro())
+		}
+		if f.Until != nil {
+			q = q.Where("ts_us <= ?", f.Until.UnixMicro())
+		}
+		return q
 	}
-	if f.Action != "" {
-		clauses = append(clauses, `action = ?`)
-		args = append(args, f.Action)
-	}
-	if f.Verdict != "" {
-		clauses = append(clauses, `verdict = ?`)
-		args = append(args, f.Verdict)
-	}
-	if f.Since != nil {
-		clauses = append(clauses, `ts_us >= ?`)
-		args = append(args, f.Since.UnixMicro())
-	}
-	if f.Until != nil {
-		clauses = append(clauses, `ts_us <= ?`)
-		args = append(args, f.Until.UnixMicro())
-	}
-	if len(clauses) == 0 {
-		return "", args
-	}
-	return ` WHERE ` + strings.Join(clauses, ` AND `), args
 }
 
-// scanAudit 还原一行。ts_us 只到微秒，读回来的时间丢原来的纳秒与原始时区（这里是本地时区），
+// auditEntryOf 还原一行。ts_us 只到微秒，读回来的时间丢原来的纳秒与原始时区（这里是本地时区），
 // 与事件表的读回完全同一口径（S04 卡 §9）。
-func scanAudit(row rowScanner) (core.AuditEntry, error) {
-	var (
-		timestampUS int64
-		actor       string
-		actorKind   string
-		role        sql.NullString
-		action      string
-		method      string
-		route       string
-		status      int
-		latencyUS   int64
-		verdict     string
-		execVerdict sql.NullString
-		execReason  sql.NullString
-		handlerKey  sql.NullString
-		profile     sql.NullString
-		jobID       sql.NullString
-		remoteIP    sql.NullString
-		userAgent   sql.NullString
-	)
-	if err := row.Scan(&timestampUS, &actor, &actorKind, &role, &action, &method, &route,
-		&status, &latencyUS, &verdict, &execVerdict, &execReason, &handlerKey, &profile,
-		&jobID, &remoteIP, &userAgent); err != nil {
-		return core.AuditEntry{}, err
-	}
-
+func auditEntryOf(row auditRecord) core.AuditEntry {
 	return core.AuditEntry{
-		Time:           time.UnixMicro(timestampUS),
-		Actor:          actor,
-		ActorKind:      actorKind,
-		Role:           role.String,
-		Action:         action,
-		Method:         method,
-		Route:          route,
-		Status:         status,
-		Latency:        time.Duration(latencyUS) * time.Microsecond,
-		Verdict:        verdict,
-		ExecVerdict:    execVerdict.String,
-		ExecReasonCode: execReason.String,
-		HandlerKey:     handlerKey.String,
-		Profile:        profile.String,
-		JobID:          jobID.String,
-		RemoteIP:       remoteIP.String,
-		UserAgent:      userAgent.String,
-	}, nil
+		Time:           time.UnixMicro(row.TimestampUS),
+		Actor:          row.Actor,
+		ActorKind:      row.ActorKind,
+		Role:           row.Role,
+		Action:         row.Action,
+		Method:         row.Method,
+		Route:          row.Route,
+		Status:         row.Status,
+		Latency:        time.Duration(row.LatencyUS) * time.Microsecond,
+		Verdict:        row.Verdict,
+		ExecVerdict:    row.ExecVerdict.String,
+		ExecReasonCode: row.ExecReason.String,
+		HandlerKey:     row.HandlerKey.String,
+		Profile:        row.Profile.String,
+		JobID:          row.JobID.String,
+		RemoteIP:       row.RemoteIP.String,
+		UserAgent:      row.UserAgent.String,
+	}
 }
 
 // Flush 立即落盘当前批次，空批次不产生事务。供关停路径与测试使用。
@@ -401,8 +311,8 @@ func (a *AuditLog) Dropped() int64 {
 
 // Count 返回库内台账行数，给验收命令与查询端点的 total 对照用。
 func (a *AuditLog) Count() (int64, error) {
-	var count int64
-	if err := a.db.SQL().QueryRow(`SELECT COUNT(*) FROM write_audit`).Scan(&count); err != nil {
+	count, err := a.db.NewSelect().Model((*auditRecord)(nil)).Count(bgCtx)
+	if err != nil {
 		return 0, fmt.Errorf("sqlite: count audit rows: %w", err)
 	}
 	return count, nil

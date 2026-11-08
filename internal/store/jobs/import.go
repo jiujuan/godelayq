@@ -1,6 +1,7 @@
 package jobs
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/jiujuan/godelayq/internal/core"
+	"github.com/uptrace/bun"
 )
 
 // ImportOnce 把 store.path 指向的 JSON 文件一次性导入任务库（TASK-M03）。
@@ -58,26 +60,30 @@ func ImportOnce(h *Handle, jsonPath string) error {
 			"fix that file or delete it to start with an empty job store", jsonPath, err)
 	}
 
-	tx, err := h.SQL().Begin()
-	if err != nil {
-		return fmt.Errorf("jobs: import begin: %w", err)
-	}
+	rows := make([]jobRow, 0, len(snapshots))
 	for id, snap := range snapshots {
 		payload, marshalErr := json.Marshal(snap)
 		if marshalErr != nil {
-			_ = tx.Rollback()
 			return fmt.Errorf("jobs: marshal import %s: %w", id, marshalErr)
 		}
-		if _, execErr := tx.Exec(`INSERT INTO jobs (id, name, status, updated_at, snapshot_json)
-VALUES (?, ?, ?, ?, ?)`,
-			snap.ID, snap.Name, core.JobStatus(snap.Status).String(),
-			snap.UpdatedAt.UnixNano(), string(payload)); execErr != nil {
-			_ = tx.Rollback()
-			return fmt.Errorf("jobs: insert import %s: %w", id, execErr)
-		}
+		rows = append(rows, jobRow{
+			ID:           snap.ID,
+			Name:         snap.Name,
+			Status:       core.JobStatus(snap.Status).String(),
+			UpdatedAt:    snap.UpdatedAt.UnixNano(),
+			SnapshotJSON: string(payload),
+		})
 	}
-	if err := tx.Commit(); err != nil {
-		return fmt.Errorf("jobs: import commit: %w", err)
+	if err := h.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
+		if len(rows) == 0 {
+			return nil
+		}
+		if _, err := tx.NewInsert().Model(&rows).Exec(ctx); err != nil {
+			return fmt.Errorf("jobs: insert import: %w", err)
+		}
+		return nil
+	}); err != nil {
+		return fmt.Errorf("jobs: import: %w", err)
 	}
 	return markImported(h)
 }
@@ -90,7 +96,10 @@ func (s *Store) ImportOnce(jsonPath string) error {
 // alreadyImported 报告标记是否已写入。
 func alreadyImported(h *Handle) (bool, error) {
 	var value string
-	err := h.SQL().QueryRow(`SELECT value FROM jobs_meta WHERE key = ?`, metaJobsImported).Scan(&value)
+	err := h.NewSelect().Model((*metaRow)(nil)).
+		ColumnExpr("value").
+		Where("key = ?", metaJobsImported).
+		Scan(bgCtx, &value)
 	if err == nil {
 		return true, nil
 	}
@@ -102,8 +111,8 @@ func alreadyImported(h *Handle) (bool, error) {
 
 // tableEmpty 报告 jobs 表是否没有行。
 func tableEmpty(h *Handle) (bool, error) {
-	var count int
-	if err := h.SQL().QueryRow(`SELECT COUNT(*) FROM jobs`).Scan(&count); err != nil {
+	count, err := h.NewSelect().Model((*jobRow)(nil)).Count(bgCtx)
+	if err != nil {
 		return false, fmt.Errorf("jobs: count jobs: %w", err)
 	}
 	return count == 0, nil
@@ -111,9 +120,13 @@ func tableEmpty(h *Handle) (bool, error) {
 
 // markImported 写标记。值只是排障参考（导入时刻的 Unix 秒）。
 func markImported(h *Handle) error {
-	_, err := h.SQL().Exec(`INSERT INTO jobs_meta (key, value) VALUES (?, ?)
-ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
-		metaJobsImported, strconv.FormatInt(time.Now().Unix(), 10))
+	_, err := h.NewInsert().Model(&metaRow{
+		Key:   metaJobsImported,
+		Value: strconv.FormatInt(time.Now().Unix(), 10),
+	}).
+		On("CONFLICT (key) DO UPDATE").
+		Set("value = EXCLUDED.value").
+		Exec(bgCtx)
 	if err != nil {
 		return fmt.Errorf("jobs: write import marker: %w", err)
 	}

@@ -110,7 +110,7 @@ func (f *fakeRegistrar) registeredKeys() []string {
 }
 
 func TestRegister_AllProfiles(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	executable := selfExecutable(t)
 	script := declareFile(t, workspace, "scripts/run.mjs")
 
@@ -153,7 +153,7 @@ func TestRegister_AllProfiles(t *testing.T) {
 }
 
 func TestRegister_KeyConflict(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	cfg := configAllowing(workspace, []string{selfExecutable(t)},
 		namedScript(t, workspace, "alpha"),
@@ -178,7 +178,7 @@ func TestRegister_KeyConflict(t *testing.T) {
 }
 
 func TestRegister_EmptyRegistry(t *testing.T) {
-	cfg := configWith(t.TempDir())
+	cfg := configWith(tempWorkspace(t))
 	cfg.Executors.Enabled = false
 
 	registry, err := NewRegistry(cfg, nil)
@@ -196,7 +196,7 @@ func TestRegister_EmptyRegistry(t *testing.T) {
 }
 
 func TestRegister_LogsWarnWithoutProfiles(t *testing.T) {
-	cfg := configWith(t.TempDir())
+	cfg := configWith(tempWorkspace(t))
 	registry, err := NewRegistry(cfg, nil)
 	require.NoError(t, err)
 	require.True(t, registry.Enabled())
@@ -217,7 +217,7 @@ func TestRegister_LogsWarnWithoutProfiles(t *testing.T) {
 // 断言方式是跑一次并检查摘要与产物文件：错误文本里有没有 "not implemented" 只能证明
 // 占位实现还在，证明不了真实执行可用。
 func TestRegister_HandlerRunsTheProfile(t *testing.T) {
-	cfg := configWith(t.TempDir(), shellCommand(t, "echo registered"))
+	cfg := configWith(tempWorkspace(t), shellCommand(t, "echo registered"))
 	registry, err := NewRegistry(cfg, quietLogger())
 	require.NoError(t, err)
 
@@ -249,7 +249,7 @@ func TestRegister_WarnsWhenAddressPolicyDisabled(t *testing.T) {
 	guarded := httpGetCommand("https://api.internal:8443/ping", "api.internal:8443")
 	guarded.Name = "prod_callback"
 
-	cfg := configWith(t.TempDir(), relaxed, guarded)
+	cfg := configWith(tempWorkspace(t), relaxed, guarded)
 	registry, err := NewRegistry(cfg, quietLogger())
 	require.NoError(t, err)
 

@@ -69,6 +69,11 @@ store:
     path: ./data/goqsys_jobs.sqlite  # 空取默认值；与管理库、观测库分文件
     busy_timeout: 5s                 # 0=默认值，与管理库同口径
     synchronous: normal              # normal|full；空=默认 normal
+    # 存储方言：sqlite（默认）| postgres。切 postgres 时 path 失效、dsn 必填
+    #（节名沿用 sqlite 是历史形成：切方言不换节名，旧配置零改动）。
+    dialect: sqlite
+    # 连接串，仅 dialect: postgres 时使用；含口令，建议经 GODELAYQ_STORE_SQLITE_DSN 注入。
+    dsn: ""
 
 logging:
   level: info           # debug|info|warn|error；排障时可临时改 debug
@@ -236,6 +241,10 @@ observability:
   # normal 在 WAL 下断电最多丢最后若干次已提交事务，与 JSONFileStore"崩溃最多丢一个合并周期"
   # 同量级；需要更强保证的部署改配 full（每次提交都等磁盘同步，写入更慢）。
   synchronous: normal
+  # 存储方言：sqlite（默认）| postgres。切 postgres 时 path 失效、dsn 必填。
+  dialect: sqlite
+  # 连接串，仅 dialect: postgres 时使用；含口令，建议经 GODELAYQ_OBSERVABILITY_DSN 注入。
+  dsn: ""
   events:
     # 运行事件表 job_events：把 EventBus 广播的 job.* 事件持久化，重启后详情页时间线仍有历史。
     # 由 S03 写入、S04 读取。关掉它只建表不写入，事件端点仍读内存缓冲（即现在的行为）。
@@ -276,6 +285,10 @@ mgrstore:
   busy_timeout: 2s
 # synchronous PRAGMA：normal（默认）| full。口径与观测库相同。
   synchronous: normal
+# 存储方言：sqlite（默认）| postgres。切 postgres 时 path 失效、dsn 必填。
+  dialect: sqlite
+# 连接串，仅 dialect: postgres 时使用；含口令，建议经 GODELAYQ_MGRSTORE_DSN 注入。
+  dsn: ""
 
 # 配置热重载：改文件即生效，不必重启进程。默认关闭，关闭时一个监听器都不建，
 # 进程行为与本节不存在时一致。

@@ -52,6 +52,13 @@ func locationOf(t *testing.T, absolute string) string {
 
 	resolved, err := filepath.Abs(filepath.Clean(absolute))
 	require.NoError(t, err)
+	// 与生产同一规范化（profile.go 的约定：生产路径永远是 filepath.EvalSymlinks）。
+	// CI 的 Windows 跑步机 TEMP 用 8.3 短名（RUNNER~1），不折过去的话
+	// 期望值与实际值差一个名字空间。路径不存在时保持 Abs 写法，
+	// "不存在"的断言由各自的用例负责。
+	if real, linkErr := filepath.EvalSymlinks(resolved); linkErr == nil {
+		return filepath.Clean(real)
+	}
 	return resolved
 }
 
@@ -64,10 +71,10 @@ func jsonPayload(t *testing.T, values map[string]any) []byte {
 }
 
 func TestAdhocSubmission_ScriptLocationAccepted(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	profile := adhocProfileOf(t, adhocEnabled(configWith(workspace)), AdhocPHPName)
 
-	outside := filepath.Join(t.TempDir(), "jobs")
+	outside := filepath.Join(tempWorkspace(t), "jobs")
 	cases := []struct {
 		name  string
 		value func() string
@@ -125,8 +132,8 @@ func TestAdhocSubmission_ScriptLocationAccepted(t *testing.T) {
 }
 
 func TestAdhocSubmission_ScriptLocationRejected(t *testing.T) {
-	workspace := t.TempDir()
-	outside := filepath.Join(t.TempDir(), "jobs")
+	workspace := tempWorkspace(t)
+	outside := filepath.Join(tempWorkspace(t), "jobs")
 	existing := writeAdhocScript(t, outside, "real.php")
 	looksLikeScript := writeAdhocScript(t, outside, "a.txt")
 
@@ -164,7 +171,7 @@ func TestAdhocSubmission_ScriptLocationRejected(t *testing.T) {
 }
 
 func TestAdhocSubmission_PathPrefixesLimitTheDirectory(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := adhocEnabled(configWith(workspace))
 	cfg.Executors.Adhoc.PathPrefixes = []string{"scripts"}
 	profile := adhocProfileOf(t, cfg, AdhocPHPName)
@@ -174,7 +181,7 @@ func TestAdhocSubmission_PathPrefixesLimitTheDirectory(t *testing.T) {
 	_, err := ValidateSubmission(profile, jsonPayload(t, map[string]any{"script": inside}))
 	require.NoError(t, err)
 
-	elsewhere := writeAdhocScript(t, filepath.Join(t.TempDir(), "elsewhere"), "ok.php")
+	elsewhere := writeAdhocScript(t, filepath.Join(tempWorkspace(t), "elsewhere"), "ok.php")
 	_, err = ValidateSubmission(profile, jsonPayload(t, map[string]any{"script": elsewhere}))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "outside the directories this server allows")
@@ -187,7 +194,7 @@ func TestAdhocSubmission_PathPrefixesLimitTheDirectory(t *testing.T) {
 }
 
 func TestAdhocSubmission_ExtensionRequirementCanBeTurnedOff(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	file := writeAdhocScript(t, filepath.Join(workspace, "scripts"), "run.txt")
 
 	cfg := adhocEnabled(configWith(workspace))
@@ -204,7 +211,7 @@ func TestAdhocSubmission_ExtensionRequirementCanBeTurnedOff(t *testing.T) {
 }
 
 func TestAdhocSubmission_URLLocationAccepted(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	cases := []struct {
 		name       string
@@ -250,7 +257,7 @@ func TestAdhocSubmission_URLLocationAccepted(t *testing.T) {
 }
 
 func TestAdhocSubmission_URLLocationRejected(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	cases := []struct {
 		name      string
@@ -287,7 +294,7 @@ func TestAdhocSubmission_URLLocationRejected(t *testing.T) {
 }
 
 func TestAdhocSubmission_KeyOwnership(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	enabled := adhocEnabled(configWith(workspace))
 	php := adhocProfileOf(t, enabled, AdhocPHPName)
 	httpProfile := adhocProfileOf(t, enabled, AdhocHTTPName)
@@ -344,7 +351,7 @@ func TestAdhocSubmission_KeyOwnership(t *testing.T) {
 }
 
 func TestSubmissionKeys_ListedByProfileKind(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	enabled := adhocEnabled(configWith(workspace))
 
 	// 内置档位：只有本类型那一个位置键 + timeout。
@@ -367,7 +374,7 @@ func TestSubmissionKeys_ListedByProfileKind(t *testing.T) {
 }
 
 func TestAdhocSubmission_TimeoutStillCapped(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := adhocEnabled(configWith(workspace))
 	cfg.Executors.MaxTimeout = 30 * time.Second
 	cfg.Executors.DefaultTimeout = 30 * time.Second
@@ -399,7 +406,7 @@ func TestAdhocSubmission_TimeoutStillCapped(t *testing.T) {
 }
 
 func TestRender_AdhocScriptUsesJobPathAndStaysTwoArgs(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	profile := adhocProfileOf(t, adhocEnabled(configWith(workspace)), AdhocPHPName)
 
 	file := writeAdhocScript(t, filepath.Join(workspace, "my work"), "任务 one.php")
@@ -418,7 +425,7 @@ func TestRender_AdhocScriptUsesJobPathAndStaysTwoArgs(t *testing.T) {
 // 新增的 Adhoc 分支不改变普通档位的 argv。非 adhoc 的全部既有用例零改动也是同一件事，
 // 这一条把"改了哪一行"钉在最直接的位置上。
 func TestRender_NonAdhocUnchanged(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	script := declareFile(t, workspace, "scripts/deploy.sh")
 	profile := mustLoad(t, configWith(workspace, scriptUsingRuntime("bash", script)))[0]
 
@@ -428,7 +435,7 @@ func TestRender_NonAdhocUnchanged(t *testing.T) {
 
 	argv, err := profile.Render(sub)
 	require.NoError(t, err)
-	assert.Equal(t, []string{"bash", filepath.Join(workspace, "scripts", "deploy.sh"), "--day=today"}, argv,
+	assert.Equal(t, []string{"bash", locationOf(t, filepath.Join(workspace, "scripts", "deploy.sh")), "--day=today"}, argv,
 		"普通档位的 argv 仍是解释器 + 档位里的脚本 + args_render")
 
 	_, err = ValidateSubmission(profile, []byte(`{"args":{"day":"today"},"script":"scripts/deploy.sh"}`))
@@ -444,7 +451,7 @@ func TestHTTPRunner_AdhocRefusesPrivateAddress(t *testing.T) {
 
 	for _, address := range []string{"127.0.0.1", "169.254.169.254"} {
 		t.Run(address, func(t *testing.T) {
-			fixture := newAdhocHTTPFixture(t, adhocEnabled(configWith(t.TempDir())))
+			fixture := newAdhocHTTPFixture(t, adhocEnabled(configWith(tempWorkspace(t))))
 			value := fmt.Sprintf("http://%s:%s/status", address, target.port())
 
 			job, err := fixture.run(context.Background(), "job-adhoc-refused", fmt.Sprintf(`{"url":%q}`, value))
@@ -461,7 +468,7 @@ func TestHTTPRunner_AdhocRefusesPrivateAddress(t *testing.T) {
 	}
 
 	// 对照：显式放开私网范围之后，同一个地址就是正常请求（开发机上打自己的服务）。
-	open := adhocEnabled(configWith(t.TempDir()))
+	open := adhocEnabled(configWith(tempWorkspace(t)))
 	open.Executors.Adhoc.URLAllowPrivate = true
 	fixture := newAdhocHTTPFixture(t, open)
 	job, err := fixture.run(context.Background(), "job-adhoc-allowed",
@@ -483,7 +490,7 @@ func TestHTTPRunner_AdhocHostGuardRunsAtExecution(t *testing.T) {
 		_, _ = w.Write([]byte("reached"))
 	}), false)
 
-	fixture := newAdhocHTTPFixture(t, adhocEnabled(configWith(t.TempDir())))
+	fixture := newAdhocHTTPFixture(t, adhocEnabled(configWith(tempWorkspace(t))))
 	value := fmt.Sprintf("http://127.0.0.1:%s/status", target.port())
 
 	// 提交期：url_hosts 留空 = 不限主机，这条取值通过。
@@ -508,7 +515,7 @@ func TestHTTPRunner_AdhocTargetWithoutTemplate(t *testing.T) {
 		_, _ = w.Write([]byte("ok"))
 	}), false)
 
-	open := adhocEnabled(configWith(t.TempDir()))
+	open := adhocEnabled(configWith(tempWorkspace(t)))
 	open.Executors.Adhoc.URLAllowPrivate = true
 	fixture := newAdhocHTTPFixture(t, open)
 	require.Empty(t, fixture.profile.URLTemplate, "内置 http 档位没有地址模板")
@@ -527,7 +534,7 @@ func TestHTTPRunner_AdhocTargetWithoutTemplate(t *testing.T) {
 // 位置不是 secret 参数，响应、日志与产物里都允许出现原文。
 // 后续若给内置档位加掩码，这条会先红——那时要回答的是"位置为什么算凭据"。
 func TestAdhoc_LocationIsNotMasked(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	profile := adhocProfileOf(t, adhocEnabled(configWith(workspace)), AdhocPHPName)
 
 	file := writeAdhocScript(t, filepath.Join(workspace, "scripts"), "token_report.php")
@@ -554,7 +561,7 @@ func TestRunner_AdhocScriptRunsJobPath(t *testing.T) {
 		t.Skipf("program %q is not available on this machine, the adhoc run case cannot run", "sh")
 	}
 
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := adhocEnabled(configWith(workspace))
 	cfg.Executors.Adhoc.ShellRuntime = "sh"
 
@@ -584,7 +591,7 @@ func TestRunner_AdhocScriptGoneAtExecutionIsPermanent(t *testing.T) {
 		t.Skipf("program %q is not available on this machine, the adhoc run case cannot run", "sh")
 	}
 
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := adhocEnabled(configWith(workspace))
 	cfg.Executors.Adhoc.ShellRuntime = "sh"
 
@@ -619,7 +626,7 @@ func newAdhocRunnerFixture(t *testing.T, cfg core.Config, name string) *runnerFi
 	profile := adhocProfileOf(t, normalized, name)
 
 	store, err := NewArtifactStore(ArtifactOptions{
-		Dir: filepath.Join(t.TempDir(), "exec"), MaxBytes: core.DefaultExecMaxOutputBytes,
+		Dir: filepath.Join(tempWorkspace(t), "exec"), MaxBytes: core.DefaultExecMaxOutputBytes,
 	}, quietLogger())
 	require.NoError(t, err)
 
@@ -638,7 +645,7 @@ func newAdhocHTTPFixture(t *testing.T, cfg core.Config) *httpFixture {
 	profile := adhocProfileOf(t, normalized, AdhocHTTPName)
 
 	store, err := NewArtifactStore(ArtifactOptions{
-		Dir: filepath.Join(t.TempDir(), "exec"), MaxBytes: core.DefaultExecMaxOutputBytes,
+		Dir: filepath.Join(tempWorkspace(t), "exec"), MaxBytes: core.DefaultExecMaxOutputBytes,
 	}, quietLogger())
 	require.NoError(t, err)
 

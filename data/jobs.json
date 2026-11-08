@@ -1,0 +1,19 @@
+{
+  "01a0ece3-89dd-7e70-949a-f02a9e96f8be": {
+    "id": "01a0ece3-89dd-7e70-949a-f02a9e96f8be",
+    "name": "data_sync",
+    "payload": null,
+    "trigger_at": "2026-11-08T16:20:00+08:00",
+    "group": "import-data",
+    "cron_expr": "0 */10 * * * *",
+    "is_repeat": true,
+    "timeout": 900000000000,
+    "max_retries": 4,
+    "retry_count": 0,
+    "retry_delay": 0,
+    "status": 0,
+    "created_at": "2026-09-29T19:18:50.0779464+08:00",
+    "updated_at": "2026-11-08T16:14:08.9566304+08:00",
+    "attempts": 0
+  }
+}

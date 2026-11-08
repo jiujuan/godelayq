@@ -96,8 +96,9 @@
 │  │  (事件时间线)    │  │ (输出文件索引)   │  │  (写操作台账)    │  │
 │  │  • 跨重启留存   │  │  • 尺寸/截断/状态 │  │  • 谁·做了什么·结论│  │
 │  └─────────────────┘  └─────────────────┘  └─────────────────┘  │
-│  一个 SQLite 文件（modernc 纯 Go 驱动，只出现在 store/sqlite）；  │
-│  定位是加速器不是账本：不搬任务快照，写失败不改变执行结果与响应    │
+│  一个库文件（SQLite 或 PostgreSQL，由 observability.dialect 切换； │
+│  驱动只出现在 store/engine）；定位是加速器不是账本：不搬任务快照，  │
+│  写失败不改变执行结果与响应                                       │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -141,7 +142,8 @@
 | `load.go` | 文件任务加载 | fsnotify 监控 + 100ms 静默窗口合并写入事件，加载后删除/归档，非法文件可隔离到 `error_dir` |
 | `config.go` | 运行配置 | viper 读 yaml + `GODELAYQ_*` 环境变量，未知键与非法取值启动即报错 |
 | `logging.go` | 日志装配 | 标准库 `log/slog`，`NewLogger` 按级别/格式构造，组件经 `WithLogger` 注入 |
-| `store/sqlite/` | 观测层存储（可选，独立于 `core.Store`） | 一个 SQLite 文件里三张表（`job_events` / `artifact_index` / `write_audit`）；全仓唯一 import 驱动（`modernc.org/sqlite`，纯 Go）的包，`core`/`api`/`executor` 都不认识 SQLite。三个写入器共用一个有界批量器：非阻塞入队、按 `flush_interval` 合并成一次事务、失败的一批重试一次后丢弃并计数，所以记不住观测数据永远不会反过来拖慢调度或请求 |
+| `store/engine/` | 数据库公共底座（唯一驱动入口） | 全仓唯一 import 数据库驱动的包（`modernc.org/sqlite` 纯 Go 无 CGO、`pgx/v5`、查询层统一走 bun 构建器）；按方言打开连接（配置节 `dialect: sqlite 或 postgres`）、连接参数读数、版本化迁移框架（迁移 DDL 可按方言分支）。`core`/`api`/`executor` 不认识任何驱动 |
+| `store/jobs/`、`store/mgr/`、`store/observe/` | 三个业务库（任务快照 / 账号分组档位 / 运行事件·产物索引·写审计） | 全部经 bun 查询构建器 + bun 事务读写，同一套代码 SQLite 与 PostgreSQL 通用；方言分歧只存在于迁移 DDL 与打开路径。观测层三个写入器共用一个有界批量器：非阻塞入队、按 `flush_interval` 合并成一次事务、失败的一批重试一次后丢弃并计数，所以记不住观测数据永远不会反过来拖慢调度或请求。测试矩阵：`scripts/test-pg.ps1` / `test-pg.sh`（`GODELAYQ_TEST_PG_DSN` 门控，未配置干净跳过） |
 
 
 ## 目录结构

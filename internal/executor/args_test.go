@@ -19,7 +19,7 @@ import (
 func loadOneProfile(t *testing.T, command core.ExecutorCommand) (*Profile, string) {
 	t.Helper()
 
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	profiles := mustLoad(t, configWith(workspace, command))
 	require.Len(t, profiles, 1)
 	return profiles[0], workspace
@@ -324,7 +324,7 @@ func TestValidateSubmission_Positional(t *testing.T) {
 
 	argv, err := etl.Render(sub)
 	require.NoError(t, err)
-	assert.Equal(t, []string{filepath.Join(workspace, "bin", "etl"), "--window=20260929", "a.csv", "b.csv"}, argv)
+	assert.Equal(t, []string{locationOf(t, filepath.Join(workspace, "bin", "etl")), "--window=20260929", "a.csv", "b.csv"}, argv)
 
 	cases := map[string]string{
 		"超过条数上限": `{"args":{"_positional":["a","b","c","d"]}}`,
@@ -347,7 +347,7 @@ func TestValidateSubmission_Positional(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not accept positional arguments")
 
 	// 档位里也不允许把保留键声明成参数名
-	_, err = LoadProfiles(configWith(t.TempDir(), core.ExecutorCommand{
+	_, err = LoadProfiles(configWith(tempWorkspace(t), core.ExecutorCommand{
 		Name: "tool", Kind: "binary", Program: "bin/tool",
 		Args: []core.ExecutorArg{{Name: positionalKey}},
 	}))

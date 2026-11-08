@@ -16,7 +16,7 @@ import (
 )
 
 // fakeArtifactIndex 是 executor.ArtifactIndexer 的替身：列表端点与 purged 标注只关心
-// 自己被怎么调用，真读库在 store/sqlite 那一侧有用例。
+// 自己被怎么调用，真读库在 store/engine 那一侧有用例。
 type fakeArtifactIndex struct {
 	rows      []core.ArtifactIndexRecord
 	listErr   error

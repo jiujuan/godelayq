@@ -40,7 +40,8 @@
        │ 隐式实现接口
 ┌──────┴───────────────────────────────────────────────────┐
 │  internal/store     基础设施适配层                          │
-│  sqlite  ── 全仓唯一 import 驱动(modernc.org/sqlite) 的包    │
+│  engine  ── 全仓唯一 import 驱动的包（bun + modernc/sqlite    │
+│             + pgx），方言可插拔（sqlite 默认 | postgres）      │
 │  jobs    ── 任务快照库（store.type=sqlite 时替代 JSON）       │
 │  mgr     ── 管理库（账号/分组/档位，mgrstore.enabled）        │
 │  observe ── 观测库（job_events/artifact_index/write_audit） │
@@ -63,11 +64,11 @@
 
 好处：api 与 observe 各自依赖 core、**互不相认**（共享词汇 `Event`、`AuditEntry` 等都放 core）；store 包不需要知道任何调用方的存在；"句柄可替换"也让关闭顺序这类时序断言在集成测试里可观察（真实句柄换成记录调用流水的假句柄）。
 
-### 2.2 依赖收敛：SQLite 驱动只有一个入口
+### 2.2 依赖收敛：数据库驱动只有一个入口
 
-`store/sqlite` 是全仓唯一 import `modernc.org/sqlite`（纯 Go、无 CGO）的包，且它对业务包**零依赖**——只提供三种机制：打开库文件、连接参数（PRAGMA）、版本化迁移框架（`Migrate`），不认识任何一张业务表。三个业务库各自用自己的迁移表名调用它。
+`store/engine` 是全仓唯一 import 数据库驱动的包（`modernc.org/sqlite` 纯 Go 无 CGO；`pgx/v5` 走 PostgreSQL；查询层统一经 bun 查询构建器生成方言 SQL），且它对业务包**零依赖**——只提供四种机制：按方言打开连接（SQLite 的 PRAGMA DSN / PG 的 DSN）、连接参数读数、版本化迁移框架（`Migrate`，迁移 DDL 可按方言分支）、`*bun.DB` 句柄，不认识任何一张业务表。三个业务库各自用自己的迁移表名调用它。
 
-这保证了：作为库引入 godelayq 的人（只用 core，见 `examples/demo1`）不会被 SQLite 依赖传染；core、api、executor 与 examples 都不许引入驱动（各包 `package_guard_test.go` 在测试期钉住这条红线）。
+这保证了：作为库引入 godelayq 的人（只用 core，见 `examples/demo1`）不会被任何驱动依赖传染；core、api、executor 与 examples 都不许引入驱动（各包 `package_guard_test.go` 在测试期钉住这条红线）。存储后端由配置节的 `dialect` 键切换（`sqlite` 默认 | `postgres`），同一套查询代码两个方言通用，方言分歧只允许存在于迁移 DDL 与打开路径。
 
 ## 3. 模块清单
 
@@ -78,7 +79,7 @@
 | `internal/core` | 调度核心 + 领域词汇 | `scheduler.go` 的 `Scheduler`、`scheduleLoop`、`executeJob`；`heap.go` 的 `QuaternaryHeap`；`job.go` 的 `Job`/`JobSnapshot`；`event.go` 的 `EventBus`；`cron.go`、`retry.go` 的 `ExponentialBackoffRetry`、`config.go` 的 `LoadConfig`、`load.go` 的目录加载器、`store.go` 的 JSON 实现 |
 | `internal/api` | HTTP 接入层 | `server.go` 的 `Server`/`NewServer` 与 Option 注入；`handlers_*.go` 各域端点；`sse.go`/`websocket.go`；`ratelimit.go`；`security.go` |
 | `internal/executor` | 执行器档位（可选层） | `registry.go` 的 `Registry`；`register.go` 的 `Register`/`Handler`；`profile.go` 的 `Profile`；`proc.go`（进程执行 + 整树终止）、`http.go`；`artifact.go` 的 `ArtifactStore`；`applier.go` 的 `Applier`；`adhoc.go`；`merge_profiles.go` 的 `MergeStoreProfiles` |
-| `internal/store/sqlite` | 公共访问底座：连接 + PRAGMA + 迁移框架 | 唯一驱动入口 |
+| `internal/store/engine` | 公共访问底座：双方言打开 + 连接参数 + 迁移框架 + bun 句柄 | 唯一驱动入口；`engine.Open`、`Migration` |
 | `internal/store/jobs` | 任务快照库（`store.type=sqlite`） | `jobs.Open`、`ImportOnce` |
 | `internal/store/mgr` | 管理库：账号/分组/档位三张表 | `mgr.Open`、`ImportOnce`、`NewUserStore`、`NewGroupStore`、`NewExecutorProfileStore` |
 | `internal/store/observe` | 观测库：运行事件/产物索引/写操作审计 | `observe.Open`、`NewEventLog`、`NewAuditLog`、`NewArtifactIndex` |
@@ -93,10 +94,10 @@
 cmd/server ──→ api, core, executor, store/{jobs,mgr,observe}, web
 api        ──→ core, executor（只读接口：Registry / ArtifactStore / ArtifactIndexer）
 executor   ──→ core
-store/jobs ──→ core, store/sqlite
-store/mgr  ──→ core, store/sqlite
-store/observe ──→ core, executor(为实现 executor.ArtifactIndexer), store/sqlite
-store/sqlite  ──→ （无内部依赖，唯一驱动入口）
+store/jobs ──→ core, store/engine
+store/mgr  ──→ core, store/engine
+store/observe ──→ core, executor(为实现 executor.ArtifactIndexer), store/engine
+store/engine  ──→ （无内部依赖，唯一驱动入口：bun + modernc/sqlite + pgx）
 core       ──→ （无内部依赖）
 web        ──→ （无内部依赖，仅 embed）
 ```

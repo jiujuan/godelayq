@@ -49,7 +49,7 @@ func profileFrom(t *testing.T, cfg core.Config, index int) *Profile {
 }
 
 func TestProbe_ScriptMissingRuntime(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	script := declareFile(t, workspace, "scripts/report.mjs")
 
 	profile := profileFrom(t, configAllowing(workspace, []string{missingProgram},
@@ -63,7 +63,7 @@ func TestProbe_ScriptMissingRuntime(t *testing.T) {
 }
 
 func TestProbe_ScriptMissingFile(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	// 解释器存在、脚本不存在：原因必须是文件缺失，不能和"PATH 里找不到解释器"混淆
 	profile := profileFrom(t, configAllowing(workspace, []string{selfExecutable(t)},
@@ -77,7 +77,7 @@ func TestProbe_ScriptMissingFile(t *testing.T) {
 }
 
 func TestProbe_ScriptIsAcceptedWithoutExecuteBit(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	absolute := filepath.Join(workspace, "scripts", "readonly.mjs")
 	require.NoError(t, os.MkdirAll(filepath.Dir(absolute), 0o750))
 	// 0600：没有执行位。脚本由解释器读取，不该要求它能被直接执行。
@@ -92,7 +92,7 @@ func TestProbe_ScriptIsAcceptedWithoutExecuteBit(t *testing.T) {
 }
 
 func TestProbe_ScriptIsDirectory(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	require.NoError(t, os.Mkdir(filepath.Join(workspace, "scripts"), 0o750))
 
 	profile := profileFrom(t, configAllowing(workspace, []string{selfExecutable(t)},
@@ -104,7 +104,7 @@ func TestProbe_ScriptIsDirectory(t *testing.T) {
 }
 
 func TestProbe_ReasonNeverLeaksWorkspacePath(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	profile := profileFrom(t, configAllowing(workspace, []string{selfExecutable(t)},
 		scriptUsingRuntime(selfExecutable(t), "scripts/absent.mjs")), 0)
@@ -117,7 +117,7 @@ func TestProbe_ReasonNeverLeaksWorkspacePath(t *testing.T) {
 }
 
 func TestProbe_BinaryInWorkspace(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	program := declareFile(t, workspace, "bin/tool.exe")
 
 	cmd := validBinaryProfile(program)
@@ -131,7 +131,7 @@ func TestProbe_BinaryInWorkspace(t *testing.T) {
 }
 
 func TestProbe_BinaryNotExecutable(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	absolute := filepath.Join(workspace, "bin", "tool")
 	require.NoError(t, os.MkdirAll(filepath.Dir(absolute), 0o750))
 	require.NoError(t, os.WriteFile(absolute, []byte("data"), 0o600))
@@ -149,7 +149,7 @@ func TestProbe_BinaryNotExecutable(t *testing.T) {
 }
 
 func TestProbe_BinaryFileMissing(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	profile := profileFrom(t, configWith(workspace, validBinaryProfile("bin/absent.exe")), 0)
 
@@ -160,7 +160,7 @@ func TestProbe_BinaryFileMissing(t *testing.T) {
 }
 
 func TestProbe_BinaryProgramNameMissing(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	cmd := validBinaryProfile(missingProgram)
 	cmd.FixedArgs = nil
@@ -174,7 +174,7 @@ func TestProbe_BinaryProgramNameMissing(t *testing.T) {
 }
 
 func TestProbe_BinaryProgramNameFound(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	executable := selfExecutable(t)
 
 	cmd := validBinaryProfile(executable)
@@ -187,7 +187,7 @@ func TestProbe_BinaryProgramNameFound(t *testing.T) {
 }
 
 func TestProbe_HTTPAlwaysAvailable(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	profile := profileFrom(t, configWith(workspace, validHTTPProfile()), 0)
 
@@ -199,7 +199,7 @@ func TestProbe_HTTPAlwaysAvailable(t *testing.T) {
 }
 
 func TestProbe_UnknownKindIsReportedNotPanicking(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	profile := profileFrom(t, configWith(workspace, validScriptProfile(declareFile(t, workspace, "a.sh"))), 0)
 
 	// E02 不允许未知 kind 通过校验，这里只确认万一被绕过也不会 panic 或误报可用
@@ -210,7 +210,7 @@ func TestProbe_UnknownKindIsReportedNotPanicking(t *testing.T) {
 }
 
 func TestProbe_ProfilesWithoutTargetFileField(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	// 手工构造一个 script 档位但没有 ScriptPath（只可能来自内部错误），
 	// 探测要给出明确原因而不是 stat 空路径的怪错

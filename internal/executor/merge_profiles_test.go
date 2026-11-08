@@ -31,7 +31,7 @@ func storeKeys(entries []StoreEntry) []string {
 }
 
 func TestMergeStoreProfiles_StoreOnlyRecords(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	executable := selfExecutable(t)
 	cfg := configAllowing(workspace, []string{executable})
 
@@ -51,7 +51,7 @@ func TestMergeStoreProfiles_StoreOnlyRecords(t *testing.T) {
 }
 
 func TestMergeStoreProfiles_NoRecordsYieldsNoEntries(t *testing.T) {
-	cfg := configAllowing(t.TempDir(), nil)
+	cfg := configAllowing(tempWorkspace(t), nil)
 
 	entries, warnings := MergeStoreProfiles(cfg, nil)
 
@@ -61,8 +61,8 @@ func TestMergeStoreProfiles_NoRecordsYieldsNoEntries(t *testing.T) {
 
 // 页面建的档位允许指向 workspace 之外的本机路径（设计文档 D5 的主动偏离）。
 func TestMergeStoreProfiles_AcceptsPathsOutsideWorkspace(t *testing.T) {
-	workspace := t.TempDir()
-	outside := t.TempDir()
+	workspace := tempWorkspace(t)
+	outside := tempWorkspace(t)
 	executable := selfExecutable(t)
 	scriptAbs := filepath.Join(outside, filepath.FromSlash(declareFile(t, outside, "scripts/report.mjs")))
 
@@ -83,7 +83,7 @@ func TestMergeStoreProfiles_AcceptsPathsOutsideWorkspace(t *testing.T) {
 }
 
 func TestMergeStoreProfiles_NameCollisionMarksStoreSideDegraded(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	executable := selfExecutable(t)
 	// config 侧声明 alpha，store 侧同名一条加另一条
 	cfg := configAllowing(workspace, []string{executable}, namedScript(t, workspace, "alpha"))
@@ -107,7 +107,7 @@ func TestMergeStoreProfiles_NameCollisionMarksStoreSideDegraded(t *testing.T) {
 
 // 降级条目交给登记表之后才是最终形态：config 那条留在表里、store 那条只进展示面。
 func TestMergeStoreProfiles_ResultFeedsApplyStore(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	executable := selfExecutable(t)
 	cfg := configAllowing(workspace, []string{executable}, namedScript(t, workspace, "alpha"))
 
@@ -136,7 +136,7 @@ func TestMergeStoreProfiles_ResultFeedsApplyStore(t *testing.T) {
 
 // store 侧不连坐：一条非法只跳过它，其余照常进表。
 func TestMergeStoreProfiles_InvalidRecordIsSkippedNotFatal(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	executable := selfExecutable(t)
 	cfg := configAllowing(workspace, []string{executable})
 
@@ -172,8 +172,8 @@ func TestMergeStoreProfiles_InvalidRecordIsSkippedNotFatal(t *testing.T) {
 
 // 同一份非法配置，config 侧照旧连坐：合并函数没有顺手放宽它。
 func TestMergeStoreProfiles_DoesNotRevalidateConfigSide(t *testing.T) {
-	workspace := t.TempDir()
-	outside := t.TempDir()
+	workspace := tempWorkspace(t)
+	outside := tempWorkspace(t)
 	climbing := filepath.Join(outside, declareFile(t, outside, "evil.sh"))
 
 	// 严格模式下越界的 config 档位：LoadProfiles 拒，因此 NewRegistry 拒
@@ -197,8 +197,8 @@ func TestMergeStoreProfiles_DoesNotRevalidateConfigSide(t *testing.T) {
 // 撞名判定只看名字，不看 config 那条合不合法：越界的 alpha 依然让 store 的 alpha 降级。
 // 这条与上一条合起来才说明"降级判据是键位占用，不是键位可用性"。
 func TestMergeStoreProfiles_CollisionChecksNameOnly(t *testing.T) {
-	workspace := t.TempDir()
-	outside := t.TempDir()
+	workspace := tempWorkspace(t)
+	outside := tempWorkspace(t)
 	climbing := filepath.Join(outside, declareFile(t, outside, "evil.sh"))
 
 	cfg := configAllowing(workspace, []string{selfExecutable(t)}, core.ExecutorCommand{
@@ -217,7 +217,7 @@ func TestMergeStoreProfiles_CollisionChecksNameOnly(t *testing.T) {
 
 // 探测失败的 store 条目照常进表：与 config 侧"看得见但跑不了"同一口径。
 func TestMergeStoreProfiles_KeepsUnavailableProbe(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := configAllowing(workspace, []string{missingProgram})
 	record := core.NewExecutorProfileRecord(scriptUsingRuntime(missingProgram,
 		declareFile(t, workspace, "scripts/plain.mjs")))
@@ -233,7 +233,7 @@ func TestMergeStoreProfiles_KeepsUnavailableProbe(t *testing.T) {
 // 档位文件里的记录进登记表之后，注册链路与配置档位走的是同一条路：
 // 这条是"页面建的档位活过重启"在包内的最小证明。
 func TestMergeStoreProfiles_RegisteredProfileReachesTheScheduler(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	executable := selfExecutable(t)
 	cfg := configAllowing(workspace, []string{executable})
 	record := core.NewExecutorProfileRecord(namedScript(t, workspace, "from_store"))

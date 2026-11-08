@@ -5,27 +5,29 @@ import (
 	"log/slog"
 
 	"github.com/jiujuan/godelayq/internal/core"
-	"github.com/jiujuan/godelayq/internal/store/sqlite"
+	"github.com/jiujuan/godelayq/internal/store/engine"
 )
 
 // Handle 是观测库的句柄：公共底座句柄加上观测库自己的读数（Stats）。
-// 嵌入让 Path/JournalMode/Synchronous/Close/SQL 按 *sqlite.DB 的原样透出，
+// 嵌入让 Path/JournalMode/Synchronous/Close/SQL 按 *engine.DB 的原样透出，
 // 装配方（cmd/server）的 observabilityDB 接口因此由本类型满足，方法集不变。
 type Handle struct {
-	*sqlite.DB
+	*engine.DB
 }
 
 // Open 建好父目录、打开连接、设置 PRAGMA、建表并应用观测层迁移。
-// 机制全部委托 sqlite.OpenFile 与 DB.Migrate，本文件只负责把 core.ObservabilityConfig
+// 机制全部委托 engine.Open 与 DB.Migrate，本文件只负责把 core.ObservabilityConfig
 // 映射成 Options、指出观测库自己的迁移表与表清单。
 //
 // 建不起库等于什么都记不住，所以任何一步失败都返回错误，由装配方决定是否终止启动
 // ——cmd/server 的口径是不带"记不住日志"的状态上线（设计文档 §11）。
 // cfg 正常应由 core.Config.Normalized() 补齐过；空路径与非法 synchronous 仍会在
-// sqlite.OpenFile 里兜底报错，因本包也会被装配方之外的调用方直接使用。
+// engine.Open 里兜底报错，因本包也会被装配方之外的调用方直接使用。
 func Open(cfg core.ObservabilityConfig, logger *slog.Logger) (*Handle, error) {
-	db, err := sqlite.OpenFile(sqlite.Options{
+	db, err := engine.Open(engine.Options{
+		Dialect:     engine.Dialect(cfg.Dialect),
 		Path:        cfg.Path,
+		DSN:         cfg.DSN,
 		BusyTimeout: cfg.BusyTimeout,
 		Synchronous: cfg.Synchronous,
 		// 写死一个连接：写入批量单点、读是短查询，单连接同时消除 SQLITE_BUSY 的
