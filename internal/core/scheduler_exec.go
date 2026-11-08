@@ -33,9 +33,10 @@ func (s *Scheduler) beginAttempt(job *Job) {
 // finishAttempt 收口账本行。调用点必须在各自的 transition 之前：
 // 时长按 job.UpdatedAt（运行态落盘时刻，与 job.completed 事件的 duration_ms 同一基准）
 // 计，transition 会把它改成本次收尾时刻。status 是这次尝试的结论
-// （success/failed/cancelled）；结论明细（类别、退出码等）由 RE04 补充。
-// 裁剪紧随收尾：主键 (job_id, seq) 前缀索引使代价为常数，失败不影响执行链路。
-func (s *Scheduler) finishAttempt(job *Job, status AttemptStatus) {
+// （success/failed/cancelled）；outcome 由调用方按需填充失败明细（TASK-RE04，
+// 仅 failed 行有），nil 表示无明细。裁剪紧随收尾：主键 (job_id, seq) 前缀索引
+// 使代价为常数，失败不影响执行链路。
+func (s *Scheduler) finishAttempt(job *Job, status AttemptStatus, outcome func(*Attempt)) {
 	if s.ledger == nil {
 		return
 	}
@@ -47,12 +48,39 @@ func (s *Scheduler) finishAttempt(job *Job, status AttemptStatus) {
 		FinishedAt: time.Now(),
 		DurationMs: time.Since(job.UpdatedAt).Milliseconds(),
 	}
+	if outcome != nil {
+		outcome(&rec)
+	}
 	if err := s.ledger.FinishAttempt(job.ID, job.Attempts, rec); err != nil {
 		s.logger.Error("failed to finish attempt", "job_id", job.ID, "seq", rec.Seq, "error", err)
 	}
 	if err := s.ledger.PruneAttempts(job.ID, s.attemptsKeepLast); err != nil {
 		s.logger.Error("failed to prune attempts", "job_id", job.ID, "error", err)
 	}
+}
+
+// fillFailureAttempt 把失败明细写进账本行（TASK-RE04）：类别文本由调用方算好
+// 传入（事件 metadata 与账本行必须同一份 class），其余字段按 AttemptOutcome 接口读。
+// 普通处理函数的失败没有 outcome——只有错误文本，与 job.failed 事件的 error
+// 字段同一暴露面。
+func (s *Scheduler) fillFailureAttempt(rec *Attempt, err error, class string) {
+	rec.Class = class
+	var outcome AttemptOutcome
+	if errors.As(err, &outcome) {
+		if retryable, ok := outcome.AttemptRetryable(); ok {
+			rec.Retryable, rec.RetryableSet = retryable, true
+		}
+		if code, ok := outcome.AttemptExitCode(); ok {
+			rec.ExitCode, rec.ExitCodeSet = code, true
+		}
+		rec.Signal = outcome.AttemptSignal()
+		if status, ok := outcome.AttemptHTTPStatus(); ok {
+			rec.HTTPStatus, rec.HTTPStatusSet = status, true
+		}
+		rec.Error = outcome.AttemptErrorText()
+		return
+	}
+	rec.Error = err.Error()
 }
 
 // 执行任务（由 worker 协程调用，阻塞直到 Handler 返回）
@@ -173,15 +201,18 @@ func (s *Scheduler) executeJob(job *Job) {
 
 	timedOut := errors.Is(err, context.DeadlineExceeded) || errors.Is(execCtx.Err(), context.DeadlineExceeded)
 	permanent := isPermanentFailure(err)
+	// 失败类别（TASK-RE04 §6.4 词表）：事件 metadata 与账本行用同一份 class。
+	failureClass := attemptClassOf(err, timedOut)
 
 	// 失败事件的 metadata：retry_count/max_retries/timeout 是既有形状，
-	// permanent 只在"重试没有意义"时加上（TASK-E12 §3.4）。
-	// 只加真值不加假值是为了让既有事件的 JSON 形状一字不变；
-	// api/history.go 与前端把这个键当透传字段，不解析。
+	// permanent 只在"重试没有意义"时加上（TASK-E12 §3.4），
+	// class 由 TASK-RE04 加上。只加真值不加假值是为了让既有事件的 JSON 形状
+	// 一字不变；api/history.go 与前端把这些键当透传字段，不解析。
 	failureMetadata := map[string]interface{}{
 		"retry_count": job.RetryCount,
 		"max_retries": job.MaxRetries,
 		"timeout":     timedOut,
+		"class":       failureClass,
 	}
 	if permanent {
 		failureMetadata["permanent"] = true
@@ -203,7 +234,7 @@ func (s *Scheduler) executeJob(job *Job) {
 	} else {
 		s.logger.Error("job failed", "job_id", job.ID, "error", err)
 	}
-	s.handleFailure(job, err)
+	s.handleFailure(job, err, failureClass)
 }
 
 // eventData 组装事件的附加数据：失败时带 error，有执行结论时带 result，
@@ -267,7 +298,7 @@ func (s *Scheduler) handleInterrupted(job *Job) {
 
 	// 用户 Cancel 的收尾认领：running→cancelled（TASK-RE01）。
 	if s.takeCancelRequested(job.ID) {
-		s.finishAttempt(job, AttemptCancelled)
+		s.finishAttempt(job, AttemptCancelled, nil)
 		s.transition(job, StatusCancelled, Event{
 			Type:      EventJobCancelled,
 			JobID:     job.ID,
@@ -288,13 +319,13 @@ func (s *Scheduler) handleInterrupted(job *Job) {
 		// 尝试确实结束了（ctx 已取消、Handler 已返回）：账本行落 cancelled，
 		// 不留无主 running 行（TASK-RE02）。任务快照维持既有口径（running，
 		// 交给重启后的 Restore 处置）。
-		s.finishAttempt(job, AttemptCancelled)
+		s.finishAttempt(job, AttemptCancelled, nil)
 		s.logger.Info("job execution cancelled", "job_id", job.ID)
 		return
 	}
 
 	// 关停打断：尝试被中止（cancelled），任务本身落回 pending，重启后照常重跑。
-	s.finishAttempt(job, AttemptCancelled)
+	s.finishAttempt(job, AttemptCancelled, nil)
 	s.transition(job, StatusPending, Event{
 		Type:      EventJobCancelled,
 		JobID:     job.ID,
@@ -324,7 +355,7 @@ func (s *Scheduler) handleSuccess(job *Job) {
 
 	// 尝试成功收口（TASK-RE02）：cron 分支与终态落盘共用这一次 finish——
 	// 尝试本身成功了，哪怕任务还要排下一轮。必须在 transition 之前（时长基准）。
-	s.finishAttempt(job, AttemptSuccess)
+	s.finishAttempt(job, AttemptSuccess, nil)
 
 	// 如果是重复任务，计算下次执行时间并重新入队。
 	// 新一轮是同 ID 的新对象，经 Schedule 以 pending 落盘——上一轮 running→pending
@@ -379,7 +410,9 @@ func (s *Scheduler) handleSuccess(job *Job) {
 //  4. 最后才是既有的"按 RetryCount 与 MaxRetries 决定重试还是落终态"。
 //
 // err 是处理函数返回的原始错误：判定要读它的 Permanent()，而 job 里没有它。
-func (s *Scheduler) handleFailure(job *Job, err error) {
+// failureClass 是 executeJob 算好的类别文本（TASK-RE04）：账本行与事件 metadata
+// 必须同一份，所以传进来而不是在这里重算。
+func (s *Scheduler) handleFailure(job *Job, err error, failureClass string) {
 	// 同 handleSuccess：中止期间 Handler 自己报了错，也按用户意图停在 paused，
 	// 不再消耗重试次数、不再重新排期。
 	if s.parkForcedPause(job, "handler_failed_despite_cancel") {
@@ -388,7 +421,7 @@ func (s *Scheduler) handleFailure(job *Job, err error) {
 
 	if s.takeCancelRequested(job.ID) {
 		s.logger.Info("cancel requested and the handler failed; job stops as cancelled", "job_id", job.ID)
-		s.finishAttempt(job, AttemptCancelled)
+		s.finishAttempt(job, AttemptCancelled, nil)
 		s.transition(job, StatusCancelled, Event{
 			Type:      EventJobCancelled,
 			JobID:     job.ID,
@@ -402,7 +435,10 @@ func (s *Scheduler) handleFailure(job *Job, err error) {
 
 	// 三个剩余分支（永久失败/重试/重试耗尽）的尝试结论都是 failed；
 	// 先收口账本再走分支（transition 会改 UpdatedAt，时长基准在此之后失效）。
-	s.finishAttempt(job, AttemptFailed)
+	// 失败明细随行落账（TASK-RE04）。
+	s.finishAttempt(job, AttemptFailed, func(rec *Attempt) {
+		s.fillFailureAttempt(rec, err, failureClass)
+	})
 
 	if isPermanentFailure(err) {
 		s.markFailed(job)

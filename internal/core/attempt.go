@@ -11,6 +11,7 @@
 package core
 
 import (
+	"errors"
 	"strings"
 	"time"
 )
@@ -119,16 +120,56 @@ type Attempt struct {
 	DurationMs int64
 
 	// 结论字段：失败时由执行器分类填充（TASK-RE04），成功时留空。
-	Class        string
-	Retryable    bool
-	RetryableSet bool
-	ExitCode     int
-	ExitCodeSet  bool
-	Signal       string
-	HTTPStatus   int
+	Class         string
+	Retryable     bool
+	RetryableSet  bool
+	ExitCode      int
+	ExitCodeSet   bool
+	Signal        string
+	HTTPStatus    int
 	HTTPStatusSet bool
 	// Error 是脱敏后的错误文本（脱敏口径在执行器侧，E08 规则）。
 	Error string
+}
+
+// attemptClassOf 定一次失败的类别文本（TASK-RE04 §6.4）。顺序即口径：
+// 超时优先（普通 handler 的 DeadlineExceeded 未必实现 AttemptOutcome，
+// 而执行器的 timeout 类经 errors.Is 也会落到这里），
+// 其次执行器侧的接口实现，最后是普通 handler 的兜底 handler_error。
+func attemptClassOf(err error, timedOut bool) string {
+	if timedOut {
+		return "timeout"
+	}
+	var outcome AttemptOutcome
+	if errors.As(err, &outcome) {
+		return outcome.AttemptClass()
+	}
+	return "handler_error"
+}
+
+// AttemptOutcome 是一次失败的分类明细（TASK-RE04）。
+//
+// core 不认识执行器的 ExitError——只按接口读，依赖方向保持 executor → core，
+// 与 PermanentError（"要不要重试"）同一手法。本接口管"失败长什么样"：
+// 类别文本、可重试性、退出码/信号/状态码与脱敏后的错误文本，落账本行与
+// job.failed 事件的 metadata。普通处理函数的失败没有这个实现——
+// 记 handler_error（或 timeout），只有错误文本可填。
+type AttemptOutcome interface {
+	// AttemptClass 返回失败类别文本（设计文档 §6.4 词表：invalid_submission/
+	// profile_unavailable/not_allowed/timeout/permit_wait/exit_code/http_status/
+	// address_refused/transport/interrupted）。
+	AttemptClass() string
+	// AttemptRetryable 返回"这次失败允许重试吗"；ok=false 表示未判定（账本列 NULL）。
+	AttemptRetryable() (retryable bool, ok bool)
+	// AttemptExitCode 返回进程退出码；ok=false 表示没有退出码可言
+	//（非 exit_code 类别一律 false——HTTP 状态码冒充退出码是假信息）。
+	AttemptExitCode() (code int, ok bool)
+	// AttemptSignal 返回终止信号名，正常退出为空。
+	AttemptSignal() string
+	// AttemptHTTPStatus 返回响应状态码；ok=false 表示非 http 类别。
+	AttemptHTTPStatus() (status int, ok bool)
+	// AttemptErrorText 返回脱敏后的错误文本（秘密止步于子进程边界，E08 口径）。
+	AttemptErrorText() string
 }
 
 // DefaultAttemptsKeepLast 是每任务账本保留条数的默认值（store.attempts_keep_last

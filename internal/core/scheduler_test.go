@@ -558,7 +558,7 @@ func TestScheduler_HandleFailure_WithRetries(t *testing.T) {
 		RetryDelay: 10 * time.Millisecond,
 	}
 
-	scheduler.handleFailure(job, errors.New("handler failed"))
+	scheduler.handleFailure(job, errors.New("handler failed"), "handler_error")
 
 	// Verify retry job was scheduled
 	if scheduler.heap.Len() != 1 {
@@ -577,7 +577,7 @@ func TestScheduler_HandleFailure_MaxRetriesExceeded(t *testing.T) {
 		RetryCount: 3,
 	}
 
-	scheduler.handleFailure(job, errors.New("handler failed"))
+	scheduler.handleFailure(job, errors.New("handler failed"), "handler_error")
 
 	// Verify no retry was scheduled
 	if scheduler.heap.Len() != 0 {

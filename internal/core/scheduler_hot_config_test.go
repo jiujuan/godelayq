@@ -56,12 +56,12 @@ func TestSetRetryPolicy_ChangesScheduledDelay(t *testing.T) {
 		MaxRetries: 2,
 		RetryDelay: 5 * time.Millisecond,
 	}
-	scheduler.handleFailure(job, errors.New("handler failed"))
+	scheduler.handleFailure(job, errors.New("handler failed"), "handler_error")
 	assertScheduledDelay(t, retriedJob(t, scheduler, "hot-retry"), first, 1, "before the swap")
 
 	second := &recordingRetryPolicy{delay: 30 * time.Millisecond}
 	scheduler.SetRetryPolicy(second)
-	scheduler.handleFailure(retriedJob(t, scheduler, "hot-retry"), errors.New("handler failed"))
+	scheduler.handleFailure(retriedJob(t, scheduler, "hot-retry"), errors.New("handler failed"), "handler_error")
 	assertScheduledDelay(t, retriedJob(t, scheduler, "hot-retry"), second, 1, "after the swap")
 }
 
@@ -90,7 +90,7 @@ func TestSetRetryPolicy_ConcurrentWithFailureHandling(t *testing.T) {
 			TriggerAt:  time.Now(),
 			MaxRetries: 1,
 			RetryDelay: time.Millisecond,
-		}, errors.New("handler failed"))
+		}, errors.New("handler failed"), "handler_error")
 		seen = append(seen, scheduler.RetryPolicyMaxDelay())
 	}
 	wg.Wait()

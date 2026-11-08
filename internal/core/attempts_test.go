@@ -6,6 +6,7 @@ package core
 import (
 	"context"
 	"errors"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -14,15 +15,18 @@ import (
 )
 
 // mockLedger 是 AttemptLedger 的内存替身：记录调用流水量，供断言轮询读取。
+// finishes 按单任务 seq 键控（单任务用例）；finishesByJob 按 "jobID#seq" 键控
+// （多任务并跑的用例——seq 在不同任务间会撞号）。
 type mockLedger struct {
-	mu        sync.Mutex
-	begins    []Attempt
-	finishes  map[int]Attempt
-	abandoned []int
+	mu            sync.Mutex
+	begins        []Attempt
+	finishes      map[int]Attempt
+	finishesByJob map[string]Attempt
+	abandoned     []int
 }
 
 func newMockLedger() *mockLedger {
-	return &mockLedger{finishes: make(map[int]Attempt)}
+	return &mockLedger{finishes: make(map[int]Attempt), finishesByJob: make(map[string]Attempt)}
 }
 
 func (m *mockLedger) BeginAttempt(jobID string, rec Attempt) error {
@@ -36,6 +40,7 @@ func (m *mockLedger) FinishAttempt(jobID string, seq int, rec Attempt) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.finishes[seq] = rec
+	m.finishesByJob[jobID+"#"+strconv.Itoa(seq)] = rec
 	return nil
 }
 
@@ -66,6 +71,14 @@ func (m *mockLedger) snapshot() (begins []Attempt, finishes map[int]Attempt, aba
 		}
 		return out
 	}(), append([]int(nil), m.abandoned...)
+}
+
+// finishOf 按任务+seq 取收口行（多任务并跑的用例）。
+func (m *mockLedger) finishOf(jobID string, seq int) (Attempt, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	rec, ok := m.finishesByJob[jobID+"#"+strconv.Itoa(seq)]
+	return rec, ok
 }
 
 // waitForLedger 轮询等待账本行数到达期望值（worker 异步收尾）。
@@ -202,6 +215,94 @@ func TestJob_CloneForRetryCarriesAttempts(t *testing.T) {
 		t.Errorf("重试副本应盖 retry 来源章，实际 %v", clone.dispatchSource)
 	}
 	if job.dispatchSource != AttemptTriggerScheduled {
-		t.Errorf("原任务的来源章不得被改动，实际 %v", job.dispatchSource)
+		t.Errorf("原任务的来源章不得被改动，实际 %v", clone.dispatchSource)
 	}
+}
+
+// classifiedError 是 AttemptOutcome 的测试替身（TASK-RE04）：core 不能 import
+// executor（依赖方向 executor → core），接口读取语义用替身验证，executor 侧的
+// 真实实现由 exit_class_test.go 钉住。
+type classifiedError struct {
+	class      string
+	retryable  bool
+	exitCode   int
+	hasCode    bool
+	httpStatus int
+	hasStatus  bool
+}
+
+func (e *classifiedError) Error() string                  { return "classified: " + e.class }
+func (e *classifiedError) AttemptClass() string           { return e.class }
+func (e *classifiedError) AttemptRetryable() (bool, bool) { return e.retryable, true }
+func (e *classifiedError) AttemptExitCode() (int, bool)   { return e.exitCode, e.hasCode }
+func (e *classifiedError) AttemptSignal() string          { return "" }
+func (e *classifiedError) AttemptHTTPStatus() (int, bool) { return e.httpStatus, e.hasStatus }
+func (e *classifiedError) AttemptErrorText() string       { return e.Error() }
+
+// TestScheduler_AttemptLedger_FailureOutcome：失败明细落账（TASK-RE04）——
+// AttemptOutcome 的字段进账本行，class 与事件 metadata 同源。
+func TestScheduler_AttemptLedger_FailureOutcome(t *testing.T) {
+	store := newMockStore()
+	ledger := newMockLedger()
+	scheduler := NewScheduler(store, nil, nil, quietLogger(), WithAttemptLedger(ledger, 0))
+	scheduler.RegisterHandler("classified", func(ctx context.Context, job *Job) error {
+		return &classifiedError{class: "transport", retryable: true}
+	})
+	scheduler.RegisterHandler("plain", func(ctx context.Context, job *Job) error {
+		return errors.New("plain boom")
+	})
+	scheduler.RegisterHandler("observed", func(ctx context.Context, job *Job) error {
+		return &classifiedError{class: "exit_code", exitCode: 9, hasCode: true}
+	})
+	events := collectEvents(scheduler.GetEventBus())
+
+	// 执行器形态的失败（有 outcome）：class/retryable 进账本行
+	scheduler.Schedule(&Job{ID: "led-outcome", Name: "classified", TriggerAt: time.Now()})
+	// 普通处理函数失败：handler_error + 错误文本
+	scheduler.Schedule(&Job{ID: "led-plain", Name: "plain", TriggerAt: time.Now()})
+	// exit_code 类别：退出码 9 进列
+	scheduler.Schedule(&Job{ID: "led-exit", Name: "observed", TriggerAt: time.Now()})
+	scheduler.Start()
+	defer scheduler.Stop()
+
+	waitSnapshotStatus(t, store, "led-outcome", StatusFailed, 3*time.Second)
+	waitSnapshotStatus(t, store, "led-plain", StatusFailed, 3*time.Second)
+	waitSnapshotStatus(t, store, "led-exit", StatusFailed, 3*time.Second)
+	waitForLedger(t, ledger, 3)
+
+	// 各任务的收口行按 job+seq 取（三个任务都是 seq=1，全局 seq 键会撞号）
+	outcome, ok := ledger.finishOf("led-outcome", 1)
+	require.True(t, ok)
+	require.Equal(t, "transport", outcome.Class)
+	require.True(t, outcome.RetryableSet)
+	require.True(t, outcome.Retryable)
+
+	plain, ok := ledger.finishOf("led-plain", 1)
+	require.True(t, ok)
+	require.Equal(t, "handler_error", plain.Class)
+	require.False(t, plain.RetryableSet, "普通 handler 的失败没有可重试性判定")
+	require.Equal(t, "plain boom", plain.Error)
+
+	exit, ok := ledger.finishOf("led-exit", 1)
+	require.True(t, ok)
+	require.Equal(t, "exit_code", exit.Class)
+	require.True(t, exit.ExitCodeSet)
+	require.Equal(t, 9, exit.ExitCode)
+
+	// job.failed 事件的 metadata 带 class（与账本行同源）
+	events.mu.Lock()
+	allFailed := countEvents(events.items, EventJobFailed)
+	events.mu.Unlock()
+	require.Len(t, allFailed, 3)
+	for _, ev := range allFailed {
+		require.NotNil(t, ev.Metadata["class"], "job.failed 事件必须带 class")
+	}
+}
+
+// TestAttemptClassOf：类别判定的顺序即口径——超时优先、接口其次、handler_error 兜底。
+func TestAttemptClassOf(t *testing.T) {
+	require.Equal(t, "timeout", attemptClassOf(context.DeadlineExceeded, true))
+	require.Equal(t, "timeout", attemptClassOf(errors.New("unrelated"), true))
+	require.Equal(t, "transport", attemptClassOf(&classifiedError{class: "transport"}, false))
+	require.Equal(t, "handler_error", attemptClassOf(errors.New("plain"), false))
 }

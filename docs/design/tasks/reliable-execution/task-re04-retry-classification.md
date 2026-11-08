@@ -52,6 +52,13 @@
 - **风险：事件 JSON 形状被前端隐式依赖**。缓解：只增键不增删；`api/history.go` 透传路径的既有断言继续跑。
 - 回滚：revert 后 attempt 行少两列语义（class/retryable 为 NULL），账本结构不受影响。
 
-## 10. 实现记录
+## 10. 实现记录（2026-11-08）
 
-（待实现后回填。）
+分支 `feat/reliable-execution`。按卡交付，无设计偏离：
+
+- **executor/exit.go**：`failureClass.String()` 十类词表（全仓唯一映射）；`ExitError` 增 `Class` 与 `HTTPStatus` 两个必填字段（构造点 `newFailure`/`newStatusFailure` 集中赋值——原实现状态码只参与重试判定不落错误对象，账本的 http_status 列因此补上来源）；`AttemptOutcome` 六方法实现 + 编译期断言（ok 语义按类别分列：exit_code/http_status 互不冒充）。
+- **core/attempt.go**：`AttemptOutcome` 接口（依赖方向 executor → core 不变，与 PermanentError 同手法）+ `attemptClassOf`（超时优先 → 接口其次 → handler_error 兜底）。
+- **core/scheduler_exec.go**：`finishAttempt` 加 outcome 闭包参数（仅 failed 行填明细，cancelled 行 class 留 NULL——cancel 原因在事件里）；`fillFailureAttempt` 按 outcome 填 class/retryable/exit_code/signal/http_status/error_text；`handleFailure` 签名加 `failureClass`（executeJob 算一次，事件 metadata 与账本行同源）；`job.failed` metadata 增 `"class"`（additive）。
+- **普通 handler**：维持 PermanentError 二分不强制分类——class 记 handler_error/timeout，attempt 只有错误文本（与事件 error 字段同一暴露面）。
+- **测试**：executor 十类词表表驱动 + 构造点分类/AttemptOutcome ok 语义；core 用 AttemptOutcome 替身（core 不能 import executor）验证明细落账三形态（outcome/handler_error/exit_code）+ attemptClassOf 顺序 + 事件 metadata class；既有 handleFailure 直调测试点补第三参。
+- **验证**：`go build/vet` 干净；`go test ./... -count=1` 九包全绿。
