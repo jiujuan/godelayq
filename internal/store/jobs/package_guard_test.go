@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jiujuan/godelayq/internal/store/storeguard"
 )
 
 // 本测试钉死本包的依赖红线（doc.go）：
@@ -50,4 +52,18 @@ func TestJobsPackageDoesNotImportForbidden(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestJobsPackageStoreRedlines 钉住 bun 化后的三条存储红线（db-quality-gates-design.md §4）：
+// 生产代码没有原生查询出口（SQL()/Query 家族）、没有方言分支标识符、构建器参数
+// 没有 fmt.Sprintf 动态拼接。三条全部零豁免：任务库的每一类操作都已有构建器写法。
+// 经变量中转的拼接拦不住（storeguard 包注释的局限声明），门禁抓的是高频捷径。
+func TestJobsPackageStoreRedlines(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("resolve package dir: %v", err)
+	}
+	storeguard.GuardNoRawSQL(t, dir, nil)
+	storeguard.GuardNoDialectBranch(t, dir, nil)
+	storeguard.GuardNoDynamicSQL(t, dir)
 }

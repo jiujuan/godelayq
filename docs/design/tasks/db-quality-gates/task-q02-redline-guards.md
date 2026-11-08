@@ -56,4 +56,12 @@ AST 规则过严误伤合法用法——白名单文件级（不是行级），�
 
 ## 10. 实现记录
 
-(执行时填写)
+- 2026-11-08 完成。storeguard 三规则：GuardNoRawSQL（SQL()/Query/QueryRow 家族——
+  后者是 *sql.DB 经嵌入提升出的逃生口，与 SQL() 一样绕过构建器）、
+  GuardNoDialectBranch、GuardNoDynamicSQL（构建器直接实参查 fmt.Sprintf）。
+- 接线：jobs（三规则零豁免）、observe（原生出口豁免 db.go——Stats 的可移植原生语句）、
+  mgr（方言分支豁免 models.go——nameConflictClause 全仓唯一分支点）。
+- **补齐欠账**：mgr 此前没有任何 package_guard_test（doc.go 写了红线但没守卫），
+  本卡一并补上驱动/消费方 import 守卫（含 pgx）。
+- 自证：mgr 下临时构造三类违规（.SQL()、engine.DialectPostgres、Sprintf 进 Where），
+  守卫逐条报文件:行号并 FAIL；删除后全绿。全仓零误报。

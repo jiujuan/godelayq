@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/jiujuan/godelayq/internal/store/storeguard"
 )
 
 // 本测试钉死本包的两条依赖红线（doc.go）：
@@ -47,4 +49,17 @@ func TestObservePackageDoesNotImportConsumers(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestObservePackageStoreRedlines 钉住 bun 化后的三条存储红线（db-quality-gates-design.md §4）。
+// 豁免仅 db.go：Stats 是三库共用的可移植原生语句（COALESCE(MAX)/COUNT），不走构建器；
+// 其余事件/审计/工件读写全部经构建器。方言分支零豁免。
+func TestObservePackageStoreRedlines(t *testing.T) {
+	dir, err := filepath.Abs(".")
+	if err != nil {
+		t.Fatalf("resolve package dir: %v", err)
+	}
+	storeguard.GuardNoRawSQL(t, dir, map[string]bool{"db.go": true})
+	storeguard.GuardNoDialectBranch(t, dir, nil)
+	storeguard.GuardNoDynamicSQL(t, dir)
 }
