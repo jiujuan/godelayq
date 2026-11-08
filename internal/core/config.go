@@ -730,6 +730,11 @@ type ObservabilityConfig struct {
 	// Synchronous SQLite synchronous PRAGMA：normal|full，空表示 DefaultObserveSynchronous。
 	// normal 在 WAL 下断电最多丢最后若干次已提交事务，与 JSONFileStore 的"最多丢一个合并周期"同量级。
 	Synchronous string `mapstructure:"synchronous"`
+	// Dialect 存储方言：sqlite（默认）| postgres。空表示 sqlite。
+	Dialect string `mapstructure:"dialect"`
+	// DSN 连接串，仅 dialect=postgres 时使用（含口令，经 GODELAYQ_* 环境变量注入更安全）；
+	// dialect=sqlite 时填写会被 Validate 拒绝。
+	DSN string `mapstructure:"dsn"`
 
 	// Events 运行事件（job_events）的开关与保留策略。
 	Events ObservabilityEventsConfig `mapstructure:"events"`
@@ -774,7 +779,10 @@ func (o ObservabilityConfig) Validate() error {
 		return nil
 	}
 
-	if strings.TrimSpace(o.Path) == "" {
+	if err := validateStoreTarget("observability", o.Dialect, o.DSN); err != nil {
+		return err
+	}
+	if storeDialectIsSQLite(o.Dialect) && strings.TrimSpace(o.Path) == "" {
 		return fmt.Errorf("observability.path must not be empty when observability.enabled is true")
 	}
 	switch strings.TrimSpace(o.Synchronous) {
@@ -834,11 +842,16 @@ type MgrStoreConfig struct {
 	// Enabled 管理库总开关。false 时不建库文件，进程按文件形态运行。
 	Enabled bool `mapstructure:"enabled"`
 	// Path 库文件路径；空表示 DefaultMgrDBPath，父目录不存在时由装配方创建。
+	// 仅 dialect=sqlite 时使用。
 	Path string `mapstructure:"path"`
 	// BusyTimeout SQLite busy 等待上限；0 表示 DefaultMgrBusyTimeout。
 	BusyTimeout time.Duration `mapstructure:"busy_timeout"`
 	// Synchronous SQLite synchronous PRAGMA：normal|full，空表示 DefaultMgrSynchronous。
 	Synchronous string `mapstructure:"synchronous"`
+	// Dialect 存储方言：sqlite（默认）| postgres。空表示 sqlite。
+	Dialect string `mapstructure:"dialect"`
+	// DSN 连接串，仅 dialect=postgres 时使用；dialect=sqlite 时填写会被 Validate 拒绝。
+	DSN string `mapstructure:"dsn"`
 }
 
 // Validate 校验管理库自身的取值。与 ObservabilityConfig.Validate 同一口径：
@@ -847,7 +860,10 @@ func (m MgrStoreConfig) Validate() error {
 	if !m.Enabled {
 		return nil
 	}
-	if strings.TrimSpace(m.Path) == "" {
+	if err := validateStoreTarget("mgrstore", m.Dialect, m.DSN); err != nil {
+		return err
+	}
+	if storeDialectIsSQLite(m.Dialect) && strings.TrimSpace(m.Path) == "" {
 		return fmt.Errorf("mgrstore.path must not be empty when mgrstore.enabled is true")
 	}
 	switch strings.TrimSpace(m.Synchronous) {
@@ -861,21 +877,58 @@ func (m MgrStoreConfig) Validate() error {
 	return nil
 }
 
+// validateStoreTarget 校验一个库的"连到哪"：方言取值合法，且两种方言互斥地
+// 要求各自的连接信息（sqlite 不许带 dsn，postgres 必须给 dsn）。
+// prefix 用于错误信息定位配置键（如 "mgrstore"、"observability"）。
+func validateStoreTarget(prefix, dialect, dsn string) error {
+	switch strings.TrimSpace(dialect) {
+	case "", "sqlite":
+		if strings.TrimSpace(dsn) != "" {
+			return fmt.Errorf("%s.dsn is only used when %s.dialect is postgres", prefix, prefix)
+		}
+	case "postgres":
+		if strings.TrimSpace(dsn) == "" {
+			return fmt.Errorf("%s.dsn must not be empty when %s.dialect is postgres", prefix, prefix)
+		}
+	default:
+		return fmt.Errorf("%s.dialect %q is invalid, use sqlite or postgres", prefix, dialect)
+	}
+	return nil
+}
+
+// storeDialectIsSQLite 报告方言取值（含空 = 默认 sqlite）是否 sqlite。
+func storeDialectIsSQLite(dialect string) bool {
+	switch strings.TrimSpace(dialect) {
+	case "", "sqlite":
+		return true
+	}
+	return false
+}
+
 // StoreSQLiteConfig 任务快照 SQLite 后端的取值。仅 store.type=sqlite 时生效；
-// 三字段与 MgrStoreConfig 同构而不抽公共结构（默认值唯一来源原则，见任务库常量注释）。
+// 字段与 MgrStoreConfig 同构而不抽公共结构（默认值唯一来源原则，见任务库常量注释）。
 type StoreSQLiteConfig struct {
 	// Path 库文件路径；空表示 DefaultJobsDBPath，父目录不存在时由装配方创建。
+	// 仅 dialect=sqlite 时使用。
 	Path string `mapstructure:"path"`
 	// BusyTimeout SQLite busy 等待上限；0 表示 DefaultJobsBusyTimeout。
 	BusyTimeout time.Duration `mapstructure:"busy_timeout"`
 	// Synchronous SQLite synchronous PRAGMA：normal|full，空表示 DefaultJobsSynchronous。
 	Synchronous string `mapstructure:"synchronous"`
+	// Dialect 存储方言：sqlite（默认）| postgres。空表示 sqlite。
+	// 节名沿用 store.sqlite（历史形成）：方言切换不换节名，旧配置零改动。
+	Dialect string `mapstructure:"dialect"`
+	// DSN 连接串，仅 dialect=postgres 时使用；dialect=sqlite 时填写会被 Validate 拒绝。
+	DSN string `mapstructure:"dsn"`
 }
 
 // Validate 校验任务库自身的取值。没有 Enabled 开关——生效与否由 store.type 决定，
 // 但取值合法性独立检查：写着 type=sqlite 却带非法 synchronous 要在启动时报错，
 // 不能等切了 type 才炸。
 func (s StoreSQLiteConfig) Validate() error {
+	if err := validateStoreTarget("store.sqlite", s.Dialect, s.DSN); err != nil {
+		return err
+	}
 	switch strings.TrimSpace(s.Synchronous) {
 	case "", "normal", "full":
 	default:
@@ -918,7 +971,7 @@ func DefaultConfig() Config {
 			HistoryLimit:  DefaultHistoryLimit,
 			HistoryTTL:    0,
 			GroupsPath:    DefaultGroupsPath,
-			SQLite:        StoreSQLiteConfig{Path: DefaultJobsDBPath},
+			SQLite:        StoreSQLiteConfig{Path: DefaultJobsDBPath, Dialect: "sqlite"},
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
@@ -964,6 +1017,7 @@ func DefaultConfig() Config {
 			QueueCapacity: DefaultObserveQueueCapacity,
 			BusyTimeout:   DefaultObserveBusyTimeout,
 			Synchronous:   DefaultObserveSynchronous,
+			Dialect:       "sqlite",
 			Events: ObservabilityEventsConfig{
 				Enabled:        true,
 				RetentionCount: DefaultObserveEventRetentionCount,
@@ -985,6 +1039,7 @@ func DefaultConfig() Config {
 			Path:        DefaultMgrDBPath,
 			BusyTimeout: DefaultMgrBusyTimeout,
 			Synchronous: DefaultMgrSynchronous,
+			Dialect:     "sqlite",
 		},
 		Reload: ReloadConfig{
 			// 默认关闭：打开它等于让进程盯着配置文件自动换取值，
@@ -1033,6 +1088,20 @@ func LoadConfig(path string) (Config, error) {
 		"store.history_limit",
 		"store.history_ttl",
 		"store.groups_path",
+		// 任务库/管理库/观测库的连接取值：全部是标量，逐项绑定。
+		// dsn 含口令，经环境变量注入与 server.auth.token 同一安全口径；
+		// 容器化部署切 PostgreSQL 靠的就是这三个 dsn 键。
+		"store.sqlite.dialect",
+		"store.sqlite.dsn",
+		"store.sqlite.path",
+		"store.sqlite.busy_timeout",
+		"store.sqlite.synchronous",
+		"mgrstore.enabled",
+		"mgrstore.dialect",
+		"mgrstore.dsn",
+		"mgrstore.path",
+		"mgrstore.busy_timeout",
+		"mgrstore.synchronous",
 		"logging.level",
 		"logging.format",
 		// 执行器：只绑定标量与简单列表。executors.commands 是"名字+参数+路径"的嵌套列表，
@@ -1068,6 +1137,8 @@ func LoadConfig(path string) (Config, error) {
 		// 路径不是凭据，所以 observability.path 也绑定（对照故意不绑的 server.auth.users、
 		// executors.commands：那是嵌套列表，且内容本身不该出现在环境变量里）。
 		"observability.enabled",
+		"observability.dialect",
+		"observability.dsn",
 		"observability.path",
 		"observability.flush_interval",
 		"observability.queue_capacity",
@@ -1330,12 +1401,22 @@ func (c Config) Normalized() Config {
 	if c.Observability.Synchronous == "" {
 		c.Observability.Synchronous = defaults.Observability.Synchronous
 	}
+	// 方言留空一律折成 sqlite：既事后端不动，配置里不写 dialect 的部署行为零变化。
+	if c.Observability.Dialect == "" {
+		c.Observability.Dialect = "sqlite"
+	}
 
 	if c.MgrStore.Path == "" {
 		c.MgrStore.Path = defaults.MgrStore.Path
 	}
-	if c.MgrStore.BusyTimeout <= 0 {
-		c.MgrStore.BusyTimeout = defaults.MgrStore.BusyTimeout
+	if c.MgrStore.Dialect == "" {
+		c.MgrStore.Dialect = "sqlite"
+	}
+	if c.Store.SQLite.Path == "" {
+		c.Store.SQLite.Path = defaults.Store.SQLite.Path
+	}
+	if c.Store.SQLite.Dialect == "" {
+		c.Store.SQLite.Dialect = "sqlite"
 	}
 	if c.Store.SQLite.Path == "" {
 		c.Store.SQLite.Path = defaults.Store.SQLite.Path

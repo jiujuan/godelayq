@@ -57,4 +57,17 @@ $env:GODELAYQ_TEST_PG_DSN='postgres://...'; go test -run TestPostgresSmoke ./int
 
 ## 10. 实现记录
 
-(执行时填写)
+- 2026-11-08 完成。engine 增 `postgres.go`（pgx/v5 stdlib + pgdialect、连接池默认 4、
+  DSN 脱敏 helper 同时处理 URL 与 keyword 两种形态）；三份 schema 补齐 UpPostgres。
+- **PG DDL 差异落地为三类**：IDENTITY 自增（job_events/write_audit 的 seq）、
+  BIGINT 升宽（所有时间戳/字节数列——SQLite INTEGER 即 64 位，PG INTEGER 是 32 位，
+  jobs.updated_at 的 UnixNano 会溢出，jobs 因此也需要 UpPostgres）、
+  lower(name) 唯一索引（mgr 三张名表）。
+- **踩坑记录**：engine.Migrate 的记账 INSERT 走 *sql.DB 原生执行，pgx 不转译 `?`
+  占位符（报 42601）——记账语句按方言取 `?`/`$N`。
+- **风险清单第一项实证通过**：`ON CONFLICT (lower(name))` 表达式冲突目标被本机
+  PostgreSQL 接受，大小写变体 upsert 命中同一行（pgtest 冒烟用例钉住）。
+- 配置面：三节 dialect/dsn、Validate 互斥校验（sqlite 带 dsn 拒绝、postgres 必给 dsn）、
+  Normalized 折默认、DefaultConfig 落 sqlite、env 绑定补齐、重载分类 ClassRestart、
+  example 与本机 config 同步（TestExampleConfigMatchesLocal 绿）。
+- 本机 PG（GODELAYQ_TEST_PG_DSN 门控）冒烟全绿；无 DSN 环境跳过不失败。

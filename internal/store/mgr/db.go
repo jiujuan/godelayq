@@ -22,7 +22,9 @@ type Handle struct {
 // 与观测库"不带记不住日志的状态上线"同一口径。
 func Open(cfg core.MgrStoreConfig, logger *slog.Logger) (*Handle, error) {
 	db, err := engine.Open(engine.Options{
+		Dialect:     engine.Dialect(cfg.Dialect),
 		Path:        cfg.Path,
+		DSN:         cfg.DSN,
 		BusyTimeout: cfg.BusyTimeout,
 		Synchronous: cfg.Synchronous,
 		// 单连接：管理库写是低频实体（建号、建组、建档位），读是登录与验签的

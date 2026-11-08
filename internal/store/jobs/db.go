@@ -72,7 +72,9 @@ var _ core.Store = (*Store)(nil)
 // 与管理库、观测库同一口径。
 func Open(cfg core.StoreSQLiteConfig, historyLimit int, historyTTL time.Duration, logger *slog.Logger) (*Store, error) {
 	db, err := engine.Open(engine.Options{
+		Dialect:     engine.Dialect(cfg.Dialect),
 		Path:        cfg.Path,
+		DSN:         cfg.DSN,
 		BusyTimeout: cfg.BusyTimeout,
 		Synchronous: cfg.Synchronous,
 		// 单连接：调度器是唯一的写方（API 的写都经它），读只有启动恢复与

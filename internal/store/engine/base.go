@@ -103,8 +103,7 @@ func Open(opts Options, logger *slog.Logger) (*DB, error) {
 	case DialectSQLite:
 		return openSQLite(opts, logger)
 	case DialectPostgres:
-		// PG 打开路径在 B05 落地（bun pgdialect + pgx 驱动 + DSN 脱敏）。
-		return nil, errors.New("engine: postgres dialect is not wired yet (task B05)")
+		return openPostgres(opts, logger)
 	default:
 		return nil, fmt.Errorf("engine: unknown dialect %q, use sqlite or postgres", opts.Dialect)
 	}
@@ -263,7 +262,12 @@ func (d *DB) Migrate(table string, ms []Migration) error {
 		return fmt.Errorf("sqlite: read schema version: %w", err)
 	}
 
+	// 记账语句经 *sql.DB 原生执行，占位符风格由方言决定：pgx 只认 $N，
+	// 不会把 ? 转译过去；sqlite 两边通吃。
 	insert := fmt.Sprintf(`INSERT INTO %s (version, applied_at) VALUES (?, ?)`, table)
+	if d.dialect == DialectPostgres {
+		insert = fmt.Sprintf(`INSERT INTO %s (version, applied_at) VALUES ($1, $2)`, table)
+	}
 	for _, m := range ms {
 		if m.Version <= applied {
 			continue

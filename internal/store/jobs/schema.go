@@ -15,6 +15,10 @@ import "github.com/jiujuan/godelayq/internal/store/engine"
 const migrationTableName = "jobs_schema_migrations"
 
 // migrations 是内置的迁移列表，必须按 version 升序排列。目前只有 version 1。
+//
+// PostgreSQL 分支（UpPostgres）与 SQLite 的差异只有一处，方言必需：
+// updated_at 是 UnixNano，SQLite 的 INTEGER 即 64 位，PG 的 INTEGER 是 32 位
+// 会溢出——升为 BIGINT。其余列两方言逐字一致。
 var migrations = []engine.Migration{
 	{
 		Version: 1,
@@ -24,6 +28,21 @@ var migrations = []engine.Migration{
   name          TEXT NOT NULL,             -- 冗余列：现场排障用，不参与接口查询
   status        TEXT NOT NULL,             -- core.JobStatus 规范名（封闭词表）
   updated_at    INTEGER NOT NULL,          -- 写入时的 UnixNano，留痕淘汰的排序键
+  snapshot_json TEXT NOT NULL              -- core.JobSnapshot 整体序列化，权威数据
+);`,
+			`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);`,
+			`CREATE INDEX IF NOT EXISTS idx_jobs_updated_at ON jobs(updated_at);`,
+			`CREATE TABLE IF NOT EXISTS jobs_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);`,
+		},
+		UpPostgres: []string{
+			`CREATE TABLE IF NOT EXISTS jobs (
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,             -- 冗余列：现场排障用，不参与接口查询
+  status        TEXT NOT NULL,             -- core.JobStatus 规范名（封闭词表）
+  updated_at    BIGINT NOT NULL,           -- 写入时的 UnixNano，留痕淘汰的排序键
   snapshot_json TEXT NOT NULL              -- core.JobSnapshot 整体序列化，权威数据
 );`,
 			`CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);`,

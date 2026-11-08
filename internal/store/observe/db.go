@@ -25,7 +25,9 @@ type Handle struct {
 // engine.Open 里兜底报错，因本包也会被装配方之外的调用方直接使用。
 func Open(cfg core.ObservabilityConfig, logger *slog.Logger) (*Handle, error) {
 	db, err := engine.Open(engine.Options{
+		Dialect:     engine.Dialect(cfg.Dialect),
 		Path:        cfg.Path,
+		DSN:         cfg.DSN,
 		BusyTimeout: cfg.BusyTimeout,
 		Synchronous: cfg.Synchronous,
 		// 写死一个连接：写入批量单点、读是短查询，单连接同时消除 SQLITE_BUSY 的
