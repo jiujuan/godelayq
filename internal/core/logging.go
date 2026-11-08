@@ -15,6 +15,9 @@ type Option func(*componentOptions)
 type componentOptions struct {
 	logger         *slog.Logger
 	allowedOrigins []string
+	// ledger/attemptsKeepLast 是逐次尝试账本的注入位（TASK-RE02，WithAttemptLedger）。
+	ledger           AttemptLedger
+	attemptsKeepLast int
 }
 
 // WithLogger 为组件注入日志器；传 nil 表示沿用 slog.Default()，

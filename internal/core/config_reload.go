@@ -78,6 +78,9 @@ var configClasses = map[string]ConfigClass{
 	// 所以下面这些也逐条列出（值相同，作用是让读的人知道它们被认真归过类）。
 	"store.type": ClassRestart, "store.path": ClassRestart,
 	"store.flush_interval": ClassRestart, "store.groups_path": ClassRestart,
+	// 账本保留条数（TASK-RE02）：读数在调度器构造时注入，热改不生效
+	// （history_limit/history_ttl 是热档，在上方单独登记）。
+	"store.attempts_keep_last": ClassRestart,
 	// 任务快照 SQLite 后端（TASK-M03）：与 mgrstore.* 同为重启档。
 	"store.sqlite.path": ClassRestart, "store.sqlite.busy_timeout": ClassRestart,
 	"store.sqlite.synchronous": ClassRestart, "store.sqlite.dialect": ClassRestart,

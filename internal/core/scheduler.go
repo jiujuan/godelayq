@@ -139,6 +139,15 @@ type Scheduler struct {
 	// 而注册表只有调度器握着。
 	restoreGuard RestoreGuard
 
+	// ledger 是逐次尝试账本（TASK-RE02），构造后不再变更；nil 表示本次部署没有
+	// 账本能力（JSON 存储）：begin/finish/abandon 全部跳过，降级在构造日志里说明一次。
+	// begin/finish 只由持有任务的 worker 协程调用，abandon 只在启动期 Restore 里调用，
+	// 不需要额外的锁。
+	ledger AttemptLedger
+
+	// attemptsKeepLast 每任务账本保留条数，收尾后裁剪用；仅 ledger 非 nil 时有意义。
+	attemptsKeepLast int
+
 	eventBus *EventBus // 新增
 
 	// logger 结构化日志器，构造后不再变更；未注入时为 slog.Default()
@@ -182,6 +191,18 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 	// targetWorkers 与 concurrency 成对初始化：构造完到 Start 之前，RuntimeStats 的
 	// Workers 读的是前者，少这一行会让没显式设置过并发的调度器报出 0 而不是 DefaultConcurrency。
 	s.targetWorkers.Store(int32(s.concurrency))
+
+	// 账本能力（TASK-RE02）：注入即启用，nil 即降级。降级只在这里说一次——
+	// 执行路径上每个尝试都记日志会把"没这能力"放大成噪音。
+	s.ledger = settings.ledger
+	if s.ledger != nil {
+		s.attemptsKeepLast = settings.attemptsKeepLast
+		if s.attemptsKeepLast <= 0 {
+			s.attemptsKeepLast = DefaultAttemptsKeepLast
+		}
+	} else {
+		s.logger.Info("attempt ledger not available; per-attempt records are disabled (audit relies on the event stream)")
+	}
 	return s
 }
 

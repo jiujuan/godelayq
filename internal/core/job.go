@@ -168,6 +168,12 @@ type Job struct {
 	// 最坏结果是"这条任务没有专用名额"，不是"任务消失"。
 	class JobClass
 
+	// dispatchSource 是本次派发的触发来源（TASK-RE02）：账本 BeginAttempt 的
+	// trigger_source 取它。不入 JSON/快照——它描述"这一次执行为什么发生"，
+	// 只在内存对象从创建（Schedule/CloneForRetry/Restore）到派发期间有意义。
+	// 零值即 AttemptTriggerScheduled：新提交与 cron 的新一轮天然落在这。
+	dispatchSource AttemptTrigger
+
 	// Cron 重复任务支持
 	CronExpr string `json:"cron_expr,omitempty"` // Cron表达式，空表示一次性任务
 	IsRepeat bool   `json:"is_repeat"`
@@ -212,6 +218,11 @@ func (j *Job) HandlerKey() string {
 // 清除 Cron 属性，避免一次性任务失败重试后被误当作周期任务重新排期。
 // 不带上一次的 Exec：副本代表一次新的执行，留着旧结论会让 GET /jobs/:id
 // 在新一轮还没跑完时就显示上一次的退出码与输出预览。
+//
+// Attempts 原样带过去（TASK-RE02 修复：此前漏拷导致重试后计数清零，
+// 与"总尝试次数（含重试）"的字段语义矛盾）；下一次执行在 executeJob 自增，
+// 账本的 seq 因此跨重试单调。dispatchSource 盖 retry 章：账本要能区分
+// "排期到期"和"失败重跑"。
 func (j *Job) CloneForRetry(nextTime time.Time) *Job {
 	return &Job{
 		ID:         j.ID,
@@ -230,6 +241,9 @@ func (j *Job) CloneForRetry(nextTime time.Time) *Job {
 		Status:     StatusPending,
 		CreatedAt:  j.CreatedAt,
 		UpdatedAt:  time.Now(),
+		Attempts:   j.Attempts,
+
+		dispatchSource: AttemptTriggerRetry,
 	}
 }
 

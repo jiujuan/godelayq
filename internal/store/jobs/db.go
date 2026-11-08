@@ -156,11 +156,22 @@ func (s *Store) upsert(snapshot core.JobSnapshot) error {
 
 // Delete 移除一条快照。ID 不存在不是错误：调用方（调度器的取消链）语义是
 // "确保不在"，与 JSON 实现的 delete-缺失-无害一致。
+// 账本行随任务一起删（TASK-RE02）：接口语义是"这条任务不存在了"。
 func (s *Store) Delete(jobID string) error {
-	if _, err := s.h.NewDelete().Model((*jobRow)(nil)).
-		Where("id = ?", jobID).
-		Exec(bgCtx); err != nil {
-		return fmt.Errorf("jobs: delete %s: %w", jobID, err)
+	if err := s.h.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
+		if _, err := tx.NewDelete().Model((*jobRow)(nil)).
+			Where("id = ?", jobID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("jobs: delete %s: %w", jobID, err)
+		}
+		if _, err := tx.NewDelete().Model((*attemptRow)(nil)).
+			Where("job_id = ?", jobID).
+			Exec(ctx); err != nil {
+			return fmt.Errorf("jobs: delete attempts %s: %w", jobID, err)
+		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	return nil
 }
@@ -226,6 +237,14 @@ func (s *Store) trimTerminal() error {
 				Exec(ctx); execErr != nil {
 				return fmt.Errorf("jobs: trim delete %s: %w", id, execErr)
 			}
+		}
+		// 账本随任务走（TASK-RE02）：任务快照被终态留痕淘汰，它的逐次尝试行
+		// 一起删——留着一堆"任务已不存在"的账本行只会在读端点制造 404 悬案。
+		// 与快照删除同事务：不存在"快照没了账本还在"的中间态。
+		if _, execErr := tx.NewDelete().Model((*attemptRow)(nil)).
+			Where("job_id IN (?)", bun.In(stale)).
+			Exec(ctx); execErr != nil {
+			return fmt.Errorf("jobs: trim delete attempts: %w", execErr)
 		}
 		return nil
 	}); err != nil {

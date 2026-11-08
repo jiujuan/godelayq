@@ -61,6 +61,17 @@ dev.ps1 起服 → 提交 `max_retries: 2` 的必失败执行器任务 → `GET 
 - **风险：trigger 来源判定出错**（restore 补跑被记成 scheduled）。缓解：来源标记显式传递（Restore 入堆时打标），不用启发式；测试覆盖三条来源。
 - 回滚：revert 后遗留表无害；`job_attempts` 行不被旧代码读写。
 
-## 10. 实现记录
+## 10. 实现记录（2026-11-08）
 
-（待实现后回填。）
+分支 `feat/reliable-execution`。按卡交付；两处口径调整已同步设计文档 §6.3：
+
+- **core/attempt.go**：`AttemptStatus`/`AttemptTrigger`（int + String/Parse 对称）、`Attempt`（可空结论字段用 `*Set` 布尔表达"未判定"）、`AttemptLedger` 接口、`WithAttemptLedger` Option、`DefaultAttemptsKeepLast=20`。Job 增 `dispatchSource`（不入快照：CloneForRetry 盖 retry、Restore 盖 restore、零值即 scheduled）。
+- **口径调整 ①**：`PruneAttempts` 从全表改为**按任务**（每次收尾后调用）——主键前缀索引使代价为常数，全表清理没有必要（停跑任务天然只剩最近几行）；设计文档 §6.3 已同步。
+- **store/jobs**：迁移 v2（`job_attempts`，双方言；`retryable` 列沿用全仓 INTEGER 0/1 先例——`sql.NullBool` 直绑会在 PG 上报类型错，模型用 NullInt64 承载）；attempts.go 五方法（begin/finish 共用 upsert，幂等重放）；`trimTerminal` 与 `Delete` 级联删账本行（同事务）。
+- **调度器挂点**：`beginAttempt`（running 落盘后）/`finishAttempt`（三个收尾 + parkForcedPause，均在各自 transition 之前以保时长基准）/`Restore` 的 `AbandonAttempts`（崩溃前 running 的快照，无论改判结果）。nil 账本全跳过，构造日志降级说明一次。
+- **Attempts 断链修复**：`CloneForRetry` 与 cron 重排保留计数——`job.started` 的 attempt 值与快照计数跨重试/轮次单调，测试钉住。
+- **api**：`attemptReader` 窄接口（消费方）+ `WithAttemptReader` Option + `GET /jobs/:id/attempts`（limit 默认 20 上界 100；JSON 部署 200 + `ledger:false` + 空数组 + detail，不是 503）。
+- **配置**：`store.attempts_keep_last`（默认 20，<=0 回默认，负数不解释成"不留账本"）；热更档 ClassRestart；example/本机两份 YAML 同步，TestExampleConfigMatchesLocal 过。
+- **测试**：store/jobs 双后端五个用例（round-trip/upsert 幂等/abandon/prune/trim 级联，本机 PG 实跑全过）；core 挂点四用例 + CloneForRetry 单测（内存账本替身）；api 端点三用例（降级/形状/limit 校验）。
+- **SQL golden**：双方言重生成，diff 只含账本 upsert/abandon/读回/裁剪与删除级联，逐行评审通过；连跑两次稳定。
+- **验证**：`go build/vet` 干净；`go test ./... -count=1` 全绿（含 PG DSN 的 jobs/sql 快照矩阵）。

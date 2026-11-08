@@ -332,7 +332,14 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 			}
 		},
 		newScheduler: func(store core.Store, retryPolicy core.RetryPolicy, eventBus *core.EventBus) schedulerAPI {
-			return core.NewScheduler(store, retryPolicy, eventBus, core.WithLogger(logger))
+			opts := []core.Option{core.WithLogger(logger)}
+			// 账本能力（TASK-RE02）：任务库实现了 AttemptLedger 就注入（同一连接、
+			// 与快照同库）；JSON 存储没有这项能力，不注入即降级（调度器构造日志说明）。
+			// keepLast 从 store.attempts_keep_last 传入，Normalized 已折过默认值。
+			if ledger, ok := store.(core.AttemptLedger); ok {
+				opts = append(opts, core.WithAttemptLedger(ledger, cfg.Store.AttemptsKeepLast))
+			}
+			return core.NewScheduler(store, retryPolicy, eventBus, opts...)
 		},
 		newExecutorRegistry: executor.NewRegistry,
 		newExecutorProfileStore: func(cfg core.Config) (core.ExecutorProfileStore, error) {
@@ -490,6 +497,14 @@ func defaultNewServer(cfg core.Config, mgrDB *mgrDBHolder, reloadStatus *reloadS
 				// 读写两面是同一个句柄：台账的写入方就是查询方
 				opts = append(opts, api.WithAuditLog(obs.audit, obs.audit))
 			}
+		}
+		// 账本读取方（TASK-RE02）：store 是任务库时注入（它同时实现了账本能力），
+		// JSON 部署不注入——/jobs/:id/attempts 走 ledger:false 的降级形状。
+		// store 参数就是 newStore 闭包的产物，类型断言在这里做一次，业务包不感知后端类型。
+		if reader, ok := store.(interface {
+			Attempts(jobID string, limit int) ([]core.Attempt, error)
+		}); ok {
+			opts = append(opts, api.WithAttemptReader(reader))
 		}
 		// 管理库模式把账号存储交给服务：认证器随之切到库模式（改账号即时生效），
 		// 账号管理端点（/admin/users）也随之启用——两者共用这一个存储句柄。

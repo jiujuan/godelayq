@@ -20,6 +20,9 @@ import (
 type Server struct {
 	scheduler *core.Scheduler
 	store     core.Store
+	// attempts 是逐次尝试账本的读取方（TASK-RE02）；nil = JSON 部署没有账本能力，
+	// /jobs/:id/attempts 返回 ledger:false 的降级形状而不是 503。
+	attempts  attemptReader
 	engine    *gin.Engine
 	wsServer  *core.WSServer
 	httpSrv   *http.Server
@@ -302,6 +305,10 @@ func (s *Server) setupRoutes() {
 			jobs.POST("/:id/resume", operator, s.ResumeJob)
 			jobs.POST("/:id/force-pause", s.RequireRole(core.RoleAdmin), s.ForcePauseJob)
 			jobs.GET("/:id/events", reader, s.GetJobEvents)
+			// 逐次尝试账本（TASK-RE02）：与事件时间线互为补充——事件有丢弃与
+			// 保留上限，账本是权威的执行留痕。账本能力缺失（JSON 部署）不是 503，
+			// 端点返回 ledger:false 的降级形状（见 handlers_attempts.go）。
+			jobs.GET("/:id/attempts", reader, s.GetJobAttempts)
 			jobs.POST("/batch-ops", operator, s.BatchJobOps)
 
 			// 执行输出正文。判档在先、依赖检查在后：未认证的连接不该从状态码里

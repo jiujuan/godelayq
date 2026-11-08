@@ -172,6 +172,10 @@ type StoreConfig struct {
 	HistoryLimit int `mapstructure:"history_limit"`
 	// HistoryTTL 终态快照保留时长，0 表示不按时间淘汰
 	HistoryTTL time.Duration `mapstructure:"history_ttl"`
+	// AttemptsKeepLast 每任务账本保留条数（TASK-RE02，仅 sqlite/PG 后端生效；
+	// JSON 后端没有账本）。0 表示 DefaultAttemptsKeepLast。收尾即裁剪，
+	// cron 任务滚动保新，不会随轮次无限增长。
+	AttemptsKeepLast int `mapstructure:"attempts_keep_last"`
 	// GroupsPath 分组元数据文件路径，与任务快照分文件存放：
 	// 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
 	GroupsPath string `mapstructure:"groups_path"`
@@ -965,13 +969,14 @@ func DefaultConfig() Config {
 			ShutdownTimeout: 5 * time.Second,
 		},
 		Store: StoreConfig{
-			Type:          "json",
-			Path:          "./data/jobs.json",
-			FlushInterval: DefaultFlushInterval,
-			HistoryLimit:  DefaultHistoryLimit,
-			HistoryTTL:    0,
-			GroupsPath:    DefaultGroupsPath,
-			SQLite:        StoreSQLiteConfig{Path: DefaultJobsDBPath, Dialect: "sqlite"},
+			Type:             "json",
+			Path:             "./data/jobs.json",
+			FlushInterval:    DefaultFlushInterval,
+			HistoryLimit:     DefaultHistoryLimit,
+			HistoryTTL:       0,
+			AttemptsKeepLast: DefaultAttemptsKeepLast,
+			GroupsPath:       DefaultGroupsPath,
+			SQLite:           StoreSQLiteConfig{Path: DefaultJobsDBPath, Dialect: "sqlite"},
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
@@ -1315,6 +1320,11 @@ func (c Config) Normalized() Config {
 	}
 	if c.Store.HistoryLimit == 0 {
 		c.Store.HistoryLimit = defaults.Store.HistoryLimit
+	}
+	if c.Store.AttemptsKeepLast <= 0 {
+		// 0 是"没配"，负数不解释成"不留账本"——账本裁剪没有"全留"的合理场景，
+		// 写错就回默认（与 history_limit 的 -1 语义刻意不同，那是有意的关闸）。
+		c.Store.AttemptsKeepLast = defaults.Store.AttemptsKeepLast
 	}
 	if c.Store.GroupsPath == "" {
 		c.Store.GroupsPath = defaults.Store.GroupsPath

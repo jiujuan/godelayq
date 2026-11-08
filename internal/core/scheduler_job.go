@@ -335,6 +335,9 @@ func (s *Scheduler) parkForcedPause(job *Job, note string) bool {
 		return false
 	}
 
+	// 尝试被强制暂停中止，账本行落 cancelled（TASK-RE02；结论明细 RE04 补）。
+	// 必须在 transition 之前：时长按运行态落盘时刻计。
+	s.finishAttempt(job, AttemptCancelled)
 	// 收尾时任务状态是 running，running→paused 是合法边。
 	s.transition(job, StatusPaused, Event{
 		Type:      EventJobPaused,

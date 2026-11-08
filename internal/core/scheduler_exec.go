@@ -11,6 +11,50 @@ import (
 	"time"
 )
 
+// beginAttempt 在运行态落盘之后记账本开始行（TASK-RE02）。
+// 只由 executeJob 调用：worker 协程持有任务，无并发写者。seq 取自增后的
+// job.Attempts，trigger 取派发来源（CloneForRetry/Restore 盖章，零值即 scheduled）。
+func (s *Scheduler) beginAttempt(job *Job) {
+	if s.ledger == nil {
+		return
+	}
+	rec := Attempt{
+		JobID:     job.ID,
+		Seq:       job.Attempts,
+		Status:    AttemptRunning,
+		Trigger:   job.dispatchSource,
+		StartedAt: time.Now(),
+	}
+	if err := s.ledger.BeginAttempt(job.ID, rec); err != nil {
+		s.logger.Error("failed to begin attempt", "job_id", job.ID, "seq", rec.Seq, "error", err)
+	}
+}
+
+// finishAttempt 收口账本行。调用点必须在各自的 transition 之前：
+// 时长按 job.UpdatedAt（运行态落盘时刻，与 job.completed 事件的 duration_ms 同一基准）
+// 计，transition 会把它改成本次收尾时刻。status 是这次尝试的结论
+// （success/failed/cancelled）；结论明细（类别、退出码等）由 RE04 补充。
+// 裁剪紧随收尾：主键 (job_id, seq) 前缀索引使代价为常数，失败不影响执行链路。
+func (s *Scheduler) finishAttempt(job *Job, status AttemptStatus) {
+	if s.ledger == nil {
+		return
+	}
+	rec := Attempt{
+		JobID:      job.ID,
+		Seq:        job.Attempts,
+		Status:     status,
+		StartedAt:  job.UpdatedAt,
+		FinishedAt: time.Now(),
+		DurationMs: time.Since(job.UpdatedAt).Milliseconds(),
+	}
+	if err := s.ledger.FinishAttempt(job.ID, job.Attempts, rec); err != nil {
+		s.logger.Error("failed to finish attempt", "job_id", job.ID, "seq", rec.Seq, "error", err)
+	}
+	if err := s.ledger.PruneAttempts(job.ID, s.attemptsKeepLast); err != nil {
+		s.logger.Error("failed to prune attempts", "job_id", job.ID, "error", err)
+	}
+}
+
 // 执行任务（由 worker 协程调用，阻塞直到 Handler 返回）
 func (s *Scheduler) executeJob(job *Job) {
 	// 在途计数按池分开：统计接口要能说出"执行器池正在跑几个"，
@@ -97,6 +141,9 @@ func (s *Scheduler) executeJob(job *Job) {
 	// 哪些任务当时在执行（由 Restore 复位为待执行），统计接口也不再依赖进程内状态。
 	job.Attempts++
 	s.transition(job, StatusRunning)
+
+	// 账本开始行（TASK-RE02）：运行态已落盘，此刻起的尝试有据可查。
+	s.beginAttempt(job)
 
 	err := job.Handler(execCtx, job)
 
@@ -219,6 +266,7 @@ func (s *Scheduler) handleInterrupted(job *Job) {
 
 	// 用户 Cancel 的收尾认领：running→cancelled（TASK-RE01）。
 	if s.takeCancelRequested(job.ID) {
+		s.finishAttempt(job, AttemptCancelled)
 		s.transition(job, StatusCancelled, Event{
 			Type:      EventJobCancelled,
 			JobID:     job.ID,
@@ -236,10 +284,16 @@ func (s *Scheduler) handleInterrupted(job *Job) {
 	s.mu.RUnlock()
 
 	if running {
+		// 尝试确实结束了（ctx 已取消、Handler 已返回）：账本行落 cancelled，
+		// 不留无主 running 行（TASK-RE02）。任务快照维持既有口径（running，
+		// 交给重启后的 Restore 处置）。
+		s.finishAttempt(job, AttemptCancelled)
 		s.logger.Info("job execution cancelled", "job_id", job.ID)
 		return
 	}
 
+	// 关停打断：尝试被中止（cancelled），任务本身落回 pending，重启后照常重跑。
+	s.finishAttempt(job, AttemptCancelled)
 	s.transition(job, StatusPending, Event{
 		Type:      EventJobCancelled,
 		JobID:     job.ID,
@@ -267,6 +321,10 @@ func (s *Scheduler) handleSuccess(job *Job) {
 		s.logger.Info("cancel requested but the handler completed; recording success", "job_id", job.ID)
 	}
 
+	// 尝试成功收口（TASK-RE02）：cron 分支与终态落盘共用这一次 finish——
+	// 尝试本身成功了，哪怕任务还要排下一轮。必须在 transition 之前（时长基准）。
+	s.finishAttempt(job, AttemptSuccess)
+
 	// 如果是重复任务，计算下次执行时间并重新入队。
 	// 新一轮是同 ID 的新对象，经 Schedule 以 pending 落盘——上一轮 running→pending
 	// 的转移因此不经 transition（新对象上无从取 from），前置事实是"本轮已成功"，
@@ -289,6 +347,7 @@ func (s *Scheduler) handleSuccess(job *Job) {
 				Status:     StatusPending,
 				CreatedAt:  job.CreatedAt,
 				UpdatedAt:  time.Now(),
+				Attempts:   job.Attempts, // 账本 seq 跨 cron 轮次单调（TASK-RE02 修复，口径同 CloneForRetry）
 				// 不写 Exec：下一轮是一次新的执行，带上一次的退出码会让详情页在跑完之前显示旧结论。
 				// 这里是显式字段列表，漏写即是置 nil，与 CloneForRetry 的口径一致。
 			}
@@ -327,6 +386,7 @@ func (s *Scheduler) handleFailure(job *Job, err error) {
 
 	if s.takeCancelRequested(job.ID) {
 		s.logger.Info("cancel requested and the handler failed; job stops as cancelled", "job_id", job.ID)
+		s.finishAttempt(job, AttemptCancelled)
 		s.transition(job, StatusCancelled, Event{
 			Type:      EventJobCancelled,
 			JobID:     job.ID,
@@ -337,6 +397,10 @@ func (s *Scheduler) handleFailure(job *Job, err error) {
 		})
 		return
 	}
+
+	// 三个剩余分支（永久失败/重试/重试耗尽）的尝试结论都是 failed；
+	// 先收口账本再走分支（transition 会改 UpdatedAt，时长基准在此之后失效）。
+	s.finishAttempt(job, AttemptFailed)
 
 	if isPermanentFailure(err) {
 		s.markFailed(job)

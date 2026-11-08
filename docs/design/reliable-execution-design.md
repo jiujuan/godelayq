@@ -244,7 +244,8 @@ type AttemptLedger interface {
     FinishAttempt(jobID string, seq int, rec Attempt) error
     AbandonAttempts(jobID string, uptoSeq int, at time.Time) error // Restore 收口悬空尝试
     Attempts(jobID string, limit int) ([]Attempt, error) // 读端点用，seq 降序取最近 limit 条
-    PruneAttempts(keepLast int) error                    // 每任务保最近 keepLast 条，写入路径周期调用
+    PruneAttempts(jobID string, keepLast int) error      // 按任务裁到最近 keepLast 条，每次收尾后调用
+                                                         //（PK 前缀索引常数代价；全表清理不需要——停跑的任务天然只剩最近几行）
 }
 
 // core/event.go

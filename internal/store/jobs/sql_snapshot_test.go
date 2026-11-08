@@ -95,9 +95,31 @@ func runSQLSnapshot(t *testing.T, s *Store, dialect string) {
 	require.NotEmpty(t, loaded)
 	require.NoError(t, s.Delete("j2"))
 
-	// 留痕淘汰：留痕上限 1，第二笔终态写入触发 trim 的扫描 + 删除。
+	// 留痕淘汰：留痕上限 1，第二笔终态写入触发 trim 的扫描 + 删除（含账本级联）。
 	require.NoError(t, s.Update(snapshot("t1", core.StatusSuccess, now)))
 	require.NoError(t, s.Update(snapshot("t2", core.StatusSuccess, now)))
+
+	// 账本链（TASK-RE02）：开始 → 收口（带结论列）→ 重试开始 → 放弃 → 读回 → 裁剪。
+	// upsert 的冲突目标、UPDATE 的表达式列、裁剪子查询的形状都靠这段进 golden。
+	require.NoError(t, s.BeginAttempt("j1", core.Attempt{
+		JobID: "j1", Seq: 1, Status: core.AttemptRunning, Trigger: core.AttemptTriggerScheduled,
+		StartedAt: now,
+	}))
+	require.NoError(t, s.FinishAttempt("j1", 1, core.Attempt{
+		JobID: "j1", Seq: 1, Status: core.AttemptFailed, Trigger: core.AttemptTriggerRetry,
+		StartedAt: now, FinishedAt: now.Add(time.Second), DurationMs: 1000,
+		Class: "timeout", Retryable: true, RetryableSet: true,
+		ExitCode: 0, ExitCodeSet: true,
+	}))
+	require.NoError(t, s.BeginAttempt("j1", core.Attempt{
+		JobID: "j1", Seq: 2, Status: core.AttemptRunning, Trigger: core.AttemptTriggerRetry,
+		StartedAt: now.Add(2 * time.Second),
+	}))
+	require.NoError(t, s.AbandonAttempts("j1", 2, now.Add(3*time.Second)))
+	attempts, err := s.Attempts("j1", 10)
+	require.NoError(t, err)
+	require.Len(t, attempts, 2)
+	require.NoError(t, s.PruneAttempts("j1", 1))
 
 	require.NotEmpty(t, rec.queries, "捕获不到语句：hook 是否挂上了？")
 	compareGolden(t, dialect, strings.Join(rec.queries, ";\n"))

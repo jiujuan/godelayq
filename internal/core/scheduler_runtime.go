@@ -115,9 +115,22 @@ func (s *Scheduler) Restore() error {
 		job.FromSnapshot(snap)
 		// 上次崩溃时处于 Running 的任务在此复位为待执行
 		job.Status = StatusPending
+		// 派发来源盖 restore 章（TASK-RE02）：账本要能区分补跑与常规排期。
+		job.dispatchSource = AttemptTriggerRestore
 		// 类别不在快照里，按注册表重新盖章：Start 之前处理函数已经注册完，
 		// 恢复出来的执行器任务因此照样落在自己的池里。
 		job.class = s.classOfKey(job.HandlerKey())
+
+		// 崩溃瞬间在跑的尝试没有结局可写（TASK-RE02）：账本行落 abandoned，
+		// finished_at 补记在重启时刻。无论后面改判成 replay 还是 pause，
+		// "那次尝试没跑完"都是事实，这一步对两种策略同样发生。
+		// 账本不可用的部署（JSON 存储）自然跳过。
+		if JobStatus(snap.Status) == StatusRunning && s.ledger != nil {
+			if err := s.ledger.AbandonAttempts(snap.ID, snap.Attempts, time.Now()); err != nil {
+				s.logger.Error("failed to abandon the interrupted attempt",
+					"job_id", snap.ID, "seq", snap.Attempts, "error", err)
+			}
+		}
 
 		// 改判发生在入堆之前：一旦进了堆就可能被 worker 取走，那时再停它要走取消。
 		// LoadAll 给的是新切片，钩子期间没有持任何锁，因此它可以回头查注册表。
