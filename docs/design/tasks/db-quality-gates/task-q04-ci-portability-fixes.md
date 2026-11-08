@@ -80,6 +80,6 @@ git push && gh run watch   # 两个 job 全绿
   成员派生与断言自然对齐，不再逐断言打补丁。
 - **第三轮 CI（42477867138）**：executor/api 清零，windows 只剩 SQL 快照——
   正是设计期预判的 golden CRLF 问题（autocrlf 检出转 CRLF vs 运行时 LF）。
-   钉 *.golden text eol=lf 收口。
+   新增 .gitattributes 钉 *.golden text eol=lf 收口。
 - **第四轮 CI（42478145828）：三 job 全绿**。门禁闭环：CI 此后每次 push/PR
   自动跑 SQLite 快档（双 OS）+ PG 全矩阵。
