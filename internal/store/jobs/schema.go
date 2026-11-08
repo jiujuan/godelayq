@@ -125,6 +125,38 @@ var migrations = []engine.Migration{
 			`CREATE INDEX IF NOT EXISTS idx_idem_created ON job_idempotency(created_at);`,
 		},
 	},
+	// Version 4（TASK-RE07）：事务性事件出口。快照/账本状态变更与出箱行同事务落库，
+	// OutboxRelay 异步投递给事件总线（at-least-once，读侧按 outbox_seq 去重）。
+	// payload_json 是 core.Event 的序列化原文；OutboxSeq 由自增列在投递时回填进事件。
+	{
+		Version: 4,
+		Up: []string{
+			`CREATE TABLE IF NOT EXISTS job_outbox (
+  seq           INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id        TEXT NOT NULL,
+  type          TEXT NOT NULL,             -- core.EventType 原文
+  payload_json  TEXT NOT NULL,             -- core.Event 序列化原文
+  status        TEXT NOT NULL,             -- pending | dispatched
+  created_at    INTEGER NOT NULL,          -- UnixNano
+  dispatched_at INTEGER
+);`,
+			`CREATE INDEX IF NOT EXISTS idx_outbox_pending ON job_outbox(status, seq);`,
+			`CREATE INDEX IF NOT EXISTS idx_outbox_job ON job_outbox(job_id, seq);`,
+		},
+		UpPostgres: []string{
+			`CREATE TABLE IF NOT EXISTS job_outbox (
+  seq           BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  job_id        TEXT NOT NULL,
+  type          TEXT NOT NULL,             -- core.EventType 原文
+  payload_json  TEXT NOT NULL,             -- core.Event 序列化原文
+  status        TEXT NOT NULL,             -- pending | dispatched
+  created_at    BIGINT NOT NULL,           -- UnixNano
+  dispatched_at BIGINT
+);`,
+			`CREATE INDEX IF NOT EXISTS idx_outbox_pending ON job_outbox(status, seq);`,
+			`CREATE INDEX IF NOT EXISTS idx_outbox_job ON job_outbox(job_id, seq);`,
+		},
+	},
 }
 
 // metaJobsImported 是一次性导入的标记：写入即生效，之后 store.path 指向的

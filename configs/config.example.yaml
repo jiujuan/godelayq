@@ -66,6 +66,9 @@ store:
   history_ttl: 0s       # 保留时长，如 24h；0 表示不按时间淘汰
   attempts_keep_last: 20 # 每任务账本保留条数（TASK-RE02，仅 sqlite/PG 后端生效）；0=用默认值
   idempotency_ttl: 24h   # 幂等键登记保留时长（TASK-RE03）；窗口内同键重放返回既有任务
+  outbox_flush_interval: 200ms # 出箱中继周期（TASK-RE07，仅 sqlite/PG 生效）；也是事件可见延迟上界
+  outbox_retention_age: 72h    # 已投递出箱行的保留时长（TASK-RE07）
+  outbox_max_pending: 100000   # pending 积压上限（TASK-RE07）；超过按最旧截断并记 error
   # 分组元数据文件（Web 控制台的 /api/v1/groups 读写它）。与任务快照分文件：
   # 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
   groups_path: ./data/groups.json

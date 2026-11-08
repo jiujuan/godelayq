@@ -66,6 +66,14 @@ dev.ps1 起服（store.type=sqlite + observability.enabled）→ 提交任务跑
 - **风险：双发或漏发**（分派分支写错）。缓解：接口注释的禁令 + core 测试断言"outbox 模式无直发"。
 - 回滚：配置不装 relay 即回现状；遗留 pending 行无害。
 
-## 10. 实现记录
+## 10. 实现记录（2026-11-08）
 
-（待实现后回填。）
+分支 `feat/reliable-execution`。按卡交付，三处实现口径说明：
+
+- **core**：`EventOutbox` 接口（UpdateWithEvents/AppendOutbox，双发禁令写进接口注释）+ `WithEventOutbox`；`Event.OutboxSeq`（omitempty）；state.go 的 `persistAndEmit`/`emit` 按能力分派——outbox 模式下状态写与事件进任务库同事务、事件由中继器投递，nil 退回直发（与 RE01 之前逐字节等价）。`job.scheduled` 随状态写同事务（persistAndEmit 的 events 参数），started/completed/failed/retrying/misfired/resumed 走 AppendOutbox——core 出箱分派测试钉住这个形状。
+- **store/jobs**：迁移 v4（job_outbox，双方言；PG 自增用 IDENTITY）；upsert 与终态淘汰抽成 `upsertSnapshot(bun.IDB)`/`trimTerminalTx(ctx, tx)` 供事务路径复用（淘汰规则只许一处，事务边界由调用方决定）；UpdateWithEvents 事务含快照 upsert + 出箱批量 INSERT + 终态淘汰（含账本级联）；**刻意不含 attempt 行**——begin/finish 由 worker 单独调用，崩溃遗留 running 行由 Restore 收口 abandoned（自愈）。OutboxRelay：单协程按 seq 顺序投递（OutboxSeq 回填）→ 同事务标记 dispatched；启动先重放一轮残留 pending；dispatched 按 TTL 淘汰、pending 超限按最旧截断（error 留痕）；一批取满立即续跑（崩溃重放收敛快）。
+- **store/observe**：迁移 v2（job_events 加 outbox_seq + 部分唯一索引）；写入按 `ON CONFLICT (outbox_seq) WHERE outbox_seq IS NOT NULL DO NOTHING` 去重——**两方言冲突子句同形，未设方言分支点**（守卫零豁免保持）；NULL 序号（直发行）不进索引、永不冲突；读端点回传 outbox_seq（客户端可识别重放旧事件）。
+- **cmd/server**：newScheduler 注入 WithEventOutbox（结构断言）；run() 在观测层写入器挂上之后、scheduler.Start 之前建 relay（启动重放的事件要被 EventLog 收进库）并 Start；**defer 声明晚于 obsEnv.close——关停时 relay.Stop 先于写入器关闭**（发布落在已关闭订阅通道上会 panic，位次是硬约束，注释写明）。JSON 存储无 relay，直发现状。
+- **配置**：store.outbox_flush_interval（默认 200ms，低于 10ms 拒启）/ outbox_retention_age（72h）/ outbox_max_pending（100000），全部 ClassRestart；两份 YAML 同步。
+- **测试**：jobs 双后端五用例（UpdateWithEvents 同事务产物/AppendOutbox/投递顺序与 OutboxSeq 回填/崩溃重放/Stop 幂等/TTL+积压截断）；observe 双后端去重（三行带序号去重 + 直发行各成一行）+ 读端点回传序号；core 出箱分派两用例（双发禁令 + identity 写形状）；四处 schema 版本断言 1→2；四份 golden 双方言重生成（diff 仅 outbox 语句与 outbox_seq 列），连跑两次稳定。
+- **验证**：`go build/vet` 干净；`go test ./... -count=1` 九包全绿（本机 PG 全矩阵实跑）。

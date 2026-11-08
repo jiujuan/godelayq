@@ -22,6 +22,8 @@ type componentOptions struct {
 	// misfirePolicy/misfireGrace 是 cron 错过窗口的注入位（TASK-RE06，WithMisfirePolicy）。
 	misfirePolicy string
 	misfireGrace  time.Duration
+	// outbox 是事务性事件出口的注入位（TASK-RE07，WithEventOutbox）。
+	outbox EventOutbox
 }
 
 // WithLogger 为组件注入日志器；传 nil 表示沿用 slog.Default()，

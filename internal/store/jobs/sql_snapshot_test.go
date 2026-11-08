@@ -128,6 +128,20 @@ func runSQLSnapshot(t *testing.T, s *Store, dialect string) {
 	require.NoError(t, s.PutIdempotency("key-1", "j2", "fp-2"))
 	require.NoError(t, s.PruneExpiredIdempotency(time.Hour))
 
+	// 出箱链（TASK-RE07）：UpdateWithEvents 同事务写、AppendOutbox 入队、
+	// 中继器的取批/标记/淘汰。总线无订阅者，Publish 按既有契约丢弃。
+	bus := core.NewEventBus(10)
+	require.NoError(t, s.UpdateWithEvents(snapshot("ob-1", core.StatusPending, now), []core.Event{
+		{Type: core.EventJobScheduled, JobID: "ob-1", JobName: "job-ob-1", Status: core.StatusPending},
+	}))
+	require.NoError(t, s.AppendOutbox([]core.Event{
+		{Type: core.EventJobStarted, JobID: "ob-1", JobName: "job-ob-1", Status: core.StatusRunning},
+	}))
+	relay, err := s.NewOutboxRelay(bus, OutboxRelayOptions{}, nil)
+	require.NoError(t, err)
+	require.NoError(t, relay.dispatchBatch())
+	relay.prune()
+
 	require.NotEmpty(t, rec.queries, "捕获不到语句：hook 是否挂上了？")
 	compareGolden(t, dialect, strings.Join(rec.queries, ";\n"))
 }

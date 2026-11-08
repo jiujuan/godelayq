@@ -342,6 +342,11 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 			// misfire 全局默认（TASK-RE06）：策略与宽限从 scheduler 节传入，
 			// 任务级 misfire_policy 字段在 core 侧优先。
 			opts = append(opts, core.WithMisfirePolicy(cfg.Scheduler.MisfirePolicy, cfg.Scheduler.MisfireGracePeriod))
+			// 出箱能力（TASK-RE07）：任务库实现了 EventOutbox 就注入——状态变更
+			// 与事件同事务落库，投递由中继器接管；JSON 存储不注入即直发（现状）。
+			if ob, ok := store.(core.EventOutbox); ok {
+				opts = append(opts, core.WithEventOutbox(ob))
+			}
 			return core.NewScheduler(store, retryPolicy, eventBus, opts...)
 		},
 		newExecutorRegistry: executor.NewRegistry,
@@ -687,6 +692,30 @@ func run(deps runtimeDeps) error {
 	}
 	if err != nil {
 		return err
+	}
+
+	// 出箱中继器（TASK-RE07）：任务库模式下把出箱事件异步投递给事件总线。
+	// 启动位次在观测层写入器挂上之后、scheduler.Start 之前——启动重放的那批
+	// 崩溃残留事件要被 EventLog 收进库。JSON 存储没有出箱能力，跳过（直发现状）。
+	//
+	// 关停顺序：defer 声明晚于 obsEnv.close 那条，因此先执行 relay.Stop 再关
+	// 观测层——发布落在已关闭的订阅通道上会 panic，这条位次是硬约束。
+	var outboxRelay *jobs.OutboxRelay
+	if relayStore, ok := store.(*jobs.Store); ok {
+		outboxRelay, err = relayStore.NewOutboxRelay(scheduler.GetEventBus(), jobs.OutboxRelayOptions{
+			FlushInterval: cfg.Store.OutboxFlushInterval,
+			RetentionAge:  cfg.Store.OutboxRetentionAge,
+			MaxPending:    cfg.Store.OutboxMaxPending,
+		}, deps.logger)
+		if err != nil {
+			return err
+		}
+		outboxRelay.Start()
+		defer func() {
+			if err := outboxRelay.Stop(); err != nil {
+				deps.logger.Error("failed to stop outbox relay", "error", err)
+			}
+		}()
 	}
 
 	// 产物清理协程在观测层挂好之后起：Start 的第一轮扫描是"孤儿清理 + TTL 清理 + 索引对账"，

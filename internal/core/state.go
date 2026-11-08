@@ -75,17 +75,33 @@ func (s *Scheduler) transition(job *Job, to JobStatus, events ...Event) bool {
 
 // persistAndEmit 把"任务快照写 + 事件"收口到惟一通道。
 //
+// 两种模式按 outbox 能力分派（TASK-RE07）：
+//   - 出箱可用（任务库部署）：UpdateWithEvents 一次事务落快照与出箱行，
+//     事件改由中继器投递给 EventBus——本方法不再 Publish（双发禁令）。
+//     WS/SSE 的事件可见延迟上界因此变为一个中继周期（store.outbox_flush_interval）。
+//   - 无出箱（JSON 部署）：store.Update 后逐个 Publish，与既有行为逐字节等价。
+//
 // 落盘失败只记日志并返回错误：与既有容错口径一致——落盘失败不回滚内存状态，
 // 重启靠 Restore 对齐；错误返回给需要传播的调用方（如 applyGroupToSnapshot 的 API 语义）。
-// 事件无论落盘成败都照发：订阅端看到的是"发生了什么"，不是"落盘成了没有"。
+// 直发模式下事件无论落盘成败都照发：订阅端看到的是"发生了什么"；
+// 出箱模式下事件的投递由中继器接管，落盘成败决定出箱行是否存在。
 //
 // 本方法不做转移校验（那是 transition 的事）：调用它的都是"状态语义上已定"的场景
 // ——首次排期（pending）与原地内容更新（identity）。
 //
 // 与 Schedule 的时序契约：持久化必须在入堆之前（任务一进堆就可能被 worker 取走并就地
 // 改写 Status/Attempts/UpdatedAt，快照是这些字段的读取方），事件随落盘一起先于入堆发出——
-// 订阅端看到的 scheduled 事件因此严格早于 started，比既有"先入堆后发事件"的顺序更强。
+// 订阅端看到的 scheduled 事件因此严格早于 started。
 func (s *Scheduler) persistAndEmit(job *Job, events ...Event) error {
+	if s.outbox != nil {
+		if err := s.outbox.UpdateWithEvents(job.ToSnapshot(), events); err != nil {
+			s.logger.Error("failed to persist job snapshot with outbox events",
+				"job_id", job.ID, "status", job.Status.String(), "error", err)
+			return err
+		}
+		return nil
+	}
+
 	var persistErr error
 	if s.store != nil {
 		persistErr = s.store.Update(job.ToSnapshot())
@@ -101,7 +117,19 @@ func (s *Scheduler) persistAndEmit(job *Job, events ...Event) error {
 }
 
 // emit 是"不带状态写的事件"的惟一出口：不伴随快照变化的事件（job.resumed、
-// job.retrying、job.misfired 等）从这里走。RE07 接 outbox 时改这里即可。
+// job.retrying、job.started/completed/failed 等）从这里走。
+// 出箱可用时事件先进出箱表（独立事务——AppendOutbox 只承担"不丢"，与状态
+// 同事务的原子性由 UpdateWithEvents 承担），由中继器投递；否则直接 Publish。
 func (s *Scheduler) emit(event Event) {
+	if s.outbox != nil {
+		if err := s.outbox.AppendOutbox([]Event{event}); err != nil {
+			// 出箱失败：这条事件不会自愈（中继器看不到它），error 级留痕。
+			// 状态一致性不受影响——出箱承载事件的"不丢"，不承载状态。
+			s.logger.Error("failed to append outbox event",
+				"job_id", event.JobID, "type", string(event.Type), "error", err)
+			return
+		}
+		return
+	}
 	s.eventBus.Publish(event)
 }

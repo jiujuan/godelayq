@@ -154,6 +154,11 @@ type Scheduler struct {
 	// attemptsKeepLast 每任务账本保留条数，收尾后裁剪用；仅 ledger 非 nil 时有意义。
 	attemptsKeepLast int
 
+	// outbox 是事务性事件出口（TASK-RE07），构造后不再变更；nil 表示本次部署
+	// 没有出箱能力（JSON 存储）：persistAndEmit/emit 退回直发（Update+Publish，
+	// 与 RE01 之前逐字节等价）。注入后事件经中继器投递，调度器不再直接 Publish。
+	outbox EventOutbox
+
 	eventBus *EventBus // 新增
 
 	// logger 结构化日志器，构造后不再变更；未注入时为 slog.Default()
@@ -220,6 +225,10 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 	if s.misfireGrace <= 0 {
 		s.misfireGrace = DefaultMisfireGracePeriod
 	}
+
+	// 出箱能力（TASK-RE07）：注入即启用，nil 即直发。两条通道的分派收口在
+	// state.go 的 persistAndEmit/emit，调用方不感知。
+	s.outbox = settings.outbox
 	return s
 }
 

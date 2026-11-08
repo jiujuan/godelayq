@@ -1117,8 +1117,8 @@ func TestRun_ObservabilityEnabledOpensAndClosesForReal(t *testing.T) {
 	if reopened.Events != 2 {
 		t.Fatalf("expected the two published events in the table, got %d", reopened.Events)
 	}
-	if reopened.SchemaVersion != 1 {
-		t.Fatalf("expected schema version 1 to come back unchanged, got %d", reopened.SchemaVersion)
+	if reopened.SchemaVersion != 2 {
+		t.Fatalf("expected schema version 2 to come back unchanged, got %d", reopened.SchemaVersion)
 	}
 }
 

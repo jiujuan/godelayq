@@ -50,6 +50,10 @@ type Event struct {
 	Data json.RawMessage `json:"data,omitempty"`
 	// Metadata 保存结构化附加信息，例如重试次数、耗时等。
 	Metadata map[string]interface{} `json:"metadata,omitempty"`
+	// OutboxSeq 是该事件的出箱序号（TASK-RE07）：中继器从 job_outbox 投递时回填，
+	// 读侧（observe.EventLog）按它去重——at-least-once 重放不产生重复行。
+	// 直发模式（JSON 部署）恒为 0，序列化时整个键不出现。
+	OutboxSeq int64 `json:"outbox_seq,omitempty"`
 }
 
 // eventSubscription 保存单个订阅的内部元数据。

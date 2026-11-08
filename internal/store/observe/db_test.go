@@ -59,8 +59,8 @@ func TestOpen_CreatesFileAndSchema(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stats failed: %v", err)
 	}
-	if stats.SchemaVersion != 1 {
-		t.Fatalf("expected schema version 1, got %d", stats.SchemaVersion)
+	if stats.SchemaVersion != 2 {
+		t.Fatalf("expected schema version 2, got %d", stats.SchemaVersion)
 	}
 	if stats.Events != 0 || stats.Artifacts != 0 || stats.AuditRows != 0 {
 		t.Fatalf("expected empty tables, got %+v", stats)
@@ -196,11 +196,11 @@ func TestIdempotentMigrations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Stats failed: %v", err)
 	}
-	if stats.SchemaVersion != 1 {
-		t.Fatalf("expected schema version to stay 1, got %d", stats.SchemaVersion)
+	if stats.SchemaVersion != 2 {
+		t.Fatalf("expected schema version to stay 2, got %d", stats.SchemaVersion)
 	}
-	if n := countQuery(t, again, `SELECT COUNT(*) FROM observe_schema_migrations`); n != 1 {
-		t.Fatalf("expected exactly one migration row, got %d", n)
+	if n := countQuery(t, again, `SELECT COUNT(*) FROM observe_schema_migrations`); n != 2 {
+		t.Fatalf("expected exactly two migration rows, got %d", n)
 	}
 }
 
@@ -238,6 +238,7 @@ func TestSchemaColumnsMatchDesign(t *testing.T) {
 		"job_events": {
 			"seq|INTEGER|0|1|", "ts_us|INTEGER|1|0|", "type|TEXT|1|0|", "job_id|TEXT|1|0|",
 			"job_name|TEXT|0|0|", "status|INTEGER|1|0|", "data|TEXT|0|0|", "metadata|TEXT|0|0|",
+			"outbox_seq|INTEGER|0|0|",
 		},
 		// 主键是 (job_id, attempt) 复合键，与"每次尝试一个文件"的布局一一对应
 		"artifact_index": {

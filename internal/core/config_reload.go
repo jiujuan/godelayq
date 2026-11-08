@@ -88,6 +88,10 @@ var configClasses = map[string]ConfigClass{
 	"store.attempts_keep_last": ClassRestart,
 	// 幂等键 TTL（TASK-RE03）：读数在 api 服务构造时注入，热改不生效。
 	"store.idempotency_ttl": ClassRestart,
+	// 出箱中继器三键（TASK-RE07）：读数在中继器构造时消费，热改不生效。
+	"store.outbox_flush_interval": ClassRestart,
+	"store.outbox_retention_age":  ClassRestart,
+	"store.outbox_max_pending":    ClassRestart,
 	// 任务快照 SQLite 后端（TASK-M03）：与 mgrstore.* 同为重启档。
 	"store.sqlite.path": ClassRestart, "store.sqlite.busy_timeout": ClassRestart,
 	"store.sqlite.synchronous": ClassRestart, "store.sqlite.dialect": ClassRestart,

@@ -192,6 +192,14 @@ type StoreConfig struct {
 	// IdempotencyTTL 幂等键登记的保留时长（TASK-RE03）。0 表示 DefaultIdempotencyTTL。
 	// JSON 后端的登记表在进程内，重启即失效，本键对它同样生效（进程生命周期内）。
 	IdempotencyTTL time.Duration `mapstructure:"idempotency_ttl"`
+	// OutboxFlushInterval 出箱中继器的批量周期（TASK-RE07，仅 sqlite/PG 后端生效：
+	// JSON 模式没有出箱，事件照旧直发）。0 表示 DefaultOutboxFlushInterval，
+	// 低于 MinOutboxFlushInterval 直接拒启。
+	OutboxFlushInterval time.Duration `mapstructure:"outbox_flush_interval"`
+	// OutboxRetentionAge 已投递出箱行的保留时长（TASK-RE07）。0 表示 DefaultOutboxRetentionAge。
+	OutboxRetentionAge time.Duration `mapstructure:"outbox_retention_age"`
+	// OutboxMaxPending pending 出箱行的积压上限（TASK-RE07）。0 表示 DefaultOutboxMaxPending。
+	OutboxMaxPending int64 `mapstructure:"outbox_max_pending"`
 	// GroupsPath 分组元数据文件路径，与任务快照分文件存放：
 	// 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
 	GroupsPath string `mapstructure:"groups_path"`
@@ -861,6 +869,16 @@ const (
 	// DefaultMisfireGracePeriod misfire 判定的宽限期（TASK-RE06）：TriggerAt 早于
 	// now-宽限才算错过。秒级停机重启不该刷 misfire 事件，60s 起步。
 	DefaultMisfireGracePeriod = 60 * time.Second
+	// DefaultOutboxFlushInterval 出箱中继器的批量周期（TASK-RE07）：
+	// 也是事件到 WS/SSE 的可见延迟上界。与观测层批量同口径（200ms）。
+	DefaultOutboxFlushInterval = DefaultObserveFlushInterval
+	// MinOutboxFlushInterval 中继周期的下限：低于它等价于"每条事件一个事务"。
+	MinOutboxFlushInterval = 10 * time.Millisecond
+	// DefaultOutboxRetentionAge 已投递（dispatched）出箱行的保留时长（TASK-RE07）。
+	DefaultOutboxRetentionAge = 72 * time.Hour
+	// DefaultOutboxMaxPending pending 出箱行的积压上限（TASK-RE07）：
+	// 超过按最旧截断并记 error——防病态场景（订阅方长期全满 + 高事件率）无界增长。
+	DefaultOutboxMaxPending = 100000
 )
 
 // MgrStoreConfig 管理库：控制台账号、分组元数据、执行器档位的 SQLite 存储。
@@ -997,15 +1015,18 @@ func DefaultConfig() Config {
 			MisfireGracePeriod: DefaultMisfireGracePeriod,
 		},
 		Store: StoreConfig{
-			Type:             "json",
-			Path:             "./data/jobs.json",
-			FlushInterval:    DefaultFlushInterval,
-			HistoryLimit:     DefaultHistoryLimit,
-			HistoryTTL:       0,
-			AttemptsKeepLast: DefaultAttemptsKeepLast,
-			IdempotencyTTL:   DefaultIdempotencyTTL,
-			GroupsPath:       DefaultGroupsPath,
-			SQLite:           StoreSQLiteConfig{Path: DefaultJobsDBPath, Dialect: "sqlite"},
+			Type:                "json",
+			Path:                "./data/jobs.json",
+			FlushInterval:       DefaultFlushInterval,
+			HistoryLimit:        DefaultHistoryLimit,
+			HistoryTTL:          0,
+			AttemptsKeepLast:    DefaultAttemptsKeepLast,
+			IdempotencyTTL:      DefaultIdempotencyTTL,
+			OutboxFlushInterval: DefaultOutboxFlushInterval,
+			OutboxRetentionAge:  DefaultOutboxRetentionAge,
+			OutboxMaxPending:    DefaultOutboxMaxPending,
+			GroupsPath:          DefaultGroupsPath,
+			SQLite:              StoreSQLiteConfig{Path: DefaultJobsDBPath, Dialect: "sqlite"},
 		},
 		Logging: LoggingConfig{
 			Level:  "info",
@@ -1271,6 +1292,9 @@ func (c Config) Validate() error {
 	if c.Store.HistoryTTL < 0 {
 		return fmt.Errorf("store.history_ttl must not be negative, got %v", c.Store.HistoryTTL)
 	}
+	if c.Store.OutboxFlushInterval > 0 && c.Store.OutboxFlushInterval < MinOutboxFlushInterval {
+		return fmt.Errorf("store.outbox_flush_interval %v is below the minimum %v", c.Store.OutboxFlushInterval, MinOutboxFlushInterval)
+	}
 	if c.Store.GroupsPath == "" {
 		return fmt.Errorf("store.groups_path must not be empty")
 	}
@@ -1379,6 +1403,15 @@ func (c Config) Normalized() Config {
 	}
 	if c.Store.IdempotencyTTL <= 0 {
 		c.Store.IdempotencyTTL = defaults.Store.IdempotencyTTL
+	}
+	if c.Store.OutboxFlushInterval == 0 {
+		c.Store.OutboxFlushInterval = defaults.Store.OutboxFlushInterval
+	}
+	if c.Store.OutboxRetentionAge <= 0 {
+		c.Store.OutboxRetentionAge = defaults.Store.OutboxRetentionAge
+	}
+	if c.Store.OutboxMaxPending <= 0 {
+		c.Store.OutboxMaxPending = defaults.Store.OutboxMaxPending
 	}
 	if c.Store.GroupsPath == "" {
 		c.Store.GroupsPath = defaults.Store.GroupsPath

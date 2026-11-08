@@ -164,6 +164,11 @@ func (e *EventLog) mapEvent(event core.Event) (eventRecord, bool) {
 		// 而排障时最常比对的正是"事件里写的那段错误原文"
 		Data: nullableText(event.Data),
 	}
+	// 出箱序号（TASK-RE07）：中继器投递的事件带值，直发事件为 0 → NULL。
+	// 读侧按它去重（部分唯一索引 + 冲突忽略），at-least-once 重放不产生重复行。
+	if event.OutboxSeq > 0 {
+		record.OutboxSeq = sql.NullInt64{Int64: event.OutboxSeq, Valid: true}
+	}
 	if event.Metadata != nil {
 		encoded, err := json.Marshal(event.Metadata)
 		if err != nil {
@@ -193,7 +198,12 @@ func (e *EventLog) writeBatch(rows []eventRecord) error {
 	err := e.db.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
 		// 一次多值插入替代 Prepare+逐行 Exec：同一事务、同一批数据，
 		// 往返从 N 次降到 1 次。rows 恒非空（batcher 不调空批回调）。
-		if _, err := tx.NewInsert().Model(&rows).Exec(ctx); err != nil {
+		// 冲突忽略（TASK-RE07）：outbox_seq 命中部分唯一索引的行是中继器
+		// at-least-once 重放的重复事件，跳过而不是报错——直发行（NULL）不进
+		// 索引、永不冲突。两方言的冲突子句同形，不需要分支点。
+		if _, err := tx.NewInsert().Model(&rows).
+			On("CONFLICT (outbox_seq) WHERE outbox_seq IS NOT NULL DO NOTHING").
+			Exec(ctx); err != nil {
 			return fmt.Errorf("sqlite: insert event batch: %w", err)
 		}
 		if err := e.prune(ctx, tx); err != nil {
@@ -319,6 +329,9 @@ func eventOf(row eventRecord) (core.Event, error) {
 			return core.Event{}, fmt.Errorf("metadata of job %s is not decodable: %w", row.JobID, err)
 		}
 		event.Metadata = parsed
+	}
+	if row.OutboxSeq.Valid {
+		event.OutboxSeq = row.OutboxSeq.Int64
 	}
 	return event, nil
 }

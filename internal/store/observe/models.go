@@ -29,6 +29,9 @@ type eventRecord struct {
 	Status      int            `bun:"column:status"`
 	Data        sql.NullString `bun:"column:data"`
 	Metadata    sql.NullString `bun:"column:metadata"`
+	// OutboxSeq 是出箱序号（TASK-RE07 迁移 v2）：中继器投递的事件带值，
+	// 直发事件（JSON 部署）为 NULL。部分唯一索引 + 冲突忽略实现读侧去重。
+	OutboxSeq sql.NullInt64 `bun:"column:outbox_seq"`
 }
 
 // auditRecord 是 write_audit 的一行。可空列用 sql.NullString：
