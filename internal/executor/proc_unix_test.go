@@ -282,7 +282,7 @@ func TestGracefulShutdown_NotStalled(t *testing.T) {
 	command.Timeout = 5 * time.Minute
 	fixture := newRunnerFixture(t, command, nil)
 
-	store, err := core.NewJSONFileStore(filepath.Join(t.TempDir(), "jobs.json"))
+	store, err := core.NewJSONFileStore(filepath.Join(tempWorkspace(t), "jobs.json"))
 	require.NoError(t, err)
 	scheduler := core.NewScheduler(store, nil, nil, core.WithLogger(quietLogger()))
 	scheduler.RegisterHandler(fixture.profile.HandlerKey(), fixture.runner.Handler())

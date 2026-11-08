@@ -19,7 +19,7 @@ import (
 func loadOneProfile(t *testing.T, command core.ExecutorCommand) (*Profile, string) {
 	t.Helper()
 
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	profiles := mustLoad(t, configWith(workspace, command))
 	require.Len(t, profiles, 1)
 	return profiles[0], workspace
@@ -347,7 +347,7 @@ func TestValidateSubmission_Positional(t *testing.T) {
 	assert.Contains(t, err.Error(), "does not accept positional arguments")
 
 	// 档位里也不允许把保留键声明成参数名
-	_, err = LoadProfiles(configWith(t.TempDir(), core.ExecutorCommand{
+	_, err = LoadProfiles(configWith(tempWorkspace(t), core.ExecutorCommand{
 		Name: "tool", Kind: "binary", Program: "bin/tool",
 		Args: []core.ExecutorArg{{Name: positionalKey}},
 	}))

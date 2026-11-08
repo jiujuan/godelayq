@@ -19,7 +19,7 @@ func execConfigForMode(t *testing.T) core.ExecutorsConfig {
 	t.Helper()
 
 	ec := core.DefaultConfig().Executors
-	ec.Workspace = t.TempDir()
+	ec.Workspace = tempWorkspace(t)
 	return ec
 }
 
@@ -159,7 +159,7 @@ func TestBuildProfileSameRulesAsLoadProfiles(t *testing.T) {
 // LoadProfiles 必须一直走严格模式：这是"config.yaml 侧口径不变"的落点。
 func TestLoadProfilesAlwaysStrictEvenWithLooseDefaults(t *testing.T) {
 	ec := execConfigForMode(t)
-	absolute := filepath.Join(t.TempDir(), "outside.py")
+	absolute := filepath.Join(tempWorkspace(t), "outside.py")
 
 	cfg := core.Config{Executors: ec}
 	cfg.Executors.Commands = []core.ExecutorCommand{{
@@ -311,7 +311,7 @@ func TestPathAnywhereDoesNotTurnProgramNameIntoPath(t *testing.T) {
 func TestProbeConsumesLooseProfileWithoutChanges(t *testing.T) {
 	ec := execConfigForMode(t)
 
-	dir := t.TempDir()
+	dir := tempWorkspace(t)
 	real := filepath.Join(dir, "present.py")
 	if err := os.WriteFile(real, []byte("print(1)\n"), 0o644); err != nil {
 		t.Fatalf("预置脚本失败: %v", err)

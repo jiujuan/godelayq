@@ -30,7 +30,7 @@ func artifactStoreFor(t *testing.T, maxBytes int, ttl time.Duration, now func() 
 	t.Helper()
 
 	store, err := NewArtifactStore(ArtifactOptions{
-		Dir:      filepath.Join(t.TempDir(), "exec"),
+		Dir:      filepath.Join(tempWorkspace(t), "exec"),
 		MaxBytes: maxBytes,
 		TTL:      ttl,
 		Now:      now,
@@ -40,7 +40,7 @@ func artifactStoreFor(t *testing.T, maxBytes int, ttl time.Duration, now func() 
 }
 
 func TestNewArtifactStore_CreatesRootDir(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "nested", "exec")
+	root := filepath.Join(tempWorkspace(t), "nested", "exec")
 
 	store, err := NewArtifactStore(ArtifactOptions{Dir: root, MaxBytes: 4096}, nil)
 	require.NoError(t, err)
@@ -61,7 +61,7 @@ func TestNewArtifactStore_RejectsBadOptions(t *testing.T) {
 	})
 
 	t.Run("负 TTL", func(t *testing.T) {
-		_, err := NewArtifactStore(ArtifactOptions{Dir: t.TempDir(), MaxBytes: 4096, TTL: -time.Minute}, nil)
+		_, err := NewArtifactStore(ArtifactOptions{Dir: tempWorkspace(t), MaxBytes: 4096, TTL: -time.Minute}, nil)
 		require.Error(t, err)
 		assert.Contains(t, err.Error(), "negative ttl")
 	})
@@ -73,7 +73,7 @@ func TestNewArtifactStore_MaxBytesFloor(t *testing.T) {
 	var logs bytes.Buffer
 
 	store, err := NewArtifactStore(ArtifactOptions{
-		Dir:      filepath.Join(t.TempDir(), "exec"),
+		Dir:      filepath.Join(tempWorkspace(t), "exec"),
 		MaxBytes: 0,
 	}, bufferLogger(&logs))
 	require.NoError(t, err)

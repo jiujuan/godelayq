@@ -112,8 +112,8 @@ type runnerFixture struct {
 func newRunnerFixture(t *testing.T, command core.ExecutorCommand, tune func(*core.Config, *ArtifactOptions)) *runnerFixture {
 	t.Helper()
 
-	cfg := configWith(t.TempDir(), command)
-	opts := ArtifactOptions{Dir: filepath.Join(t.TempDir(), "exec"), MaxBytes: core.DefaultExecMaxOutputBytes}
+	cfg := configWith(tempWorkspace(t), command)
+	opts := ArtifactOptions{Dir: filepath.Join(tempWorkspace(t), "exec"), MaxBytes: core.DefaultExecMaxOutputBytes}
 	if tune != nil {
 		tune(&cfg, &opts)
 	}

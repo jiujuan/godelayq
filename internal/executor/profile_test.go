@@ -105,8 +105,8 @@ func expectLoadError(t *testing.T, cfg core.Config, contains ...string) {
 // 这条是卡片 §7 的手工验证的可执行版本：服务端把 LoadProfiles 接进启动流程（TASK-E04）之后，
 // 配置里一条越界的脚本路径就必须让进程起不来，并指出是哪一条档位。
 func TestLoadProfiles_FromConfigFile(t *testing.T) {
-	workspace := t.TempDir()
-	dir := t.TempDir()
+	workspace := tempWorkspace(t)
+	dir := tempWorkspace(t)
 	path := filepath.Join(dir, "config.yaml")
 	body := `
 executors:
@@ -130,7 +130,7 @@ executors:
 }
 
 func TestLoadProfiles_KindsAndDefaults(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	script := declareFile(t, workspace, "scripts/report.mjs")
 	program := declareFile(t, workspace, "bin/etl")
 
@@ -218,7 +218,7 @@ func TestLoadProfiles_KindsAndDefaults(t *testing.T) {
 }
 
 func TestLoadProfiles_ProgramNameInRuntimeAllow(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	// program 精确命中 runtime_allow 时按 PATH 里的程序处理，不要求它是 workspace 内的文件
 	profile := mustLoad(t, configWith(workspace, core.ExecutorCommand{
@@ -238,7 +238,7 @@ func TestLoadProfiles_ProgramNameInRuntimeAllow(t *testing.T) {
 }
 
 func TestLoadProfiles_PathEscape(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	for _, tc := range []struct {
 		name  string
@@ -283,8 +283,8 @@ func TestLoadProfiles_PathEscape(t *testing.T) {
 }
 
 func TestLoadProfiles_SymlinkEscape(t *testing.T) {
-	workspace := t.TempDir()
-	outside := t.TempDir()
+	workspace := tempWorkspace(t)
+	outside := tempWorkspace(t)
 	target := filepath.Join(outside, "secret.txt")
 	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
 		t.Fatalf("prepare target failed: %v", err)
@@ -316,10 +316,10 @@ func TestLoadProfiles_SymlinkEscape(t *testing.T) {
 // 上一条真实符号链接的用例在 Windows 上需要管理员权限或开发者模式，没权限时整段跳过；
 // 这个版本不依赖平台权限，保证同一条判定在任何机器上都被执行过。
 func TestLoadProfiles_SymlinkEscapeViaResolver(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	script := declareFile(t, workspace, "scripts/report.mjs")
 
-	outside, err := filepath.Abs(filepath.Join(t.TempDir(), "escape.sh"))
+	outside, err := filepath.Abs(filepath.Join(tempWorkspace(t), "escape.sh"))
 	require.NoError(t, err)
 	require.NoError(t, os.WriteFile(outside, []byte("#!/bin/sh\n"), 0o600))
 
@@ -354,7 +354,7 @@ func TestLoadProfiles_SymlinkEscapeViaResolver(t *testing.T) {
 func TestLoadProfiles_MissingFileIsNotAProfileError(t *testing.T) {
 	// 文件是否真的存在属于探测（TASK-E03），不属于档位校验：
 	// 配置先写、脚本后部署是常见顺序，这种写法应该让档位显示"不可用"，而不是让进程起不来。
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	profile := mustLoad(t, configWith(workspace, validScriptProfile("scripts/absent.mjs")))[0]
 	if profile.ScriptPath == "" {
@@ -366,7 +366,7 @@ func TestLoadProfiles_MissingFileIsNotAProfileError(t *testing.T) {
 }
 
 func TestLoadProfiles_UnknownRuntime(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	cmd := validScriptProfile(declareFile(t, workspace, "scripts/report.mjs"))
 	cmd.Runtime = "ruby"
@@ -379,7 +379,7 @@ func TestLoadProfiles_UnknownRuntime(t *testing.T) {
 }
 
 func TestLoadProfiles_ArgRules(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	script := declareFile(t, workspace, "scripts/report.mjs")
 
 	base := func(mutate func(*core.ExecutorCommand)) core.Config {
@@ -457,7 +457,7 @@ func TestLoadProfiles_ArgRules(t *testing.T) {
 }
 
 func TestLoadProfiles_EnvAndFixedArgRules(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	script := declareFile(t, workspace, "scripts/report.mjs")
 
 	base := func(mutate func(*core.ExecutorCommand)) core.Config {
@@ -503,7 +503,7 @@ func TestLoadProfiles_EnvAndFixedArgRules(t *testing.T) {
 }
 
 func TestLoadProfiles_HttpRules(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	base := func(mutate func(*core.ExecutorCommand)) core.Config {
 		cmd := validHTTPProfile()
@@ -597,7 +597,7 @@ func TestLoadProfiles_HttpRules(t *testing.T) {
 }
 
 func TestLoadProfiles_NameCharset(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	script := declareFile(t, workspace, "scripts/report.mjs")
 
 	for _, tc := range []struct {
@@ -628,7 +628,7 @@ func TestLoadProfiles_NameCharset(t *testing.T) {
 // 档位之间重名由本任务检查；档位名与代码注册的处理函数重名属于注册环节（TASK-E04），
 // 因为那需要调度器的注册表才能判断。
 func TestLoadProfiles_DuplicateDetectionBoundary(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cmd := validScriptProfile(declareFile(t, workspace, "scripts/report.mjs"))
 	cmd.Name = "payment_check"
 
@@ -639,7 +639,7 @@ func TestLoadProfiles_DuplicateDetectionBoundary(t *testing.T) {
 }
 
 func TestLoadProfiles_KindFieldMismatch(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	script := declareFile(t, workspace, "scripts/report.mjs")
 	program := declareFile(t, workspace, "bin/etl")
 
@@ -694,7 +694,7 @@ func TestLoadProfiles_KindFieldMismatch(t *testing.T) {
 }
 
 func TestLoadProfiles_TimeoutRules(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	script := declareFile(t, workspace, "scripts/report.mjs")
 
 	cfg := configWith(workspace, func() core.ExecutorCommand {
@@ -729,7 +729,7 @@ func TestLoadProfiles_TimeoutRules(t *testing.T) {
 }
 
 func TestLoadProfiles_EmptyCommandsIsLegal(t *testing.T) {
-	profiles, err := LoadProfiles(configWith(t.TempDir()))
+	profiles, err := LoadProfiles(configWith(tempWorkspace(t)))
 	if err != nil {
 		t.Fatalf("an empty command list must not be an error: %v", err)
 	}
@@ -739,7 +739,7 @@ func TestLoadProfiles_EmptyCommandsIsLegal(t *testing.T) {
 }
 
 func TestProfile_ValidatePayloadKeys(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	profiles := mustLoad(t, configWith(workspace,
 		validScriptProfile(declareFile(t, workspace, "scripts/report.mjs")),
 		validHTTPProfile(),
@@ -784,7 +784,7 @@ func TestProfile_ValidatePayloadKeys(t *testing.T) {
 }
 
 func TestProfile_ArgLookup(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	profile := mustLoad(t, configWith(workspace,
 		validScriptProfile(declareFile(t, workspace, "scripts/report.mjs")),
 	))[0]
@@ -803,7 +803,7 @@ func TestProfile_ArgLookup(t *testing.T) {
 
 // 错误信息必须能定位到具体档位，并带上可 grep 的键名，否则配置多了以后无从下手。
 func TestProfileErrorPrefix(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cmd := validScriptProfile(declareFile(t, workspace, "scripts/report.mjs"))
 	cmd.Timeout = 48 * time.Hour
 
@@ -821,8 +821,8 @@ func TestProfileErrorPrefix(t *testing.T) {
 // 而 configs/config.example.yaml 的写法与 envNamePattern 都是大写环境变量名。
 // 这一条固定"从 YAML 读进来仍然按大写校验并保存"，否则示例配置自己就加载不过。
 func TestLoadProfiles_ConfigFileEnvKeys(t *testing.T) {
-	workspace := t.TempDir()
-	path := filepath.Join(t.TempDir(), "config.yaml")
+	workspace := tempWorkspace(t)
+	path := filepath.Join(tempWorkspace(t), "config.yaml")
 	body := `
 executors:
   enabled: true

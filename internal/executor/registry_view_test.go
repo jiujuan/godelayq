@@ -18,7 +18,7 @@ import (
 func TestPathDisplay_Kinds(t *testing.T) {
 	ec := execConfigForMode(t)
 	workspace := ec.Workspace
-	outside := filepath.Join(t.TempDir(), "elsewhere", "report.mjs")
+	outside := filepath.Join(tempWorkspace(t), "elsewhere", "report.mjs")
 
 	// 同盘越界的相对写法：filepath.Rel 会给 ..\..\ 上跳形式，判越界不能看这个形状（D-0201）
 	upJump := filepath.Join("..", "..", "outside-by-relative", "report.mjs")
@@ -134,7 +134,7 @@ func newViewRegistry(t *testing.T, webEnabled bool) *Registry {
 	cfg := core.DefaultConfig()
 	cfg.Executors.Enabled = true
 	cfg.Executors.WebEnabled = webEnabled
-	cfg.Executors.Workspace = t.TempDir()
+	cfg.Executors.Workspace = tempWorkspace(t)
 	cfg.Executors.Commands = []core.ExecutorCommand{
 		{Name: "cfg_a", Kind: "http", Method: "GET",
 			URLTemplate: "https://api.example.com/a", AllowedHosts: []string{"api.example.com"}},

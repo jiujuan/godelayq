@@ -29,7 +29,7 @@ func namedScript(t *testing.T, workspace, name string) core.ExecutorCommand {
 }
 
 func TestNewRegistry_EmptyWhenDisabled(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	// 关闭状态下配置里的错误不暴露：这是 E02/E03 一致采用的"关闭即完全惰性"口径
 	cfg := configAllowing(workspace, []string{missingProgram},
@@ -52,14 +52,14 @@ func TestNewRegistry_EmptyWhenDisabled(t *testing.T) {
 }
 
 func TestNewRegistry_EnabledWithoutCommands(t *testing.T) {
-	registry, err := NewRegistry(configWith(t.TempDir()), nil)
+	registry, err := NewRegistry(configWith(tempWorkspace(t)), nil)
 	require.NoError(t, err)
 	assert.True(t, registry.Enabled())
 	assert.Empty(t, registry.Keys())
 }
 
 func TestNewRegistry_LookupAndSort(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	// 故意按非字典序声明，验证输出顺序与声明顺序无关
 	registry, err := NewRegistry(configAllowing(workspace, []string{selfExecutable(t)},
@@ -109,7 +109,7 @@ func TestNewRegistry_LookupAndSort(t *testing.T) {
 }
 
 func TestNewRegistry_LogsUnavailable(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	var log bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&log, nil))
 
@@ -138,7 +138,7 @@ func TestNewRegistry_LogsUnavailable(t *testing.T) {
 }
 
 func TestNewRegistry_InvalidProfileIsAnError(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	cfg := configAllowing(workspace, []string{selfExecutable(t)},
 		scriptUsingRuntime(selfExecutable(t), "../../evil.sh"))
@@ -150,7 +150,7 @@ func TestNewRegistry_InvalidProfileIsAnError(t *testing.T) {
 }
 
 func TestRegistry_AccessorsReflectConfig(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	cfg := configAllowing(workspace, []string{selfExecutable(t)},
 		namedScript(t, workspace, "one"))
@@ -193,13 +193,13 @@ func TestRegistry_AccessorsReflectConfig(t *testing.T) {
 // 卡片 §7 写的"启动服务看日志"要到 TASK-E04 把 NewRegistry 接进装配之后才可能，
 // 本卡以这条测试替代，并在这里说明而不是假装验证过。
 func TestNewRegistry_FromConfigFile(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	executable := selfExecutable(t)
 	require.NoError(t, os.MkdirAll(filepath.Join(workspace, "scripts"), 0o750))
 	require.NoError(t, os.WriteFile(filepath.Join(workspace, "scripts", "present.mjs"),
 		[]byte("console.log('ok')\n"), 0o600))
 
-	path := filepath.Join(t.TempDir(), "config.yaml")
+	path := filepath.Join(tempWorkspace(t), "config.yaml")
 	body := `
 executors:
   enabled: true

@@ -39,7 +39,7 @@ func adhocConfig(workspace string, tune func(*core.Config)) core.Config {
 }
 
 func TestRegister_AdhocEnabledWarnsOnceWithTheFourFacts(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 	cfg := adhocConfig(workspace, func(cfg *core.Config) {
 		cfg.Executors.Adhoc.PathPrefixes = []string{"scripts", "jobs"}
 		cfg.Executors.Adhoc.URLHosts = []string{"hook.example.com"}
@@ -64,13 +64,13 @@ func TestRegister_AdhocEnabledWarnsOnceWithTheFourFacts(t *testing.T) {
 
 func TestRegister_AdhocWarnsOnEachTurnedOffGuard(t *testing.T) {
 	t.Run("限定目录留空", func(t *testing.T) {
-		logs := registerWithLogger(t, adhocConfig(t.TempDir(), nil))
+		logs := registerWithLogger(t, adhocConfig(tempWorkspace(t), nil))
 		assert.Contains(t, logs, "executors.adhoc.path_prefixes is empty",
 			"不限目录必须单独说一句：它不是配置漏填就是放开本机任意文件")
 	})
 
 	t.Run("放开回环与私网", func(t *testing.T) {
-		logs := registerWithLogger(t, adhocConfig(t.TempDir(), func(cfg *core.Config) {
+		logs := registerWithLogger(t, adhocConfig(tempWorkspace(t), func(cfg *core.Config) {
 			cfg.Executors.Adhoc.URLAllowPrivate = true
 			prefixes := filepath.Join(cfg.Executors.Workspace, "scripts")
 			cfg.Executors.Adhoc.PathPrefixes = []string{prefixes}
@@ -84,7 +84,7 @@ func TestRegister_AdhocWarnsOnEachTurnedOffGuard(t *testing.T) {
 	})
 
 	t.Run("整节关闭时半句都没有", func(t *testing.T) {
-		cfg := configWith(t.TempDir(), scriptUsingRuntime("bash", "scripts/deploy.sh"))
+		cfg := configWith(tempWorkspace(t), scriptUsingRuntime("bash", "scripts/deploy.sh"))
 		logs := registerWithLogger(t, cfg)
 		assert.NotContains(t, logs, "free-form execution profiles")
 		assert.NotContains(t, logs, "path_prefixes is empty")
@@ -95,7 +95,7 @@ func TestRegister_AdhocWarnsOnEachTurnedOffGuard(t *testing.T) {
 // TestRegister_AdhocEnabledButAllYielded 覆盖那条"打开却一条都没登记"的分支：
 // 四条全被 executors.commands 顶掉时，说清状态比留一份安静更负责。
 func TestRegister_AdhocEnabledButAllYielded(t *testing.T) {
-	workspace := t.TempDir()
+	workspace := tempWorkspace(t)
 
 	// 四条内置档位的键全部被 executors.commands 占掉：内置那四条一条条让位，
 	// 于是"整节打开"与"有一条能用"是两件事，这一行状态要说出来。

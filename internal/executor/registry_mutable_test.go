@@ -21,7 +21,7 @@ func newConfigRegistry(t *testing.T, names ...string) *Registry {
 
 	ec := core.DefaultConfig().Executors
 	ec.Enabled = true
-	ec.Workspace = t.TempDir()
+	ec.Workspace = tempWorkspace(t)
 	for _, name := range names {
 		ec.Commands = append(ec.Commands, core.ExecutorCommand{
 			Name: name, Kind: "script", Runtime: "node", Script: "scripts/" + name + ".mjs",
@@ -381,7 +381,7 @@ func TestRegisterCountsDegradedProfiles(t *testing.T) {
 	}
 
 	artifacts, err := NewArtifactStore(ArtifactOptions{
-		Dir: filepath.Join(t.TempDir(), "exec"), MaxBytes: 4096,
+		Dir: filepath.Join(tempWorkspace(t), "exec"), MaxBytes: 4096,
 	}, quietLogger())
 	if err != nil {
 		t.Fatalf("NewArtifactStore 失败: %v", err)

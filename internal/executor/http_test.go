@@ -83,8 +83,8 @@ type httpFixture struct {
 func newHTTPFixture(t *testing.T, command core.ExecutorCommand, tune func(*core.Config, *ArtifactOptions)) *httpFixture {
 	t.Helper()
 
-	cfg := configWith(t.TempDir(), command)
-	opts := ArtifactOptions{Dir: filepath.Join(t.TempDir(), "exec"), MaxBytes: core.DefaultExecMaxOutputBytes}
+	cfg := configWith(tempWorkspace(t), command)
+	opts := ArtifactOptions{Dir: filepath.Join(tempWorkspace(t), "exec"), MaxBytes: core.DefaultExecMaxOutputBytes}
 	if tune != nil {
 		tune(&cfg, &opts)
 	}
@@ -699,7 +699,7 @@ func TestHTTP_ResponseWithoutCaptureFlag(t *testing.T) {
 // 手工构造时把非 http 档位交给 HTTPRunner，要构造失败而不是拿到一个能跑的实例。
 func TestHTTP_ProfileRejectedByWrongRunnerKind(t *testing.T) {
 	command := shellCommand(t, "echo hello")
-	cfg := configWith(t.TempDir(), command).Normalized()
+	cfg := configWith(tempWorkspace(t), command).Normalized()
 	profiles := mustLoad(t, cfg)
 
 	runner, err := NewHTTPRunner(profiles[0], nil, cfg.Executors, quietLogger())

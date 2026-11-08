@@ -91,7 +91,7 @@ func TestApplier_ApplyConfig_IllegalEntryLeavesEverythingAlone(t *testing.T) {
 
 	// 一条越界的命令：脚本落在另一个临时目录里（frozen workspace 之外），
 	// 但它与同批里那条合法的 gone 一起，被 LoadProfiles 的连坐规则整批拒绝。
-	outside := t.TempDir()
+	outside := tempWorkspace(t)
 	rel := declareFile(t, outside, "scripts/outside.mjs")
 	abs := filepath.Join(outside, filepath.FromSlash(rel))
 	illegal := core.ExecutorCommand{Name: "outside", Kind: "script", Runtime: selfExecutable(t), Script: abs}
@@ -161,7 +161,7 @@ func TestApplier_ApplyConfig_ValidatesAgainstFrozenPermissions(t *testing.T) {
 	farScript := declareFile(t, f.workspace, "scripts/far.mjs")
 	farNode := core.ExecutorCommand{Name: "far_node", Kind: "script", Runtime: missingProgram, Script: farScript}
 
-	elsewhere := t.TempDir()
+	elsewhere := tempWorkspace(t)
 	relaxedExec := f.executor // 从冻结值出发，再放宽顶层许可
 	relaxedExec.Workspace = elsewhere
 	relaxedExec.RuntimeAllow = append(append([]string{}, f.executor.RuntimeAllow...), missingProgram)
