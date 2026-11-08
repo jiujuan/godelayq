@@ -931,3 +931,26 @@ func TestLoadConfig_SlowQueryThreshold(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, MinSlowQueryThreshold, floor.Store.SlowQueryThreshold)
 }
+
+// 语句超时（G6/Q07）：0 不设（默认）；负数拒启；sqlite 方言上写 PG 专属键拒启
+// （与"sqlite 却写 dsn"同一口径——方言专属键写错方言是配置错误）。
+func TestLoadConfig_StatementTimeout(t *testing.T) {
+	omitted, err := LoadConfig(writeConfigFile(t, "store:\n  statement_timeout: 0s\n"))
+	require.NoError(t, err, "0 表示不设，必须放过")
+	assert.Zero(t, omitted.Store.StatementTimeout)
+
+	_, err = LoadConfig(writeConfigFile(t, "store:\n  statement_timeout: -1s\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must not be negative")
+
+	// 默认方言（sqlite）写它：拒绝而不是静默忽略
+	_, err = LoadConfig(writeConfigFile(t, "store:\n  type: sqlite\n  statement_timeout: 5s\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only used when store.sqlite.dialect is postgres")
+
+	// postgres 方言 + 超时：合法
+	pg, err := LoadConfig(writeConfigFile(t,
+		"store:\n  type: sqlite\n  statement_timeout: 5s\n  sqlite:\n    dialect: postgres\n    dsn: postgres://u:p@localhost:5432/db\n"))
+	require.NoError(t, err)
+	assert.Equal(t, 5*time.Second, pg.Store.StatementTimeout)
+}

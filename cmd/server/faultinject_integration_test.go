@@ -31,7 +31,7 @@ func newOutboxE2EEnv(t *testing.T) *outboxE2EEnv {
 	t.Helper()
 	logger := slog.New(slog.NewTextHandler(testWriterFor(t), nil))
 
-	jobsDB, err := jobs.Open(core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}, 0, 0, 0, logger)
+	jobsDB, err := jobs.Open(core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")}, 0, 0, 0, 0, logger)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = jobsDB.Close() })
 

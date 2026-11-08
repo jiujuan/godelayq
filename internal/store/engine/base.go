@@ -66,6 +66,11 @@ type Options struct {
 	// 钩子，每查询零开销。取值合法性与下限守卫归调用方的配置层（core.Validate），
 	// 本包只认"正数即开启"。
 	SlowQueryThreshold time.Duration
+	// StatementTimeout 语句超时（G6/Q07）：仅 postgres 方言生效，经 DSN 注入
+	// statement_timeout 运行时参数；0（默认）不注入，openPostgres 会记一条 Warn。
+	// 迁移事务内的 DDL 经 SET LOCAL 豁免（Migrate 注释），业务查询带上限。
+	// 负值在本包按 0 处理；取值校验归配置层。
+	StatementTimeout time.Duration
 }
 
 // DB 是一个数据库的句柄。它是纯机制对象：不认识任何一张业务表，
@@ -155,6 +160,13 @@ func openSQLite(opts Options, logger *slog.Logger) (*DB, error) {
 
 	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
 		return nil, fmt.Errorf("sqlite: create dir for %s: %w", path, err)
+	}
+	// 语句超时是 PG 专属（G6/Q07）：SQLite 没有对应物。配置层会拒绝
+	// "dialect=sqlite 却写 statement_timeout"，这里对直接使用本包的调用方
+	// 只提示不拒绝——配置写了但没生效这件事必须可见。
+	if opts.StatementTimeout > 0 {
+		logger.Warn("statement_timeout is postgres-only; ignored on sqlite",
+			"path", path)
 	}
 	// 先按目标权限把文件建出来，再让驱动打开：驱动自己创建时权限由系统 umask 决定，
 	// 同机其它用户可能正好能读这份带账号名的台账。已存在的文件不动它的权限。
@@ -297,6 +309,17 @@ func (d *DB) Migrate(table string, ms []Migration) error {
 		tx, err := d.sqlDB.Begin()
 		if err != nil {
 			return fmt.Errorf("sqlite: begin migration %d: %w", m.Version, err)
+		}
+		// 语句超时豁免（G6/Q07）：业务连接经 DSN 带 statement_timeout，而迁移里的
+		// DDL 可能远超业务上限。SET LOCAL 只在本事务内生效、提交即消失——
+		// 豁免不会随连接归还泄漏给后续业务查询。SQLite 没有这条语句（也没有
+		// statement_timeout），按方言跳过。事务外的记账查询（建表/读版本/落版本）
+		// 都是亚毫秒级快语句，留在业务上限之内。
+		if d.dialect == DialectPostgres {
+			if _, err := tx.Exec(`SET LOCAL statement_timeout = 0`); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("sqlite: exempt migration %d from statement_timeout: %w", m.Version, err)
+			}
 		}
 		for _, stmt := range m.statements(d.dialect) {
 			if _, err := tx.Exec(stmt); err != nil {

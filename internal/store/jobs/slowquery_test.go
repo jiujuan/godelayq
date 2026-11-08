@@ -51,7 +51,7 @@ func (h *jobsLogCapture) slowQueryCount() int {
 func TestOpen_WiresSlowQueryHook(t *testing.T) {
 	handler := &jobsLogCapture{}
 	s, err := Open(core.StoreSQLiteConfig{Path: filepath.Join(t.TempDir(), "jobs.sqlite")},
-		0, 0, 10*time.Millisecond, slog.New(handler))
+		0, 0, 10*time.Millisecond, 0, slog.New(handler))
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = s.Close() })
 

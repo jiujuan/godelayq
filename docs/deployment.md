@@ -45,6 +45,7 @@ store:
   outbox_retention_age: 72h   # 已投递出箱行的保留时长（仅 sqlite/PG 生效）
   outbox_max_pending: 100000  # pending 积压上限；超过按最旧截断并记 error
   slow_query_threshold: 0s    # 慢查询日志阈值（仅 sqlite/PG 生效）；0=关（默认），开启后下限 1ms
+  statement_timeout: 0s       # PG 语句超时（仅 dialect=postgres 生效）；0=不设（默认，启动有 Warn）
   groups_path: /var/lib/godelayq/groups.json  # 分组注册表（改动即同步落盘）
   sqlite:                     # 仅 type: sqlite 时生效（TASK-M03）
     path: /var/lib/godelayq/goqsys_jobs.sqlite
@@ -96,6 +97,13 @@ logging:
   这是 W 系列（写合并）改动的基线证据来源——开它跑一轮到期风暴，对比
   `/admin/runtime` 的 `db.pool.wait_*` 前后读数。钩子在启动装配时挂上，热改阈值
   不生效（重启档）；要把日志阈值压到下限以下应该用基准而不是改配置。
+- `statement_timeout`（仅 `dialect=postgres`）经 DSN 注入 `statement_timeout`，
+  给每条业务语句一个服务端上限。写在 sqlite 方言上启动直接拒绝（方言专属键
+  写错方言与 dsn 同罪）。两个豁免与一条边界：迁移事务内的 DDL 经 `SET LOCAL`
+  豁免（事务结束即失效，不会泄漏给业务查询）；DSN 里已带同名参数时启动报错
+  （两处上限取哪边都是猜）；它只管单条语句时长，不管事务总时长与锁等待
+  （`idle_in_transaction_session_timeout` / `lock_timeout` 是另外的键，本卡不提供）。
+  未配置时启动日志有一条 Warn 提示"没有上限"。
 - `scheduler.recovery_policy` 显式配置（非 `auto`）时全局生效，压过只管执行器的
   `executors.restore_policy`；两者同时显式且结论不同时启动日志会有一条 warn 迁移提示。
 

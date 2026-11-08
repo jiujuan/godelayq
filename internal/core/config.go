@@ -204,6 +204,12 @@ type StoreConfig struct {
 	// JSON 后端没有查询）。0 表示关闭（默认）。开启后低于 MinSlowQueryThreshold
 	// 直接拒启——把阈值设得比本地常规查询还快，等于把日志阈值当成日志洪水开关。
 	SlowQueryThreshold time.Duration `mapstructure:"slow_query_threshold"`
+	// StatementTimeout PG 语句超时（G6/Q07，仅 store.type=sqlite 且 dialect=postgres
+	// 生效）：经 DSN 注入 statement_timeout，业务查询的上限；迁移事务内 SET LOCAL
+	// 豁免，启动期长迁移不受影响。0 表示不设（默认），启动日志会 Warn 提示。
+	// 写在 sqlite 方言上会被 Validate 拒绝（与 dsn 同一口径：方言专属键写错方言
+	// 是配置错误，不是"反正不生效"）。
+	StatementTimeout time.Duration `mapstructure:"statement_timeout"`
 	// GroupsPath 分组元数据文件路径，与任务快照分文件存放：
 	// 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
 	GroupsPath string `mapstructure:"groups_path"`
@@ -1281,6 +1287,15 @@ func (c Config) Validate() error {
 		if err := c.Store.SQLite.Validate(); err != nil {
 			return err
 		}
+		// 语句超时是 PG 方言专属（G6/Q07）：写在 sqlite 方言上与"sqlite 却写 dsn"
+		// 同罪——方言专属键写错方言是配置错误，静默忽略会让人以为上限在生效。
+		// type=json 不查（与 outbox_* 同口径：仅库后端生效的键，文档说明即可）。
+		switch strings.TrimSpace(c.Store.SQLite.Dialect) {
+		case "", "sqlite":
+			if c.Store.StatementTimeout > 0 {
+				return fmt.Errorf("store.statement_timeout is only used when store.sqlite.dialect is postgres, got %v", c.Store.StatementTimeout)
+			}
+		}
 	case "":
 		return fmt.Errorf("store.type must not be empty")
 	default:
@@ -1310,6 +1325,9 @@ func (c Config) Validate() error {
 	}
 	if c.Store.SlowQueryThreshold > 0 && c.Store.SlowQueryThreshold < MinSlowQueryThreshold {
 		return fmt.Errorf("store.slow_query_threshold %v is below the minimum %v", c.Store.SlowQueryThreshold, MinSlowQueryThreshold)
+	}
+	if c.Store.StatementTimeout < 0 {
+		return fmt.Errorf("store.statement_timeout must not be negative, got %v", c.Store.StatementTimeout)
 	}
 	if c.Store.GroupsPath == "" {
 		return fmt.Errorf("store.groups_path must not be empty")

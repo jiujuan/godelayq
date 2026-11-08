@@ -43,6 +43,19 @@ func (h *captureHandler) slowQueryRecords() []slog.Record {
 	return out
 }
 
+// countMsg 统计 Message 含 substr 的记录条数（语句超时等其它用例共用）。
+func (h *captureHandler) countMsg(substr string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, r := range h.records {
+		if strings.Contains(r.Message, substr) {
+			n++
+		}
+	}
+	return n
+}
+
 // attrOf 取记录里某个字段的值（slog 的 Attr 只能遍历拿）。
 func attrOf(r slog.Record, key string) (slog.Value, bool) {
 	var found slog.Value

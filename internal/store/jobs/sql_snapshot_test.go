@@ -65,7 +65,7 @@ func TestSQLSnapshot(t *testing.T) {
 		cfg := core.StoreSQLiteConfig{Dialect: "postgres", DSN: pgtest.Database(t, "snap_jobs")}
 		// 阈值 0：快照 golden 在"慢查询钩子未挂"的默认态生成——
 		// 两个钩子并存的文本一致性由 engine 的并存用例钉住。
-		s, err := Open(cfg, 1, 0, 0, nil)
+		s, err := Open(cfg, 1, 0, 0, 0, nil)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = s.Close() })
 		runSQLSnapshot(t, s, "postgres")

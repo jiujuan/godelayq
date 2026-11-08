@@ -94,6 +94,8 @@ var configClasses = map[string]ConfigClass{
 	"store.outbox_max_pending":    ClassRestart,
 	// 慢查询日志阈值（G5/Q06）：钩子在 engine.Open 时挂上，热改不能重挂，重启才生效。
 	"store.slow_query_threshold": ClassRestart,
+	// 语句超时（G6/Q07）：上限在 engine.Open 拼 DSN 时定死，热改不重开连接。
+	"store.statement_timeout": ClassRestart,
 	// 任务快照 SQLite 后端（TASK-M03）：与 mgrstore.* 同为重启档。
 	"store.sqlite.path": ClassRestart, "store.sqlite.busy_timeout": ClassRestart,
 	"store.sqlite.synchronous": ClassRestart, "store.sqlite.dialect": ClassRestart,

@@ -70,6 +70,7 @@ store:
   outbox_retention_age: 72h    # 已投递出箱行的保留时长（TASK-RE07）
   outbox_max_pending: 100000   # pending 积压上限（TASK-RE07）；超过按最旧截断并记 error
   slow_query_threshold: 0s     # 慢查询日志阈值（仅 sqlite/PG 生效）；0=关（默认），开启后下限 1ms
+  statement_timeout: 0s        # PG 语句超时（仅 dialect=postgres 生效）；0=不设（默认，启动有 Warn）
   # 分组元数据文件（Web 控制台的 /api/v1/groups 读写它）。与任务快照分文件：
   # 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
   groups_path: ./data/groups.json
