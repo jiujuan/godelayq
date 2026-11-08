@@ -29,6 +29,9 @@ scheduler:
   queue_capacity: 0           # 执行队列容量；0 表示与 workers 相等
   max_retry_delay: 30m        # 指数退避的单次重试延迟上限
   shutdown_timeout: 5s        # 优雅关闭等待时长；开启执行器时建议 >=10s（见"开启执行器"第 4 条）
+  recovery_policy: auto       # 崩溃恢复策略：auto（执行器任务停 paused、普通任务重放）|replay|pause
+  misfire_policy: fire_once   # cron 错过窗口的策略：fire_once（补跑一次）|skip
+  misfire_grace_period: 60s   # misfire 宽限：TriggerAt 早于 now-宽限才算错过
 
 store:
   type: json                  # json | sqlite；切换需重启
@@ -36,6 +39,11 @@ store:
   flush_interval: 200ms       # 合并落盘周期；仅 json 后端生效（sqlite 直写无此环节）
   history_limit: 1000         # 终态快照留痕条数；0 用默认值，-1 不留痕
   history_ttl: 0s             # 终态快照保留时长，如 24h；0 不按时间淘汰
+  attempts_keep_last: 20      # 每任务账本保留条数（仅 sqlite/PG 生效；JSON 无账本）
+  idempotency_ttl: 24h        # 幂等键登记保留时长（JSON 模式仅进程生命周期内有效）
+  outbox_flush_interval: 200ms # 出箱中继周期（仅 sqlite/PG 生效）；也是事件可见延迟上界
+  outbox_retention_age: 72h   # 已投递出箱行的保留时长（仅 sqlite/PG 生效）
+  outbox_max_pending: 100000  # pending 积压上限；超过按最旧截断并记 error
   groups_path: /var/lib/godelayq/groups.json  # 分组注册表（改动即同步落盘）
   sqlite:                     # 仅 type: sqlite 时生效（TASK-M03）
     path: /var/lib/godelayq/goqsys_jobs.sqlite
@@ -60,6 +68,29 @@ logging:
 确认无误后可自行归档）。终态留痕（`history_limit`/`history_ttl`）两种后端语义一致。
 想切回 json 直接改回 `store.type` 重启即可，但注意 `jobs.json` 里是切走之前的旧快照，
 回滚前先用 API 把库中的任务状态核对清楚。
+
+### 可靠执行能力与 JSON 模式的边界（TASK-RE01–RE07）
+
+以下能力只在 `store.type: sqlite`（含 `dialect: postgres`）时全量生效；`json` 后端
+退回改造前的行为，边界如下：
+
+| 能力 | sqlite/PG | JSON 模式 |
+| --- | --- | --- |
+| 逐次尝试账本（`GET /jobs/:id/attempts`） | ✅ 每尝试一行，随终态留痕淘汰 | ❌ 端点返回 `ledger: false`，审计靠事件流 |
+| 事务性 Outbox（状态与事件同事务） | ✅ `job_outbox` 表 + 中继器投递，at-least-once | ❌ 事件直发总线，队满即丢（有丢弃计数） |
+| 幂等键跨重启 | ✅ `job_idempotency` 表持久 | ⚠️ 进程内 map，重启失效（进程生命周期内仍幂等） |
+| `job_events` 去重 | ✅ 按出箱序号，崩溃重放不重复 | 不适用（无出箱） |
+
+调参建议：
+
+- `outbox_flush_interval` 是事件到 WS/SSE 的可见延迟上界。调小（下限 10ms）换取
+  近实时，代价是中继器更频繁地与调度写入排队（任务库单连接）；默认 200ms 对绝大多数部署够用。
+- `misfire_grace_period` 太小会让每次重启都刷 misfire 事件——秒级停机不该算错过，
+  默认 60s 起步；cron 窗口比 1 分钟还密的部署可以酌情调小。
+- `attempts_keep_last` 是每任务上限（默认 20），cron 任务滚动保新；需要更长审计窗口
+  优先调观测层的 `observability.events.retention_*`（事件流），不要盲目放大账本。
+- `scheduler.recovery_policy` 显式配置（非 `auto`）时全局生效，压过只管执行器的
+  `executors.restore_policy`；两者同时显式且结论不同时启动日志会有一条 warn 迁移提示。
 
 两点设计取舍，配置校验会直接拒绝未知键，因此不要照抄旧文档里的其它字段：
 
@@ -297,9 +328,15 @@ HTTP 档位的产物文件里 `a<attempt>.out` 是**对端返回的响应体**�
 崩溃（`kill -9`、`taskkill /F`、断电）之后重启，默认会把"上次正在执行"的执行器任务停在 `paused` 上等人确认
 （`executors.restore_policy: pause`）；`replay` 才是照常重新入队。
 
+`scheduler.recovery_policy`（TASK-RE05）是它的全局版：`auto`（缺省）维持上一句的语义；
+`replay` 所有类别一律重放；`pause` 所有类别（含普通任务）一律停 paused。新键显式配置时
+压过旧键，两者结论不同时启动日志有一条 warn——迁移完成后建议删掉旧键只留全局键。
+
 判据是存储里的 `running` 快照，这一点最容易误解：强杀来不及写任何结论，所以留下 `running`；
 **正常停服不会**——优雅关闭路径把被打断的任务落成 `pending`，重启后照常重跑。
 外部副作用的结果未知时不替人决定重复执行，这就是默认 `pause` 的理由。
+无论哪种策略，崩溃前在跑的那次尝试在账本上都会收口为 `abandoned`
+（`GET /jobs/:id/attempts` 可见），重跑开出新序号——审计上没有永远悬空的行。
 
 重启后的现场（本机实测）：
 

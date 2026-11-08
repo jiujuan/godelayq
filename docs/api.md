@@ -202,6 +202,9 @@ Content-Type: application/json
 | cron\_expr   | string | 条件 | Cron 表达式，如 "0 \*/5 \* \* \* \*"                     |
 | payload      | object | ❌  | 任务数据，JSON 对象，会透传给 Handler；执行器任务的顶层键是固定的，见[执行器 API](#执行器-api)                           |
 | group        | string | ❌  | 分组标签，`[A-Za-z0-9_-]{1,64}`；不要求该分组已在 `/groups` 注册   |
+| job\_id      | string | ❌  | 客户端指定的任务 ID，`[A-Za-z0-9_-]{1,64}`（[幂等提交](#幂等提交)）。撞既有任务时按内容指纹区分重放（200）与冲突（409） |
+| timezone     | string | ❌  | cron 展开用的 IANA 时区，如 `Asia/Shanghai`；空 = 服务器本地。仅对 cron 表达式有意义，非法名 400 |
+| misfire\_policy | string | ❌ | cron 错过触发窗口的策略：`fire_once`（默认，补跑一次）\| `skip`（跳到下一窗口）；空 = 继承全局 `scheduler.misfire_policy`。错过的窗口会发 `job.misfired` 事件（含 `missed_count`） |
 | is\_repeat   | bool   | ❌  | 是否重复执行（Cron 任务需设为 true）                             |
 | timeout      | string | ❌  | 单次执行超时，如 "30s"；为空不限制。Handler 需检查 ctx 才能被按时中止；执行器任务以 `payload.timeout` 为准      |
 | max\_retries | int    | ❌  | 最大重试次数。**省略即 0（不重试）**，想要重试必须显式给值                |
@@ -253,6 +256,28 @@ Content-Type: application/json
 
 响应里的 `type` 说的是同一件事：旧写法建的任务 `type` 省略（此时名称就是类型）。
 读回来的对象改几个字段再 `PUT` 回去是安全的——`type` 传相同值按没传处理。
+
+#### 幂等提交
+
+提交方超时重发不该产生第二个任务。两条去重通道，可单独或组合使用：
+
+**`Idempotency-Key` 请求头**（trim 后 1..128 字符）：
+
+| 场景 | 响应 |
+| --- | --- |
+| 键首次出现 | `201`，创建并登记（键 → 任务 ID + 内容指纹） |
+| 键命中且内容指纹相同 | `200` + 响应头 `Idempotency-Replayed: true`，返回既有任务，**不创建** |
+| 键命中但内容指纹不同 | `409`，details 指明键已被不同内容占用 |
+
+**请求体 `job_id`**（可单独使用，兼作幂等键）：任务以它为主键；撞既有任务时按快照上
+的内容指纹比对——相同判重放（`200`），不同判冲突（`409`，绝不静默覆盖）。判定走快照
+直查，与登记表无关，重启后依然有效。
+
+- 指纹覆盖 name/type/payload/cron/is_repeat/时间声明/group/timeout/max_retries/retry_delay；
+  时间声明用**原文**（`delay: "10m"` 隔几秒重发的指纹不变；delay 与等效 trigger_at 写法判为不同内容）。
+- 键的登记保留 `store.idempotency_ttl`（默认 24h）；过期后同键重发会创建新任务。
+- `store.type: json` 时登记表在进程内，重启即失效——**JSON 模式的幂等只在进程生命周期内成立**；
+  sqlite/PG 模式持久。批量接口逐条独立走同一套判定。
 
 ### 2. 创建 Cron 重复任务
 
@@ -354,6 +379,48 @@ GET /jobs/:id
 { "code": 404, "message": "job not found" }
 ```
 
+#### 逐次尝试账本：`GET /jobs/:id/attempts`
+
+每次尝试一行的执行账本（事件流有丢弃与保留上限，账本与任务快照同库淘汰，是权威留痕）：
+
+```json
+GET /jobs/:id/attempts?limit=20
+```
+
+```json
+{
+  "job_id": "0198a2e3-7d4f-7abc-9def-0123456789ab",
+  "ledger": true,
+  "items": [
+    {
+      "seq": 2,
+      "status": "failed",
+      "trigger_source": "retry",
+      "started_at": "2024-01-02T15:30:00+08:00",
+      "finished_at": "2024-01-02T15:30:31+08:00",
+      "duration_ms": 30120,
+      "class": "timeout",
+      "retryable": true,
+      "exit_code": 0,
+      "signal": "",
+      "http_status": null,
+      "error": ""
+    }
+  ]
+}
+```
+
+- `seq` 全任务单调递增（跨重试与 cron 轮次不清零）；`trigger_source` 取
+  `scheduled | retry | restore | misfire`；`status` 取
+  `running | success | failed | cancelled | abandoned`（abandoned = 崩溃前在跑、
+  结局无从知晓的尝试，由恢复流程收口）。
+- `class` 是失败类别文本（`timeout`/`exit_code`/`transport`/`handler_error` 等，
+  见 job.failed 事件 metadata 的同名键）；`retryable`/`exit_code`/`http_status`
+  未判定时为 `null`（与"退出码 0"分得开）。
+- `?limit=` 1..100，默认 20。
+- **JSON 存储没有账本能力**：返回 `200` + `"ledger": false` + 空 `items`（不是 404/503），
+  客户端按 `ledger` 标志决定是否展示账本页。
+
 ### 5. 更新任务（仅 pending 状态）
 
 ```json
@@ -400,14 +467,19 @@ DELETE /jobs/:id
 POST /jobs/:id/cancel
 ```
 
-成功返回 `204 No Content`（无响应体）。任务不在堆里（已弹出执行、已结束或从未存在）返回 404：
+成功返回 `204 No Content`（无响应体）。ID 从未存在时返回 404。
 
-```json
-{ "code": 404, "message": "job not found or already executed" }
-```
+取消会落 `cancelled` 终态快照（不再删除记录）：之后 `GET /jobs/:id` 返回
+`status: "cancelled"` 的记录（**行为变更**：改造前返回 404），受终态留痕淘汰
+策略管理，崩溃恢复不会复活终态。三条取消路径的语义：
 
-正在执行的任务会连同其 `context` 一起被取消，Handler 收到 `context.Canceled`，
-这类中断不计入失败与重试。
+- 堆内/暂停中：立即落终态并发 `job.cancelled` 事件；
+- 执行中：取消 context，`job.cancelled` 事件在收尾认领时发出（对应"确实停住了"），
+  Handler 收到 `context.Canceled`，这类中断不计入失败与重试；
+- Handler 不响应取消而照常成功返回的，按成功落终态（已完成的工作不因"取消来得晚"
+  被说成 cancelled）；失败返回的落 cancelled 且不再重试。
+
+批量取消（`batch-ops`）的 `items` 因此回得到 `cancelled` 现状。
 
 ### 7. 手动重试失败任务
 
@@ -1942,7 +2014,28 @@ data: {"type":"job.scheduled","job_id":"...","job_name":"...","status":0,"timest
 
 | 参数 | 写法 | 语义 |
 | --- | --- | --- |
-| `event_types` | 可重复，也可逗号分隔（`?event_types=job.failed,job.completed`） | 按事件类型做**服务端订阅**（`EventBus.Subscribe(types...)`），不是收全量再丢弃；取值必须是已发布的类型：`job.scheduled`、`job.started`、`job.completed`、`job.failed`、`job.cancelled`、`job.retrying`、`job.paused`、`job.resumed`，未知取值在建流前返回 400 |
+| `event_types` | 可重复，也可逗号分隔（`?event_types=job.failed,job.completed`） | 按事件类型做**服务端订阅**（`EventBus.Subscribe(types...)`），不是收全量再丢弃；取值必须是已发布的类型：`job.scheduled`、`job.started`、`job.completed`、`job.failed`、`job.cancelled`、`job.retrying`、`job.paused`、`job.resumed`、`job.misfired`，未知取值在建流前返回 400 |
 | `job_types` | 可重复 | 按事件的 `job_name` 过滤（事件总线不感知任务属性，这一层在 SSE 处理器内完成） |
 
 同一类型重复出现只注册一次，事件不会重复投递。过滤参数只在建连时生效，变更需重连。
+## 变更记录（可靠执行改造，TASK-RE01–RE08）
+
+相对可靠执行改造之前的接口行为差异，升级前请核对：
+
+1. **取消不再 404**：取消过的任务以 `cancelled` 终态留在存储里，`GET /jobs/:id`
+   返回记录而非 404；列表里会出现 cancelled 记录（受 `store.history_limit`/TTL 淘汰）。
+   依赖 404 判断"已取消"的调用方请改读 `status` 字段。
+2. **批量取消回得出现状**：`batch-ops` 的 cancel 动作在 `items` 里带回
+   `status: "cancelled"`（原先因删除而无 items）。
+3. **新增幂等提交**：`Idempotency-Key` 头与 `job_id` 字段，重放返回 200 而不是 201
+   （见[幂等提交](#幂等提交)）。不使用新参数的调用方行为不变（201）。
+4. **新增账本端点**：`GET /jobs/:id/attempts`；JSON 存储返回 `ledger: false` 的降级形状。
+5. **创建请求新增可选字段**：`job_id`、`timezone`、`misfire_policy`；不传行为不变。
+6. **事件字段 additive**：`job.failed` 的 metadata 新增 `"class"`（失败类别）；
+   事件 JSON 新增可选 `outbox_seq`（库模式下经出箱投递的事件携带，客户端可识别
+   崩溃重放的重复投递）。既有键与形状不变，前端透传即可。
+7. **库模式下事件经出箱中继**：WS/SSE 的事件可见延迟上界约为
+   `store.outbox_flush_interval`（默认 200ms）；崩溃恢复后可能收到少量重复事件
+   （带 `outbox_seq` 可识别）。JSON 模式直发不变。
+8. **重试/轮次的尝试序号不再清零**：`job.started` 事件 metadata 的 `attempt` 值
+   与快照 `attempts` 计数跨重试、跨 cron 轮次单调递增（此前重试会清零）。

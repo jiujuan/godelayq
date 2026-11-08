@@ -1,6 +1,6 @@
 # 架构说明：分层、模块、依赖与主业务流程
 
-> 状态：基于 main 分支（6bb34b3）的代码走读整理，2026-11-08。
+> 状态：基于 main（b8ab637）走读整理、可靠执行改造（TASK-RE01–RE08）落地后更新，2026-11-09。
 > 引用约定：按**符号**锚定代码（如 `core/scheduler.go` 的 `scheduleLoop`），不写行号——行号会漂移，符号不会。
 > 本文件回答"代码长什么样、为什么这么分层、一条任务从提交到终态经过哪些步骤"。
 > 面向使用者的配置与接口说明见 `docs/deployment.md` 与 `docs/api.md`；各能力的立项与取舍见 `docs/design/` 下的设计文档。
@@ -80,7 +80,7 @@
 | `internal/api` | HTTP 接入层 | `server.go` 的 `Server`/`NewServer` 与 Option 注入；`handlers_*.go` 各域端点；`sse.go`/`websocket.go`；`ratelimit.go`；`security.go` |
 | `internal/executor` | 执行器档位（可选层） | `registry.go` 的 `Registry`；`register.go` 的 `Register`/`Handler`；`profile.go` 的 `Profile`；`proc.go`（进程执行 + 整树终止）、`http.go`；`artifact.go` 的 `ArtifactStore`；`applier.go` 的 `Applier`；`adhoc.go`；`merge_profiles.go` 的 `MergeStoreProfiles` |
 | `internal/store/engine` | 公共访问底座：双方言打开 + 连接参数 + 迁移框架 + bun 句柄 | 唯一驱动入口；`engine.Open`、`Migration` |
-| `internal/store/jobs` | 任务快照库（`store.type=sqlite`） | `jobs.Open`、`ImportOnce` |
+| `internal/store/jobs` | 任务快照库（`store.type=sqlite`）+ 可靠执行账本：jobs / job_attempts（逐次尝试账本，TASK-RE02）/ job_idempotency（幂等键登记，TASK-RE03）/ job_outbox（事务性事件出口，TASK-RE07，带中继器） | `jobs.Open`、`ImportOnce`、`OutboxRelay` |
 | `internal/store/mgr` | 管理库：账号/分组/档位三张表 | `mgr.Open`、`ImportOnce`、`NewUserStore`、`NewGroupStore`、`NewExecutorProfileStore` |
 | `internal/store/observe` | 观测库：运行事件/产物索引/写操作审计 | `observe.Open`、`NewEventLog`、`NewAuditLog`、`NewArtifactIndex` |
 | `internal/web` | 控制台静态资源嵌入 | `Dist`（不带 `-tags dashboard` 时恒为 nil） |
@@ -165,8 +165,12 @@ web        ──→ （无内部依赖，仅 embed）
 ```
 POST /api/v1/jobs
   → 中间件链：JWT 认证 → RBAC(operator) → 限流 → 审计
-  → api.CreateJob 校验 → scheduler.Schedule(job)
-      · 四叉堆 PushItem + store.Save 落盘 + notifyNewJob 唤醒调度循环
+  → api.CreateJob 校验 → 幂等查重（Idempotency-Key / job_id，TASK-RE03）
+      · 同键同指纹 → 200 重放既有任务；异指纹 → 409；未命中 → Schedule
+  → scheduler.Schedule(job):
+      · 快照 + job.scheduled 事件经 persistAndEmit 收口（TASK-RE01/07）：
+        库模式一次事务落 jobs + job_outbox；JSON 模式 Update + Publish 直发
+      · 四叉堆 PushItem + notifyNewJob 唤醒调度循环
   → scheduleLoop:
       · heap.PopIfDueWhere(now, dispatchable) —— 原子取"到期且目标池有空位"的任务
         （dispatchable 在堆写锁内只读 channel len/cap 与任务类别，刻意不查注册表，
@@ -174,19 +178,23 @@ POST /api/v1/jobs
       · dispatch：JobClassExec 走 execCh（非阻塞，满了塞回堆等空位信号）
                  普通任务走 workCh（满了阻塞，背压交给 worker 池）
   → worker → executeJob:
-      · 发布 job.started 事件
+      · 发布 job.started 事件（emit 收口：库模式进出箱，JSON 直发）
       · 按注册表恢复 Handler（Type 优先，回退 Name；显式绑定优先）
-      · 建 cancelCtx + 单次超时；store.Update(running) 落盘运行态
+      · 建 cancelCtx + 单次超时；状态机转移 pending→running + 账本 BeginAttempt（TASK-RE02）
       · handler(ctx, job)
-      · 成功 → handleSuccess：Cron 任务算 next 重新 Schedule（同 ID 覆盖），
-               否则落 success 终态快照（是否长期保留由存储保留策略决定）
-      · 失败 → handleFailure 三分支判定（顺序即口径）:
-             ① parkForcedPause：用户强制暂停优先于一切，不消耗重试次数、不再排期
-             ② 永久失败（error 带 Permanent）→ markFailed，重跑只会重现同一错误
-             ③ RetryCount < MaxRetries → retryPolicy.NextRetry（指数退避）
-                → job.CloneForRetry → 重新 Schedule（发布 job.retrying 事件）
-             否则 markFailed 落终态
-      · ctx.Canceled（用户 Cancel / 优雅关停）→ handleInterrupted 落回 pending，重启后照常重跑
+      · 成功 → handleSuccess：账本 FinishAttempt(success)；Cron 任务算 next 重新 Schedule
+               （同 ID 覆盖），否则状态机转移 success 落终态快照
+      · 失败 → handleFailure 四分支判定（顺序即口径）:
+             ① parkForcedPause：用户强制暂停优先于一切
+             ② cancelRequested：用户取消认领，落 cancelled 终态（TASK-RE01）
+             ③ 永久失败（error 带 Permanent）→ markFailed
+             ④ RetryCount < MaxRetries → retryPolicy.NextRetry（指数退避）
+                → CloneForRetry 重新 Schedule（发布 job.retrying）；否则 markFailed
+             每个失败分支先 FinishAttempt（类别/retryable 随行落账，TASK-RE04）
+      · ctx.Canceled（用户 Cancel / 优雅关停）→ handleInterrupted：
+             取消认领 → cancelled 终态；关停打断 → pending，重启后照常重跑
+  → 状态写点全部经 transition（转移表校验）+ persistAndEmit（TASK-RE01）；
+    库模式下事件由 OutboxRelay 异步投递给 EventBus（at-least-once，读侧按 outbox_seq 去重）
 ```
 
 调度循环有一个细节（`scheduleLoop`）：有到期任务但执行器池满时，不能按 `TriggerAt` 继续等（那是过去的时刻，等于零时长定时器忙等），改为等 `execSlotFreed` 空位信号 + 500ms 兜底唤醒（`execBlockedRetry`）。
@@ -203,13 +211,29 @@ POST /api/v1/jobs
 4. `proc.go` 起进程（取消时杀**整棵进程树**，防孤儿）或 `http.go` 调 HTTP（白名单 host、拒内网地址可选）→ stdout/stderr 流式写 `ArtifactStore`（MaxBytes 限额、TTL、孤儿清理）→ 退出码/时长/尾部预览组成 `ExecMeta` 进事件；快照只放摘要，全量输出按 `job_id/attempt` 落产物目录（D4：JSON 存储是整文件重写，128KB 输出进快照会把 flush 放大 128MB）。
 5. 单次超时是硬约束：`Job.Timeout == 0` 表示不限，一个挂死的 shell 会永久占住 worker，因此档位级 `default_timeout`/`max_timeout` 是上限（`Registry.EffectiveTimeout`）。
 
-### 6.5 崩溃恢复（Restore + RestoreGuard）
+### 6.5 崩溃恢复（Restore + RestoreGuard + Recovery Policy）
 
-`scheduler.Start` 第一步执行 `Restore`：`store.LoadAll` 取全部快照，非终态任务回堆重新排期。**`running` 状态的快照**含义是"进程确实起来过、结果未知"（被强杀的进程来不及写任何结论），交给 `RestoreGuard` 钩子改判：
+`scheduler.Start` 第一步执行 `Restore`：`store.LoadAll` 取全部快照，非终态任务回堆重新排期。
+**`running` 状态的快照**含义是"进程确实起来过、结果未知"（被强杀的进程来不及写任何结论），
+交给 `RestoreGuard` 钩子改判；改判策略由 `scheduler.recovery_policy` 配置（TASK-RE05）：
 
-- `cmd/server` 的 `pauseRunningExecOnRestore` 只拦"`running` 且类别是 `JobClassExec`"的快照，改判为 **paused** 等人确认——重放可能重复外部副作用；
-- `executors.restore_policy=replay` 时守卫不装（部署方明确承担重复执行后果）；
-- 优雅关闭不走守卫：`handleInterrupted` 已把在途任务落成 pending，重启后照常重跑。
+- `auto`（缺省）：`cmd/server` 的 `pauseRunningExecOnRestore` 只拦"`running` 且类别是
+  `JobClassExec`"的快照，改判为 **paused** 等人确认——重放可能重复外部副作用；
+  普通任务照旧重放（执行器未启用时不装守卫）；
+- `replay`：所有类别一律复位 pending；
+- `pause`：所有类别一律停 paused；
+- `executors.restore_policy=replay` 时（auto 下）守卫不装——部署方明确承担重复执行后果；
+  新键显式配置时压过旧键（结论分歧启动日志有 warn）。
+
+无论策略如何，崩溃前在跑的那次尝试在账本上都会收口为 **`abandoned`**（`AbandonAttempts`，
+TASK-RE02/05）——审计上没有永远悬空的行，重跑开出新序号。
+
+cron 任务恢复时按 `misfire_policy` 处置错过的窗口（TASK-RE06）：`fire_once`（默认）
+保持过期触发时刻立即补跑一次，`skip` 跳到下一窗口；两种都发 `job.misfired` 事件
+（含 `missed_count`），宽限期内的过期时刻不算错过。
+
+优雅关闭不走守卫：`handleInterrupted` 已把在途任务落成 pending，重启后照常重跑；
+用户取消的在途任务由 `cancelRequested` 认领，落 `cancelled` 终态。
 
 ### 6.6 配置热重载（reload.go + `core/config_reload.go`）
 
@@ -225,12 +249,30 @@ POST /api/v1/jobs
 
 ### 6.7 观测与实时推送
 
-`EventBus`（core，进程内 Pub/Sub）有两个订阅者：
+`EventBus`（core，进程内 Pub/Sub）有两条生产通道与两个订阅者：
+
+- **直发通道**（JSON 部署）：调度器经 `emit`/`persistAndEmit` 直接 Publish——尽力而为，
+  队满即丢；
+- **出箱通道**（任务库部署，TASK-RE07）：状态变更与事件同事务落 `job_outbox`
+  （`persistAndEmit`/`emit` 的能力分派），`OutboxRelay` 单协程按 seq 顺序投递给
+  EventBus——at-least-once，事件可见延迟上界 = 一个中继周期
+  （`store.outbox_flush_interval`，默认 200ms）。投递成功、标记 dispatched 前崩溃
+  会重放重复事件，读侧去重。
+
+订阅者：
 
 - **api 内存缓冲** → WS（`/ws`，凭 `/auth/ws-ticket` 短票连接）+ SSE（`/sse/events`）+ `GET /events`；
-- **observe.EventLog** → 批量周期写 SQLite `job_events`（队列满丢弃但计数 `Dropped`，关停时打进日志——库里缺页是读不出来的，必须留痕）。
+- **observe.EventLog** → 批量周期写 SQLite `job_events`（队满丢弃但计数 `Dropped`，
+  关停时打进日志——库里缺页是读不出来的，必须留痕）。带 `outbox_seq` 的事件按
+  部分唯一索引冲突忽略去重，崩溃重放不产生重复行。
 
-审计：写操作中间件 → `AuditLog` → `write_audit` 表；写入方与查询方是同一个句柄（`GET /admin/audit`）。产物清理协程每轮做"孤儿清理 + TTL 清理 + 与 `artifact_index` 对账"。
+审计：写操作中间件 → `AuditLog` → `write_audit` 表；写入方与查询方是同一个句柄
+（`GET /admin/audit`）。逐次尝试的执行账本在 `job_attempts`（任务库），
+`GET /jobs/:id/attempts` 读取，与事件时间线互为补充——事件是观测，账本是审计。
+产物清理协程每轮做"孤儿清理 + TTL 清理 + 与 `artifact_index` 对账"。
+
+中继器的关停位次是硬约束：`cmd/server` 的 defer 链里 `relay.Stop` 声明晚于
+`obsEnv.close`（先执行）——发布落在已关闭的订阅通道上会 panic。
 
 ### 6.8 认证与账号
 
@@ -238,7 +280,8 @@ JWT：`/auth/login|refresh|logout|me|ws-ticket`；RBAC 四角色 reader / operat
 
 ## 7. 设计要点小结
 
-1. **组合根很重**：所有"开关组合出的部署形态"（执行器 × 观测层 × 管理库 × 热重载）都收敛到 `cmd/server` 的装配层，业务包里不出现散落的 `if enabled`；未启用的行为靠"不注入 = nil = 明确的 503/默认路径"表达。
+1. **组合根很重**：所有"开关组合出的部署形态"（执行器 × 观测层 × 管理库 × 热重载）都收敛到 `cmd/server` 的装配层，业务包里不出现散落的 `if enabled`；未启用的行为靠"不注入 = nil = 明确的 503/默认路径"表达。可靠执行的能力位（账本/出箱/幂等表）沿用同一取向：任务库实现了就注入，JSON 存储不注入即降级（`GET /jobs/:id/attempts` 返回 `ledger:false` 而不是 503——能力缺失不是故障）。
 2. **消费方接口 + 隐式实现**让依赖倒置落地成本极低，每个窄接口都带一条"为什么定义在消费方"的注释（通常是：只有句柄可替换，关闭顺序才断言得出来）。
-3. **顺序即正确性**：启动/关停每一步顺序都有注释论证（Restore 前必须装守卫、EventLog 必须挂在 Start 前、defer 位次决定关闭顺序），并有测试钉住。
+3. **顺序即正确性**：启动/关停每一步顺序都有注释论证（Restore 前必须装守卫、EventLog 必须挂在 Start 前、relay.Stop 必须先于事件写入器关闭、defer 位次决定关闭顺序），并有测试钉住。
 4. **失败口径统一**：配置非法 / 库建不起 / 文件读不出 = 拒启；热重载起不来 = 降级继续服务 + 留痕。哪些错误拦启动、哪些只记日志，每处都写明了理由。
+5. **状态机与出箱是可靠执行的两根轴（TASK-RE01/07）**：状态转移集中在 `core/state.go` 的转移表，非法转移"保状态、发事件、报 error"——宁可账本少一行，不可账本说谎；事件与状态的同事务原子性只由 `UpdateWithEvents` 承诺，`AppendOutbox` 只承担"不丢"——两条承诺的边界写进了接口注释。

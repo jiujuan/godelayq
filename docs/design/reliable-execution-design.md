@@ -492,3 +492,14 @@ func (s *Scheduler) persistAndEmit(job *Job, events ...Event)
 ## 13. 实施计划
 
 拆卡与依赖见 `docs/design/tasks/reliable-execution/README.md`。顺序：re01（状态机地基）→ re02（账本）→ re03 幂等 ∥ re04 分类 ∥ re05 恢复 ∥ re06 cron，re07（outbox）只需 re01 可提前并行，re08（故障注入 + 文档）收口。每卡一个 PR，沿用 N 卡提交与全量回归的惯例。
+
+### 13.1 实现差异（各卡实现记录的汇总，2026-11-09 收口）
+
+八张卡全部按设计落地，偏离点已在各卡 §10 详述并同步回本设计文档：
+
+- **RE01**：新增 `pending→failed` 转移边（派发期失败——设计文档 §6.5 已补）；cron 重排与 Resume 的转移以"同 ID 新对象 identity 写"实现，不经运行期校验（前置校验在调用点，§6.5 注记）。
+- **RE02**：`PruneAttempts` 从全表改为按任务（收尾后调用，PK 前缀索引常数代价，§6.3 已同步）；`retryable` 列沿用全仓 INTEGER 0/1 先例（NullBool 直绑 PG 报类型错）。
+- **RE03**：指纹的时间输入改为**时间声明原文**（解析后时刻随重发漂移会把重放误判成冲突），指纹随任务落快照、job_id 撞车直接比对（§7.3 已修订）。
+- **RE06**：宽限内的过期 cron 时刻从"重算跳过该窗口"改为"立即触发"（宽限语义的自洽结论，行为变化见 api.md 变更记录）。
+- **RE07**：出箱去重的冲突子句两方言同形，未设方言分支点（守卫豁免保持为零，observe）；attempt 行刻意不进 UpdateWithEvents 事务（崩溃遗留 running 行由 Restore 收口自愈）。
+- **RE08**：`jobs.Store.SQL()` 原生语句出口收进 `sqloutlet.go` 单文件并登记守卫豁免（mgr/observe 的文件级豁免先例）；SSE 事件类型清单补 `job.misfired`（RE06 的遗漏，收口时发现并修复）。

@@ -72,6 +72,19 @@ CI 两档全绿；本地跑一次完整验收剧本（设计文档 §12 第 9 �
 - **风险：-race 本机跑不了（TSan 环境问题），竞态用例本地验证不充分**。缓解：竞态用例 `-count=10` 重复跑；-race 交给 CI。
 - 回滚：纯测试与文档，revert 无副作用。
 
-## 10. 实现记录
+## 10. 实现记录（2026-11-09）
 
-（待实现后回填。）
+分支 `feat/reliable-execution`。按卡交付，矩阵全部落地、文档四处同步：
+
+- **替身（core/faultinject_test.go）**：`flakyStore`/`flakyLedger` 按"第 N 次调用"注入失败（接口边界替身，不摸私有状态）。假时钟未引入：misfire 判定点在 `applyMisfirePolicy(job, now)` 已收 now 参数，边界用例直接传值——设计文档 §3.1 的"若缺注入点则补"不需要动生产代码。
+- **用例矩阵**：
+  - 存储故障：运行态落盘失败（快照保持上次成功写入、循环不死）、失败收尾落盘失败（重试照常排上——断言走 retrying 事件，堆长度窗口窄于轮询间隔的教训记录在案）、BeginAttempt 失败（finish 的 upsert 补齐缺口）。
+  - 崩溃点矩阵：RE05 六组合矩阵 + RE02 RestoreAbandons 已覆盖；本卡补宽限边界（恰在 cutoff 不算错过）与时钟回拨（未来 TriggerAt 不改写不发事件）。
+  - 关停：优雅关停在途任务落 pending；取消在途 + 关停竞态 → 取消认领优先落 cancelled；两用例 `-count=10` 连跑稳定。
+  - Outbox 回滚（store/jobs/fault_test.go）：预埋非法 status 行让 trim 在事务内失败——证明 UpdateWithEvents 中途失败整体回滚（快照/出箱/脏行三面断言）；正路径同事务含账本级联。
+  - 跨库集成（cmd/server/faultinject_integration_test.go）：任务库+观测库两份真实 sqlite，走完"同事务落出箱 → 中继器投递 → EventLog 落库带 outbox_seq → 崩溃重放（dispatched 拨回 pending）不产生重复行"。
+  - 幂等故障（api/idempotency_fault_test.go）：登记表全故障提交照常 201（重发重复建任务 = 声明的降级口径）、过期键重发允许新建、淘汰随成功创建驱动。
+- **守卫豁免（设计文档 §11 追加）**：跨库集成需要把 dispatched 拨回 pending，`jobs.Store.SQL()` 原生出口收进 `sqloutlet.go` 单文件并在 package_guard_test 登记文件级豁免（mgr/observe 先例同形）。
+- **收口修复**：SSE 的 `publishedEventTypes` 补 `job.misfired`（RE06 漏同步，类型级订阅下 `?event_types=job.misfired` 会 400——sse.go 头注释写明的那类静默失败）。
+- **文档同步**：architecture.md（§1 模块表、§6.2 主链路、§6.5 恢复策略与 abandoned、§6.7 出箱通道与去重、§7 新增第五条设计要点）；api.md（参数表三行、幂等提交节、attempts 端点节、取消语义改写、SSE 类型清单、文末"变更记录"八条）；deployment.md（配置骨架九个新键、"可靠执行能力与 JSON 模式边界"对照表 + 调参建议、§9 补全局恢复键关系与 abandoned）；设计文档 §13.1 实现差异汇总。
+- **验证**：`go build/vet` 干净；`go test ./... -count=1` 九包全绿（本机 PG 矩阵实跑）；关停竞态用例 `-count=10` 稳定。
