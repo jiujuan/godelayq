@@ -300,6 +300,26 @@ func (d *DB) SQL() *sql.DB {
 	return d.sqlDB
 }
 
+// Stats 返回连接池的瞬时占用（G4/Q05）：运维端点读数用。
+// 机制读数归机制包：业务包（jobs/observe/mgr）的读数方法折算自这里，
+// 不各自摸 *sql.DB。
+func (d *DB) Stats() sql.DBStats {
+	return d.sqlDB.Stats()
+}
+
+// MigrationVersion 读取已应用迁移的最高版本号；迁移表无行（全新库）返回 0。
+// 与 Migrate 共用同一张版本表（表名由调用方给）与同一条读法——版本号的
+// 权威语义只有这一份，运维读数与迁移判定不许分叉。
+// 语句无占位符，两方言通吃，与 Migrate 的 readVersion 同一取向。
+func (d *DB) MigrationVersion(table string) (int, error) {
+	readVersion := fmt.Sprintf(`SELECT COALESCE(MAX(version), 0) FROM %s`, table)
+	var applied int
+	if err := d.sqlDB.QueryRow(readVersion).Scan(&applied); err != nil {
+		return 0, fmt.Errorf("engine: read schema version of %s: %w", table, err)
+	}
+	return applied, nil
+}
+
 // Dialect 返回本句柄使用的方言。
 func (d *DB) Dialect() Dialect {
 	return d.dialect

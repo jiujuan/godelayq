@@ -3,6 +3,7 @@ package core
 import (
 	"encoding/json"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -74,6 +75,11 @@ type EventBus struct {
 	mu sync.RWMutex
 	// bufferSize 是每个订阅通道的默认缓冲区大小。
 	bufferSize int
+	// dropped 累计"订阅缓冲已满被丢弃"的事件数（G4/Q05）。
+	// 满即丢是有意取舍（不拖慢调度主流程），缺的从来不是取舍而是痕迹：
+	// 直发模式下没有出箱 seq 去重兜底，丢了就是丢了，运维至少要能看见"丢了多少"。
+	// 只增不减，进程生命周期内单调。
+	dropped atomic.Int64
 }
 
 // NewEventBus 创建一个新的事件总线。
@@ -181,6 +187,8 @@ func (eb *EventBus) Unsubscribe(id string, eventTypes ...EventType) {
 
 // Publish 向匹配的订阅者广播事件。
 // 发送采用非阻塞方式，订阅者缓冲区满时会直接丢弃该事件，避免拖慢调度主流程。
+// 丢弃不是静默的：每次丢弃都计入 dropped（Dropped 读数），慢订阅者丢事件
+// 至少在 /admin/runtime 可见。
 func (eb *EventBus) Publish(event Event) {
 	eb.mu.RLock()
 	defer eb.mu.RUnlock()
@@ -190,6 +198,7 @@ func (eb *EventBus) Publish(event Event) {
 		select {
 		case ch <- event:
 		default:
+			eb.dropped.Add(1)
 		}
 	}
 
@@ -198,9 +207,16 @@ func (eb *EventBus) Publish(event Event) {
 			select {
 			case ch <- event:
 			default:
+				eb.dropped.Add(1)
 			}
 		}
 	}
+}
+
+// Dropped 返回累计丢弃的事件数（G4/Q05）。满即丢是既有契约，本读数不改变它，
+// 只让"丢了多少"从猜测变成数字。
+func (eb *EventBus) Dropped() int64 {
+	return eb.dropped.Load()
 }
 
 // Close 关闭事件总线。

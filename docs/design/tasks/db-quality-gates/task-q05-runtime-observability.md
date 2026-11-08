@@ -59,4 +59,30 @@ DBStats 读取本身无锁竞争风险（标准库快照）。回退：摘掉 db
 
 ## 10. 实现记录
 
-- 待实施。
+- 2026-11-09 完成。读数词汇 `core.DBRuntimeStats` + `core.DBPoolStats` 落在 core/store.go
+  （与 RuntimeStats 同层的公共形状）：jobs 填、api 嵌、cmd/server 直接断言注入，
+  **不需要适配器**。池读数折算自 sql.DBStats，不把 database/sql 类型引进 core。
+- 出箱积压计数随 `Store.DBRuntime()` 直查表（`pendingOutboxCount`，与 relay 的
+  prune 截断判定共用同一条查询），**没有落在 relay 上**——与卡面 §3 的偏差：
+  api 注入点是 store 类型断言，relay 不经过那条线，且周期缓存会给出陈旧值。
+  计数语义只有一份（积压判定与 /admin/runtime 读数同源）。
+- engine 新增 `Stats()`（sql.DBStats 透传）与 `MigrationVersion(table)`（与 Migrate
+  共用版本表与读法，无占位符两方言通吃）。业务包不摸 *sql.DB。
+- EventBus 满丢处加 atomic 计数器 `Dropped()`；Publish 的 per-type 与 all 两条路径
+  都计入，语义是"投递次数"（一个订阅者丢一次计 1）。
+- api：`dbRuntimeSource` 接口定义在消费方（eventReader 同惯例）、`WithDBRuntime`
+  注入；RuntimeResponse 加 `db`（指针 + omitempty，与 Reload 同一手法）与
+  `dropped_events_total`（值类型，始终在位）。读数失败 → db 键缺席 + error 日志
+  （半截读数比缺席更易误读），端点照常 200。
+- cmd/server：defaultNewServer 里 store 类型断言注入（与 attempts/idempotency
+  同一取向），JSON 部署自然缺席。
+- 测试：core（丢弃计数精确值，缓冲 2 丢 3；all 订阅者逐个计）、engine（版本读数
+  含"表不存在报错不是 0"与空表 0 两分支；Stats 透传）、jobs（四读数 + 积压随
+  AppendOutbox 增长，SQLite 真跑 + PG DSN 门控真跑）、api（db 键缺席/键集合封闭/
+  失败缺席/丢弃计数经端点与总线一致且增长）。
+- 已知边界：端点丢弃读数是全总线共享计数器，测试服务器自带订阅者（事件历史）
+  超载时同样丢弃——端点侧只断"与总线一致且增长"，精确数字归 core 单测。
+- 文档：docs/api.md 的 GET /admin/runtime 段补 db 字段表与 dropped_events_total
+  口径（含"积压 vs 丢弃"的联合判读）。
+- 自证：`go build ./... && go vet ./... && go test ./...` 全绿；本机 PG
+  （GODELAYQ_TEST_PG_DSN 注入）jobs/engine/cmd/server 真跑全绿。

@@ -1538,6 +1538,20 @@ GET /admin/runtime
     "exec_queue_length": 2,
     "exec_queue_capacity": 2
   },
+  "dropped_events_total": 3,
+  "db": {
+    "dialect": "sqlite",
+    "schema_version": 4,
+    "pool": {
+      "max_open": 1,
+      "open": 1,
+      "in_use": 0,
+      "idle": 1,
+      "wait_count": 1204,
+      "wait_duration_ns": 38200000
+    },
+    "outbox_pending": 0
+  },
   "event_history": {
     "jobs": 42,
     "events": 118,
@@ -1580,6 +1594,25 @@ GET /admin/runtime
 
 两个时间字段是 RFC3339Nano 字符串，零值不给键。三个键清单为空时序列化出 `null`（`omitempty`
 对 nil 切片的效果），消费方要把 `null` 与"缺键"当成同一件事——"没有内容"。
+
+`dropped_events_total` 是事件总线的累计丢弃数：订阅者（WS/SSE/内存历史）的缓冲占满时
+发布侧满即丢是既有契约（不拖慢调度），这个数字让"丢了多少"可查。它统计的是**投递次数**
+——一条事件被两个订阅者各丢一次计 2。长期为 0 说明订阅端消化正常；持续增长说明有慢订阅者，
+先看事件历史的占用再看连接数。
+
+`db` 这一段是任务库的机制性读数，**JSON 存储部署整个键缺省**（没有任务库，
+"没这个能力"不是"读数为零"）。读数源查询失败时整键缺席并记一条 error 日志——
+半截读数（比如 `schema_version=0`）会被误读成空库，缺席加日志至少把故障摆到眼前。
+
+| 字段 | 含义 |
+| --- | --- |
+| `dialect` | 任务库方言：`sqlite` / `postgres` |
+| `schema_version` | 已应用的最高迁移版本号；与迁移判定同源（迁移表 max version） |
+| `pool.max_open` / `open` / `in_use` / `idle` | 连接池上限与瞬时占用。任务库固定单连接，`max_open` 恒为 1 |
+| `pool.wait_count` / `wait_duration_ns` | 累计等待空闲连接的次数与时长（纳秒）。等待在涨说明写入在排队——W 系列写合并的前后对比就看这两个数 |
+| `outbox_pending` | 出箱表里待投递的事件行数。长期 >0 说明事件中继没跟上或订阅端堵了；它与 `dropped_events_total` 一同看才能分清"积压"与"丢弃" |
+
+全部是瞬时值，用来看趋势不是用来审计的。
 
 本系列**没有新增任何端点**：`/admin/runtime` 仍是 ops 档专用（`ops` 角色或运维凭据），
 读端点仍不进写操作台账；配置里那三份凭据的取值不会出现在这段读数里。

@@ -21,6 +21,12 @@ type RuntimeResponse struct {
 	StartedAt time.Time `json:"started_at" format:"date-time"`
 	// Scheduler 调度与执行侧的实时占用
 	Scheduler core.RuntimeStats `json:"scheduler"`
+	// DB 任务库的机制性读数（G4/Q05）：方言、schema 版本、连接池占用、出箱积压。
+	// 整个键缺省表示 JSON 部署没有任务库（指针 + omitempty，与 Reload 同一手法）。
+	DB *core.DBRuntimeStats `json:"db,omitempty"`
+	// DroppedEventsTotal 事件总线累计丢弃的事件数（G4/Q05）：慢订阅者把订阅缓冲
+	// 占满时 Publish 满即丢是既有契约，这个数字让"丢了多少"可查。
+	DroppedEventsTotal int64 `json:"dropped_events_total"`
 	// EventHistory 事件内存缓冲的占用（详情页时间线的数据源）
 	EventHistory EventHistoryStats `json:"event_history"`
 	// SchedulingSuspendedNote 只在挂起时给一句话解释，避免运维误读成"服务卡死"
@@ -38,10 +44,21 @@ func (s *Server) GetRuntime(c *gin.Context) {
 	stats := s.scheduler.RuntimeStats()
 
 	resp := RuntimeResponse{
-		Uptime:       time.Since(s.startTime).String(),
-		StartedAt:    s.startTime,
-		Scheduler:    stats,
-		EventHistory: s.history.Stats(),
+		Uptime:             time.Since(s.startTime).String(),
+		StartedAt:          s.startTime,
+		Scheduler:          stats,
+		DroppedEventsTotal: s.scheduler.GetEventBus().Dropped(),
+		EventHistory:       s.history.Stats(),
+	}
+	// db 段读数失败时整键缺席并记日志：半截读数（如 schema_version=0）会被误读成
+	// 空库，"缺席 + error 日志"至少把故障摆到眼前。端点本身照常 200——
+	// 诊断端点不该因为一个读数查询失败而整个失败。
+	if s.dbRuntime != nil {
+		if dr, err := s.dbRuntime.DBRuntime(); err == nil {
+			resp.DB = &dr
+		} else {
+			s.logger.Error("failed to read task-db runtime stats", "error", err)
+		}
 	}
 	if stats.Suspended {
 		resp.SchedulingSuspendedNote = "due jobs are not dispatched until unsuspend; restart clears it"

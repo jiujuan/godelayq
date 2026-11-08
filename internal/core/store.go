@@ -62,6 +62,40 @@ type StoreOptions struct {
 	Logger *slog.Logger
 }
 
+// DBPoolStats 是任务库连接池的瞬时占用（G4/Q05）。字段折算自 sql.DBStats，
+// 只留运维要看的六个读数——不把 database/sql 的类型引进 core 的公共词汇。
+type DBPoolStats struct {
+	// MaxOpen 连接池上限（任务库固定 1，读数即配置口径的回声）
+	MaxOpen int `json:"max_open"`
+	// Open 当前已建立的连接数
+	Open int `json:"open"`
+	// InUse 正被占用的连接数
+	InUse int `json:"in_use"`
+	// Idle 空闲连接数
+	Idle int `json:"idle"`
+	// WaitCount 累计等待空闲连接的次数（进程启动以来）
+	WaitCount int64 `json:"wait_count"`
+	// WaitDurationNs 累计等待时长（纳秒）。用纳秒不用毫秒：亚毫秒等待在
+	// 忙等场景正是要看的信号，折成毫秒会读成 0 而误判"没有竞争"。
+	WaitDurationNs int64 `json:"wait_duration_ns"`
+}
+
+// DBRuntimeStats 是任务库的机制性读数（G4/Q05），/admin/runtime 的 db 段数据源。
+// JSON 存储不提供这段：接口断言失败时整个键缺省（api 侧指针 + omitempty）。
+// 全部是瞬时值，读到的只是调用那一刻的状态，与 RuntimeStats 同一取向——
+// 用于观察趋势而不是审计。
+type DBRuntimeStats struct {
+	// Dialect 方言名（sqlite|postgres）
+	Dialect string `json:"dialect"`
+	// SchemaVersion 已应用的最高迁移版本号；空库（迁移表无行）为 0
+	SchemaVersion int `json:"schema_version"`
+	// Pool 连接池瞬时占用
+	Pool DBPoolStats `json:"pool"`
+	// OutboxPending 出箱表中待投递行数（TASK-RE07）。库模式必然有出箱能力，
+	// 长期 >0 说明中继器没跟上或事件订阅端堵了。
+	OutboxPending int64 `json:"outbox_pending"`
+}
+
 // JSONFileStore 基于JSON文件的存储，写入按 Interval 合并
 type JSONFileStore struct {
 	filePath string

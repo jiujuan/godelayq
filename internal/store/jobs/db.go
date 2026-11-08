@@ -114,6 +114,38 @@ func (s *Store) SetHistoryRetention(limit int, ttl time.Duration) {
 	s.historyTTL.Store(storedTTL)
 }
 
+// DBRuntime 返回任务库的机制性读数（G4/Q05），/admin/runtime 的 db 段数据源。
+// 接口断言注入（cmd/server 的 defaultNewServer），JSON 部署没有这个方法，
+// db 段随之整键缺省。全部是瞬时值。
+// 失败口径：任何一项查询失败都整体报错、不返回半截读数——SchemaVersion=0
+// 与"迁移表读不出来"在数字上无法区分，误读成空库比缺席更糟（缺席 + error 日志
+// 至少把故障摆到眼前）。
+func (s *Store) DBRuntime() (core.DBRuntimeStats, error) {
+	st := s.h.Stats()
+	out := core.DBRuntimeStats{
+		Dialect: string(s.h.Dialect()),
+		Pool: core.DBPoolStats{
+			MaxOpen:        st.MaxOpenConnections,
+			Open:           st.OpenConnections,
+			InUse:          st.InUse,
+			Idle:           st.Idle,
+			WaitCount:      st.WaitCount,
+			WaitDurationNs: int64(st.WaitDuration),
+		},
+	}
+	if v, err := s.h.MigrationVersion(migrationTableName); err == nil {
+		out.SchemaVersion = v
+	} else {
+		return out, fmt.Errorf("jobs: read schema version for runtime stats: %w", err)
+	}
+	pending, err := pendingOutboxCount(s.h)
+	if err != nil {
+		return out, fmt.Errorf("jobs: read outbox backlog for runtime stats: %w", err)
+	}
+	out.OutboxPending = pending
+	return out, nil
+}
+
 // Save 落一条快照并按需触发终态留痕。直写：成功返回即已持久化。
 func (s *Store) Save(job *core.Job) error {
 	if job == nil {

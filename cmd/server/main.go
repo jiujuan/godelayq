@@ -526,6 +526,14 @@ func defaultNewServer(cfg core.Config, mgrDB *mgrDBHolder, reloadStatus *reloadS
 		} else {
 			opts = append(opts, api.WithMemoryIdempotencyStore(cfg.Store.IdempotencyTTL))
 		}
+		// 任务库机制性读数（G4/Q05）：store 是任务库时注入 db 段读口，JSON 部署不注入
+		// ——/admin/runtime 的 db 键整个缺省（与 Reload 同一语义："没这个能力"不是
+		// "读数为零"）。断言形状与上面两个注入点同一取向。
+		if rt, ok := store.(interface {
+			DBRuntime() (core.DBRuntimeStats, error)
+		}); ok {
+			opts = append(opts, api.WithDBRuntime(rt))
+		}
 		// 管理库模式把账号存储交给服务：认证器随之切到库模式（改账号即时生效），
 		// 账号管理端点（/admin/users）也随之启用——两者共用这一个存储句柄。
 		// 关闭时账号走配置快照（遗留模式），管理端点不存在。

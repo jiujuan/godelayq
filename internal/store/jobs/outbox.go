@@ -281,6 +281,21 @@ func (r *OutboxRelay) dispatchBatch() error {
 	return nil
 }
 
+// pendingOutboxCount 统计出箱表中待投递行数。中继器的积压上限判定（prune）与
+// 运维读数（Store.DBRuntime，G4/Q05）共用这一条查询——积压的语义只有一份，
+// 截断判定与 /admin/runtime 读数不许分叉。
+// 入参收 *Handle 而不是 bun.IDB：Handle 的 Dialect() 被 engine.DB 遮蔽成
+// engine.Dialect，不再满足 bun.IDB，而这里也不需要更宽的入参。
+func pendingOutboxCount(db *Handle) (int64, error) {
+	count, err := db.NewSelect().Model((*outboxRow)(nil)).
+		Where("status = ?", outboxStatusPending).
+		Count(bgCtx)
+	if err != nil {
+		return 0, fmt.Errorf("jobs: count pending outbox rows: %w", err)
+	}
+	return int64(count), nil
+}
+
 // prune 做两件清理：dispatched 行按 TTL 淘汰；pending 超过积压上限时按最旧截断。
 // 两者都在各自的小事务里；失败只记日志——清理是下限保障，不影响投递正确性。
 func (r *OutboxRelay) prune() {
@@ -292,10 +307,7 @@ func (r *OutboxRelay) prune() {
 		r.logger.Error("failed to prune dispatched outbox rows", "error", err)
 	}
 
-	
-	count, err := r.h.NewSelect().Model((*outboxRow)(nil)).
-		Where("status = ?", outboxStatusPending).
-		Count(bgCtx)
+	count, err := pendingOutboxCount(r.h)
 	if err != nil {
 		r.logger.Error("failed to count pending outbox rows", "error", err)
 		return
