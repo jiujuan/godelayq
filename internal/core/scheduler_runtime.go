@@ -167,20 +167,14 @@ func (s *Scheduler) askRestoreGuard(snap JobSnapshot) (status JobStatus, hold bo
 
 // holdRestored 把改判后的任务落盘并发布事件，它不进堆。
 //
+// 落盘与状态转移走 transition 收口（TASK-RE01）：崩溃快照是 running，
+// running→paused 是转移表里的合法边（Restore 守卫改判）。
 // 落盘失败的后果是"下次启动再判一次"（存储里还是 running 快照），可接受，
 // 但必须留下日志：这条任务本进程已经不执行了，存储与内存此刻不一致。
 // 事件按 newStatus 分派：改判成 paused 才发 job.paused，
 // 改判成别的状态时发暂停事件就是在说谎，那种用法将来要另配事件类型。
 func (s *Scheduler) holdRestored(job *Job, newStatus JobStatus) {
-	job.Status = newStatus
-	job.UpdatedAt = time.Now()
-
-	if s.store != nil {
-		if err := s.store.Update(job.ToSnapshot()); err != nil {
-			s.logger.Error("failed to persist the restored job status",
-				"job_id", job.ID, "status", newStatus, "error", err)
-		}
-	}
+	s.transition(job, newStatus)
 
 	if newStatus != StatusPaused {
 		s.logger.Warn("restored job held out of the queue without a matching event",
@@ -188,7 +182,7 @@ func (s *Scheduler) holdRestored(job *Job, newStatus JobStatus) {
 		return
 	}
 
-	s.eventBus.Publish(Event{
+	s.emit(Event{
 		Type:      EventJobPaused,
 		JobID:     job.ID,
 		JobName:   job.Name,
@@ -312,6 +306,9 @@ func (s *Scheduler) Start() {
 	// 退场余额与停止信号同理：跨重启不留残留名额。上一代的 worker 已经全部退出
 	// （Stop 等过 wg），留下的名额只会让这一代凭空少几个 worker。
 	s.retireRequests.Store(0)
+	// cancelRequested 与 suspended 同理是进程内意图：上一代没被认领的取消请求
+	// （比如收尾还没跑完进程就退了）不该拦住这一代的执行。
+	s.cancelRequested = make(map[string]struct{})
 	// 调度总开关不跨重启：suspend 是给"这次发版/维护窗口"用的进程内意图，
 	// 进程都换了，留着它只会让人对着一个不出任务的调度器猜原因。
 	s.suspended.Store(false)

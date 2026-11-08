@@ -39,20 +39,13 @@ func (s *Scheduler) Schedule(job *Job) error {
 	// Status/Attempts/UpdatedAt（executeJob 开头那三行），而快照是这些字段的读取方。
 	// 反过来先入堆再落盘，等于允许"执行中的任务被同一个指针读一次状态"，
 	// -race 下会在 Resume→Schedule 这条路径上判为数据竞争（同一指针，两个协程）。
+	// 落盘与 job.scheduled 事件一并走 persistAndEmit 收口（TASK-RE01）；JSON 存储下
+	// Save(job) 与 Update(ToSnapshot) 等价，收口后 RE07 才能把两者放进同一事务。
 	// 落盘失败只记日志、照常入堆，与之前的容错口径一致。
-	if s.store != nil {
-		if err := s.store.Save(job); err != nil {
-			s.logger.Error("failed to persist job", "job_id", job.ID, "error", err)
-		}
-	}
-
-	s.heap.PushItem(job)
-
-	// 通知调度循环可能有更早的任务
-	s.notifyNewJob()
-
-	// 发布事件
-	s.eventBus.Publish(Event{
+	//
+	// 这里不经 transition：入堆的都是新排期（pending，含 cron 重排的同 ID 新对象），
+	// "上一轮 running→pending"的转移在新对象上无从取 from，语义说明见 handleSuccess。
+	if err := s.persistAndEmit(job, Event{
 		Type:      EventJobScheduled,
 		JobID:     job.ID,
 		JobName:   job.Name,
@@ -62,7 +55,14 @@ func (s *Scheduler) Schedule(job *Job) error {
 			"trigger_at": job.TriggerAt,
 			"is_repeat":  job.IsRepeat,
 		},
-	})
+	}); err != nil {
+		s.logger.Error("failed to persist job", "job_id", job.ID, "error", err)
+	}
+
+	s.heap.PushItem(job)
+
+	// 通知调度循环可能有更早的任务
+	s.notifyNewJob()
 
 	return nil
 }
@@ -80,54 +80,64 @@ func (s *Scheduler) CancelRunning(jobID string) bool {
 	return true
 }
 
-// Cancel 取消任务：待执行任务从堆中移除，已出堆正在执行的任务取消其执行上下文。
-// 两种情况都会清理存储，避免下次启动时被 Restore 重新入队。
+// Cancel 取消任务（TASK-RE01 起落 cancelled 终态，不再删除快照）。三条路径：
+//
+//   - 堆内：摘出后转移 pending→cancelled，终态快照落盘；
+//   - 执行中：登记 cancelRequested 并取消上下文，由 handleInterrupted 收尾认领
+//     （转移 running→cancelled）。job.cancelled 事件因此晚于本调用返回——它对应
+//     "确实停住了"这个事实，与 ForcePause 的认领语义同一取向；
+//   - 暂停中：快照转移 paused→cancelled。
+//
+// 三条路径都保留终态留痕（受 store.history_limit/TTL 淘汰策略管理，Restore 跳过终态
+// 不会复活）：可审计要求"这条任务存在过且被取消"在存储里可查。
+// 行为变化见 docs/design/reliable-execution-design.md §11.3：取消后 GET /jobs/:id
+// 返回 cancelled 记录而非 404。
+//
+// 已知边界（与改动前同窗，未扩大）：任务刚被调度循环弹出、还没登记进 cancelMap 的
+// 瞬间，堆内与执行中两条都查不到，快照也还是 pending——按不存在处理返回
+// ErrJobNotFound。要收紧这个窗口需要"弹出中"的中间态，收益撑不起复杂度。
 func (s *Scheduler) Cancel(jobID string) error {
-	cancelled := false
-
-	if job := s.heap.Remove(jobID); job != nil {
-		job.(*Job).Status = StatusCancelled
-		cancelled = true
-	}
-	if s.CancelRunning(jobID) {
-		cancelled = true
-	}
-
-	if !cancelled {
-		// 暂停中的任务既不在堆里也不在执行中，但它确实存在且必须还能被删掉——
-		// 否则一旦暂停就再也清理不掉，存储里只会长出删不掉的僵尸快照。
-		if snap, ok := s.findSnapshot(jobID); ok && JobStatus(snap.Status) == StatusPaused {
-			if s.store != nil {
-				if err := s.store.Delete(jobID); err != nil {
-					s.logger.Error("failed to delete paused job", "job_id", jobID, "error", err)
-				}
-			}
-			s.eventBus.Publish(Event{
-				Type:      EventJobCancelled,
-				JobID:     jobID,
-				JobName:   snap.Name,
-				Status:    StatusCancelled,
-				Timestamp: time.Now(),
-				Metadata:  map[string]interface{}{"was_paused": true},
-			})
-			return nil
-		}
-		return ErrJobNotFound
+	if item := s.heap.Remove(jobID); item != nil {
+		job := item.(*Job)
+		s.transition(job, StatusCancelled, Event{
+			Type:      EventJobCancelled,
+			JobID:     jobID,
+			JobName:   job.Name,
+			Status:    StatusCancelled,
+			Timestamp: time.Now(),
+		})
+		return nil
 	}
 
-	if s.store != nil {
-		if err := s.store.Delete(jobID); err != nil {
-			s.logger.Error("failed to delete cancelled job", "job_id", jobID, "error", err)
-		}
+	// 执行中：登记必须在取消之前——反过来 Handler 可能在登记前就返回了，
+	// 收尾认领不到标记，取消请求就此丢失。
+	s.mu.Lock()
+	cancel, running := s.cancelMap[jobID]
+	if running {
+		s.cancelRequested[jobID] = struct{}{}
+	}
+	s.mu.Unlock()
+	if running {
+		cancel()
+		return nil
 	}
 
-	s.eventBus.Publish(Event{
-		Type:      EventJobCancelled,
-		JobID:     jobID,
-		Status:    StatusCancelled,
-		Timestamp: time.Now(),
-	})
-	return nil
+	// 暂停中的任务既不在堆里也不在执行中，但它确实存在且必须还能被取消——
+	// 否则一旦暂停就再也清理不掉，存储里只会长出删不掉的僵尸快照。
+	if snap, ok := s.findSnapshot(jobID); ok && JobStatus(snap.Status) == StatusPaused {
+		job := &Job{}
+		job.FromSnapshot(snap)
+		s.transition(job, StatusCancelled, Event{
+			Type:      EventJobCancelled,
+			JobID:     jobID,
+			JobName:   snap.Name,
+			Status:    StatusCancelled,
+			Timestamp: time.Now(),
+			Metadata:  map[string]interface{}{"was_paused": true},
+		})
+		return nil
+	}
+	return ErrJobNotFound
 }
 
 // Pause 暂停一个待执行任务：把它从堆里取出，并以 paused 状态写回存储。
@@ -155,24 +165,11 @@ func (s *Scheduler) Pause(jobID string) (*Job, error) {
 	return s.pausePendingJob(item.(*Job), false)
 }
 
-// pausePendingJob 把一个刚从堆里摘下的任务落成 paused：落盘 + 唤醒循环 + 广播。
+// pausePendingJob 把一个刚从堆里摘下的任务落成 paused：转移 + 落盘 + 唤醒循环 + 广播。
 // forced 只影响事件里的标记位，状态迁移两条路径完全一致。
+// 入参来自堆（或 ForcePause 的堆内分支），状态必为 pending，pending→paused 是合法边。
 func (s *Scheduler) pausePendingJob(job *Job, forced bool) (*Job, error) {
-	job.Status = StatusPaused
-	job.UpdatedAt = time.Now()
-
-	if s.store != nil {
-		if err := s.store.Update(job.ToSnapshot()); err != nil {
-			// 堆里已经取走了，落盘失败只可能让重启后的恢复口径不一致：
-			// 记日志并继续，任务此刻确实处于暂停中。
-			s.logger.Error("failed to persist paused job", "job_id", job.ID, "error", err)
-		}
-	}
-
-	// 堆顶可能变了，唤醒调度循环重算等待时长
-	s.notifyNewJob()
-
-	s.eventBus.Publish(Event{
+	s.transition(job, StatusPaused, Event{
 		Type:      EventJobPaused,
 		JobID:     job.ID,
 		JobName:   job.Name,
@@ -183,6 +180,9 @@ func (s *Scheduler) pausePendingJob(job *Job, forced bool) (*Job, error) {
 			"forced":     forced,
 		},
 	})
+
+	// 堆顶可能变了，唤醒调度循环重算等待时长
+	s.notifyNewJob()
 
 	return job, nil
 }
@@ -221,8 +221,9 @@ func (s *Scheduler) Resume(jobID string) (*Job, error) {
 	}
 
 	// Schedule 已广播 job.scheduled（它确实被重新排期了）；再补一条 resumed，
-	// 让时间线能把"恢复"这个人为动作与自动重排区分开。
-	s.eventBus.Publish(Event{
+	// 让时间线能把"恢复"这个人为动作与自动重排区分开。这是不带状态写的事件，
+	// 走 emit 收口（TASK-RE01）。
+	s.emit(Event{
 		Type:      EventJobResumed,
 		JobID:     job.ID,
 		JobName:   job.Name,
@@ -272,19 +273,19 @@ func (s *Scheduler) ForcePause(jobID string) (*Job, error) {
 
 	// 先把期望状态落盘，再取消：即便 Handler 完全不响应取消，
 	// 收尾路径也会在它返回时把状态钉回 paused（见 handleSuccess 等处的守卫）。
+	// 落盘走 transition 收口（TASK-RE01），不发事件——job.paused 由收尾的
+	// parkForcedPause 统一发，这里先发一条等于说"已经停稳了"，与事实不符。
 	//
 	// 只在真的取到快照时才改写它：纯内存部署（store 为 nil）没有可写的记录，
 	// 而"store 非空却查不到"的极端竞态下用零值快照覆盖，会把任务内容抹平。
-	job := &Job{ID: jobID, Status: StatusPaused, UpdatedAt: time.Now()}
+	var job *Job
 	if snap, found := s.findSnapshot(jobID); found {
-		snap.Status = int(StatusPaused)
-		snap.UpdatedAt = job.UpdatedAt
-		if s.store != nil {
-			if err := s.store.Update(snap); err != nil {
-				s.logger.Error("failed to persist force-paused job", "job_id", jobID, "error", err)
-			}
-		}
-		job.FromSnapshot(snap) // 快照里的 status 已被置为 paused
+		job = &Job{}
+		job.FromSnapshot(snap)
+		// 崩溃快照/执行中的任务此刻状态是 running，running→paused 是合法边。
+		s.transition(job, StatusPaused)
+	} else {
+		job = &Job{ID: jobID, Status: StatusPaused, UpdatedAt: time.Now()}
 	}
 
 	cancel()
@@ -303,6 +304,20 @@ func (s *Scheduler) takeForcedPause(jobID string) bool {
 	return true
 }
 
+// takeCancelRequested 消费一个取消请求标记（一次性），返回它是否存在（TASK-RE01）。
+// 与 takeForcedPause 同形：标记由执行收尾路径认领，谁先回来谁负责落终态。
+// 三条收尾路径（handleInterrupted/handleSuccess/handleFailure）都必须消费它——
+// Handler 不响应取消而照常收尾时，标记不能泄漏成"永远待认领"。
+func (s *Scheduler) takeCancelRequested(jobID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, ok := s.cancelRequested[jobID]; !ok {
+		return false
+	}
+	delete(s.cancelRequested, jobID)
+	return true
+}
+
 // parkForcedPause 由执行收尾调用：若该任务被请求过强制暂停，就把它钉在 paused 上
 // 并广播 job.paused，返回 true 表示调用方应当放弃自己原有的收尾逻辑
 // （不再记成功、不再计重试、不再重排 Cron 的下一轮）。
@@ -311,20 +326,17 @@ func (s *Scheduler) takeForcedPause(jobID string) bool {
 // （见 executeJob 的超时注释），它可能压根没注意到上下文已被取消，
 // 于是照常返回 nil 或 error。没有这层守卫，一次强制暂停会被随后的
 // Cron 重排悄悄复活。
+//
+// 认领顺序的锚点：本函数先于取消标记检查执行（各收尾路径的第一行），
+// "强制暂停优先于一切"——用户已经要求停住等技术员确认，同一时刻到达的
+// 取消请求不得改写结果。
 func (s *Scheduler) parkForcedPause(job *Job, note string) bool {
 	if !s.takeForcedPause(job.ID) {
 		return false
 	}
 
-	job.Status = StatusPaused
-	job.UpdatedAt = time.Now()
-	if s.store != nil {
-		if err := s.store.Update(job.ToSnapshot()); err != nil {
-			s.logger.Error("failed to persist force-paused job", "job_id", job.ID, "error", err)
-		}
-	}
-
-	s.eventBus.Publish(Event{
+	// 收尾时任务状态是 running，running→paused 是合法边。
+	s.transition(job, StatusPaused, Event{
 		Type:      EventJobPaused,
 		JobID:     job.ID,
 		JobName:   job.Name,
@@ -382,11 +394,10 @@ func (s *Scheduler) UpdatePending(jobID string, apply func(*Job) error) (*Job, e
 		return nil, ErrJobNotPending
 	}
 
-	if s.store != nil {
-		if err := s.store.Update(updated.ToSnapshot()); err != nil {
-			s.logger.Error("failed to persist updated job", "job_id", updated.ID, "error", err)
-		}
-	}
+	// 内容更新不改状态（pending→pending 的 identity），不经 transition；
+	// 落盘走 persistAndEmit 收口（TASK-RE01）。落盘失败维持既有口径：
+	// 只记日志，接口照常返回成功——堆里已是新内容，重启后由 Restore 对齐差异。
+	_ = s.persistAndEmit(&updated)
 
 	// 触发时间可能提前，唤醒调度循环重算等待时长
 	s.notifyNewJob()
@@ -474,10 +485,9 @@ func (s *Scheduler) applyGroupToSnapshot(snap JobSnapshot, toGroup string) (bool
 			// 取到条目之后被调度循环弹出了，交给执行侧
 			return false, nil
 		}
-		if s.store == nil {
-			return true, nil
-		}
-		if err := s.store.Update(job.ToSnapshot()); err != nil {
+		// 状态不变的纯内容更新，经 persistAndEmit 收口（TASK-RE01）；
+		// 错误照旧向上传播（SetGroup 的 API 语义依赖它）。
+		if err := s.persistAndEmit(&job); err != nil {
 			return false, err
 		}
 		return true, nil
@@ -493,7 +503,11 @@ func (s *Scheduler) applyGroupToSnapshot(snap JobSnapshot, toGroup string) (bool
 
 	snap.Group = toGroup
 	snap.UpdatedAt = time.Now()
-	if err := s.store.Update(snap); err != nil {
+	// 非堆内路径改的是快照（暂停中/终态留痕），同样走收口；终态→终态的 identity
+	// 不经 transition 校验（分组改挂与状态机无关）。
+	job := &Job{}
+	job.FromSnapshot(snap)
+	if err := s.persistAndEmit(job); err != nil {
 		return false, err
 	}
 	return true, nil

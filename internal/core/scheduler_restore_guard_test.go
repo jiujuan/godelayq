@@ -300,7 +300,8 @@ func TestRestore_GuardStoreUpdateFailure(t *testing.T) {
 	}
 	output := logs.String()
 	for _, id := range []string{"exec-one", "exec-two"} {
-		if !strings.Contains(output, "failed to persist the restored job status") || !strings.Contains(output, "job_id="+id) {
+		// TASK-RE01 起落盘统一走 persistAndEmit，日志消息是收口的通用形状。
+		if !strings.Contains(output, "failed to persist job snapshot") || !strings.Contains(output, "job_id="+id) {
 			t.Fatalf("%s 的落盘失败没有记日志，实际日志：%q", id, output)
 		}
 	}

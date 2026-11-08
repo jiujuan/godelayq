@@ -192,7 +192,8 @@ func (s *Server) BatchJobOps(c *gin.Context) {
 }
 
 // applyJobOp 执行单个动作。返回的 code/message 为空表示成功；
-// job 为 nil 表示没有可返回的任务现状（目前只有 cancel：记录已被删除）。
+// job 为 nil 表示没有可返回的任务现状（目前只有 move 之前的 cancel：
+// TASK-RE01 起取消会落 cancelled 快照，回读一次把终态返回给调用方）。
 func (s *Server) applyJobOp(action string, jobID string, group *string) (*core.Job, int, string) {
 	var (
 		job *core.Job
@@ -202,6 +203,10 @@ func (s *Server) applyJobOp(action string, jobID string, group *string) (*core.J
 	switch action {
 	case jobOpCancel:
 		err = s.scheduler.Cancel(jobID)
+		if err == nil {
+			// 取消有终态留痕了：回读一次，让批量响应里能看到 cancelled 现状
+			job = s.jobByID(jobID)
+		}
 	case jobOpPause:
 		job, err = s.scheduler.Pause(jobID)
 	case jobOpForcePause:

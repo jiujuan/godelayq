@@ -299,7 +299,10 @@ func TestScheduler_Resume_RejectsNonPausedAndUnknown(t *testing.T) {
 	}
 }
 
-func TestScheduler_Cancel_PausedJobIsStillDeletable(t *testing.T) {
+// TASK-RE01：暂停中的任务仍然可以被取消，但取消改为落 cancelled 终态快照，
+// 不再删除——"这条任务存在过且被取消"在存储里可查（可审计），
+// 且受终态留痕淘汰策略管理、Restore 跳过终态不会复活。
+func TestScheduler_Cancel_PausedJobLandsCancelled(t *testing.T) {
 	store := newMockStore()
 	scheduler := NewScheduler(store, nil, nil)
 	events := collectEvents(scheduler.GetEventBus())
@@ -311,15 +314,19 @@ func TestScheduler_Cancel_PausedJobIsStillDeletable(t *testing.T) {
 		t.Fatalf("Pause 失败: %v", err)
 	}
 
-	// 暂停后不在堆里也不在执行中，若 Cancel 只认这两种，任务就再也删不掉了
+	// 暂停后不在堆里也不在执行中，若 Cancel 只认这两种，任务就再也取消不掉了
 	if err := scheduler.Cancel("cancel-paused"); err != nil {
 		t.Fatalf("Cancel 暂停任务失败: %v", err)
 	}
-	if _, ok := store.snapshotOf("cancel-paused"); ok {
-		t.Error("Cancel 应连同快照一起删除")
+	stored, ok := store.snapshotOf("cancel-paused")
+	if !ok {
+		t.Fatal("Cancel 应把暂停中的任务落成 cancelled 终态快照")
 	}
-	if store.GetDeleteCalls() != 1 {
-		t.Errorf("应发生一次存储删除，实际 %d 次", store.GetDeleteCalls())
+	if JobStatus(stored.Status) != StatusCancelled {
+		t.Errorf("终态应为 cancelled，实际 %v", JobStatus(stored.Status))
+	}
+	if store.GetDeleteCalls() != 0 {
+		t.Errorf("取消不应删除快照，实际删除 %d 次", store.GetDeleteCalls())
 	}
 
 	events.waitFor(t, EventJobCancelled, "cancel-paused", time.Second)

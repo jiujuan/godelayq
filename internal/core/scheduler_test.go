@@ -16,6 +16,7 @@ type mockStore struct {
 	loadErr     error
 	updateErr   error
 	saveCalls   int
+	updateCalls int
 	deleteCalls int
 }
 
@@ -39,6 +40,7 @@ func (m *mockStore) Save(job *Job) error {
 func (m *mockStore) Update(snapshot JobSnapshot) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	m.updateCalls++
 	if m.updateErr != nil {
 		return m.updateErr
 	}
@@ -83,6 +85,14 @@ func (m *mockStore) GetSaveCalls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.saveCalls
+}
+
+// GetUpdateCalls 统计 Update 调用次数。TASK-RE01 之后调度器的落盘都走
+// persistAndEmit（内部是 Update），Save 只剩实现方兼容接口的用途。
+func (m *mockStore) GetUpdateCalls() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.updateCalls
 }
 
 func (m *mockStore) GetDeleteCalls() int {
@@ -204,9 +214,9 @@ func TestScheduler_Schedule(t *testing.T) {
 		t.Error("Expected job ID to be generated")
 	}
 
-	// Verify job was persisted
-	if store.GetSaveCalls() != 1 {
-		t.Errorf("Expected 1 save call, got %d", store.GetSaveCalls())
+	// Verify job was persisted (TASK-RE01 起经 persistAndEmit 的 Update 通道)
+	if store.GetUpdateCalls() != 1 {
+		t.Errorf("Expected 1 update call, got %d", store.GetUpdateCalls())
 	}
 
 	// Verify status was set
@@ -282,9 +292,17 @@ func TestScheduler_Cancel(t *testing.T) {
 		t.Errorf("Expected heap to be empty, got length %d", scheduler.heap.Len())
 	}
 
-	// Verify job was deleted from store
-	if store.GetDeleteCalls() != 1 {
-		t.Errorf("Expected 1 delete call, got %d", store.GetDeleteCalls())
+	// TASK-RE01：取消不再删除快照，改为落 cancelled 终态留痕
+	// （Restore 跳过终态不会复活；受终态留痕淘汰策略管理）。
+	if store.GetDeleteCalls() != 0 {
+		t.Errorf("Expected no delete call, got %d", store.GetDeleteCalls())
+	}
+	stored, ok := store.snapshotOf("cancel-test")
+	if !ok {
+		t.Fatal("Expected a cancelled snapshot to be persisted")
+	}
+	if JobStatus(stored.Status) != StatusCancelled {
+		t.Errorf("Expected stored status Cancelled, got %v", JobStatus(stored.Status))
 	}
 }
 
@@ -438,6 +456,9 @@ func TestScheduler_HandleSuccess_OneTime(t *testing.T) {
 	job := &Job{
 		ID:       "success-test",
 		IsRepeat: false,
+		// 真实链路里 handleSuccess 只会在执行后到达（任务处于 running）；
+		// running→success 是转移表里的合法边，pending→success 会被拒绝。
+		Status: StatusRunning,
 	}
 
 	scheduler.handleSuccess(job)

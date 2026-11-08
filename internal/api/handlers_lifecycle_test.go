@@ -162,7 +162,11 @@ func (s *APITestSuite) TestBatchJobOpsPausesMovesAndReportsFailures() {
 		IDs:    createdIDs,
 	}, &cancelResult))
 	assert.Equal(s.T(), 3, cancelResult.Succeeded)
-	assert.Empty(s.T(), cancelResult.Items, "取消后已经没有任务现状可返回")
+	// TASK-RE01：取消落 cancelled 终态快照，批量响应回得到终态现状
+	require.Len(s.T(), cancelResult.Items, 3)
+	for _, item := range cancelResult.Items {
+		assert.Equal(s.T(), "cancelled", item.Status)
+	}
 	assert.Equal(s.T(), 0, s.scheduler.HeapLen())
 }
 

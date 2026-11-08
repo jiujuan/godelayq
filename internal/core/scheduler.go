@@ -124,6 +124,12 @@ type Scheduler struct {
 	// 用集合而不是存指针：中止是异步的，标记由 handleInterrupted/handleSuccess/
 	// handleFailure 三条收尾路径之一消费，谁先回来谁负责把任务停在 paused。
 	forcedPause map[string]struct{}
+	// cancelRequested 记下"已请求取消、等待执行收尾认领"的任务 ID（TASK-RE01）。
+	// 与 forcedPause 同形同理由：取消是异步的，Cancel 调用侧只登记标记并取消上下文，
+	// 落 cancelled 终态由收尾路径认领——事件对应"确实停住了"这个事实。
+	// 认领顺序：parkForcedPause 的标记先于本标记检查（强制暂停优先于一切）；
+	// 三条收尾路径都会消费它，Handler 不响应取消而正常收尾时也不泄漏。
+	cancelRequested map[string]struct{}
 
 	// inFlight 已进入 Handler 执行、尚未返回的任务数，供统计接口读取
 	inFlight atomic.Int32
@@ -164,6 +170,8 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 		handlerClasses: make(map[string]JobClass),
 		cancelMap:      make(map[string]context.CancelFunc),
 		forcedPause:    make(map[string]struct{}),
+		// cancelRequested 与 forcedPause 同批初始化（见字段注释）。
+		cancelRequested: make(map[string]struct{}),
 		// 预览上限默认取配置默认值：不装配执行器的程序也一样，事件里的预览不会没头没尾。
 		eventPreviewLimit: DefaultExecInlinePreview,
 		eventBus:          eventBus,

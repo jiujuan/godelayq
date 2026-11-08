@@ -23,8 +23,8 @@ func (s *Scheduler) executeJob(job *Job) {
 	counter.Add(1)
 	defer counter.Add(-1)
 
-	// 发布开始事件
-	s.eventBus.Publish(Event{
+	// 发布开始事件（不带状态写，走 emit 收口；metadata.attempt 的口径 RE02 才修）
+	s.emit(Event{
 		Type:      EventJobStarted,
 		JobID:     job.ID,
 		JobName:   job.Name,
@@ -43,13 +43,11 @@ func (s *Scheduler) executeJob(job *Job) {
 		}
 		if job.Handler == nil {
 			s.logger.Error("no handler registered for job", "job_id", job.ID, "handler_key", key)
-			job.Status = StatusFailed
-			job.UpdatedAt = time.Now()
-			if s.store != nil {
-				s.store.Update(job.ToSnapshot())
-			}
+			// 派发期失败：任务从未开始执行就注定终态，pending→failed 是转移表里
+			// 惟一的 pending→failed 边（TASK-RE01）。与现状一致：不写 running 快照、
+			// 不递增 Attempts，直接落失败终态；失败事件随转移一起收口发出。
 			errData, _ := json.Marshal(map[string]string{"error": "no handler registered"})
-			s.eventBus.Publish(Event{
+			s.transition(job, StatusFailed, Event{
 				Type:      EventJobFailed,
 				JobID:     job.ID,
 				JobName:   job.Name,
@@ -94,23 +92,17 @@ func (s *Scheduler) executeJob(job *Job) {
 		execCtx = withTimeout
 	}
 
-	job.Status = StatusRunning
+	// 运行态落盘经 transition 收口（TASK-RE01）：pending→running。
+	// Attempts 先自增再落盘（快照带本次尝试号）；崩溃后重启能从快照看出
+	// 哪些任务当时在执行（由 Restore 复位为待执行），统计接口也不再依赖进程内状态。
 	job.Attempts++
-	job.UpdatedAt = time.Now()
-
-	// 落盘运行态：崩溃后重启能看出哪些任务当时在执行（由 Restore 复位为待执行），
-	// 统计接口也不再依赖进程内状态。写入会被合并落盘吸收，不增加每次一写。
-	if s.store != nil {
-		if err := s.store.Update(job.ToSnapshot()); err != nil {
-			s.logger.Error("failed to persist running job", "job_id", job.ID, "error", err)
-		}
-	}
+	s.transition(job, StatusRunning)
 
 	err := job.Handler(execCtx, job)
 
 	if err == nil {
-		// 发布成功事件
-		s.eventBus.Publish(Event{
+		// 发布成功事件（不带状态写，走 emit 收口；终态落盘在 handleSuccess 的 transition 里）
+		s.emit(Event{
 			Type:      EventJobCompleted,
 			JobID:     job.ID,
 			JobName:   job.Name,
@@ -148,8 +140,8 @@ func (s *Scheduler) executeJob(job *Job) {
 		failureMetadata["permanent"] = true
 	}
 
-	// 发布失败事件
-	s.eventBus.Publish(Event{
+	// 发布失败事件（不带状态写，走 emit 收口；终态落盘在 handleFailure 的 transition 里）
+	s.emit(Event{
 		Type:      EventJobFailed,
 		JobID:     job.ID,
 		JobName:   job.Name,
@@ -210,13 +202,32 @@ func (s *Scheduler) eventResult(job *Job) (ExecMeta, bool) {
 }
 
 // handleInterrupted 处理"执行被打断"：既不记为失败，也不消耗重试次数。
-// 用户主动取消时，事件与存储清理由 Cancel 完成；关停打断时把任务保持为
-// Pending 落盘，交由下次 Start 的 Restore 重新入队（至少一次语义，
-// 副作用可能重复，Handler 需自行保证幂等）。
+// 三条出路按优先级（TASK-RE01 的认领顺序锚定在 parkForcedPause）：
+//  1. 强制暂停标记 → 停 paused（用户要求停住等人确认，优先于一切）；
+//  2. 取消请求标记 → 落 cancelled 终态（Cancel 的收尾认领：事件与快照对应
+//     "确实停住了"，Cancel 调用侧不再立即落盘）；
+//  3. 调度器已停止 → 落回 pending，重启后照常重跑（优雅关停路径，至少一次语义，
+//     副作用可能重复，Handler 需自行保证幂等）。
+// 调度器还在跑、又没有任何标记：只有绕过 Cancel 直调 CancelRunning 才会走到这里，
+// 维持既有口径——只记日志，快照保持 running，交给重启后的 Restore 处置。
 func (s *Scheduler) handleInterrupted(job *Job) {
 	// 强制暂停优先于关停恢复：否则"取消上下文"会被当成关停打断，
 	// 任务被复位成 pending 重新排期，暂停请求当场失效。
 	if s.parkForcedPause(job, "interrupted") {
+		return
+	}
+
+	// 用户 Cancel 的收尾认领：running→cancelled（TASK-RE01）。
+	if s.takeCancelRequested(job.ID) {
+		s.transition(job, StatusCancelled, Event{
+			Type:      EventJobCancelled,
+			JobID:     job.ID,
+			JobName:   job.Name,
+			Status:    StatusCancelled,
+			Timestamp: time.Now(),
+			Metadata:  map[string]interface{}{"reason": "cancel"},
+		})
+		s.logger.Info("job cancelled", "job_id", job.ID)
 		return
 	}
 
@@ -229,15 +240,7 @@ func (s *Scheduler) handleInterrupted(job *Job) {
 		return
 	}
 
-	job.Status = StatusPending
-	job.UpdatedAt = time.Now()
-	if s.store != nil {
-		if err := s.store.Update(job.ToSnapshot()); err != nil {
-			s.logger.Error("failed to persist interrupted job", "job_id", job.ID, "error", err)
-		}
-	}
-
-	s.eventBus.Publish(Event{
+	s.transition(job, StatusPending, Event{
 		Type:      EventJobCancelled,
 		JobID:     job.ID,
 		JobName:   job.Name,
@@ -257,10 +260,17 @@ func (s *Scheduler) handleSuccess(job *Job) {
 		return
 	}
 
-	job.Status = StatusSuccess
-	job.UpdatedAt = time.Now()
+	// 取消请求认领（TASK-RE01）：Handler 不响应取消而正常返回时，工作已经做完，
+	// 结果为真就按成功落终态——已完成的事不能因为"取消来得晚"被说成 cancelled。
+	// 标记必须消费掉，否则泄漏成永远待认领。
+	if s.takeCancelRequested(job.ID) {
+		s.logger.Info("cancel requested but the handler completed; recording success", "job_id", job.ID)
+	}
 
-	// 如果是重复任务，计算下次执行时间并重新入队
+	// 如果是重复任务，计算下次执行时间并重新入队。
+	// 新一轮是同 ID 的新对象，经 Schedule 以 pending 落盘——上一轮 running→pending
+	// 的转移因此不经 transition（新对象上无从取 from），前置事实是"本轮已成功"，
+	// 例外已被 parkForcedPause 认领与 cancelRequested 消费兜住。
 	if job.IsRepeat && job.CronExpr != "" {
 		next, err := s.cronParser.Next(job.CronExpr, time.Now())
 		if err == nil {
@@ -288,29 +298,43 @@ func (s *Scheduler) handleSuccess(job *Job) {
 		s.logger.Error("failed to compute next run for cron job", "job_id", job.ID, "cron_expr", job.CronExpr, "error", err)
 	}
 
-	// 终态留痕：写入成功快照，是否长期保留由存储的保留策略决定
-	if s.store != nil {
-		if err := s.store.Update(job.ToSnapshot()); err != nil {
-			s.logger.Error("failed to persist completed job", "job_id", job.ID, "error", err)
-		}
-	}
+	// 终态留痕：completed 事件已在 executeJob 发布，这里只转移 + 落快照（无事件）。
+	// 是否长期保留由存储保留策略决定。cron 分支计算失败也会落到这里，
+	// 与改动前"落成功快照"的兜底一致。
+	s.transition(job, StatusSuccess)
 }
 
 // 处理失败与重试。
 //
-// 三个分支的先后顺序就是判定口径（TASK-E12 §3.3），改之前先读理由：
+// 四个分支的先后顺序就是判定口径（TASK-E12 §3.3 + TASK-RE01 的取消认领），改之前先读理由：
 //  1. 强制暂停在最前：用户已经要求把这个任务停在 paused 上等技术员确认，
 //     此时错误是永久还是可重试都不该改变结果——既不消耗重试次数，也不再排期。
 //     parkForcedPause 认领中止标记的语义也依赖它先执行，后移会让暂停当场失效。
-//  2. 永久失败其次：参数写错、命令不存在这类问题，重跑只会把同一个错误再产生一遍，
+//  2. 取消请求其次（TASK-RE01）：Handler 不响应取消而自己报了错——按用户意图停住，
+//     落 cancelled 终态，不再消耗重试次数、不再重新排期。失败结论已经在
+//     executeJob 的 job.failed 事件里，时间线能看到完整经过。
+//  3. 永久失败再次：参数写错、命令不存在这类问题，重跑只会把同一个错误再产生一遍，
 //     还白占执行名额（拼错的解释器名配 max_retries: 5 就是五条同样无用的事件）。
-//  3. 最后才是既有的"按 RetryCount 与 MaxRetries 决定重试还是落终态"。
+//  4. 最后才是既有的"按 RetryCount 与 MaxRetries 决定重试还是落终态"。
 //
 // err 是处理函数返回的原始错误：判定要读它的 Permanent()，而 job 里没有它。
 func (s *Scheduler) handleFailure(job *Job, err error) {
 	// 同 handleSuccess：中止期间 Handler 自己报了错，也按用户意图停在 paused，
 	// 不再消耗重试次数、不再重新排期。
 	if s.parkForcedPause(job, "handler_failed_despite_cancel") {
+		return
+	}
+
+	if s.takeCancelRequested(job.ID) {
+		s.logger.Info("cancel requested and the handler failed; job stops as cancelled", "job_id", job.ID)
+		s.transition(job, StatusCancelled, Event{
+			Type:      EventJobCancelled,
+			JobID:     job.ID,
+			JobName:   job.Name,
+			Status:    StatusCancelled,
+			Timestamp: time.Now(),
+			Metadata:  map[string]interface{}{"reason": "cancel"},
+		})
 		return
 	}
 
@@ -324,8 +348,9 @@ func (s *Scheduler) handleFailure(job *Job, err error) {
 		// 否则中间插进一次 SetRetryPolicy 就会让两条记录给出不同的重试时刻
 		nextTime := (*s.retryPolicy.Load()).NextRetry(job)
 
-		// 发布重试事件
-		s.eventBus.Publish(Event{
+		// 发布重试事件。它不带状态写（重试是"新对象重新 Schedule"），走 emit 收口；
+		// 排期本身的落盘在下面 Schedule 的 persistAndEmit 里。
+		s.emit(Event{
 			Type:      EventJobRetrying,
 			JobID:     job.ID,
 			JobName:   job.Name,
@@ -349,11 +374,6 @@ func (s *Scheduler) handleFailure(job *Job, err error) {
 // markFailed 把任务落成失败终态并落盘。
 // 重试耗尽与永久失败共用这一份收尾逻辑：状态仍是 StatusFailed，本卡不新增 JobStatus（§8）。
 func (s *Scheduler) markFailed(job *Job) {
-	job.Status = StatusFailed
-	job.UpdatedAt = time.Now()
-	if s.store != nil {
-		if err := s.store.Update(job.ToSnapshot()); err != nil {
-			s.logger.Error("failed to persist failed job", "job_id", job.ID, "error", err)
-		}
-	}
+	// 收尾时任务状态是 running，running→failed 是合法边。
+	s.transition(job, StatusFailed)
 }
