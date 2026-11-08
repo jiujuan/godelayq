@@ -40,6 +40,15 @@ type Store interface {
 	SetHistoryRetention(limit int, ttl time.Duration)
 }
 
+// SnapshotReader 是按 ID 读单条快照的窄能力接口（TASK-RE03）。
+// 接口定义在 core（消费方是调度器的 findSnapshot 与幂等撞 ID 查重），
+// JSON 实现与 store/jobs 各自隐式实现；第三方 Store 实现可以不提供——
+// 调度器对没有该能力的 Store 回退到 LoadAll 线性扫描（既有行为）。
+type SnapshotReader interface {
+	// Get 按 ID 取快照；不存在返回 ok=false（不是错误）。
+	Get(jobID string) (snapshot JobSnapshot, ok bool, err error)
+}
+
 // StoreOptions 存储构造参数，零值即使用各项默认。
 type StoreOptions struct {
 	// Interval 合并落盘周期，<=0 使用 DefaultFlushInterval
@@ -181,6 +190,15 @@ func (s *JSONFileStore) LoadAll() ([]JobSnapshot, error) {
 		jobs = append(jobs, v)
 	}
 	return jobs, nil
+}
+
+// Get 按 ID 读单条快照（TASK-RE03 的 SnapshotReader）：map 直查，替代
+// findSnapshot 曾经的 LoadAll 全量扫描。
+func (s *JSONFileStore) Get(jobID string) (JobSnapshot, bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	snap, ok := s.data[jobID]
+	return snap, ok, nil
 }
 
 // trimTerminalLocked 按保留策略清理终态快照，Pending/Running 永不淘汰。

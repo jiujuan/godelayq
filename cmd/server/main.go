@@ -506,6 +506,18 @@ func defaultNewServer(cfg core.Config, mgrDB *mgrDBHolder, reloadStatus *reloadS
 		}); ok {
 			opts = append(opts, api.WithAttemptReader(reader))
 		}
+		// 幂等登记表（TASK-RE03）：任务库实现即注入（持久，重启有效）；
+		// JSON 部署退回进程内 map——幂等只在进程生命周期内成立（能力边界，
+		// deployment.md 说明）。TTL 来自 store.idempotency_ttl。
+		if ids, ok := store.(interface {
+			LookupIdempotency(key string) (string, string, bool, error)
+			PutIdempotency(key string, jobID string, fingerprint string) error
+			PruneExpiredIdempotency(ttl time.Duration) error
+		}); ok {
+			opts = append(opts, api.WithIdempotencyStore(ids, cfg.Store.IdempotencyTTL))
+		} else {
+			opts = append(opts, api.WithMemoryIdempotencyStore(cfg.Store.IdempotencyTTL))
+		}
 		// 管理库模式把账号存储交给服务：认证器随之切到库模式（改账号即时生效），
 		// 账号管理端点（/admin/users）也随之启用——两者共用这一个存储句柄。
 		// 关闭时账号走配置快照（遗留模式），管理端点不存在。

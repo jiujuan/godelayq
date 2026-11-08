@@ -335,7 +335,7 @@ func (s *Scheduler) persistAndEmit(job *Job, events ...Event)
 ### 7.3 幂等提交（re03）
 
 - 请求头 `Idempotency-Key`（trim 后 1..128 字符）或请求体 `job_id`（可选，[A-Za-z0-9_-]{1,64}）。两者可同时给：`job_id` 决定任务 ID，`Idempotency-Key` 决定查重键（缺省时用 `job_id` 兼作键）。
-- 指纹：对 `{name, type, payload, cron_expr, is_repeat, trigger_at(解析后), group, timeout, max_retries, retry_delay}` 的固定结构体做 `json.Marshal`（Go 结构体字段序确定）取 SHA256 hex。
+- 指纹：对 `{name, type, payload, cron_expr, is_repeat, time_spec, group, timeout, max_retries, retry_delay}` 的固定结构体做 `json.Marshal`（Go 结构体字段序确定）取 SHA256 hex。**time_spec 用提交侧的时间声明原文**（cron 表达式 / trigger_at 时刻 / delay 字符串），不是解析后的绝对时刻——delay:10m 隔三秒重发的解析结果差 3 秒，指纹必须不变；代价是 delay 与等效 trigger_at 写法判为不同内容（可预期性优先于语义等价）。指纹随任务落快照（`JobSnapshot.Fingerprint`，omitempty），job_id 撞车判定直接与快照比对——与登记表无关、重启有效；没有指纹的旧记录一律判冲突，绝不静默覆盖。
 - 语义（`api.createJobFromRequest` 在 `Schedule` 之前查）：
 
 | 场景 | 响应 |
@@ -343,8 +343,8 @@ func (s *Scheduler) persistAndEmit(job *Job, events ...Event)
 | 键首次出现 | 201，登记 (key → job_id, fingerprint) |
 | 键命中且指纹相同 | 200，返回既有任务 + 响应头 `Idempotency-Replayed: true`，**不创建** |
 | 键命中但指纹不同 | 409 conflict，details 指明键已被不同内容占用 |
-| `job_id` 与既有非终态任务撞且指纹不同 | 409 |
-| `job_id` 撞且指纹相同 | 等价重放，200 |
+| `job_id` 撞既有任务且指纹相同（快照带指纹） | 等价重放，200 |
+| `job_id` 撞既有任务且指纹不同（或旧记录无指纹） | 409，绝不覆盖 |
 
 - 幂等键淘汰：`store.idempotency_ttl`（默认 24h），与 attempt 淘汰共用写入路径的周期清理。
 - 幂等存储的接口按消费方定义在 `api`（`IdempotencyStore`：`Lookup(key)` / `Put(key, jobID, fingerprint)` / `PruneExpired`），`store/jobs.Store` 隐式实现（server.go 的 Option 注入，与既有 eventReader 等窄接口同一手法）；RE07 事务化后登记并入 `UpdateWithEvents`。

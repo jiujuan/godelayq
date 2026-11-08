@@ -60,6 +60,15 @@ curl 连发两次同一 `Idempotency-Key` 的提交（中间加 `-w '%{http_code
 - **风险：登记与创建之间的窗口**（创建成功、登记失败 → 重发会重复）。缓解：RE07 事务化前先记 error 日志留痕；窗口仅在存储故障时出现，与既有"落盘失败只记日志"口径一致。
 - 回滚：revert 后遗留表无害；api 层头部参数对旧调用方不可见。
 
-## 10. 实现记录
+## 10. 实现记录（2026-11-08）
 
-（待实现后回填。）
+分支 `feat/reliable-execution`。按卡交付，一处口径修订已同步设计文档 §7.3：
+
+- **core**：`SnapshotReader` 窄接口（Get）；`JSONFileStore.Get`（map 直查）与 `jobs.Store.Get`（主键查）实现；`Scheduler.findSnapshot` 优先直查、第三方 Store 回退 LoadAll 扫描（兼容层非待删代码，注释声明）。`Job`/`JobSnapshot` 增 `Fingerprint`（omitempty），重试副本与 cron 重排都携带（job_id 撞车判定要用）。
+- **store/jobs**：迁移 v3（`job_idempotency`，双方言）；`LookupIdempotency/PutIdempotency/PruneExpiredIdempotency`——Put 先到先得（ON CONFLICT DO NOTHING），Prune 由 api 层每次成功创建后驱动（无后台协程）。
+- **api**：`idempotencyStore` 窄接口（消费方）+ `WithIdempotencyStore`/`WithMemoryIdempotencyStore`；`Idempotency-Key` 头（1..128）与 `job_id`（[A-Za-z0-9_-]{1,64}）校验；查重收口在 `createJobFromRequest` 的 Schedule 之前（签名加 replayed 返回值），单条 200 + `Idempotency-Replayed: true`，批量同键同内容两条返回同 ID。
+- **口径修订（指纹）**：原设计用"解析后的 trigger_at"，实现时发现 delay 类请求隔秒重发的解析结果漂移会把重放误判成冲突——改为**时间声明原文**（cron/trigger_at/delay/immediate 四档，与 calculateTriggerTime 同优先级）；指纹随任务落快照，job_id 撞车直接比对快照指纹，旧记录无指纹一律 409（绝不静默覆盖）。设计文档 §7.3 已同步。
+- **cmd/server**：任务库实现即注入登记表（持久）；JSON 部署注入进程内 map（重启失效，能力边界）。
+- **配置**：`store.idempotency_ttl`（默认 24h，<=0 回默认）；热更档 ClassRestart；两份 YAML 同步。
+- **测试**：api 套件八用例（重放/冲突/delay 重发稳定性/job_id 三态/旧行为回归/批量/格式校验/服务端 ID）；store 双后端三用例（登记先到先得/TTL 淘汰/SnapshotReader Get）；SQL golden 双方言重生成（幂等三语句 + Get 进快照）。
+- **验证**：`go build/vet` 干净；`go test ./... -count=1` 九包全绿。

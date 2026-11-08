@@ -219,11 +219,20 @@ func (s *Scheduler) notifyExecSlot() {
 
 // findSnapshot 按 ID 取存储中的快照。
 //
-// 线性扫描 LoadAll：与 hasStoredJob 同一代价，当前 history_limit 量级可接受。
-// 等 Store 有 Get(jobID) 之后这两处一起收敛。
+// Store 提供 SnapshotReader 能力时直查（TASK-RE03，JSON 与任务库都实现）；
+// 第三方 Store 没有这项能力时回退 LoadAll 线性扫描（既有行为，量级由
+// history_limit 约束）。这条回退是有意的兼容层，不是待删代码。
 func (s *Scheduler) findSnapshot(jobID string) (JobSnapshot, bool) {
 	if s.store == nil {
 		return JobSnapshot{}, false
+	}
+	if reader, ok := s.store.(SnapshotReader); ok {
+		snap, found, err := reader.Get(jobID)
+		if err != nil {
+			s.logger.Error("failed to load a job snapshot", "job_id", jobID, "error", err)
+			return JobSnapshot{}, false
+		}
+		return snap, found
 	}
 
 	snapshots, err := s.store.LoadAll()

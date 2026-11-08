@@ -190,6 +190,11 @@ type Job struct {
 
 	// 元数据
 	Attempts int `json:"attempts"` // 总尝试次数（含重试）
+
+	// Fingerprint 是创建请求的内容指纹（TASK-RE03，api 层按 §7.3 口径计算）。
+	// 幂等的 job_id 撞车判定拿它与重发请求的指纹比对。core 只存储不解释——
+	// 服务端内部创建的任务（目录加载等）没有指纹，空串即"不可比"，撞 ID 一律判冲突。
+	Fingerprint string `json:"fingerprint,omitempty"`
 }
 
 // Handler 任务处理函数
@@ -244,6 +249,9 @@ func (j *Job) CloneForRetry(nextTime time.Time) *Job {
 		Attempts:   j.Attempts,
 
 		dispatchSource: AttemptTriggerRetry,
+
+		// 指纹跟着逻辑任务走：重试是同一份内容的新一轮（job_id 撞车判定要用它）。
+		Fingerprint: j.Fingerprint,
 	}
 }
 
@@ -265,6 +273,9 @@ type JobSnapshot struct {
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 	Attempts   int       `json:"attempts"`
+
+	// Fingerprint 是创建请求的内容指纹（TASK-RE03）；老数据文件里没有这个键，解码后为空。
+	Fingerprint string `json:"fingerprint,omitempty"`
 
 	// Exec 是执行结论摘要；老数据文件里没有这个键，解码后为 nil。
 	// 用 omitempty：绝大多数任务不是执行器任务，不该在每条快照里都写出一个空 exec 键。
@@ -307,6 +318,8 @@ func (j *Job) ToSnapshot() JobSnapshot {
 		// 因为存储里的快照与任务对象指向同一份内容（事件发布读的也是它）。
 		// 收尾顺序本来就是"先填摘要、再 Update(ToSnapshot())"，共享指针不会读到半成品。
 		Exec: j.Exec,
+
+		Fingerprint: j.Fingerprint,
 	}
 }
 
@@ -330,4 +343,5 @@ func (j *Job) FromSnapshot(s JobSnapshot) {
 	j.UpdatedAt = s.UpdatedAt
 	j.Attempts = s.Attempts
 	j.Exec = s.Exec
+	j.Fingerprint = s.Fingerprint
 }

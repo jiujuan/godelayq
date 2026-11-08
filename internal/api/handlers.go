@@ -81,26 +81,34 @@ func (s *Server) CreateJob(c *gin.Context) {
 		return
 	}
 
-	job, failure := s.createJobFromRequest(c, req)
+	job, replayed, failure := s.createJobFromRequest(c, req)
 	if failure != nil {
 		c.JSON(failure.Code, *failure)
 		return
 	}
 
 	stashAuditJobID(c, job.ID)
+	if replayed {
+		// 幂等重放（TASK-RE03）：同一请求重发，返回既有任务而不是再建一个。
+		// 200 + Idempotency-Replayed 头让调用方能区分"新建"与"命中重放"。
+		c.Header("Idempotency-Replayed", "true")
+		c.JSON(200, s.toJobResponse(job))
+		return
+	}
 	c.JSON(201, s.toJobResponse(job))
 }
 
 // createJobFromRequest 校验请求并把任务交给调度器，供单条与批量创建共用。
-// 返回非 nil 的 ErrorResponse 表示失败，调用方决定如何呈现（400/500 或批量里的逐条错误）。
+// 第二个返回值表示命中幂等重放（job 是既有任务而不是新建的）；非 nil 的
+// ErrorResponse 表示失败，调用方决定如何呈现（400/500 或批量里的逐条错误）。
 //
 // c 是 TASK-E16 加的第一个参数：执行器任务的提交档位（executors.required_role）要看请求身份，
 // 而身份只在 gin 上下文里。批量接口逐条独立，档位不够的那一条拿 403，其余照常创建。
-func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*core.Job, *ErrorResponse) {
+func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*core.Job, bool, *ErrorResponse) {
 	// 计算触发时间
 	triggerAt, err := s.calculateTriggerTime(req)
 	if err != nil {
-		return nil, &ErrorResponse{Code: 400, Message: "invalid time format", Details: err.Error()}
+		return nil, false, &ErrorResponse{Code: 400, Message: "invalid time format", Details: err.Error()}
 	}
 
 	// 名称与类型的分工（设计文档 §D4）：带了 type → Name 是标签，套标签规则；
@@ -108,13 +116,13 @@ func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*co
 	legacy := strings.TrimSpace(req.Type) == ""
 	if !legacy {
 		if failure := validateJobNameField(req.Name); failure != nil {
-			return nil, failure
+			return nil, false, failure
 		}
 	}
 
 	key := registrationKey(req)
 	if key == "" {
-		return nil, &ErrorResponse{
+		return nil, false, &ErrorResponse{
 			Code:    400,
 			Message: "job type is required",
 			Details: "either name or type must name a registered job type",
@@ -124,7 +132,7 @@ func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*co
 	// 检查Handler是否存在（注册表在调度器，执行时按同一键回查）
 	handler, ok := s.scheduler.LookupHandler(key)
 	if !ok {
-		return nil, &ErrorResponse{
+		return nil, false, &ErrorResponse{
 			Code:    400,
 			Message: "unknown job type",
 			Details: fmt.Sprintf("job type '%s' not registered", key),
@@ -132,7 +140,7 @@ func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*co
 	}
 
 	if failure := validateJobGroup(req.Group); failure != nil {
-		return nil, failure
+		return nil, false, failure
 	}
 
 	// 解析重试延迟
@@ -148,9 +156,70 @@ func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*co
 	if req.Timeout != "" {
 		d, err := time.ParseDuration(req.Timeout)
 		if err != nil {
-			return nil, &ErrorResponse{Code: 400, Message: "invalid timeout format", Details: err.Error()}
+			return nil, false, &ErrorResponse{Code: 400, Message: "invalid timeout format", Details: err.Error()}
 		}
 		timeout = d
+	}
+
+	// 幂等查重（TASK-RE03）：指纹输入已齐（req 字段 + 解析后的 timeout/retryDelay），
+	// 必须在 Schedule 之前——入队之后才发现"是重放"就晚了。两条判定通道：
+	//   - Idempotency-Key：查登记表（键 → job_id + 指纹），JSON 部署为进程内实现，重启失效；
+	//   - 客户端 job_id：按 SnapshotReader 直查既有快照比对指纹，与登记表无关，重启有效。
+	// 登记与创建当前不是同一事务（TASK-RE07 收口）：登记失败记 error 日志、提交照常——
+	// 幂等保护降级但不挡提交，那个窗口里重发可能重复建任务。
+	requestFingerprint := fingerprintOfRequest(req, timeout, retryDelay)
+
+	idempotencyKey, keyErr := validateIdempotencyKey(c.GetHeader("Idempotency-Key"))
+	if keyErr != nil {
+		return nil, false, keyErr
+	}
+	clientJobID, idErr := validateJobIDField(req.JobID)
+	if idErr != nil {
+		return nil, false, idErr
+	}
+
+	if s.idempotency != nil && idempotencyKey != "" {
+		existingID, existingFingerprint, found, lookupErr := s.idempotency.LookupIdempotency(idempotencyKey)
+		switch {
+		case lookupErr != nil:
+			// 登记表读失败不挡提交：幂等是保护，不是门闩
+			s.logger.Error("idempotency lookup failed; proceeding without dedup",
+				"key", idempotencyKey, "error", lookupErr)
+		case found && existingFingerprint != requestFingerprint:
+			return nil, false, &ErrorResponse{
+				Code:    409,
+				Message: "idempotency key conflict",
+				Details: fmt.Sprintf("Idempotency-Key %q is already bound to job %s with different content", idempotencyKey, existingID),
+			}
+		case found:
+			if job, ok := s.replayJobByID(existingID); ok {
+				return job, true, nil
+			}
+			// 登记表有、快照没了（终态留痕被淘汰）：按未命中处理，重建一份
+			s.logger.Warn("idempotency key points to a pruned job; creating a new one",
+				"key", idempotencyKey, "job_id", existingID)
+		}
+	}
+	if clientJobID != "" {
+		snap, found, getErr := s.snapshotFor(clientJobID)
+		switch {
+		case getErr != nil:
+			s.logger.Error("job id conflict check failed; proceeding without dedup",
+				"job_id", clientJobID, "error", getErr)
+		case found && snap.Fingerprint != "" && snap.Fingerprint == requestFingerprint:
+			job := &core.Job{}
+			job.FromSnapshot(snap)
+			return job, true, nil
+		case found:
+			// 指纹不同，或既有记录没有指纹（TASK-RE03 之前创建 / 服务端内部创建）：
+			// 一律判冲突——ID 被占用就绝不静默覆盖，那是审计黑洞。重放请走
+			// Idempotency-Key，或换一个 job_id。
+			return nil, false, &ErrorResponse{
+				Code:    409,
+				Message: "job id conflict",
+				Details: fmt.Sprintf("job_id %q already exists with different content", clientJobID),
+			}
+		}
 	}
 
 	// 创建任务。Type 存请求原文而不是 trim 后的值：查询时才需要 trim，
@@ -170,11 +239,15 @@ func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*co
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
 	}
+	// 客户端指定的 ID 在 Schedule 之前放进去（Schedule 只在 ID 为空时生成）
+	job.ID = clientJobID
+	// 内容指纹随任务落快照（TASK-RE03）：job_id 撞车判定与重放比对都以它为准
+	job.Fingerprint = requestFingerprint
 
 	// 执行器任务的提交期判定（档位、探测结论、payload、生效超时）。
 	// 必须在 Schedule 之前：入队之后非法 payload 也会真的被执行一次。
 	if failure := s.gateExecutorSubmission(c, job, timeout); failure != nil {
-		return nil, failure
+		return nil, false, failure
 	}
 
 	// 绑定Handler（与执行侧回查用的是同一份注册表）
@@ -182,10 +255,51 @@ func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*co
 
 	// 添加到调度器
 	if err := s.scheduler.Schedule(job); err != nil {
-		return nil, &ErrorResponse{Code: 500, Message: "failed to schedule job", Details: err.Error()}
+		return nil, false, &ErrorResponse{Code: 500, Message: "failed to schedule job", Details: err.Error()}
 	}
 
-	return job, nil
+	// 登记幂等键（TASK-RE03）：创建成功才登记——失败路径不该占用键。
+	// 顺手淘汰过期登记（带索引的删除）；淘汰失败只记日志，下一次提交再试。
+	if s.idempotency != nil && idempotencyKey != "" {
+		if err := s.idempotency.PutIdempotency(idempotencyKey, job.ID, requestFingerprint); err != nil {
+			s.logger.Error("failed to register idempotency key; a retry may create a duplicate",
+				"key", idempotencyKey, "job_id", job.ID, "error", err)
+		} else if err := s.idempotency.PruneExpiredIdempotency(s.idempotencyTTL); err != nil {
+			s.logger.Error("failed to prune expired idempotency keys", "error", err)
+		}
+	}
+
+	return job, false, nil
+}
+
+// snapshotFor 读单条快照：store 实现 SnapshotReader 就直查（JSON 与任务库都有），
+// 第三方实现回退 LoadAll 扫描——与调度器 findSnapshot 的兼容层同一形状。
+func (s *Server) snapshotFor(jobID string) (core.JobSnapshot, bool, error) {
+	if reader, ok := s.store.(core.SnapshotReader); ok {
+		return reader.Get(jobID)
+	}
+	snapshots, err := s.store.LoadAll()
+	if err != nil {
+		return core.JobSnapshot{}, false, err
+	}
+	for _, snap := range snapshots {
+		if snap.ID == jobID {
+			return snap, true, nil
+		}
+	}
+	return core.JobSnapshot{}, false, nil
+}
+
+// replayJobByID 取回要重放的任务：快照已被终态留痕淘汰时返回 false，
+// 调用方按未命中重建（键的登记还在但任务没了，没法重放一份不存在的内容）。
+func (s *Server) replayJobByID(jobID string) (*core.Job, bool) {
+	snap, found, err := s.snapshotFor(jobID)
+	if err != nil || !found {
+		return nil, false
+	}
+	job := &core.Job{}
+	job.FromSnapshot(snap)
+	return job, true
 }
 
 // ListJobs 获取任务列表
@@ -631,7 +745,7 @@ func (s *Server) BatchCreateJobs(c *gin.Context) {
 	failures := make([]BatchItemError, 0)
 
 	for index, req := range reqs {
-		job, failure := s.createJobFromRequest(c, req)
+		job, _, failure := s.createJobFromRequest(c, req)
 		if failure != nil {
 			failures = append(failures, BatchItemError{
 				Index:   index,

@@ -99,6 +99,32 @@ var migrations = []engine.Migration{
 			`CREATE INDEX IF NOT EXISTS idx_attempts_status ON job_attempts(status);`,
 		},
 	},
+	// Version 3（TASK-RE03）：幂等提交登记表。key 是 Idempotency-Key（缺省时
+	// 客户端 job_id 兼作键）；fingerprint 是请求内容的 SHA256（口径见 api 层），
+	// 键命中即比对它区分"重放"与"冲突"。TTL 淘汰由 api 层按 store.idempotency_ttl 驱动。
+	{
+		Version: 3,
+		Up: []string{
+			`CREATE TABLE IF NOT EXISTS job_idempotency (
+  key         TEXT PRIMARY KEY,
+  job_id      TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  created_at  INTEGER NOT NULL           -- UnixNano，TTL 淘汰的排序键
+);`,
+			`CREATE INDEX IF NOT EXISTS idx_idem_job ON job_idempotency(job_id);`,
+			`CREATE INDEX IF NOT EXISTS idx_idem_created ON job_idempotency(created_at);`,
+		},
+		UpPostgres: []string{
+			`CREATE TABLE IF NOT EXISTS job_idempotency (
+  key         TEXT PRIMARY KEY,
+  job_id      TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  created_at  BIGINT NOT NULL            -- UnixNano，TTL 淘汰的排序键
+);`,
+			`CREATE INDEX IF NOT EXISTS idx_idem_job ON job_idempotency(job_id);`,
+			`CREATE INDEX IF NOT EXISTS idx_idem_created ON job_idempotency(created_at);`,
+		},
+	},
 }
 
 // metaJobsImported 是一次性导入的标记：写入即生效，之后 store.path 指向的

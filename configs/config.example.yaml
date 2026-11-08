@@ -62,6 +62,7 @@ store:
   history_limit: 1000   # 保留条数；0=用默认值，-1=不留痕（写入即删除，文件最小）
   history_ttl: 0s       # 保留时长，如 24h；0 表示不按时间淘汰
   attempts_keep_last: 20 # 每任务账本保留条数（TASK-RE02，仅 sqlite/PG 后端生效）；0=用默认值
+  idempotency_ttl: 24h   # 幂等键登记保留时长（TASK-RE03）；窗口内同键重放返回既有任务
   # 分组元数据文件（Web 控制台的 /api/v1/groups 读写它）。与任务快照分文件：
   # 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
   groups_path: ./data/groups.json

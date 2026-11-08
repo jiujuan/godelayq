@@ -121,6 +121,13 @@ func runSQLSnapshot(t *testing.T, s *Store, dialect string) {
 	require.Len(t, attempts, 2)
 	require.NoError(t, s.PruneAttempts("j1", 1))
 
+	// 幂等链（TASK-RE03）：快照直查（SnapshotReader）+ 登记表的查/登（先到先得）/淘汰。
+	_, _, _ = s.Get("j1")
+	_, _, _, _ = s.LookupIdempotency("key-1")
+	require.NoError(t, s.PutIdempotency("key-1", "j1", "fp-1"))
+	require.NoError(t, s.PutIdempotency("key-1", "j2", "fp-2"))
+	require.NoError(t, s.PruneExpiredIdempotency(time.Hour))
+
 	require.NotEmpty(t, rec.queries, "捕获不到语句：hook 是否挂上了？")
 	compareGolden(t, dialect, strings.Join(rec.queries, ";\n"))
 }

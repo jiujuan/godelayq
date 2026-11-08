@@ -22,11 +22,16 @@ type Server struct {
 	store     core.Store
 	// attempts 是逐次尝试账本的读取方（TASK-RE02）；nil = JSON 部署没有账本能力，
 	// /jobs/:id/attempts 返回 ledger:false 的降级形状而不是 503。
-	attempts  attemptReader
-	engine    *gin.Engine
-	wsServer  *core.WSServer
-	httpSrv   *http.Server
-	port      string
+	attempts attemptReader
+	// idempotency 是幂等键登记表（TASK-RE03）：库模式由 jobs.Store 实现（持久），
+	// JSON 模式注入进程内 map（重启失效）。nil 表示调用方既没注入任何一种——
+	// 提交按"无幂等"处理（旧行为），不报错。
+	idempotency    idempotencyStore
+	idempotencyTTL time.Duration
+	engine         *gin.Engine
+	wsServer       *core.WSServer
+	httpSrv        *http.Server
+	port           string
 	sec       Security
 	startTime time.Time
 	// logger 访问日志与服务器生命周期日志

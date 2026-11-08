@@ -81,6 +81,8 @@ var configClasses = map[string]ConfigClass{
 	// 账本保留条数（TASK-RE02）：读数在调度器构造时注入，热改不生效
 	// （history_limit/history_ttl 是热档，在上方单独登记）。
 	"store.attempts_keep_last": ClassRestart,
+	// 幂等键 TTL（TASK-RE03）：读数在 api 服务构造时注入，热改不生效。
+	"store.idempotency_ttl": ClassRestart,
 	// 任务快照 SQLite 后端（TASK-M03）：与 mgrstore.* 同为重启档。
 	"store.sqlite.path": ClassRestart, "store.sqlite.busy_timeout": ClassRestart,
 	"store.sqlite.synchronous": ClassRestart, "store.sqlite.dialect": ClassRestart,

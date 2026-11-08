@@ -176,6 +176,9 @@ type StoreConfig struct {
 	// JSON 后端没有账本）。0 表示 DefaultAttemptsKeepLast。收尾即裁剪，
 	// cron 任务滚动保新，不会随轮次无限增长。
 	AttemptsKeepLast int `mapstructure:"attempts_keep_last"`
+	// IdempotencyTTL 幂等键登记的保留时长（TASK-RE03）。0 表示 DefaultIdempotencyTTL。
+	// JSON 后端的登记表在进程内，重启即失效，本键对它同样生效（进程生命周期内）。
+	IdempotencyTTL time.Duration `mapstructure:"idempotency_ttl"`
 	// GroupsPath 分组元数据文件路径，与任务快照分文件存放：
 	// 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
 	GroupsPath string `mapstructure:"groups_path"`
@@ -836,6 +839,9 @@ const (
 	DefaultJobsBusyTimeout = DefaultObserveBusyTimeout
 	// DefaultJobsSynchronous 任务快照库 synchronous PRAGMA 取值。
 	DefaultJobsSynchronous = DefaultObserveSynchronous
+	// DefaultIdempotencyTTL 幂等键登记的保留时长（TASK-RE03，store.idempotency_ttl
+	// 的 0/缺省取值）。窗口内同一键重放返回既有任务；过期后同一键可以再建新任务。
+	DefaultIdempotencyTTL = 24 * time.Hour
 )
 
 // MgrStoreConfig 管理库：控制台账号、分组元数据、执行器档位的 SQLite 存储。
@@ -975,6 +981,7 @@ func DefaultConfig() Config {
 			HistoryLimit:     DefaultHistoryLimit,
 			HistoryTTL:       0,
 			AttemptsKeepLast: DefaultAttemptsKeepLast,
+			IdempotencyTTL:   DefaultIdempotencyTTL,
 			GroupsPath:       DefaultGroupsPath,
 			SQLite:           StoreSQLiteConfig{Path: DefaultJobsDBPath, Dialect: "sqlite"},
 		},
@@ -1325,6 +1332,9 @@ func (c Config) Normalized() Config {
 		// 0 是"没配"，负数不解释成"不留账本"——账本裁剪没有"全留"的合理场景，
 		// 写错就回默认（与 history_limit 的 -1 语义刻意不同，那是有意的关闸）。
 		c.Store.AttemptsKeepLast = defaults.Store.AttemptsKeepLast
+	}
+	if c.Store.IdempotencyTTL <= 0 {
+		c.Store.IdempotencyTTL = defaults.Store.IdempotencyTTL
 	}
 	if c.Store.GroupsPath == "" {
 		c.Store.GroupsPath = defaults.Store.GroupsPath

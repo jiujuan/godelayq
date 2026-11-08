@@ -255,6 +255,7 @@ func (s *Scheduler) eventResult(job *Job) (ExecMeta, bool) {
 //     "确实停住了"，Cancel 调用侧不再立即落盘）；
 //  3. 调度器已停止 → 落回 pending，重启后照常重跑（优雅关停路径，至少一次语义，
 //     副作用可能重复，Handler 需自行保证幂等）。
+//
 // 调度器还在跑、又没有任何标记：只有绕过 Cancel 直调 CancelRunning 才会走到这里，
 // 维持既有口径——只记日志，快照保持 running，交给重启后的 Restore 处置。
 func (s *Scheduler) handleInterrupted(job *Job) {
@@ -333,21 +334,22 @@ func (s *Scheduler) handleSuccess(job *Job) {
 		next, err := s.cronParser.Next(job.CronExpr, time.Now())
 		if err == nil {
 			newJob := &Job{
-				ID:         job.ID, // 保持相同ID会覆盖旧数据
-				Name:       job.Name,
-				Type:       job.Type,
-				Payload:    job.Payload,
-				Group:      job.Group, // 重排是同一逻辑任务的下一轮，丢分组等于凭空换组
-				TriggerAt:  next,
-				Handler:    job.Handler,
-				CronExpr:   job.CronExpr,
-				IsRepeat:   true,
-				MaxRetries: job.MaxRetries,
-				Timeout:    job.Timeout,
-				Status:     StatusPending,
-				CreatedAt:  job.CreatedAt,
-				UpdatedAt:  time.Now(),
-				Attempts:   job.Attempts, // 账本 seq 跨 cron 轮次单调（TASK-RE02 修复，口径同 CloneForRetry）
+				ID:          job.ID, // 保持相同ID会覆盖旧数据
+				Name:        job.Name,
+				Type:        job.Type,
+				Payload:     job.Payload,
+				Group:       job.Group, // 重排是同一逻辑任务的下一轮，丢分组等于凭空换组
+				TriggerAt:   next,
+				Handler:     job.Handler,
+				CronExpr:    job.CronExpr,
+				IsRepeat:    true,
+				MaxRetries:  job.MaxRetries,
+				Timeout:     job.Timeout,
+				Status:      StatusPending,
+				CreatedAt:   job.CreatedAt,
+				UpdatedAt:   time.Now(),
+				Attempts:    job.Attempts, // 账本 seq 跨 cron 轮次单调（TASK-RE02 修复，口径同 CloneForRetry）
+				Fingerprint: job.Fingerprint,
 				// 不写 Exec：下一轮是一次新的执行，带上一次的退出码会让详情页在跑完之前显示旧结论。
 				// 这里是显式字段列表，漏写即是置 nil，与 CloneForRetry 的口径一致。
 			}
