@@ -62,6 +62,15 @@ cron 触发按任务自己的时区计算；停机错过的窗口有策略（补
 - **风险：grace_period 太小导致每次重启刷 misfire 事件**。默认 60s 起步，deployment.md（RE08）给调参建议。
 - 回滚：revert 后回本地时区 + 立即补跑现状；快照里多出的 `timezone` 字段被旧代码忽略。
 
-## 10. 实现记录
+## 10. 实现记录（2026-11-08）
 
-（待实现后回填。）
+分支 `feat/reliable-execution`。按卡交付，两处口径补充进代码注释与设计文档：
+
+- **core/cron.go**：`Next(expr, now, loc)`——nil 表示按入参时刻自带时区展开（与旧行为逐字节等价，robfig 按入参时区计算）；`CountMissedWindows(expr, from, to)`（迭代封顶 1000，截断返回 true）；`WithMisfirePolicy(policy, grace)` Option。
+- **core/job.go**：Job/JobSnapshot 增 `Timezone`/`MisfirePolicy`（omitempty，快照往返有测试）；`EffectiveLocation`（非法名防御性回本地）与 `EffectiveMisfirePolicy`（任务级优先，未知值回 fire_once）。
+- **core/scheduler_runtime.go**：`applyMisfirePolicy`——判定（IsRepeat+Cron+TriggerAt 非零+早于 now-宽限）→ fire_once 保持过期时刻（立即补跑，dispatchSource 盖 misfire 章）/ skip 改写下一窗口（回 scheduled 章），两种都发 `job.misfired`（missed_count/first_missed_at/policy，截断加标）；Restore 判定点在改判与入堆之前。
+- **core/scheduler_job.go（Schedule 判定点）**：cron 分支三路径——TriggerAt 为零按表达式（含时区）取下一窗口；其余交 applyMisfirePolicy。**与旧行为的惟一差异**：宽限内的过期时刻从"重算 Next(now) 跳过该窗口"改为"立即触发该窗口"——宽限语义的自洽结论，已有测试（TestScheduler_Resume_CronJobKeepsRecentTrigger）按新契约改写；表达式合法性先验一次（三条路径都要求可解析）。
+- **api**：`timezone`/`misfire_policy` 请求字段 + 提交期校验（非法 IANA 名/未知策略 400）；calculateTriggerTime 按声明时区算首轮。
+- **配置**：`scheduler.misfire_policy`（fire_once|skip，默认 fire_once）+ `scheduler.misfire_grace_period`（默认 60s，负值拒）；ClassRestart；两份 YAML 同步；cmd/server 注入 WithMisfirePolicy。
+- **测试**：misfire_test.go 九用例——计数（正常/空区间/封顶/非法表达式）、NY 时区跨春秋令墙钟不变、Restore fire_once/skip/宽限/封顶四态（含 dispatchSource 与事件 metadata 断言）、Schedule 双判定点、快照往返、EffectiveLocation 防御回退。
+- **验证**：`go build/vet` 干净；`go test ./... -count=1` 九包全绿（TestExampleConfigMatchesLocal 含新键）。

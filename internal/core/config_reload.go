@@ -74,6 +74,9 @@ var configClasses = map[string]ConfigClass{
 	"scheduler.shutdown_timeout": ClassRestart,
 	// 恢复策略（TASK-RE05）：读数在 installRestoreGuard 装配时消费，热改不生效。
 	"scheduler.recovery_policy":  ClassRestart,
+	// misfire 策略与宽限（TASK-RE06）：读数在调度器构造时注入，热改不生效。
+	"scheduler.misfire_policy":   ClassRestart,
+	"scheduler.misfire_grace_period": ClassRestart,
 	"logging.format":             ClassRestart,
 	"reload.enabled":             ClassRestart,
 	// 其余全部落在重启档：用一张默认表反而看不清"哪些键想过关"，

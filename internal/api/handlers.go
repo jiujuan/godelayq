@@ -161,6 +161,23 @@ func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*co
 		timeout = d
 	}
 
+	// 时区与 misfire 策略的提交期校验（TASK-RE06）：非法 IANA 名与未知策略直接 400，
+	// 不靠 core 的防御性兜底——写错的时区会让"每天 09:00"悄悄落到服务器本地。
+	if req.Timezone != "" {
+		if _, err := time.LoadLocation(req.Timezone); err != nil {
+			return nil, false, &ErrorResponse{Code: 400, Message: "invalid timezone", Details: err.Error()}
+		}
+	}
+	switch req.MisfirePolicy {
+	case "", "fire_once", "skip":
+	default:
+		return nil, false, &ErrorResponse{
+			Code:    400,
+			Message: "invalid misfire policy",
+			Details: fmt.Sprintf("misfire_policy %q is invalid, use fire_once or skip", req.MisfirePolicy),
+		}
+	}
+
 	// 幂等查重（TASK-RE03）：指纹输入已齐（req 字段 + 解析后的 timeout/retryDelay），
 	// 必须在 Schedule 之前——入队之后才发现"是重放"就晚了。两条判定通道：
 	//   - Idempotency-Key：查登记表（键 → job_id + 指纹），JSON 部署为进程内实现，重启失效；
@@ -225,19 +242,21 @@ func (s *Server) createJobFromRequest(c *gin.Context, req CreateJobRequest) (*co
 	// 创建任务。Type 存请求原文而不是 trim 后的值：查询时才需要 trim，
 	// 而存进快照与响应的应当是调用方写下的那个写法。
 	job := &core.Job{
-		Name:       req.Name,
-		Type:       req.Type,
-		Payload:    []byte(req.Payload),
-		TriggerAt:  triggerAt,
-		Group:      req.Group,
-		CronExpr:   req.CronExpr,
-		IsRepeat:   req.IsRepeat,
-		Timeout:    timeout,
-		MaxRetries: req.MaxRetries,
-		RetryDelay: retryDelay,
-		Status:     core.StatusPending,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
+		Name:          req.Name,
+		Type:          req.Type,
+		Payload:       []byte(req.Payload),
+		TriggerAt:     triggerAt,
+		Group:         req.Group,
+		CronExpr:      req.CronExpr,
+		IsRepeat:      req.IsRepeat,
+		Timezone:      req.Timezone,
+		MisfirePolicy: req.MisfirePolicy,
+		Timeout:       timeout,
+		MaxRetries:    req.MaxRetries,
+		RetryDelay:    retryDelay,
+		Status:        core.StatusPending,
+		CreatedAt:     time.Now(),
+		UpdatedAt:     time.Now(),
 	}
 	// 客户端指定的 ID 在 Schedule 之前放进去（Schedule 只在 ID 为空时生成）
 	job.ID = clientJobID
@@ -774,9 +793,17 @@ func (s *Server) calculateTriggerTime(req CreateJobRequest) (time.Time, error) {
 
 	// 优先级：Cron > TriggerAt > Delay > 立即执行
 	if req.CronExpr != "" {
-		// 计算下次执行时间（使用robfig/cron）
+		// 计算下次执行时间（使用robfig/cron）；任务声明了时区就按它展开（TASK-RE06）
+		var loc *time.Location
+		if req.Timezone != "" {
+			loaded, err := time.LoadLocation(req.Timezone)
+			if err != nil {
+				return time.Time{}, fmt.Errorf("invalid timezone %q: %w", req.Timezone, err)
+			}
+			loc = loaded
+		}
 		parser := core.NewCronParser()
-		next, err := parser.Next(req.CronExpr, now)
+		next, err := parser.Next(req.CronExpr, now, loc)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("invalid cron expression: %w", err)
 		}

@@ -239,18 +239,21 @@ func TestScheduler_Resume_ExpiredOneShotRunsImmediately(t *testing.T) {
 	}
 }
 
-func TestScheduler_Resume_CronJobGetsFutureTrigger(t *testing.T) {
+// TASK-RE06 后的 Resume cron 契约：宽限内刚过期的触发时刻不算错过，
+// 原样保留（调度循环立即触发该窗口），不发 misfired 事件、不丢表达式。
+// 超宽限的处置（补跑/跳过）由 misfire_test.go 按策略覆盖。
+func TestScheduler_Resume_CronJobKeepsRecentTrigger(t *testing.T) {
 	store := newMockStore()
-	scheduler := NewScheduler(store, nil, nil)
+	scheduler := NewScheduler(store, nil, nil, WithMisfirePolicy("fire_once", time.Minute))
+	events := collectEvents(scheduler.GetEventBus())
 
-	before := time.Now()
 	job := &Job{
 		ID:        "resume-cron",
 		Name:      "tick",
 		Type:      "tick",
 		CronExpr:  "*/5 * * * * *", // 每 5 秒
 		IsRepeat:  true,
-		TriggerAt: before.Add(-time.Minute),
+		TriggerAt: time.Now().Add(-time.Second), // 宽限（1 分钟）之内
 	}
 	if err := scheduler.Schedule(job); err != nil {
 		t.Fatalf("Schedule 失败: %v", err)
@@ -263,11 +266,14 @@ func TestScheduler_Resume_CronJobGetsFutureTrigger(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Resume 失败: %v", err)
 	}
-	if !resumed.TriggerAt.After(before) {
-		t.Errorf("Cron 任务恢复后应排在将来时刻，实际 %v（早于 %v）", resumed.TriggerAt, before)
+	if resumed.TriggerAt.After(time.Now()) {
+		t.Errorf("宽限内的触发时刻应原样保留（立即触发该窗口），实际被改写为 %v", resumed.TriggerAt)
 	}
 	if resumed.CronExpr != "*/5 * * * * *" {
 		t.Errorf("恢复不该丢 Cron 表达式，实际 %q", resumed.CronExpr)
+	}
+	if events.has(EventJobMisfired, "resume-cron") {
+		t.Error("宽限内的恢复不该发 misfired 事件")
 	}
 }
 

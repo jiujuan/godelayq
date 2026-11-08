@@ -362,7 +362,7 @@ func (s *Scheduler) handleSuccess(job *Job) {
 	// 的转移因此不经 transition（新对象上无从取 from），前置事实是"本轮已成功"，
 	// 例外已被 parkForcedPause 认领与 cancelRequested 消费兜住。
 	if job.IsRepeat && job.CronExpr != "" {
-		next, err := s.cronParser.Next(job.CronExpr, time.Now())
+		next, err := s.cronParser.Next(job.CronExpr, time.Now(), job.EffectiveLocation())
 		if err == nil {
 			newJob := &Job{
 				ID:          job.ID, // 保持相同ID会覆盖旧数据

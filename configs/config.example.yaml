@@ -53,6 +53,8 @@ scheduler:
   max_retry_delay: 30m  # 指数退避的单次重试延迟上限
   shutdown_timeout: 5s  # 优雅关闭等待时长
   recovery_policy: auto # 崩溃恢复策略（TASK-RE05）：auto（执行器停paused，普通重放）|replay|pause
+  misfire_policy: fire_once # cron 错过窗口的策略（TASK-RE06）：fire_once（补跑一次）|skip
+  misfire_grace_period: 60s # misfire 判定宽限（TASK-RE06）：TriggerAt 早于 now-宽限才算错过
 
 store:
   type: json            # 存储后端：json（默认，合并落盘）|sqlite（直写，TASK-M03）；切换需重启

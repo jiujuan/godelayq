@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"time"
 )
 
 // Option 是组件构造时的可选配置，供 NewScheduler、NewWSServer 等共用。
@@ -18,6 +19,9 @@ type componentOptions struct {
 	// ledger/attemptsKeepLast 是逐次尝试账本的注入位（TASK-RE02，WithAttemptLedger）。
 	ledger           AttemptLedger
 	attemptsKeepLast int
+	// misfirePolicy/misfireGrace 是 cron 错过窗口的注入位（TASK-RE06，WithMisfirePolicy）。
+	misfirePolicy string
+	misfireGrace  time.Duration
 }
 
 // WithLogger 为组件注入日志器；传 nil 表示沿用 slog.Default()，

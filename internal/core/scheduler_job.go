@@ -22,13 +22,23 @@ func (s *Scheduler) Schedule(job *Job) error {
 		job.Status = StatusPending
 	}
 
-	// 如果是Cron任务，计算下次执行时间
+	// 如果是Cron任务，先验表达式合法性，再按触发时刻分派（TASK-RE06）：
+	//   - TriggerAt 为零 = 新提交：按表达式（含任务时区）取下一个未来时点；
+	//   - 其余（未来的下一轮、宽限内的刚过期、超宽限的错过）交给
+	//     applyMisfirePolicy——未来与宽限内原样保留，错过才按策略处置。
+	// 与旧行为的惟一差异：宽限内的过期时刻从"重算 Next(now) 跳过该窗口"
+	// 改为"立即触发该窗口"，理由见设计文档 §7.6。
 	if job.IsRepeat && job.CronExpr != "" {
-		next, err := s.cronParser.Next(job.CronExpr, time.Now())
-		if err != nil {
+		now := time.Now()
+		if _, err := s.cronParser.Next(job.CronExpr, now, job.EffectiveLocation()); err != nil {
 			return err
 		}
-		job.TriggerAt = next
+		if job.TriggerAt.IsZero() {
+			next, _ := s.cronParser.Next(job.CronExpr, now, job.EffectiveLocation())
+			job.TriggerAt = next
+		} else {
+			s.applyMisfirePolicy(job, now)
+		}
 	}
 
 	// 执行类别在入堆之前盖章：投递判断要在堆的锁里读它，那时不该再回头查注册表。

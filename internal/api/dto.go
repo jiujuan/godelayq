@@ -35,6 +35,13 @@ type CreateJobRequest struct {
 	Payload  json.RawMessage `json:"payload,omitempty" swaggertype:"object"` // 任务数据
 	IsRepeat bool            `json:"is_repeat,omitempty"`                    // 是否重复执行（Cron任务）
 
+	// Timezone 是 cron 展开用的 IANA 时区（可选，TASK-RE06），如 Asia/Shanghai；
+	// 空 = 服务器本地。仅对 cron 表达式有意义，一次性任务给的是绝对时刻。
+	Timezone string `json:"timezone,omitempty" example:"Asia/Shanghai"`
+	// MisfirePolicy 是 cron 错过窗口的策略（可选，TASK-RE06）：
+	// fire_once（默认，补跑一次）| skip（跳到下一窗口）；空 = 继承全局默认。
+	MisfirePolicy string `json:"misfire_policy,omitempty"`
+
 	// Group 分组标签，可留空。不要求分组已在 /groups 注册（见 docs/design/web-console-design.md §5.3），
 	// 取值受 core 的名称规则约束，因为它会出现在 URL 查询参数里。
 	Group string `json:"group,omitempty" example:"nightly"`

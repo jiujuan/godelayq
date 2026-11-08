@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -43,6 +44,11 @@ type Scheduler struct {
 	// 指针指向的是"接口值本身"，因此读写都是整条策略一次换掉，不存在半新半旧的策略。
 	retryPolicy atomic.Pointer[RetryPolicy]
 	cronParser  CronParser
+
+	// misfirePolicy/misfireGrace 是 cron 错过窗口的全局默认（TASK-RE06），
+	// 构造后不变（配置归 ClassRestart）；任务级 MisfirePolicy 字段优先于全局默认。
+	misfirePolicy string
+	misfireGrace  time.Duration
 
 	// 控制
 	mu      sync.RWMutex
@@ -202,6 +208,17 @@ func NewScheduler(store Store, retryPolicy RetryPolicy, eventBus *EventBus, opts
 		}
 	} else {
 		s.logger.Info("attempt ledger not available; per-attempt records are disabled (audit relies on the event stream)")
+	}
+
+	// misfire 全局默认（TASK-RE06）：未注入用默认（fire_once + 60s 宽限），
+	// 与"什么都不配 = 现状行为"对齐。
+	s.misfirePolicy = settings.misfirePolicy
+	if s.misfirePolicy == "" {
+		s.misfirePolicy = DefaultMisfirePolicy
+	}
+	s.misfireGrace = settings.misfireGrace
+	if s.misfireGrace <= 0 {
+		s.misfireGrace = DefaultMisfireGracePeriod
 	}
 	return s
 }

@@ -9,7 +9,7 @@ func TestNewCronParser(t *testing.T) {
 	parser := NewCronParser()
 	// Test that parser can be created without panic
 	// and can parse a simple cron expression
-	_, err := parser.Next("* * * * *", time.Now())
+	_, err := parser.Next("* * * * *", time.Now(), nil)
 	if err != nil {
 		t.Errorf("Expected parser to work, got error: %v", err)
 	}
@@ -158,7 +158,7 @@ func TestCronParser_Next(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			next, err := parser.Next(tt.cronExpr, tt.now)
+			next, err := parser.Next(tt.cronExpr, tt.now, nil)
 
 			if tt.wantErr {
 				if err == nil {
@@ -193,7 +193,7 @@ func TestCronParser_Next_EdgeCases(t *testing.T) {
 		cronExpr := "0 12 29 2 *"
 		now := time.Date(2024, 1, 1, 0, 0, 0, 0, time.UTC)
 
-		next, err := parser.Next(cronExpr, now)
+		next, err := parser.Next(cronExpr, now, nil)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -208,7 +208,7 @@ func TestCronParser_Next_EdgeCases(t *testing.T) {
 		cronExpr := "0 0 1 1 *" // Jan 1 at midnight
 		now := time.Date(2024, 12, 31, 23, 0, 0, 0, time.UTC)
 
-		next, err := parser.Next(cronExpr, now)
+		next, err := parser.Next(cronExpr, now, nil)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -223,12 +223,12 @@ func TestCronParser_Next_EdgeCases(t *testing.T) {
 		cronExpr := "*/10 * * * *" // Every 10 minutes
 		now := time.Date(2024, 1, 1, 12, 0, 0, 0, time.UTC)
 
-		next1, err := parser.Next(cronExpr, now)
+		next1, err := parser.Next(cronExpr, now, nil)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
 
-		next2, err := parser.Next(cronExpr, next1)
+		next2, err := parser.Next(cronExpr, next1, nil)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}

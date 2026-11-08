@@ -339,6 +339,9 @@ func defaultRuntimeDeps(cfg core.Config, configPath string, levelVar *slog.Level
 			if ledger, ok := store.(core.AttemptLedger); ok {
 				opts = append(opts, core.WithAttemptLedger(ledger, cfg.Store.AttemptsKeepLast))
 			}
+			// misfire 全局默认（TASK-RE06）：策略与宽限从 scheduler 节传入，
+			// 任务级 misfire_policy 字段在 core 侧优先。
+			opts = append(opts, core.WithMisfirePolicy(cfg.Scheduler.MisfirePolicy, cfg.Scheduler.MisfireGracePeriod))
 			return core.NewScheduler(store, retryPolicy, eventBus, opts...)
 		},
 		newExecutorRegistry: executor.NewRegistry,

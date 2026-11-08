@@ -26,6 +26,10 @@ const (
 	EventJobPaused EventType = "job.paused"
 	// EventJobResumed 表示暂停的任务被恢复排期。
 	EventJobResumed EventType = "job.resumed"
+	// EventJobMisfired 表示 cron 任务错过了触发窗口（TASK-RE06）。
+	// metadata：missed_count（错过的窗口数，封顶截断时附 missed_count_truncated）、
+	// first_missed_at（第一个错过的触发时刻）、policy（fire_once|skip）。
+	EventJobMisfired EventType = "job.misfired"
 	// EventHeapUpdate 预留给堆状态变化或监控场景使用。
 	EventHeapUpdate EventType = "heap.updated"
 )

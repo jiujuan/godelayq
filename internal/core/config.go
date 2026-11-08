@@ -162,6 +162,12 @@ type SchedulerConfig struct {
 	//   pause：所有类别一律停 paused（保守部署：外部副作用不可重放的任务都等人确认）。
 	// 显式配置（非空非 auto）时全局生效，优先于只管执行器的 executors.restore_policy。
 	RecoveryPolicy string `mapstructure:"recovery_policy"`
+	// MisfirePolicy cron 错过窗口的全局默认策略（TASK-RE06）：fire_once（缺省，
+	// 补跑一次）| skip（跳到下一窗口）。任务级 misfire_policy 字段优先于它。
+	MisfirePolicy string `mapstructure:"misfire_policy"`
+	// MisfireGracePeriod misfire 判定的宽限期（TASK-RE06）：TriggerAt 早于
+	// now-宽限才算错过。0 表示 DefaultMisfireGracePeriod；负值同样回默认。
+	MisfireGracePeriod time.Duration `mapstructure:"misfire_grace_period"`
 }
 
 // StoreConfig 持久化配置
@@ -849,6 +855,12 @@ const (
 	// DefaultIdempotencyTTL 幂等键登记的保留时长（TASK-RE03，store.idempotency_ttl
 	// 的 0/缺省取值）。窗口内同一键重放返回既有任务；过期后同一键可以再建新任务。
 	DefaultIdempotencyTTL = 24 * time.Hour
+	// DefaultMisfirePolicy cron 错过窗口的全局默认策略（TASK-RE06）：
+	// fire_once = 补跑一次（既有行为的显式化）。
+	DefaultMisfirePolicy = "fire_once"
+	// DefaultMisfireGracePeriod misfire 判定的宽限期（TASK-RE06）：TriggerAt 早于
+	// now-宽限才算错过。秒级停机重启不该刷 misfire 事件，60s 起步。
+	DefaultMisfireGracePeriod = 60 * time.Second
 )
 
 // MgrStoreConfig 管理库：控制台账号、分组元数据、执行器档位的 SQLite 存储。
@@ -976,11 +988,13 @@ func DefaultConfig() Config {
 			},
 		},
 		Scheduler: SchedulerConfig{
-			Workers:         DefaultConcurrency,
-			QueueCapacity:   0, // 与 Workers 相等
-			MaxRetryDelay:   30 * time.Minute,
-			ShutdownTimeout: 5 * time.Second,
-			RecoveryPolicy:  "auto",
+			Workers:            DefaultConcurrency,
+			QueueCapacity:      0, // 与 Workers 相等
+			MaxRetryDelay:      30 * time.Minute,
+			ShutdownTimeout:    5 * time.Second,
+			RecoveryPolicy:     "auto",
+			MisfirePolicy:      DefaultMisfirePolicy,
+			MisfireGracePeriod: DefaultMisfireGracePeriod,
 		},
 		Store: StoreConfig{
 			Type:             "json",
@@ -1223,6 +1237,14 @@ func (c Config) Validate() error {
 	default:
 		return fmt.Errorf("scheduler.recovery_policy %q is invalid, use auto, replay or pause", c.Scheduler.RecoveryPolicy)
 	}
+	switch c.Scheduler.MisfirePolicy {
+	case "", "fire_once", "skip":
+	default:
+		return fmt.Errorf("scheduler.misfire_policy %q is invalid, use fire_once or skip", c.Scheduler.MisfirePolicy)
+	}
+	if c.Scheduler.MisfireGracePeriod < 0 {
+		return fmt.Errorf("scheduler.misfire_grace_period must not be negative, got %v", c.Scheduler.MisfireGracePeriod)
+	}
 
 	switch c.Store.Type {
 	case "json":
@@ -1328,6 +1350,12 @@ func (c Config) Normalized() Config {
 	}
 	if c.Scheduler.RecoveryPolicy == "" {
 		c.Scheduler.RecoveryPolicy = defaults.Scheduler.RecoveryPolicy
+	}
+	if c.Scheduler.MisfirePolicy == "" {
+		c.Scheduler.MisfirePolicy = defaults.Scheduler.MisfirePolicy
+	}
+	if c.Scheduler.MisfireGracePeriod <= 0 {
+		c.Scheduler.MisfireGracePeriod = defaults.Scheduler.MisfireGracePeriod
 	}
 	if c.Scheduler.ShutdownTimeout <= 0 {
 		c.Scheduler.ShutdownTimeout = defaults.Scheduler.ShutdownTimeout

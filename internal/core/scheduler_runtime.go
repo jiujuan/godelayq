@@ -78,6 +78,62 @@ func (s *Scheduler) restoreGuardFn() RestoreGuard {
 	return s.restoreGuard
 }
 
+// applyMisfirePolicy 判定一条 cron 任务是否错过了触发窗口并按策略处置（TASK-RE06）。
+// 判定：IsRepeat + CronExpr + TriggerAt 非零 + TriggerAt 早于 now-宽限期；
+// 未来时刻与宽限内的过期时刻直接返回（后者会立即触发，比"跳到下一窗口"
+// 更贴近排期意图，也是 misfire 语义不把小抖动当故障的边界）。
+// 处置（两种都发 job.misfired 事件留痕）：
+//   - fire_once（默认）：保持过期的 TriggerAt——调度循环马上弹出补跑一次，
+//     派发来源盖 misfire 章（账本上能认出这是补跑）；
+//   - skip：TriggerAt 改写为下一个未来窗口，派发来源回 scheduled
+//    （之后那次执行是正常窗口，不是补跑）；改写失败（表达式此刻解析不出）
+//     保持原时刻立即补跑——好过静默跳过，非法表达式在执行侧自有失败出口。
+//
+// 调用点：Restore（快照重入堆之前）与 Schedule 的 cron 分支——两处都在任务
+// 入堆之前，改写不会与执行侧竞态。
+func (s *Scheduler) applyMisfirePolicy(job *Job, now time.Time) {
+	if !job.IsRepeat || job.CronExpr == "" || job.TriggerAt.IsZero() {
+		return
+	}
+	cutoff := now.Add(-s.misfireGrace)
+	if !job.TriggerAt.Before(cutoff) {
+		return
+	}
+
+	firstMissedAt := job.TriggerAt
+	missed, truncated := s.cronParser.CountMissedWindows(job.CronExpr, firstMissedAt, now)
+
+	policy := job.EffectiveMisfirePolicy(s.misfirePolicy)
+	if policy == "skip" {
+		if next, err := s.cronParser.Next(job.CronExpr, now, job.EffectiveLocation()); err == nil {
+			job.TriggerAt = next
+			job.dispatchSource = AttemptTriggerScheduled
+		}
+	} else {
+		job.dispatchSource = AttemptTriggerMisfire
+	}
+
+	metadata := map[string]interface{}{
+		"missed_count":    missed,
+		"first_missed_at": firstMissedAt,
+		"policy":          policy,
+	}
+	if truncated {
+		metadata["missed_count_truncated"] = true
+	}
+	s.emit(Event{
+		Type:      EventJobMisfired,
+		JobID:     job.ID,
+		JobName:   job.Name,
+		Status:    StatusPending,
+		Timestamp: now,
+		Metadata:  metadata,
+	})
+	s.logger.Warn("cron job missed its trigger window",
+		"job_id", job.ID, "policy", policy, "missed_count", missed,
+		"first_missed_at", firstMissedAt, "next_trigger_at", job.TriggerAt)
+}
+
 // Restore 从持久化存储重建调度队列（崩溃/重启恢复）。
 // 快照中仅 Pending/Running 状态的任务会被重新入队，状态重置为 Pending；
 // 终态留痕与 paused 任务都不入队——暂停是人为决定，重启不该替用户取消它。
@@ -130,6 +186,13 @@ func (s *Scheduler) Restore() error {
 				s.logger.Error("failed to abandon the interrupted attempt",
 					"job_id", snap.ID, "seq", snap.Attempts, "error", err)
 			}
+		}
+
+		// cron 快照错过窗口的判定（TASK-RE06）：在改判与入堆之前应用策略——
+		// fire_once 保持过期时刻立即补跑（dispatchSource 被 misfire 章覆盖），
+		// skip 改写为下一窗口并回 scheduled 章；没错过则维持 restore 章。
+		if job.IsRepeat && job.CronExpr != "" {
+			s.applyMisfirePolicy(job, time.Now())
 		}
 
 		// 改判发生在入堆之前：一旦进了堆就可能被 worker 取走，那时再停它要走取消。
