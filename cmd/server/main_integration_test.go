@@ -686,7 +686,7 @@ type retentionCall struct {
 }
 
 // eventLogStub 是事件写入器的替身：它只回答"关了几次、什么时候关的、丢了多少"，
-// 以及"是不是同一个实例被交给了服务"。真实写入器的读写行为在 store/sqlite 与 api
+// 以及"是不是同一个实例被交给了服务"。真实写入器的读写行为在 store/engine 与 api
 // 两侧各有用例，这里守的是装配与关停顺序。
 type eventLogStub struct {
 	mu         sync.Mutex
@@ -729,7 +729,7 @@ func (s *eventLogStub) Events(string, int) ([]core.Event, error) { return nil, n
 func (s *eventLogStub) Recent(int) ([]core.Event, error) { return nil, nil }
 
 // auditLogStub 是台账写入器的替身：装配用例只关心"交出去的是不是同一个实例"、
-// 关了几次、什么时候关的。真实的写入与查询在 store/sqlite 有用例。
+// 关了几次、什么时候关的。真实的写入与查询在 store/engine 有用例。
 type auditLogStub struct {
 	mu         sync.Mutex
 	closeCalls int
@@ -1055,7 +1055,7 @@ func TestRun_ObservabilityClosedBeforeStore(t *testing.T) {
 }
 
 // TestRun_ObservabilityEnabledOpensAndClosesForReal 用真实的 observe.Open 走一遍装配：
-// 闭包的映射（cfg.Observability → store/sqlite）与 defer 的关闭都是被执行过的那条路径，
+// 闭包的映射（cfg.Observability → store/engine）与 defer 的关闭都是被执行过的那条路径，
 // 替身断言不了这条。库文件建出来、启动日志有那一行、run 返回后连接确实已关。
 func TestRun_ObservabilityEnabledOpensAndClosesForReal(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "data", "observe.sqlite")
@@ -1305,7 +1305,7 @@ func TestRun_NoServerReaderWhenEventsDisabled(t *testing.T) {
 }
 
 // artifactIndexStub 是产物索引的替身：装配用例只回答"闭包返回的那一个实例有没有挂到产物存储上"。
-// 索引真正的读写行为在 store/sqlite 与 executor 两侧各有用例。
+// 索引真正的读写行为在 store/engine 与 executor 两侧各有用例。
 type artifactIndexStub struct{}
 
 func (s *artifactIndexStub) Record(core.ArtifactIndexRecord) error { return nil }

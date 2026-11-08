@@ -1,6 +1,6 @@
 package observe
 
-import "github.com/jiujuan/godelayq/internal/store/sqlite"
+import "github.com/jiujuan/godelayq/internal/store/engine"
 
 // 三张表的 DDL 与 docs/design/sqlite-observability-design.md §6 逐字一致。
 // 表名、列名、索引名一经落地就是契约：S03/S05/S06 只读写，不再执行任何 DDL。
@@ -8,12 +8,12 @@ import "github.com/jiujuan/godelayq/internal/store/sqlite"
 
 // migrationTableName 是观测库记录已应用迁移版本的表名。表名带 observe_ 前缀：
 // 将来若把任务快照也换成 SQLite（设计文档 §4.3），两张迁移表不能撞名
-// （设计文档 §13 风险 6）。建表语句由 sqlite.DB.Migrate 按这个名字生成。
+// （设计文档 §13 风险 6）。建表语句由 engine.DB.Migrate 按这个名字生成。
 const migrationTableName = "observe_schema_migrations"
 
 // migrations 是内置的迁移列表，必须按 version 升序排列。
 // 本卡只有 version 1：建三张表与八个索引。
-var migrations = []sqlite.Migration{
+var migrations = []engine.Migration{
 	{
 		Version: 1,
 		Up: []string{

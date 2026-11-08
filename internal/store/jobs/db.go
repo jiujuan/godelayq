@@ -9,13 +9,13 @@ import (
 	"time"
 
 	"github.com/jiujuan/godelayq/internal/core"
-	"github.com/jiujuan/godelayq/internal/store/sqlite"
+	"github.com/jiujuan/godelayq/internal/store/engine"
 )
 
 // Handle 是任务库的连接句柄：公共底座句柄嵌入。库文件级读数（行数、WAL 大小）
 // 若日后要进运维端点，挂在本类型上。
 type Handle struct {
-	*sqlite.DB
+	*engine.DB
 }
 
 // Store 是 jobs 表上的 core.Store 实现：直写、每变更一个事务，没有内存缓存
@@ -44,7 +44,7 @@ var _ core.Store = (*Store)(nil)
 // 打不开任务库等于快照无处安放，任何一步失败都返回错误，由装配方拒绝启动——
 // 与管理库、观测库同一口径。
 func Open(cfg core.StoreSQLiteConfig, historyLimit int, historyTTL time.Duration, logger *slog.Logger) (*Store, error) {
-	db, err := sqlite.OpenFile(sqlite.Options{
+	db, err := engine.Open(engine.Options{
 		Path:        cfg.Path,
 		BusyTimeout: cfg.BusyTimeout,
 		Synchronous: cfg.Synchronous,

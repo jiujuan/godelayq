@@ -102,7 +102,7 @@ func TestEventEndpointsAreReadLevel(t *testing.T) {
 }
 
 // fakeEventReader 是 eventReader 的替身：它只回答"读到些什么"和"收到了哪个 limit"，
-// 用来把两个端点的库路径与错误路径固定下来。真读库在 store/sqlite 那一侧有用例。
+// 用来把两个端点的库路径与错误路径固定下来。真读库在 store/engine 那一侧有用例。
 type fakeEventReader struct {
 	eventsByJob map[string][]core.Event
 	recent      []core.Event

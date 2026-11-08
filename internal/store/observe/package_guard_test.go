@@ -14,7 +14,7 @@ import (
 //   - 生产文件（非 _test.go）不得 import godelayq/api 与 godelayq/executor：
 //     接口定义在消费方，本包只做隐式实现；反向 import 会把存储层焊死在某个
 //     消费者上，也与"满足关系由装配方编译期把关"的口径冲突。
-//   - 与 store/sqlite 的 TestSQLitePackageImportsNothingInRepo 同一取向：
+//   - 与 store/engine 的 TestSQLitePackageImportsNothingInRepo 同一取向：
 //     违规要在这里被点名，而不是等编译器给一条不带解释的报错。
 //
 // 测试文件例外：artifacts_test.go import executor 构造真实的 ArtifactStore

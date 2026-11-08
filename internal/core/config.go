@@ -1312,7 +1312,7 @@ func (c Config) Normalized() Config {
 		c.Executors.Output.Dir = defaults.Executors.Output.Dir
 	}
 
-	// SQLite 观测层：Enabled 为 false 时这些取值本身不生效，但归一化后传给 store/sqlite
+	// SQLite 观测层：Enabled 为 false 时这些取值本身不生效，但归一化后传给 store/engine
 	// 就不必再各自判空补默认（Validate 已拦下 enabled 时的显式 0 值，这里的补齐只服务
 	// 代码里直接构造的配置）。retention_age 的 0 是"不按时间淘汰"的有意取值，保持原样。
 	if c.Observability.Path == "" {

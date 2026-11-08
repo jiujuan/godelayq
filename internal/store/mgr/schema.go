@@ -1,6 +1,6 @@
 package mgr
 
-import "github.com/jiujuan/godelayq/internal/store/sqlite"
+import "github.com/jiujuan/godelayq/internal/store/engine"
 
 // 表的 DDL 与设计约定一致。表名、列名一经落地就是契约：改动只能以新增迁移
 // 版本号的方式表达，改 version 1 的语句会让已存在的库文件对不上号。
@@ -12,7 +12,7 @@ import "github.com/jiujuan/godelayq/internal/store/sqlite"
 const migrationTableName = "mgr_schema_migrations"
 
 // migrations 是内置的迁移列表，必须按 version 升序排列。目前只有 version 1。
-var migrations = []sqlite.Migration{
+var migrations = []engine.Migration{
 	{
 		Version: 1,
 		Up: []string{

@@ -69,7 +69,7 @@ type Server struct {
 	history *EventHistory
 	// events 是事件时间线的持久化读取方；nil 表示这次部署没装配事件库，
 	// 两个事件端点退回 history（即 S03 之前的行为）。
-	// 它定义在消费方而不是由 store/sqlite 传一个具体类型进来：api 包不许碰驱动。
+	// 它定义在消费方而不是由 store/engine 传一个具体类型进来：api 包不许碰驱动。
 	events eventReader
 	// auditLog 是写操作台账的写入方；nil 表示这次部署没装配观测库（或关了审计子开关），
 	// 中间件退回只记一行结构化日志。它与 events 不同——那一个是读路径，这一个两端都用。
@@ -141,7 +141,7 @@ func WithArtifacts(store *executor.ArtifactStore) Option {
 	return func(s *Server) { s.artifacts = store }
 }
 
-// eventReader 是事件时间线的持久化读取方，由 store/sqlite.EventLog 实现。
+// eventReader 是事件时间线的持久化读取方，由 store/observe.EventLog 实现。
 // 两个方法都按写入顺序升序返回；nil 表示这次部署没装配事件库，
 // GET /jobs/:id/events 与 GET /events 退回内存缓冲（api.EventHistory）。
 //
