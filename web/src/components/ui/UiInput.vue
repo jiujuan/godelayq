@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed } from 'vue'
+import { computed, useId } from 'vue'
 
 interface Props {
   modelValue: string
@@ -18,8 +18,7 @@ const props = defineProps<Props>()
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 
 // label 与 input 必须成对绑定 id，否则点标签聚焦不到输入框，读屏也念不出字段名
-let seq = 0
-const inputId = `ui-input-${++seq}`
+const inputId = useId()
 
 const invalid = computed(() => Boolean(props.error))
 </script>

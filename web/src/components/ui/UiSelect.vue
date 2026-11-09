@@ -6,7 +6,7 @@
    group 是可选的分组名（TASK-N07 的任务类型下拉要用）：原生 select 的分组只能靠 optgroup，
    用一条"—— 分组名 ——"的伪选项代替会让 :key 撞车（多个空值选项），也会让分隔行看着可选中。
    没有一项带 group 时渲染路径与之前逐字相同。 */
-import { computed } from 'vue'
+import { computed, useId } from 'vue'
 
 export interface SelectOption {
   value: string
@@ -28,8 +28,7 @@ interface Props {
 const props = defineProps<Props>()
 const emit = defineEmits<{ 'update:modelValue': [value: string] }>()
 
-let seq = 0
-const selectId = `ui-select-${++seq}`
+const selectId = useId()
 
 const invalid = computed(() => Boolean(props.error))
 
