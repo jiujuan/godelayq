@@ -137,6 +137,20 @@ func TestSlowQueryHook_TruncatesLongSQL(t *testing.T) {
 	assert.True(t, utf8.ValidString(got), "截断收口在 rune 边界上")
 }
 
+// 切点 1023/1024/1025 分别落在 3 字节汉字的末尾、领头字节后、第二个字节后：
+// 三种切法正文都应收口到 1023 字节（341 个完整 rune），结果仍是合法 UTF-8。
+func TestTruncateSQL_MultibyteRuneBoundary(t *testing.T) {
+	long := strings.Repeat("中", 400) // 1200 字节
+	for _, cut := range []int{1023, 1024, 1025} {
+		got := truncateSQL(long, cut)
+		assert.True(t, utf8.ValidString(got), "切点 %d：截断结果必须是合法 UTF-8", cut)
+		require.True(t, strings.HasSuffix(got, slowQueryTruncatedMark), "切点 %d：要带截断标记", cut)
+		body := strings.TrimSuffix(got, slowQueryTruncatedMark)
+		assert.Equal(t, 1023, len(body), "切点 %d：正文是切点前最长的完整 rune 前缀", cut)
+		assert.True(t, strings.HasPrefix(long, body), "切点 %d：正文必须是原文前缀", cut)
+	}
+}
+
 // 失败查询同样记录，并带 error 字段："慢且失败"也是事实。
 func TestSlowQueryHook_FailedQueryLogged(t *testing.T) {
 	hook, handler := newHookWithCapture(time.Millisecond)

@@ -13,8 +13,8 @@ package engine
 import (
 	"context"
 	"log/slog"
+	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/uptrace/bun"
 )
@@ -68,9 +68,6 @@ func truncateSQL(query string, maxBytes int) string {
 	if maxBytes <= 0 || len(query) <= maxBytes {
 		return query
 	}
-	cut := query[:maxBytes]
-	for len(cut) > 0 && !utf8.RuneStart(cut[len(cut)-1]) {
-		cut = cut[:len(cut)-1]
-	}
-	return cut + slowQueryTruncatedMark
+	// 字节切点可能切开多字节字符，ToValidUTF8 把不完整的尾部 rune 整段丢掉。
+	return strings.ToValidUTF8(query[:maxBytes], "") + slowQueryTruncatedMark
 }
