@@ -17,6 +17,11 @@
     表项里的绑定地址决定可用范围：Go 侧的 :::8080 是双栈（IPv4 与 IPv6 都收），
     Vite 默认只绑 ::1（只有 IPv6 回环能用 localhost 连到它）。
 
+    注意：部分 Windows 版本/更新后，TCP 表对 :: 双栈监听行整行查不到
+    （2026-10 的更新后本机实测如此）。脚本对此的对策：等待监听时表查不到
+    就直接探回环口；vite 端口认不到就从它的 Local: 日志行解析；
+    启动前"表里没行但端口能连上"按占用处理并说明，不再盲起进程去撞 bind。
+
     Vite 在配置端口被占用时会自动顺延（vite.config.ts 未设 strictPort），
     因此前端实际端口取自它自己打印的 "Local:" 一行，而不是配置文件里的数字。
 
@@ -372,12 +377,17 @@ function Start-Backend {
     $bin = if ($UseDashboard) { $ConsolePath } else { $ServerBin }
     $record = Read-Record -Service 'backend'
     # 运行记录优先于端口表项：一个在跑的 backend 无论端口对错都占着同一份 ./data，
-    # 再起一个只会让两个进程互相踩快照。
+    # 再起一个只会让两个进程互相踩快照。pid 活着且形态相同就直接认定"已在运行"，
+    # 不再依赖端口表——TCP 表看不见 :: 双栈监听行的环境下，端口分析根本找不到它。
     if ($record) {
         $recPid = 0
         [void][int]::TryParse((Get-Prop $record 'pid'), [ref]$recPid)
-        if ((Test-ProcessAlive -TargetPid $recPid) -and (Get-Prop $record 'command') -ne $bin) {
-            throw ('backend 已在运行（pid {0}，端口 {1}，形态 {2}），换端口或换 -Dashboard 形态请先 stop。' -f $recPid, (Get-Prop $record 'port'), (Get-Prop $record 'command'))
+        if (Test-ProcessAlive -TargetPid $recPid) {
+            if ((Get-Prop $record 'command') -ne $bin) {
+                throw ('backend 已在运行（pid {0}，端口 {1}，形态 {2}），换端口或换 -Dashboard 形态请先 stop。' -f $recPid, (Get-Prop $record 'port'), (Get-Prop $record 'command'))
+            }
+            Write-Line ('backend 已在运行（pid {0}，端口 {1}），本次不重复启动。' -f $recPid, (Get-Prop $record 'port'))
+            return
         }
     }
     $ownPids = @(Get-ManagedPids -Service 'backend')
@@ -386,6 +396,15 @@ function Start-Backend {
     if ($analysis.Verdict -eq 'foreign') {
         Show-PortBlock -Title 'backend' -Analysis $analysis
         throw ('backend 需要的端口 {0} 被外部进程占用：先处理它，或用 -BackendPort 换一个端口。' -f $Port)
+    }
+    if ($analysis.Verdict -eq 'free' -and $analysis.V4) {
+        # 表里没有监听行但端口能连上：本机 TCP 表看不见这类监听行（:: 双栈行在某些
+        # Windows 版本/更新后查不到）。占用者是谁无法确认，盲目再起一个只会撞 bind，
+        # 然后留下一个没有运行记录的孤儿——拒绝并说清处置办法。
+        Show-PortBlock -Title 'backend' -Analysis $analysis
+        $msg = ('端口 {0} 能连通但监听表里查不到占用者（本机 TCP 表看不见这类监听行）。' -f $Port)
+        $msg += '若是上次没记上账的 godelayq-server，先结束该进程再 start；或用 -BackendPort 换端口。'
+        throw $msg
     }
 
     $running = @($analysis.Managed | Where-Object { Test-ProcessAlive -TargetPid $_.Pid })
@@ -471,6 +490,15 @@ function Wait-ForListen {
         if ($ports -contains $Port) { return $Port }
         # 进程活着却绑在别的端口（配置与环境变量各说各话）：如实交回，不在这里替它编理由
         if ($ports.Count -gt 0) { return $ports[0] }
+        # TCP 表查不到监听行时的兜底：本机 TCP 表对 :: 双栈监听行可能整行不可见
+        # （2026-10 的 Windows 更新后实测如此，Go 服务绑的 [::]:8080 查不到）。
+        # 直接探回环口；探到后再等一拍确认进程没死——端口真被外部占用时，
+        # bind 冲突的进程会在这 400ms 里退出，那样交回 -1 走"启动后退出"的报错。
+        if (Test-TcpPort -Port $Port) {
+            Start-Sleep -Milliseconds 400
+            if (-not (Test-ProcessAlive -TargetPid $OwnPid)) { return -1 }
+            return $Port
+        }
         Start-Sleep -Milliseconds 300
     }
     return 0
@@ -499,6 +527,17 @@ function Find-OwnListenPort {
         if ($candidate -ge $BasePort -and $candidate -lt ($BasePort + $Span)) { return $candidate }
     }
     if ($ports.Count -gt 0) { return $ports[0] }
+    return 0
+}
+
+function Get-VitePortFromLog {
+    param([string]$LogPath)
+    # TCP 表查不到监听行时的兜底：Vite 自己打印的 Local: 行就是实际端口
+    # （启动时设了 NO_COLOR=1，日志里没有 ANSI 转义码）。
+    if (-not (Test-Path -LiteralPath $LogPath)) { return 0 }
+    $hit = Select-String -LiteralPath $LogPath -Pattern 'Local:\s*https?://localhost:(\d+)' -ErrorAction SilentlyContinue |
+        Select-Object -Last 1
+    if ($hit) { return [int]$hit.Matches[0].Groups[1].Value }
     return 0
 }
 
@@ -556,6 +595,8 @@ function Start-Frontend {
     for ($i = 0; $i -lt 80; $i++) {
         if (-not (Test-ProcessAlive -TargetPid $p.Id)) { break }
         $actual = Find-OwnListenPort -BasePort $Port -OwnPid $p.Id -Span $ViteProbeCount
+        # 表里查不到监听行（:: 行不可见的环境）就从它自己的日志里认端口
+        if ($actual -le 0) { $actual = Get-VitePortFromLog -LogPath $logPath }
         if ($actual -gt 0) { break }
         Start-Sleep -Milliseconds 250
     }
