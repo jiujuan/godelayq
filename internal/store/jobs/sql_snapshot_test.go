@@ -63,7 +63,9 @@ func TestSQLSnapshot(t *testing.T) {
 	})
 	t.Run("postgres", func(t *testing.T) {
 		cfg := core.StoreSQLiteConfig{Dialect: "postgres", DSN: pgtest.Database(t, "snap_jobs")}
-		s, err := Open(cfg, 1, 0, nil)
+		// 阈值 0：快照 golden 在"慢查询钩子未挂"的默认态生成——
+		// 两个钩子并存的文本一致性由 engine 的并存用例钉住。
+		s, err := Open(cfg, 1, 0, 0, 0, nil)
 		require.NoError(t, err)
 		t.Cleanup(func() { _ = s.Close() })
 		runSQLSnapshot(t, s, "postgres")
@@ -133,6 +135,14 @@ func runSQLSnapshot(t *testing.T, s *Store, dialect string) {
 	bus := core.NewEventBus(10)
 	require.NoError(t, s.UpdateWithEvents(snapshot("ob-1", core.StatusPending, now), []core.Event{
 		{Type: core.EventJobScheduled, JobID: "ob-1", JobName: "job-ob-1", Status: core.StatusPending},
+	}))
+	// W1/Q08：running 快照 + 出箱行 + 账本开始行同一事务——合并通道的语句序列
+	// 靠这一步进 golden，"两条语句并入一个事务"的 diff 在两方言上逐行可见。
+	require.NoError(t, s.UpdateWithEventsAndAttempt(snapshot("ob-2", core.StatusRunning, now), []core.Event{
+		{Type: core.EventJobStarted, JobID: "ob-2", JobName: "job-ob-2", Status: core.StatusRunning},
+	}, core.Attempt{
+		JobID: "ob-2", Seq: 1, Status: core.AttemptRunning, Trigger: core.AttemptTriggerScheduled,
+		StartedAt: now,
 	}))
 	require.NoError(t, s.AppendOutbox([]core.Event{
 		{Type: core.EventJobStarted, JobID: "ob-1", JobName: "job-ob-1", Status: core.StatusRunning},

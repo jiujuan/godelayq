@@ -103,7 +103,7 @@ func TestRun_PostgresStoresEndToEnd(t *testing.T) {
 	require.NotContains(t, logs.String(), "admin123", "启动日志不得泄漏 DSN 口令")
 
 	// 重新打开任务库：直写的那条快照还在——恢复链路的数据源成立。
-	reopened, err := jobs.Open(cfg.Store.SQLite, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	reopened, err := jobs.Open(cfg.Store.SQLite, 0, 0, 0, 0, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.NoError(t, err)
 	defer reopened.Close()
 	snaps, err := reopened.LoadAll()

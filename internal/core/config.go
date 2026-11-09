@@ -200,6 +200,16 @@ type StoreConfig struct {
 	OutboxRetentionAge time.Duration `mapstructure:"outbox_retention_age"`
 	// OutboxMaxPending pending 出箱行的积压上限（TASK-RE07）。0 表示 DefaultOutboxMaxPending。
 	OutboxMaxPending int64 `mapstructure:"outbox_max_pending"`
+	// SlowQueryThreshold 慢查询日志阈值（G5/Q06，仅 sqlite/PG 后端生效：
+	// JSON 后端没有查询）。0 表示关闭（默认）。开启后低于 MinSlowQueryThreshold
+	// 直接拒启——把阈值设得比本地常规查询还快，等于把日志阈值当成日志洪水开关。
+	SlowQueryThreshold time.Duration `mapstructure:"slow_query_threshold"`
+	// StatementTimeout PG 语句超时（G6/Q07，仅 store.type=sqlite 且 dialect=postgres
+	// 生效）：经 DSN 注入 statement_timeout，业务查询的上限；迁移事务内 SET LOCAL
+	// 豁免，启动期长迁移不受影响。0 表示不设（默认），启动日志会 Warn 提示。
+	// 写在 sqlite 方言上会被 Validate 拒绝（与 dsn 同一口径：方言专属键写错方言
+	// 是配置错误，不是"反正不生效"）。
+	StatementTimeout time.Duration `mapstructure:"statement_timeout"`
 	// GroupsPath 分组元数据文件路径，与任务快照分文件存放：
 	// 分组是低频实体，不该被 jobs.json 的高频合并写盘拖着一起重写。
 	GroupsPath string `mapstructure:"groups_path"`
@@ -874,6 +884,10 @@ const (
 	DefaultOutboxFlushInterval = DefaultObserveFlushInterval
 	// MinOutboxFlushInterval 中继周期的下限：低于它等价于"每条事件一个事务"。
 	MinOutboxFlushInterval = 10 * time.Millisecond
+	// MinSlowQueryThreshold 慢查询日志阈值的下限（G5/Q06）：本地 SQLite 常规查询
+	// 在亚毫秒级，低于 1ms 的阈值会把每条查询都记成慢——那是日志洪水不是观测。
+	// 要看更细的耗时分布应该用基准（P2 的 G9），不是把日志阈值压到底。
+	MinSlowQueryThreshold = 1 * time.Millisecond
 	// DefaultOutboxRetentionAge 已投递（dispatched）出箱行的保留时长（TASK-RE07）。
 	DefaultOutboxRetentionAge = 72 * time.Hour
 	// DefaultOutboxMaxPending pending 出箱行的积压上限（TASK-RE07）：
@@ -1273,6 +1287,15 @@ func (c Config) Validate() error {
 		if err := c.Store.SQLite.Validate(); err != nil {
 			return err
 		}
+		// 语句超时是 PG 方言专属（G6/Q07）：写在 sqlite 方言上与"sqlite 却写 dsn"
+		// 同罪——方言专属键写错方言是配置错误，静默忽略会让人以为上限在生效。
+		// type=json 不查（与 outbox_* 同口径：仅库后端生效的键，文档说明即可）。
+		switch strings.TrimSpace(c.Store.SQLite.Dialect) {
+		case "", "sqlite":
+			if c.Store.StatementTimeout > 0 {
+				return fmt.Errorf("store.statement_timeout is only used when store.sqlite.dialect is postgres, got %v", c.Store.StatementTimeout)
+			}
+		}
 	case "":
 		return fmt.Errorf("store.type must not be empty")
 	default:
@@ -1294,6 +1317,17 @@ func (c Config) Validate() error {
 	}
 	if c.Store.OutboxFlushInterval > 0 && c.Store.OutboxFlushInterval < MinOutboxFlushInterval {
 		return fmt.Errorf("store.outbox_flush_interval %v is below the minimum %v", c.Store.OutboxFlushInterval, MinOutboxFlushInterval)
+	}
+	// 负数不是"关"：0 才是关（默认）。负值只可能是笔误，静默折成 0 会把
+	// "我想开但写错了"埋成"开着默认"，与 attempts_keep_last 的取向一致。
+	if c.Store.SlowQueryThreshold < 0 {
+		return fmt.Errorf("store.slow_query_threshold must not be negative, got %v", c.Store.SlowQueryThreshold)
+	}
+	if c.Store.SlowQueryThreshold > 0 && c.Store.SlowQueryThreshold < MinSlowQueryThreshold {
+		return fmt.Errorf("store.slow_query_threshold %v is below the minimum %v", c.Store.SlowQueryThreshold, MinSlowQueryThreshold)
+	}
+	if c.Store.StatementTimeout < 0 {
+		return fmt.Errorf("store.statement_timeout must not be negative, got %v", c.Store.StatementTimeout)
 	}
 	if c.Store.GroupsPath == "" {
 		return fmt.Errorf("store.groups_path must not be empty")

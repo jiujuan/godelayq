@@ -11,12 +11,14 @@ import (
 	"time"
 )
 
-// beginAttempt 在运行态落盘之后记账本开始行（TASK-RE02）。
-// 只由 executeJob 调用：worker 协程持有任务，无并发写者。seq 取自增后的
-// job.Attempts，trigger 取派发来源（CloneForRetry/Restore 盖章，零值即 scheduled）。
-func (s *Scheduler) beginAttempt(job *Job) {
+// newRunningAttempt 组装本次尝试的账本开始行（W1/Q08 拆分自 beginAttempt）。
+// 出箱模式把它并进 running 落盘的同一事务；ledger 不可用（JSON 部署）返回 nil，
+// 调用方据此退回"落盘、账本各自独立"的既有路径。只由 executeJob 调用：
+// worker 协程持有任务，无并发写者。seq 取自增后的 job.Attempts，
+// trigger 取派发来源（CloneForRetry/Restore 盖章，零值即 scheduled）。
+func (s *Scheduler) newRunningAttempt(job *Job) *Attempt {
 	if s.ledger == nil {
-		return
+		return nil
 	}
 	rec := Attempt{
 		JobID:     job.ID,
@@ -25,8 +27,14 @@ func (s *Scheduler) beginAttempt(job *Job) {
 		Trigger:   job.dispatchSource,
 		StartedAt: time.Now(),
 	}
-	if err := s.ledger.BeginAttempt(job.ID, rec); err != nil {
-		s.logger.Error("failed to begin attempt", "job_id", job.ID, "seq", rec.Seq, "error", err)
+	return &rec
+}
+
+// writeBeginAttempt 把开始行写给账本（直发路径的独立补写；出箱路径由合并事务
+// 承担，不经过这里）。调用方已保证 ledger 非 nil。
+func (s *Scheduler) writeBeginAttempt(rec Attempt) {
+	if err := s.ledger.BeginAttempt(rec.JobID, rec); err != nil {
+		s.logger.Error("failed to begin attempt", "job_id", rec.JobID, "seq", rec.Seq, "error", err)
 	}
 }
 
@@ -34,8 +42,14 @@ func (s *Scheduler) beginAttempt(job *Job) {
 // 时长按 job.UpdatedAt（运行态落盘时刻，与 job.completed 事件的 duration_ms 同一基准）
 // 计，transition 会把它改成本次收尾时刻。status 是这次尝试的结论
 // （success/failed/cancelled）；outcome 由调用方按需填充失败明细（TASK-RE04，
-// 仅 failed 行有），nil 表示无明细。裁剪紧随收尾：主键 (job_id, seq) 前缀索引
-// 使代价为常数，失败不影响执行链路。
+// 仅 failed 行有），nil 表示无明细。
+//
+// 裁剪按 seq 取模降频（W3/Q10）：job.Attempts % attemptsKeepLast == 0 时才跑
+// PruneAttempts——cron 高频任务每轮收尾都空跑一次 DELETE（表里几乎永远没有可删
+// 的行）是纯开销。规则不加后台协程、可从账本行 seq 推导（可复现、可解释）；
+// 不恰逢取模点的收尾不补裁，单任务行数上界 keepLast + 未裁窗口（≤ 2×keepLast），
+// 读侧 Attempts 按 limit 取最近 N 条不受影响。终态收尾恰逢取模点时照常裁剪，
+// 不额外补裁。ledger nil（JSON 部署）整段跳过，降级在构造日志里说明过一次。
 func (s *Scheduler) finishAttempt(job *Job, status AttemptStatus, outcome func(*Attempt)) {
 	if s.ledger == nil {
 		return
@@ -54,8 +68,11 @@ func (s *Scheduler) finishAttempt(job *Job, status AttemptStatus, outcome func(*
 	if err := s.ledger.FinishAttempt(job.ID, job.Attempts, rec); err != nil {
 		s.logger.Error("failed to finish attempt", "job_id", job.ID, "seq", rec.Seq, "error", err)
 	}
-	if err := s.ledger.PruneAttempts(job.ID, s.attemptsKeepLast); err != nil {
-		s.logger.Error("failed to prune attempts", "job_id", job.ID, "error", err)
+	// 除数恒 ≥1：ledger 非 nil 时构造器已把 attemptsKeepLast 折成 DefaultAttemptsKeepLast。
+	if job.Attempts%s.attemptsKeepLast == 0 {
+		if err := s.ledger.PruneAttempts(job.ID, s.attemptsKeepLast); err != nil {
+			s.logger.Error("failed to prune attempts", "job_id", job.ID, "error", err)
+		}
 	}
 }
 
@@ -164,20 +181,21 @@ func (s *Scheduler) executeJob(job *Job) {
 		execCtx = withTimeout
 	}
 
-	// 运行态落盘经 transition 收口（TASK-RE01）：pending→running。
+	// 运行态落盘与账本开始行（TASK-RE02 → W1/Q08）：出箱模式下两者同事务落库
+	//（transitionWithAttempt），任何一步失败一起回滚；JSON 部署（attempt 为 nil）
+	// 退回"先落盘、后记账"的独立两次调用，与改动前逐字节一致。
 	// Attempts 先自增再落盘（快照带本次尝试号）；崩溃后重启能从快照看出
 	// 哪些任务当时在执行（由 Restore 复位为待执行），统计接口也不再依赖进程内状态。
 	job.Attempts++
-	s.transition(job, StatusRunning)
-
-	// 账本开始行（TASK-RE02）：运行态已落盘，此刻起的尝试有据可查。
-	s.beginAttempt(job)
+	s.transitionWithAttempt(job, StatusRunning, s.newRunningAttempt(job))
 
 	err := job.Handler(execCtx, job)
 
 	if err == nil {
-		// 发布成功事件（不带状态写，走 emit 收口；终态落盘在 handleSuccess 的 transition 里）
-		s.emit(Event{
+		// 成功事件（W2/Q09）：completed 在这里组装一次（duration_ms 按
+		// job.UpdatedAt——运行态落盘时刻——算定，与 job.completed 事件的既有基准
+		// 相同；transition 会改 UpdatedAt，但时长在组装时就已定死）。
+		completed := Event{
 			Type:      EventJobCompleted,
 			JobID:     job.ID,
 			JobName:   job.Name,
@@ -187,9 +205,16 @@ func (s *Scheduler) executeJob(job *Job) {
 			Metadata: map[string]interface{}{
 				"duration_ms": time.Since(job.UpdatedAt).Milliseconds(),
 			},
-		})
-
-		s.handleSuccess(job)
+		}
+		// 发布点按能力分派：
+		//   - 直发（JSON）模式：这里立即发，保持"事件先于终态落盘"的既有顺序语义；
+		//   - 出箱模式：事件交给 handleSuccess——终态路径随终态快照同事务落库
+		//    （completed 与"任务确实成功"这个结论同生共死）；旁路路径（强制暂停
+		//     改判、cron 重排）没有终态转移，在各自分支开头按既有顺序补发。
+		if s.outbox == nil {
+			s.emit(completed)
+		}
+		s.handleSuccess(job, completed)
 		return
 	}
 
@@ -337,12 +362,33 @@ func (s *Scheduler) handleInterrupted(job *Job) {
 	s.logger.Info("job interrupted by shutdown, kept pending for recovery", "job_id", job.ID)
 }
 
-// 处理成功
-func (s *Scheduler) handleSuccess(job *Job) {
+// 处理成功。
+//
+// completed 事件的发布点按能力分派（W2/Q09）：
+//   - 直发模式：executeJob 已按既有顺序发过，这里的一切照旧；
+//   - 出箱模式 + 终态路径：completed 作为随行事件进 transition(success) 的同一
+//     事务——"任务成功"的结论与它的终态快照同生共死（合并的目的）；
+//   - 出箱模式 + 旁路路径（强制暂停改判、cron 重排）：没有终态转移，completed
+//     在分支开头照旧独立 emit（AppendOutbox），顺序与改动前逐字节一致
+//     （completed 先于 paused / scheduled）。
+func (s *Scheduler) handleSuccess(job *Job, completed Event) {
+	// 强制暂停旁路（出箱模式）：completed 必须先于 paused 事件（既有顺序），
+	// 而 paused 在 parkForcedPause 内部随转移发出——先偷看标记决定是否提前发。
+	// 偷看到认领之间才落进来的标记是竞态窗口：窗口里 completed 在 park 之后
+	// 补偿发出（顺序让步，事件不丢）。直发模式无此问题——executeJob 已按
+	// 既有顺序发过，这里全程不再发。
+	earlyEmitted := false
+	if s.outbox != nil && s.forcedPausePending(job.ID) {
+		s.emit(completed)
+		earlyEmitted = true
+	}
 	// 被请求过强制暂停的任务即便"成功返回"也要停在 paused：
 	// 不检查 ctx 的 Handler 会走到这里，若不拦下来，Cron 的下一轮会被悄悄排上，
 	// 暂停看起来像只生效了几秒钟。
 	if s.parkForcedPause(job, "handler_completed_despite_cancel") {
+		if s.outbox != nil && !earlyEmitted {
+			s.emit(completed)
+		}
 		return
 	}
 
@@ -364,6 +410,11 @@ func (s *Scheduler) handleSuccess(job *Job) {
 	if job.IsRepeat && job.CronExpr != "" {
 		next, err := s.cronParser.Next(job.CronExpr, time.Now(), job.EffectiveLocation())
 		if err == nil {
+			// cron 重排旁路（出箱模式）：没有终态转移，completed 独立发
+			//（AppendOutbox），保持 completed 先于 scheduled 的既有顺序。
+			if s.outbox != nil {
+				s.emit(completed)
+			}
 			newJob := &Job{
 				ID:          job.ID, // 保持相同ID会覆盖旧数据
 				Name:        job.Name,
@@ -390,10 +441,16 @@ func (s *Scheduler) handleSuccess(job *Job) {
 		s.logger.Error("failed to compute next run for cron job", "job_id", job.ID, "cron_expr", job.CronExpr, "error", err)
 	}
 
-	// 终态留痕：completed 事件已在 executeJob 发布，这里只转移 + 落快照（无事件）。
+	// 终态留痕：直发模式的 completed 已在 executeJob 发布（无随行事件，与改动前
+	// 逐字节一致）；出箱模式的 completed 随终态快照进同一事务（W2/Q09 的目的——
+	// persistAndEmit 把随行事件与状态写一起交 UpdateWithEvents）。
 	// 是否长期保留由存储保留策略决定。cron 分支计算失败也会落到这里，
 	// 与改动前"落成功快照"的兜底一致。
-	s.transition(job, StatusSuccess)
+	var terminalEvents []Event
+	if s.outbox != nil {
+		terminalEvents = append(terminalEvents, completed)
+	}
+	s.transition(job, StatusSuccess, terminalEvents...)
 }
 
 // 处理失败与重试。

@@ -23,6 +23,7 @@ type mockLedger struct {
 	finishes      map[int]Attempt
 	finishesByJob map[string]Attempt
 	abandoned     []int
+	prunes        []string // 每次 PruneAttempts 记 "jobID#keepLast"（W3/Q10 的位置断言用）
 }
 
 func newMockLedger() *mockLedger {
@@ -53,7 +54,12 @@ func (m *mockLedger) AbandonAttempts(jobID string, uptoSeq int, at time.Time) er
 
 func (m *mockLedger) Attempts(jobID string, limit int) ([]Attempt, error) { return nil, nil }
 
-func (m *mockLedger) PruneAttempts(jobID string, keepLast int) error { return nil }
+func (m *mockLedger) PruneAttempts(jobID string, keepLast int) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.prunes = append(m.prunes, jobID+"#"+strconv.Itoa(keepLast))
+	return nil
+}
 
 func (m *mockLedger) beginCount() int {
 	m.mu.Lock()
@@ -305,4 +311,32 @@ func TestAttemptClassOf(t *testing.T) {
 	require.Equal(t, "timeout", attemptClassOf(errors.New("unrelated"), true))
 	require.Equal(t, "transport", attemptClassOf(&classifiedError{class: "transport"}, false))
 	require.Equal(t, "handler_error", attemptClassOf(errors.New("plain"), false))
+}
+
+// W3/Q10：prune 按 seq 取模触发——只在 attempts % keepLast == 0 的收尾跑，
+// 不逢取模点的收尾（含终态）不补裁；cron 高频路径的空跑 DELETE 因此消除。
+// mockLedger 记的是 keepLast（每次调用同值），位置断言按"逐 seq 的累计次数"做。
+func TestFinishAttempt_PruneThrottledBySeqModulo(t *testing.T) {
+	ledger := newMockLedger()
+	scheduler := NewScheduler(newMockStore(), nil, nil, quietLogger(), WithAttemptLedger(ledger, 3))
+
+	job := &Job{ID: "w3", Status: StatusRunning}
+	cumulative := make(map[int]int, 9) // seq -> 该次收尾后的累计 prune 次数
+	for seq := 1; seq <= 7; seq++ {
+		job.Attempts = seq
+		scheduler.finishAttempt(job, AttemptFailed, nil)
+		ledger.mu.Lock()
+		cumulative[seq] = len(ledger.prunes)
+		ledger.mu.Unlock()
+	}
+	require.Equal(t, map[int]int{1: 0, 2: 0, 3: 1, 4: 1, 5: 1, 6: 2, 7: 2}, cumulative,
+		"prune 恰在 seq=3、6 两个取模点各触发一次；seq=7（终态不逢取模）不补裁")
+
+	// 取模点恰逢终态：照常裁剪，不做任何特殊化。
+	job.Attempts = 9
+	scheduler.finishAttempt(job, AttemptFailed, nil)
+	ledger.mu.Lock()
+	total := len(ledger.prunes)
+	ledger.mu.Unlock()
+	require.Equal(t, 3, total)
 }

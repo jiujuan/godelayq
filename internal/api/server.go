@@ -97,6 +97,11 @@ type Server struct {
 	// 它单独存一份而不是取 State().Enabled：读数要说的是"这台进程的配置开关是什么"，
 	// 而"开关开着、监听器没建起来"那种部署的 State() 里那位是假的（R05 的 D-R0503）。
 	reloadEnabled bool
+	// dbRuntime 是任务库的机制性读数源（G4/Q05）；nil = JSON 部署没有任务库，
+	// /admin/runtime 连 db 这个键都不给（见 RuntimeResponse.DB）。
+	// 与 events 同一惯例：接口定义在消费方，api 包不许碰驱动——
+	// 实现方是 jobs.Store，读数词汇是 core.DBRuntimeStats。
+	dbRuntime dbRuntimeSource
 
 	// baseCtx 传给每个请求；Stop 取消它即可让 SSE 等长连接立即收尾
 	baseCtx    context.Context
@@ -167,6 +172,19 @@ type eventReader interface {
 // "取自持久化事件库"那句，读的人知道自己在看什么。
 func WithEventLog(r eventReader) Option {
 	return func(s *Server) { s.events = r }
+}
+
+// dbRuntimeSource 是任务库机制性读数的来源（G4/Q05），由 jobs.Store 实现。
+// 接口定义在消费方与 eventReader 同一理由：api 不 import store 包，按能力声明；
+// 读数词汇 core.DBRuntimeStats 定义在 core（与 RuntimeStats 同层的公共形状）。
+type dbRuntimeSource interface {
+	DBRuntime() (core.DBRuntimeStats, error)
+}
+
+// WithDBRuntime 注入任务库读数源。传 nil 与不注入等价，db 段都不出现——
+// JSON 部署没有任务库，"没这个能力"与"读数是零"必须区分开。
+func WithDBRuntime(src dbRuntimeSource) Option {
+	return func(s *Server) { s.dbRuntime = src }
 }
 
 // NewServer 创建API服务器。sec 为零值时不鉴权、接受任意跨域来源；

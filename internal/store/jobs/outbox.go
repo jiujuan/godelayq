@@ -51,8 +51,10 @@ const (
 // 终态时的留痕淘汰（含账本级联，trimTerminalTx 复用）。任何一步失败整体回滚——
 // "状态落了事件没了"的窗口由本方法关闭。
 //
-// 刻意不含 attempt 行：账本的 begin/finish 由 worker 协程单独调用，崩溃遗留的
-// running 行由 Restore 收口为 abandoned（自愈），不进本事务。
+// 账本开始行自 W1/Q08 起经 UpdateWithEventsAndAttempt 并进 running 落盘的同一
+// 事务；本方法保留为首次排期（pending）与 identity 写的通道。finish/abandon 仍由
+// worker 协程与 Restore 单独调用（崩溃遗留的 running 行由 Restore 收口为
+// abandoned，自愈），不进本事务。
 func (s *Store) UpdateWithEvents(snapshot core.JobSnapshot, events []core.Event) error {
 	err := s.h.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
 		if err := upsertSnapshot(tx, snapshot); err != nil {
@@ -70,6 +72,39 @@ func (s *Store) UpdateWithEvents(snapshot core.JobSnapshot, events []core.Event)
 	})
 	if err != nil {
 		return fmt.Errorf("jobs: update with events %s: %w", snapshot.ID, err)
+	}
+	return nil
+}
+
+// UpdateWithEventsAndAttempt 在同一事务里落任务快照、出箱事件与账本开始行
+//（core.EventOutbox 的 W1/Q08 扩展，调用方 transitionWithAttempt）。
+//
+// 事务内容：快照 upsert + 出箱批量 INSERT + 账本开始行 upsert（与直写路径共用
+// 同一条冲突更新链）+ 终态时的留痕淘汰。任何一步失败整体回滚——"状态落了、
+// 账本没开行"的半截现场由本方法关闭。
+//
+// 主用场是 running 落盘（非终态）；终态分支保留只为与 UpdateWithEvents 同构，
+// 不为调用方承诺（finish 自有通道）。
+func (s *Store) UpdateWithEventsAndAttempt(snapshot core.JobSnapshot, events []core.Event, attempt core.Attempt) error {
+	err := s.h.RunInTx(bgCtx, nil, func(ctx context.Context, tx bun.Tx) error {
+		if err := upsertSnapshot(tx, snapshot); err != nil {
+			return err
+		}
+		if len(events) > 0 {
+			if err := insertOutboxEvents(ctx, tx, events); err != nil {
+				return err
+			}
+		}
+		if err := upsertAttemptOn(ctx, tx, attempt); err != nil {
+			return err
+		}
+		if core.JobStatus(snapshot.Status).IsTerminal() {
+			return trimTerminalTx(ctx, tx, s.historyLimit.Load(), time.Duration(s.historyTTL.Load()))
+		}
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("jobs: update with events and attempt %s: %w", snapshot.ID, err)
 	}
 	return nil
 }
@@ -281,6 +316,21 @@ func (r *OutboxRelay) dispatchBatch() error {
 	return nil
 }
 
+// pendingOutboxCount 统计出箱表中待投递行数。中继器的积压上限判定（prune）与
+// 运维读数（Store.DBRuntime，G4/Q05）共用这一条查询——积压的语义只有一份，
+// 截断判定与 /admin/runtime 读数不许分叉。
+// 入参收 *Handle 而不是 bun.IDB：Handle 的 Dialect() 被 engine.DB 遮蔽成
+// engine.Dialect，不再满足 bun.IDB，而这里也不需要更宽的入参。
+func pendingOutboxCount(db *Handle) (int64, error) {
+	count, err := db.NewSelect().Model((*outboxRow)(nil)).
+		Where("status = ?", outboxStatusPending).
+		Count(bgCtx)
+	if err != nil {
+		return 0, fmt.Errorf("jobs: count pending outbox rows: %w", err)
+	}
+	return int64(count), nil
+}
+
 // prune 做两件清理：dispatched 行按 TTL 淘汰；pending 超过积压上限时按最旧截断。
 // 两者都在各自的小事务里；失败只记日志——清理是下限保障，不影响投递正确性。
 func (r *OutboxRelay) prune() {
@@ -292,10 +342,7 @@ func (r *OutboxRelay) prune() {
 		r.logger.Error("failed to prune dispatched outbox rows", "error", err)
 	}
 
-	
-	count, err := r.h.NewSelect().Model((*outboxRow)(nil)).
-		Where("status = ?", outboxStatusPending).
-		Count(bgCtx)
+	count, err := pendingOutboxCount(r.h)
 	if err != nil {
 		r.logger.Error("failed to count pending outbox rows", "error", err)
 		return

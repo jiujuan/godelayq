@@ -328,6 +328,17 @@ func (s *Scheduler) takeCancelRequested(jobID string) bool {
 	return true
 }
 
+// forcedPausePending 只读偷看：该任务是否有待认领的强制暂停标记。
+// 供 handleSuccess 在"completed 先于 paused"的顺序要求下提前发事件用
+// （W2/Q09）；真正的认领仍由 parkForcedPause 完成——偷看到认领之间标记
+// 才落进来的竞态窗口由调用方补偿（事件不丢，顺序让步）。
+func (s *Scheduler) forcedPausePending(jobID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, ok := s.forcedPause[jobID]
+	return ok
+}
+
 // parkForcedPause 由执行收尾调用：若该任务被请求过强制暂停，就把它钉在 paused 上
 // 并广播 job.paused，返回 true 表示调用方应当放弃自己原有的收尾逻辑
 // （不再记成功、不再计重试、不再重排 Cron 的下一轮）。

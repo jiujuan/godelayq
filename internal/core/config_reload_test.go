@@ -653,6 +653,8 @@ func TestClassifyUnknownPathIsNotSilent(t *testing.T) {
 	}{
 		{"logging.level", ClassHot},
 		{"server.port", ClassRestart},
+		{"store.slow_query_threshold", ClassRestart},
+		{"store.statement_timeout", ClassRestart},
 		{"server.auth.token", ClassReject},
 		{"server.auth.users.#0.password_bcrypt", ClassReject},
 		{"executors.commands", ClassHot},

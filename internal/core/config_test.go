@@ -907,3 +907,50 @@ func TestValidate_Reload(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "parse config failed")
 }
+
+// 慢查询日志阈值（G5/Q06）：缺省 0=关；负数与低于下限拒启（对齐 outbox_flush_interval
+// 的下限守卫模式）。
+func TestLoadConfig_SlowQueryThreshold(t *testing.T) {
+	omitted, err := LoadConfig(writeConfigFile(t, "store:\n  slow_query_threshold: 0s\n"))
+	require.NoError(t, err, "0 表示关闭，必须放过")
+	assert.Zero(t, omitted.Store.SlowQueryThreshold)
+
+	// 负数拒启：0 才是"关"，负值只可能是笔误，静默折成 0 会把"想开但写错"埋成"开着默认"
+	_, err = LoadConfig(writeConfigFile(t, "store:\n  slow_query_threshold: -5s\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "slow_query_threshold")
+	assert.Contains(t, err.Error(), "must not be negative")
+
+	// 低于下限拒启：本地常规查询在亚毫秒级，压到下限以下等于日志洪水开关
+	_, err = LoadConfig(writeConfigFile(t, "store:\n  slow_query_threshold: 500us\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "below the minimum")
+
+	// 下界本身合法
+	floor, err := LoadConfig(writeConfigFile(t, "store:\n  slow_query_threshold: 1ms\n"))
+	require.NoError(t, err)
+	assert.Equal(t, MinSlowQueryThreshold, floor.Store.SlowQueryThreshold)
+}
+
+// 语句超时（G6/Q07）：0 不设（默认）；负数拒启；sqlite 方言上写 PG 专属键拒启
+// （与"sqlite 却写 dsn"同一口径——方言专属键写错方言是配置错误）。
+func TestLoadConfig_StatementTimeout(t *testing.T) {
+	omitted, err := LoadConfig(writeConfigFile(t, "store:\n  statement_timeout: 0s\n"))
+	require.NoError(t, err, "0 表示不设，必须放过")
+	assert.Zero(t, omitted.Store.StatementTimeout)
+
+	_, err = LoadConfig(writeConfigFile(t, "store:\n  statement_timeout: -1s\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must not be negative")
+
+	// 默认方言（sqlite）写它：拒绝而不是静默忽略
+	_, err = LoadConfig(writeConfigFile(t, "store:\n  type: sqlite\n  statement_timeout: 5s\n"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "only used when store.sqlite.dialect is postgres")
+
+	// postgres 方言 + 超时：合法
+	pg, err := LoadConfig(writeConfigFile(t,
+		"store:\n  type: sqlite\n  statement_timeout: 5s\n  sqlite:\n    dialect: postgres\n    dsn: postgres://u:p@localhost:5432/db\n"))
+	require.NoError(t, err)
+	assert.Equal(t, 5*time.Second, pg.Store.StatementTimeout)
+}

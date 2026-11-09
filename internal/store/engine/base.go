@@ -61,6 +61,16 @@ type Options struct {
 	// 观测库传 1：写入批量单点、读是短查询，单连接同时消除 SQLITE_BUSY 的主要来源
 	// （设计文档 §7.2）。
 	MaxOpenConns int
+	// SlowQueryThreshold 慢查询日志阈值（G5/Q06）：>0 时挂 bun QueryHook，
+	// 单条查询耗时超过阈值打 Warn（SQL 截断文本 + 耗时 + 方言）；0（默认）不挂
+	// 钩子，每查询零开销。取值合法性与下限守卫归调用方的配置层（core.Validate），
+	// 本包只认"正数即开启"。
+	SlowQueryThreshold time.Duration
+	// StatementTimeout 语句超时（G6/Q07）：仅 postgres 方言生效，经 DSN 注入
+	// statement_timeout 运行时参数；0（默认）不注入，openPostgres 会记一条 Warn。
+	// 迁移事务内的 DDL 经 SET LOCAL 豁免（Migrate 注释），业务查询带上限。
+	// 负值在本包按 0 处理；取值校验归配置层。
+	StatementTimeout time.Duration
 }
 
 // DB 是一个数据库的句柄。它是纯机制对象：不认识任何一张业务表，
@@ -99,14 +109,31 @@ func Open(opts Options, logger *slog.Logger) (*DB, error) {
 	if dialect == "" {
 		dialect = DialectSQLite
 	}
+	var db *DB
+	var err error
 	switch dialect {
 	case DialectSQLite:
-		return openSQLite(opts, logger)
+		db, err = openSQLite(opts, logger)
 	case DialectPostgres:
-		return openPostgres(opts, logger)
+		db, err = openPostgres(opts, logger)
 	default:
 		return nil, fmt.Errorf("engine: unknown dialect %q, use sqlite or postgres", opts.Dialect)
 	}
+	if err != nil {
+		return nil, err
+	}
+	// 慢查询钩子（G5/Q06）挂在 Open：业务包经 Options 传阈值，钩子装配只有这一处。
+	// 关闭（0）时一条钩子都不挂——bun 在无钩子时连 QueryEvent 都不建（hook.go
+	// beforeQuery 的短路），关闭路径是真的零开销。
+	if opts.SlowQueryThreshold > 0 {
+		db.AddQueryHook(&slowQueryHook{
+			threshold: opts.SlowQueryThreshold,
+			maxBytes:  DefaultSlowQueryLogBytes,
+			dialect:   db.dialect,
+			logger:    logger,
+		})
+	}
+	return db, nil
 }
 
 // openSQLite 建好父目录、打开连接、设置 PRAGMA（sqlite 方言分支）。
@@ -133,6 +160,13 @@ func openSQLite(opts Options, logger *slog.Logger) (*DB, error) {
 
 	if err := os.MkdirAll(filepath.Dir(path), dirPerm); err != nil {
 		return nil, fmt.Errorf("sqlite: create dir for %s: %w", path, err)
+	}
+	// 语句超时是 PG 专属（G6/Q07）：SQLite 没有对应物。配置层会拒绝
+	// "dialect=sqlite 却写 statement_timeout"，这里对直接使用本包的调用方
+	// 只提示不拒绝——配置写了但没生效这件事必须可见。
+	if opts.StatementTimeout > 0 {
+		logger.Warn("statement_timeout is postgres-only; ignored on sqlite",
+			"path", path)
 	}
 	// 先按目标权限把文件建出来，再让驱动打开：驱动自己创建时权限由系统 umask 决定，
 	// 同机其它用户可能正好能读这份带账号名的台账。已存在的文件不动它的权限。
@@ -276,6 +310,17 @@ func (d *DB) Migrate(table string, ms []Migration) error {
 		if err != nil {
 			return fmt.Errorf("sqlite: begin migration %d: %w", m.Version, err)
 		}
+		// 语句超时豁免（G6/Q07）：业务连接经 DSN 带 statement_timeout，而迁移里的
+		// DDL 可能远超业务上限。SET LOCAL 只在本事务内生效、提交即消失——
+		// 豁免不会随连接归还泄漏给后续业务查询。SQLite 没有这条语句（也没有
+		// statement_timeout），按方言跳过。事务外的记账查询（建表/读版本/落版本）
+		// 都是亚毫秒级快语句，留在业务上限之内。
+		if d.dialect == DialectPostgres {
+			if _, err := tx.Exec(`SET LOCAL statement_timeout = 0`); err != nil {
+				_ = tx.Rollback()
+				return fmt.Errorf("sqlite: exempt migration %d from statement_timeout: %w", m.Version, err)
+			}
+		}
 		for _, stmt := range m.statements(d.dialect) {
 			if _, err := tx.Exec(stmt); err != nil {
 				_ = tx.Rollback()
@@ -298,6 +343,26 @@ func (d *DB) Migrate(table string, ms []Migration) error {
 // 写入器先撤订阅并落完最后一批，最后才轮到本方法拿到的这条连接退场（设计文档 §7.3）。
 func (d *DB) SQL() *sql.DB {
 	return d.sqlDB
+}
+
+// Stats 返回连接池的瞬时占用（G4/Q05）：运维端点读数用。
+// 机制读数归机制包：业务包（jobs/observe/mgr）的读数方法折算自这里，
+// 不各自摸 *sql.DB。
+func (d *DB) Stats() sql.DBStats {
+	return d.sqlDB.Stats()
+}
+
+// MigrationVersion 读取已应用迁移的最高版本号；迁移表无行（全新库）返回 0。
+// 与 Migrate 共用同一张版本表（表名由调用方给）与同一条读法——版本号的
+// 权威语义只有这一份，运维读数与迁移判定不许分叉。
+// 语句无占位符，两方言通吃，与 Migrate 的 readVersion 同一取向。
+func (d *DB) MigrationVersion(table string) (int, error) {
+	readVersion := fmt.Sprintf(`SELECT COALESCE(MAX(version), 0) FROM %s`, table)
+	var applied int
+	if err := d.sqlDB.QueryRow(readVersion).Scan(&applied); err != nil {
+		return 0, fmt.Errorf("engine: read schema version of %s: %w", table, err)
+	}
+	return applied, nil
 }
 
 // Dialect 返回本句柄使用的方言。

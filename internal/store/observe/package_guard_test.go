@@ -63,3 +63,17 @@ func TestObservePackageStoreRedlines(t *testing.T) {
 	storeguard.GuardNoDialectBranch(t, dir, nil)
 	storeguard.GuardNoDynamicSQL(t, dir)
 }
+
+// 迁移纪律守卫（G7/Q11）：版本严格递增无重复、UpPostgres 方言可移植
+// （AUTOINCREMENT 必须配 IDENTITY）、version 1 语句文本逐字节冻结。
+// v1 golden 的重写通道与 SQL 快照同款：
+//
+//	go test ./internal/store/observe/ -run TestPackageGuard -update
+//
+// 冻结的是既有部署迁移判定的起点，变更必须 diff 评审后显式更新。
+func TestObserveMigrationDiscipline(t *testing.T) {
+	storeguard.RequireMigrationVersions(t, migrations)
+	storeguard.RequireMigrationPortable(t, migrations)
+	storeguard.RequireMigrationV1Frozen(t, migrations,
+		filepath.Join("testdata", "migration_v1.golden"), *updateSnapshot)
+}

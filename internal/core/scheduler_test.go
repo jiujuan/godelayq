@@ -461,7 +461,7 @@ func TestScheduler_HandleSuccess_OneTime(t *testing.T) {
 		Status: StatusRunning,
 	}
 
-	scheduler.handleSuccess(job)
+	scheduler.handleSuccess(job, Event{Type: EventJobCompleted, JobID: job.ID})
 
 	if job.Status != StatusSuccess {
 		t.Errorf("Expected status Success, got %v", job.Status)
@@ -499,7 +499,7 @@ func TestScheduler_HandleSuccess_Repeat(t *testing.T) {
 		IsRepeat: true,
 	}
 
-	scheduler.handleSuccess(job)
+	scheduler.handleSuccess(job, Event{Type: EventJobCompleted, JobID: job.ID})
 
 	// Verify new job was scheduled
 	if scheduler.heap.Len() != 1 {
@@ -529,7 +529,7 @@ func TestScheduler_HandleSuccess_RepeatDropsPreviousExec(t *testing.T) {
 		Exec:     &ExecMeta{Kind: "script", Profile: "nightly_report", ExitCode: 1, DurationMs: 20},
 	}
 
-	scheduler.handleSuccess(job)
+	scheduler.handleSuccess(job, Event{Type: EventJobCompleted, JobID: job.ID})
 
 	item := scheduler.heap.Peek()
 	if item == nil {

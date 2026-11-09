@@ -1,0 +1,53 @@
+version 1 up:
+CREATE TABLE IF NOT EXISTS mgr_users (
+  name            TEXT PRIMARY KEY COLLATE NOCASE,
+  password_bcrypt TEXT NOT NULL,
+  role            TEXT NOT NULL CHECK (role IN ('viewer','operator','admin','ops')),
+  created_at      INTEGER NOT NULL,           -- 写入时的 Unix 秒
+  updated_at      INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mgr_groups (
+  name        TEXT PRIMARY KEY COLLATE NOCASE,
+  description TEXT NOT NULL DEFAULT '',
+  color       TEXT NOT NULL DEFAULT '',
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mgr_executor_profiles (
+  name        TEXT PRIMARY KEY COLLATE NOCASE,
+  record_json TEXT NOT NULL,                  -- core.ExecutorProfileRecord 整体序列化：
+                                              -- 字段随 ExecutorCommand 演进，整存最稳，
+                                              -- 与 JSON 文件格式同构，迁移零转换
+  updated_at  INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mgr_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);
+version 1 up_postgres:
+CREATE TABLE IF NOT EXISTS mgr_users (
+  name            TEXT PRIMARY KEY,
+  password_bcrypt TEXT NOT NULL,
+  role            TEXT NOT NULL CHECK (role IN ('viewer','operator','admin','ops')),
+  created_at      BIGINT NOT NULL,            -- 写入时的 Unix 秒
+  updated_at      BIGINT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mgr_users_name_lower ON mgr_users (lower(name));
+CREATE TABLE IF NOT EXISTS mgr_groups (
+  name        TEXT PRIMARY KEY,
+  description TEXT NOT NULL DEFAULT '',
+  color       TEXT NOT NULL DEFAULT '',
+  created_at  BIGINT NOT NULL,
+  updated_at  BIGINT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mgr_groups_name_lower ON mgr_groups (lower(name));
+CREATE TABLE IF NOT EXISTS mgr_executor_profiles (
+  name        TEXT PRIMARY KEY,
+  record_json TEXT NOT NULL,                  -- core.ExecutorProfileRecord 整体序列化
+  updated_at  BIGINT NOT NULL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_mgr_profiles_name_lower ON mgr_executor_profiles (lower(name));
+CREATE TABLE IF NOT EXISTS mgr_meta (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL
+);

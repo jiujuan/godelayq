@@ -1,0 +1,104 @@
+version 1 up:
+CREATE TABLE IF NOT EXISTS job_events (
+  seq      INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_us    INTEGER NOT NULL,               -- core.Event.Timestamp，Unix 微秒
+  type     TEXT    NOT NULL,               -- job.scheduled|started|completed|failed|cancelled|retrying|paused|resumed
+  job_id   TEXT    NOT NULL,
+  job_name TEXT,
+  status   INTEGER NOT NULL,               -- core.JobStatus 的 int，与 JobSnapshot.Status 同一口径
+  data     TEXT,                           -- core.Event.Data 原文（JSON），可空
+  metadata TEXT                            -- core.Event.Metadata 序列化为 JSON
+);
+CREATE INDEX IF NOT EXISTS idx_events_job ON job_events(job_id, seq);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON job_events(ts_us);
+CREATE INDEX IF NOT EXISTS idx_events_type ON job_events(type, ts_us);
+CREATE TABLE IF NOT EXISTS artifact_index (
+  job_id    TEXT NOT NULL,
+  attempt   INTEGER NOT NULL,
+  kind      TEXT NOT NULL,                 -- script|binary|http
+  profile   TEXT,                          -- 档位名，不含 exec. 前缀
+  out_rel   TEXT, err_rel  TEXT,           -- 相对 executors.output.dir；不存绝对路径
+  out_bytes INTEGER NOT NULL DEFAULT 0,
+  err_bytes INTEGER NOT NULL DEFAULT 0,
+  truncated INTEGER NOT NULL DEFAULT 0,
+  state     TEXT NOT NULL,                 -- available|purged
+  created_at INTEGER NOT NULL,
+  PRIMARY KEY (job_id, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_artifact_state ON artifact_index(state, created_at);
+CREATE TABLE IF NOT EXISTS write_audit (
+  seq       INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_us     INTEGER NOT NULL,
+  actor     TEXT,                          -- 账号名；静态凭据记 "machine"；未认证记空
+  actor_kind TEXT NOT NULL,                -- user|machine|anonymous
+  role      TEXT,                          -- viewer|operator|admin|ops|machine
+  action    TEXT NOT NULL,                 -- 封闭集：job.create|job.cancel|job.pause|…（见 §9.5 映射表）
+  method    TEXT NOT NULL,                 -- POST|PUT|DELETE
+  route     TEXT NOT NULL,                 -- gin 路由模板，如 /api/v1/jobs/:id/pause；不存原始 URL 与查询串
+  status    INTEGER NOT NULL,              -- HTTP 状态码（来自 c.Writer.Status()）
+  latency_us INTEGER NOT NULL,
+  verdict   TEXT NOT NULL,                 -- ok|denied|bad_request|not_found|conflict|error（按 status 派生）
+  exec_verdict TEXT,                       -- 仅执行器任务：accepted|role_denied|profile_unavailable|payload_rejected|timeout_rejected
+  exec_reason_code TEXT,                   -- 封闭枚举；不存 error 原文
+  handler_key TEXT,                        -- 仅执行器任务：注册键 exec.<name>
+  profile   TEXT,                          -- 仅执行器任务：档位名
+  job_id    TEXT,                          -- 有归属时填；批量请求填请求级 ID 留空
+  remote_ip TEXT,
+  user_agent TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON write_audit(ts_us);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON write_audit(actor, ts_us);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON write_audit(action, ts_us);
+CREATE INDEX IF NOT EXISTS idx_audit_verdict ON write_audit(verdict, ts_us);
+version 1 up_postgres:
+CREATE TABLE IF NOT EXISTS job_events (
+  seq      BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  ts_us    BIGINT  NOT NULL,               -- core.Event.Timestamp，Unix 微秒
+  type     TEXT    NOT NULL,               -- job.scheduled|started|completed|failed|cancelled|retrying|paused|resumed
+  job_id   TEXT    NOT NULL,
+  job_name TEXT,
+  status   INTEGER NOT NULL,               -- core.JobStatus 的 int，与 JobSnapshot.Status 同一口径
+  data     TEXT,                           -- core.Event.Data 原文（JSON），可空
+  metadata TEXT                            -- core.Event.Metadata 序列化为 JSON
+);
+CREATE INDEX IF NOT EXISTS idx_events_job ON job_events(job_id, seq);
+CREATE INDEX IF NOT EXISTS idx_events_ts ON job_events(ts_us);
+CREATE INDEX IF NOT EXISTS idx_events_type ON job_events(type, ts_us);
+CREATE TABLE IF NOT EXISTS artifact_index (
+  job_id    TEXT NOT NULL,
+  attempt   INTEGER NOT NULL,
+  kind      TEXT NOT NULL,                 -- script|binary|http
+  profile   TEXT,                          -- 档位名，不含 exec. 前缀
+  out_rel   TEXT, err_rel  TEXT,           -- 相对 executors.output.dir；不存绝对路径
+  out_bytes BIGINT NOT NULL DEFAULT 0,
+  err_bytes BIGINT NOT NULL DEFAULT 0,
+  truncated INTEGER NOT NULL DEFAULT 0,
+  state     TEXT NOT NULL,                 -- available|purged
+  created_at BIGINT NOT NULL,
+  PRIMARY KEY (job_id, attempt)
+);
+CREATE INDEX IF NOT EXISTS idx_artifact_state ON artifact_index(state, created_at);
+CREATE TABLE IF NOT EXISTS write_audit (
+  seq       BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+  ts_us     BIGINT  NOT NULL,
+  actor     TEXT,                          -- 账号名；静态凭据记 "machine"；未认证记空
+  actor_kind TEXT NOT NULL,                -- user|machine|anonymous
+  role      TEXT,                          -- viewer|operator|admin|ops|machine
+  action    TEXT NOT NULL,                 -- 封闭集：job.create|job.cancel|job.pause|…（见 §9.5 映射表）
+  method    TEXT NOT NULL,                 -- POST|PUT|DELETE
+  route     TEXT NOT NULL,                 -- gin 路由模板，如 /api/v1/jobs/:id/pause；不存原始 URL 与查询串
+  status    INTEGER NOT NULL,              -- HTTP 状态码（来自 c.Writer.Status()）
+  latency_us BIGINT NOT NULL,
+  verdict   TEXT NOT NULL,                 -- ok|denied|bad_request|not_found|conflict|error（按 status 派生）
+  exec_verdict TEXT,                       -- 仅执行器任务：accepted|role_denied|profile_unavailable|payload_rejected|timeout_rejected
+  exec_reason_code TEXT,                   -- 封闭枚举；不存 error 原文
+  handler_key TEXT,                        -- 仅执行器任务：注册键 exec.<name>
+  profile   TEXT,                          -- 仅执行器任务：档位名
+  job_id    TEXT,                          -- 有归属时填；批量请求填请求级 ID 留空
+  remote_ip TEXT,
+  user_agent TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_audit_ts ON write_audit(ts_us);
+CREATE INDEX IF NOT EXISTS idx_audit_actor ON write_audit(actor, ts_us);
+CREATE INDEX IF NOT EXISTS idx_audit_action ON write_audit(action, ts_us);
+CREATE INDEX IF NOT EXISTS idx_audit_verdict ON write_audit(verdict, ts_us);

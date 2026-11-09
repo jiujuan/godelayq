@@ -180,3 +180,31 @@ func TestAttemptTrimCascade(t *testing.T) {
 		require.Empty(t, rows, "快照被淘汰的任务，账本行必须级联删除")
 	})
 }
+
+// W3/Q10 窗口上界：core.finishAttempt 的取模规则下，单任务行数 ≤ 2×keepLast。
+// 规则本体在 core（finishAttempt），这里用真实 store SQL 钉住它的算术结果：
+// 裁剪保留最近 k 行，两次裁剪之间至多再涨 k-1 行；读侧 Attempts 按 limit 取
+// 最近 N 条的语义不受超窗影响（Attempts 既有用例钉住）。
+func TestPruneThrottle_WindowBound(t *testing.T) {
+	runWithStoreBackends(t, func(t *testing.T, open storeOpener) {
+		s := open(t)
+		const k = 3
+		for seq := 1; seq <= 9; seq++ {
+			require.NoError(t, s.FinishAttempt("w3-bound", seq, core.Attempt{
+				JobID: "w3-bound", Seq: seq, Status: core.AttemptFailed, StartedAt: time.Now(),
+			}))
+			if seq%k == 0 {
+				require.NoError(t, s.PruneAttempts("w3-bound", k))
+			}
+			count, err := s.h.NewSelect().Model((*attemptRow)(nil)).
+				Where("job_id = ?", "w3-bound").Count(bgCtx)
+			require.NoError(t, err)
+			require.LessOrEqual(t, count, int64(2*k), "seq=%d 时行数越界", seq)
+		}
+		// 终态：恰逢取模点的最后一次裁剪把行数收回 keepLast。
+		count, err := s.h.NewSelect().Model((*attemptRow)(nil)).
+			Where("job_id = ?", "w3-bound").Count(bgCtx)
+		require.NoError(t, err)
+		require.EqualValues(t, k, count)
+	})
+}
