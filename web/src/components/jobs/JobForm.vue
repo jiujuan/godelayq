@@ -802,9 +802,11 @@ function createGroup(): void {
       <UiInput
         v-else-if="form.triggerMode === 'at'"
         label="触发时间"
+        type="datetime-local"
         :model-value="form.triggerAt"
         :disabled="busy"
         :error="triggerError"
+        :hint="mode === 'create' ? '按本机时区选择日期与时间，要选一个还没到的时刻' : '按本机时区选择日期与时间'"
         @update:model-value="form.triggerAt = $event"
       />
 

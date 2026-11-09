@@ -4,7 +4,7 @@ import { computed, useId } from 'vue'
 interface Props {
   modelValue: string
   label?: string
-  type?: 'text' | 'password'
+  type?: 'text' | 'password' | 'datetime-local'
   placeholder?: string
   autocomplete?: string
   error?: string | null
